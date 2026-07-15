@@ -1,14 +1,37 @@
-# VexiiRiscv + MiCo
+# CfuGym
+
+CfuGym is a VexiiRiscv-based hardware/software co-design workspace for building, integrating, and validating custom function units (CFUs), custom RISC-V instructions, and mixed-precision accelerators. It keeps the original VexiiRiscv and MiCo context while adding practical flows for SoC generation, bare-metal software validation, simulation, profiling, and hardware-cost exploration.
+
+## Install the CFU Designer Skill
+
+This repo includes a Codex skill for CFU design at `skills/cfu-designer`. Install it into your local Codex skills directory with:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" skills/cfu-designer
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+rsync -a --delete --exclude '__pycache__' --exclude '*.pyc' \
+  skills/cfu-designer/ "${CODEX_HOME:-$HOME/.codex}/skills/cfu-designer/"
+```
+
+Restart Codex after installation so the new skill is discovered. Use it in future prompts with:
+
+```text
+Use $cfu-designer to design, validate, and estimate hardware cost for a CfuGym CFU.
+```
+
+## Original VexiiRiscv + MiCo Context
+
+### VexiiRiscv + MiCo
 
 VexiiRiscv-MiCo is a mixed-precision computing extension plugin for VexiiRiscv.
 
 You can find the MiCo plugin in scala class `vexiiriscv.execute.MiCoPlugin`.
 
-## MiCo Plugin
+### MiCo Plugin
 
 The MiCo plugin provides 10 custom insturctions, focusing on signed dot product operations between two 32/64-bit vectors. Each of the packed vectors can contain INT8/INT4/INT2/INT1 data.
 
-### Usage
+#### Usage
 
 To add the `MiCoPlugin` into `Param.scala`, you need to find the lines about the `lane0`, and add one more line for `MiCoPlugin`:
 ```scala
