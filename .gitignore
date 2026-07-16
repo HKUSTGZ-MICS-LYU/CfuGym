@@ -66,3 +66,6 @@ tmp/
 
 vnc_done
 docker_xfce4.lop
+
+# soc
+soc.h
