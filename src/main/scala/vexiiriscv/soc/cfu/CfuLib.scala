@@ -1,4 +1,4 @@
-package vexiiriscv.soc.mico
+package vexiiriscv.soc.cfu
 
 import spinal.core._
 import spinal.lib._
