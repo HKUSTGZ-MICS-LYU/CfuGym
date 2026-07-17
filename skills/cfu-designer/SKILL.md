@@ -37,6 +37,8 @@ Read only the references needed for the current task:
 - For fast hardware-cost estimation with Yosys, read `references/yosys-cost-flow.md`.
 - For acceleration-pattern selection and optimization-loop structure, read `references/acceleration-patterns.md`.
 - For a minimal SIMD int8 summing CFU example, read `references/minimal-example-simd8-sum.md`.
+- For VPU-style universal vector register files, dedicated CFU memories, datapath-width parameters, and optional compute pipelining, read `references/vector-rf-vpu-pattern.md`.
+- For a memory-backed weighted-sum/average experiment with resident product vectors, read `references/u8-weighted-average-experiment.md`.
 
 Use the starter assets only when creating a new CFU surface:
 
@@ -57,6 +59,8 @@ Use the starter assets only when creating a new CFU surface:
 - Keep the CPU CFU bus single-owner unless the SoC explicitly adds arbitration. This repo currently legalizes MiCo VPU and BitNet CFU as mutually exclusive users of the single CFU bus.
 - For CPU-written data later read by the CFU or DMA/TileLink path, check fence/cache/visibility before changing math.
 - Prefer acceleration patterns that amortize instruction overhead. A CFU instruction should usually replace several scalar operations, remove loop-carried work, reduce memory traffic, or expose a better layout.
+- For multi-operation kernels, look for an intermediate result that can stay resident inside the CFU. Avoid writing vector temporaries back to memory when the next operation is an immediate reduction or transform.
+- Use a VPU-style vector RF or dedicated CFU memory when more than one operation reuses loaded vectors, when raw `rs1`/`rs2` should name CFU registers, or when the datapath needs tunable `vlen`/`xlen`/`maclen`/pipeline tradeoffs.
 - Keep scalar fallback and measurement hooks close to the accelerated kernel until correctness and speedup are stable.
 - Do not claim performance or cost from compile success. Use cycle/profile lines, simulator output, Yosys cost reports, or vendor synthesis reports.
 

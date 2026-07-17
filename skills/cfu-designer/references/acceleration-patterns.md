@@ -64,6 +64,8 @@ Design choices:
 - Add explicit config/reset instructions.
 - Reset cursors and accumulators on config, command completion, or software-visible boundaries.
 - Check fences if software writes memory before CFU loads it.
+- For reusable designs, separate `vlen`, memory beat width, compute slice width, RF depth, RF backend, and pipeline toggles. Avoid baking one workload's temporary-vector shape into the universal RF.
+- If an operation widens lanes, such as `int8 * int8 -> int16`, either reduce immediately, allocate widened storage, split the result across multiple RF entries, or explicitly make the command process fewer lanes.
 
 ### Memory Transform or DMA-Like CFU
 

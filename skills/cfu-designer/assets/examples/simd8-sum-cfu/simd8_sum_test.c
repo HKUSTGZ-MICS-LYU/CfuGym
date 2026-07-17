@@ -111,9 +111,9 @@ int main(void) {
     g_simd8_sum_cfu_cycles = (uint32_t)cfu_time;
     g_simd8_sum_speedup_x100 = (uint32_t)speedup_x100;
 
-    printf("SIMD8_SUM PASS scalar=%ld cfu=%ld\n", (long)scalar, (long)accel);
-    printf("SIMD8_SUM_PROFILE scalar=%ld cfu=%ld speedup_x100=%ld\n",
-           scalar_time, cfu_time, speedup_x100);
+    printf("SIMD8_SUM PASS scalar=%d cfu=%d\n", (int)scalar, (int)accel);
+    printf("SIMD8_SUM_PROFILE scalar=%d cfu=%d speedup_x100=%d\n",
+           (int)scalar_time, (int)cfu_time, (int)speedup_x100);
 
     return 0;
 }

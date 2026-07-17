@@ -3,6 +3,7 @@ package vexiiriscv.soc.mico
 import spinal.core._
 import spinal.lib._
 import vexiiriscv.execute.cfu._
+import vexiiriscv.soc.cfu.DirectCfuSpec
 
 object Simd8SumCfu {
   def busParameter(xlen: Int = 32) = CfuBusParameter(
@@ -24,6 +25,15 @@ object Simd8SumCfu {
   )
 }
 
+case class Simd8SumCfuSpec() extends DirectCfuSpec {
+  override def cfuBusParameter(xlen: Int) = Simd8SumCfu.busParameter(xlen)
+
+  override def build(cfuParam: CfuBusParameter, cfuBus: CfuBus) = new Area {
+    val cfu = new Simd8SumCfu(cfuParam)
+    cfu.io.bus <> cfuBus
+  }
+}
+
 class Simd8SumCfu(cfuParam: CfuBusParameter) extends Component {
   val io = new Bundle {
     val bus = slave(CfuBus(cfuParam))
@@ -35,25 +45,8 @@ class Simd8SumCfu(cfuParam: CfuBusParameter) extends Component {
   val lanes = io.bus.cmd.inputs(0).subdivideIn(8 bits).map(_.asSInt.resize(16))
   val sum = Vec(lanes).reduceBalancedTree(_ +^ _).resize(cfuParam.CFU_OUTPUT_DATA_W)
 
-  val rspValid = RegInit(False)
-  val rspResponseId = Reg(UInt(cfuParam.CFU_REQ_RESP_ID_W bits)) init(0)
-  val rspData = Reg(Bits(cfuParam.CFU_OUTPUT_DATA_W bits)) init(0)
-  val rspStatus = if(cfuParam.CFU_WITH_STATUS) Reg(Bits(3 bits)) init(0) else null
-
-  io.bus.cmd.ready := !rspValid
-  io.bus.rsp.valid := rspValid
-  io.bus.rsp.response_id := rspResponseId
-  io.bus.rsp.outputs(0) := rspData
-  if(cfuParam.CFU_WITH_STATUS) io.bus.rsp.status := rspStatus
-
-  when(io.bus.rsp.fire) {
-    rspValid := False
-  }
-
-  when(io.bus.cmd.fire) {
-    rspValid := True
-    rspResponseId := io.bus.cmd.request_id
-    rspData := isSum4.mux(sum.asBits, B(0, cfuParam.CFU_OUTPUT_DATA_W bits))
-    if(cfuParam.CFU_WITH_STATUS) rspStatus := isSum4.mux(B"000", B"001")
-  }
+  io.bus.rsp.arbitrationFrom(io.bus.cmd)
+  io.bus.rsp.response_id := io.bus.cmd.request_id
+  io.bus.rsp.outputs(0) := isSum4.mux(sum.asBits, B(0, cfuParam.CFU_OUTPUT_DATA_W bits))
+  if(cfuParam.CFU_WITH_STATUS) io.bus.rsp.status := isSum4.mux(B"000", B"001")
 }
