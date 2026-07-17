@@ -16,6 +16,7 @@ Use this optimization loop:
 3. Estimate the CFU contract before coding: instruction encoding, operands, state, result, memory access, and software intrinsic/API.
 4. Choose the integration style:
    - Use an in-core execution plugin for short, combinational or tightly staged ALU-like instructions.
+   - Use `CfuPlugin` plus a direct `CfuBus` spec for stateless register-input/register-output CFUs.
    - Use `CfuPlugin` plus a `CfuBus`/TileLink fiber for stateful, memory-backed, multi-cycle, or reusable accelerators.
 5. Design CFU hardware: start with the smallest datapath that removes the bottleneck, add pipeline stages only when timing or throughput requires them.
 6. Develop the accelerated kernel: isolate the custom instruction sequence behind intrinsics or target-specific kernels, keeping scalar fallback available.
@@ -50,6 +51,8 @@ Use the starter assets only when creating a new CFU surface:
 - Preserve local patterns before introducing abstractions. In CfuGym, mirror `BitNetCfu`, `VpuCfu`, `TilelinkBitNetCfuFiber`, and `MiCoSocParam` unless the user asks for a new architecture.
 - Treat `CfuPlugin` as the CPU-side bridge: it decodes custom instructions, freezes the lane while waiting for `cmd.ready`/`rsp.valid`, and writes one integer result at `joinAt`.
 - Treat the CFU component as the accelerator owner: it implements command decode, internal state/FSM, optional TileLink memory access, response timing, and status.
+- Choose the shared CFU container style by behavior: use `DirectCfuSpec`/`DirectCfuFiber` for ALU-style CFUs such as SIMD8 sum; use `TilelinkCfuSpec`/`TilelinkCfuFiber` for memory-backed CFUs such as VPU, BitNet, or I8VAdd.
+- For a pure direct CFU, keep the command/response width equal to CPU XLEN and prefer the zero-latency `io.bus.rsp.arbitrationFrom(io.bus.cmd)` pattern. Use registered responses only when the CFU is genuinely multi-cycle.
 - Treat Vexii CPU parameters and SoC parameters as separate layers. A SoC option that needs a CPU feature must update `p.vexii`, not only instantiate hardware.
 - Keep the CPU CFU bus single-owner unless the SoC explicitly adds arbitration. This repo currently legalizes MiCo VPU and BitNet CFU as mutually exclusive users of the single CFU bus.
 - For CPU-written data later read by the CFU or DMA/TileLink path, check fence/cache/visibility before changing math.

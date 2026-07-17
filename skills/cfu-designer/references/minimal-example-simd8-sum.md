@@ -55,21 +55,35 @@ io.bus.rsp.outputs(0) := sum.asBits
 
 Integration options:
 
-- For a minimal SoC smoke test, instantiate `Simd8SumCfu` where `CfuTest` is used and connect `cfu.io.bus << cpuCfuBus`.
-- For a reusable MiCo-style integration, add a `Tilelink*Fiber` only if the CFU later needs memory. This stateless example does not need TileLink.
+- For the reusable MiCo-style integration, wrap it as a `DirectCfuSpec` and select it through the shared CFU container/fiber path. This keeps direct ALU-style CFUs and TileLink-backed CFUs behind the same SoC selection abstraction.
+- Add a `TilelinkCfuSpec` only if the CFU needs memory. This stateless example does not need TileLink.
+- Keep the direct CFU command/response data width equal to CPU XLEN. For the default MiCo configuration this is 32 bits, so the software packs four int8 lanes per instruction.
 - Keep the instruction encoding in the C intrinsic and Scala decode comments synchronized.
 
 Minimal patch shape:
 
 ```scala
-val cfuConnect = p.vexii.withCfu generate (Fiber patch new Area {
-  val cpuCfuBus = cpu.logic.core.host[CfuPlugin].logic.bus
-  val cfu = new Simd8SumCfu(Simd8SumCfu.busParameter(p.vexii.xlen))
-  cfu.io.bus << cpuCfuBus
-})
+case class Simd8SumCfuSpec() extends DirectCfuSpec {
+  override def cfuBusParameter(xlen: Int) = Simd8SumCfu.busParameter(xlen)
+
+  override def build(cfuParam: CfuBusParameter, cfuBus: CfuBus) = new Area {
+    val cfu = new Simd8SumCfu(cfuParam)
+    cfu.io.bus <> cfuBus
+  }
+}
 ```
 
 For production integration, expose this through a SoC parameter and avoid colliding with other users of the single CPU CFU bus.
+
+Because this CFU is a pure register-input/register-output reduction, use the same zero-latency stream style as `CfuTest`:
+
+```scala
+io.bus.rsp.arbitrationFrom(io.bus.cmd)
+io.bus.rsp.response_id := io.bus.cmd.request_id
+io.bus.rsp.outputs(0) := sum.asBits
+```
+
+Use registered responses for multi-cycle or memory-backed CFUs, not for this direct ALU-style example.
 
 ## C Self-Validation and Speed Measurement
 
@@ -99,14 +113,21 @@ long elapsed = cfu_counter_elapsed(start_time, cfu_counter_read());
 
 On RISC-V, `cfu_counter_read()` uses `rdcycle` directly. That keeps the example usable in the original VexiiRiscv platform without `profile.h`, `MiCo_time()`, or MiCo-Lib target headers. In Vexii simulation, pair this with a CPU configuration that implements `zicntr`; in this repo's CLI that means adding `--with-rdtime`. Without that hardware option, a `rdcycle` instruction can compile but still trap or stall at runtime because the counter CSR path is not present. See `references/vexii-cfu-methodology.md` for the CPU-parameter vs SoC-parameter checklist.
 
-One validated CfuGym smoke result on the fuller simulated SoC configuration was:
+Validated CfuGym command pair:
+
+```bash
+make TARGET=vexii_soc MAIN=tests/simd8_sum_cfu_test BUILD=build_simd8_sum_cfu_direct_onchip2 MARCH=rv32imc_zicsr_zifencei OPT=cfu compile
+sbt "runMain vexiiriscv.soc.mico.MiCoSocSim --load-elf sw/tests/simd8_sum_cfu_test.elf --with-rvc --with-rvm --with-rdtime --mico-simd8-sum-cfu"
+```
+
+Validated output:
 
 ```text
 SIMD8_SUM PASS scalar=-4 cfu=-4
-SIMD8_SUM_PROFILE scalar=231709 cfu=166079 speedup_x100=139
+SIMD8_SUM_PROFILE scalar=1183632 cfu=661522 speedup_x100=178
 ```
 
-That is a measured kernel speedup of `1.39x`. Treat it as a smoke-test reference point, not a portable promise: compiler flags, CPU configuration, CFU latency, memory latency, loop shape, and packing strategy all affect the result.
+That is a measured kernel speedup of `1.78x`. Treat it as a smoke-test reference point, not a portable promise: compiler flags, CPU configuration, CFU latency, memory latency, loop shape, and packing strategy all affect the result.
 
 ## Optimization Iteration
 
