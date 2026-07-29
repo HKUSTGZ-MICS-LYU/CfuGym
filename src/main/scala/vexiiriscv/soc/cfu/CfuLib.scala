@@ -84,13 +84,16 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
   dBus.a.opcode := tilelink.Opcode.A.GET
   dBus.a.param := tilelink.Param.Hint.NO_ALLOCATE_ON_MISS
   dBus.a.source := requestIndex.resized
-  dBus.a.data := 0
+  if(dBus.a.data != null) dBus.a.data := 0
   dBus.a.address := accessAddr
-  dBus.a.mask := mask
+  if(dBus.a.mask != null) dBus.a.mask := mask
   dBus.a.size := log2Up(p.beatBytes)
-  dBus.a.corrupt := False
+  if(dBus.a.corrupt != null) dBus.a.corrupt := False
   dBus.a.valid := False
   dBus.d.ready := False
+
+  def dDenied = if(dBus.d.denied != null) dBus.d.denied else False
+  def dCorrupt = if(dBus.d.corrupt != null) dBus.d.corrupt else False
 
   val fsm = new StateMachine {
     val IDLE = new State with EntryPoint
@@ -160,7 +163,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
         dBus.a.valid := True
         dBus.a.opcode := tilelink.Opcode.A.GET
         dBus.a.param := tilelink.Param.Hint.NO_ALLOCATE_ON_MISS
-        dBus.a.data := 0
+        if(dBus.a.data != null) dBus.a.data := 0
         when(dBus.a.fire) {
           goto(LOAD_WAIT)
         }
@@ -169,7 +172,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
       LOAD_WAIT.whenIsActive {
         dBus.d.ready := True
         when(dBus.d.fire) {
-          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK_DATA && !dBus.d.denied && !dBus.d.corrupt
+          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK_DATA && !dDenied && !dCorrupt
           when(goodRsp) {
             load.valid := True
             load.index := beatIndex
@@ -195,7 +198,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
         dBus.a.valid := issueValid
         dBus.a.opcode := tilelink.Opcode.A.GET
         dBus.a.param := tilelink.Param.Hint.NO_ALLOCATE_ON_MISS
-        dBus.a.data := 0
+        if(dBus.a.data != null) dBus.a.data := 0
         dBus.d.ready := True
 
         when(dBus.a.fire) {
@@ -208,7 +211,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
 
         when(dBus.d.fire) {
           val rspIndex = dBus.d.source.resize(beatIndexWidth)
-          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK_DATA && !dBus.d.denied && !dBus.d.corrupt
+          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK_DATA && !dDenied && !dCorrupt
           rspHits(rspIndex) := True
           when(!goodRsp) {
             memError := True
@@ -235,7 +238,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
         dBus.a.source := U(0, widthOf(dBus.a.source) bits)
         dBus.a.address := baseAddr
         dBus.a.size := log2Up(p.vectorBytes)
-        dBus.a.data := 0
+        if(dBus.a.data != null) dBus.a.data := 0
         dBus.d.ready := True
 
         when(dBus.a.fire) {
@@ -244,7 +247,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
 
         when(dBus.d.fire) {
           val rspIndex = dBus.d.beatCounter().resize(beatIndexWidth)
-          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK_DATA && !dBus.d.denied && !dBus.d.corrupt
+          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK_DATA && !dDenied && !dCorrupt
           when(!goodRsp) {
             memError := True
           } otherwise {
@@ -277,7 +280,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
       STORE_WAIT.whenIsActive {
         dBus.d.ready := True
         when(dBus.d.fire) {
-          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK && !dBus.d.denied && !dBus.d.corrupt
+          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK && !dDenied && !dCorrupt
           when(goodRsp) {
             when(lastBeat) {
               done := True
@@ -314,7 +317,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
 
         when(dBus.d.fire) {
           val rspIndex = dBus.d.source.resize(beatIndexWidth)
-          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK && !dBus.d.denied && !dBus.d.corrupt
+          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK && !dDenied && !dCorrupt
           rspHits(rspIndex) := True
           when(!goodRsp) {
             memError := True
@@ -350,7 +353,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
         }
 
         when(dBus.d.fire) {
-          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK && !dBus.d.denied && !dBus.d.corrupt
+          val goodRsp = dBus.d.opcode === tilelink.Opcode.D.ACCESS_ACK && !dDenied && !dCorrupt
           when(!goodRsp) {
             memError := True
           }
