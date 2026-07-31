@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,7 +77,7 @@ class RepoToolbox:
             raise ValueError(f"write path is not allowlisted: {rel_path}")
         normalized = Path(rel_path).as_posix()
         path = self.resolve(rel_path)
-        if self.dry_run and not normalized.startswith("agents/generated/"):
+        if self.dry_run and not is_dry_run_artifact(normalized):
             return f"dry-run: would write {rel_path}"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
@@ -125,9 +126,10 @@ class RepoToolbox:
         if args[0] in {"rg", "sed"}:
             return True
         if args[0] == "sbt" and len(args) >= 2:
+            joined = " ".join(args[1:])
             return (
-                "runMain vexiiriscv.soc.mico.MiCoSocGen" in args[1]
-                or "runMain vexiiriscv.soc.mico.MiCoSocSim" in args[1]
+                "runMain vexiiriscv.soc.mico.MiCoSocGen" in joined
+                or "runMain vexiiriscv.soc.mico.MiCoSocSim" in joined
             )
         if args[0] == "make":
             return any(arg == "TARGET=vexii_soc" for arg in args)
@@ -187,6 +189,33 @@ class RepoToolbox:
             return check
         return self.run_command(["git", "apply", "-"], input_text=patch_text, mutate=True)
 
+    def copy_tree(self, src_rel: str, dst_rel: str) -> str:
+        if not self.is_write_allowed(dst_rel):
+            raise ValueError(f"copy destination is not allowlisted: {dst_rel}")
+        src = self.resolve(src_rel)
+        dst = self.resolve(dst_rel)
+        if self.dry_run:
+            return f"dry-run: would copy {src_rel} to {dst_rel}"
+        ignore = shutil.ignore_patterns(
+            "build*",
+            "target",
+            ".git",
+            "__pycache__",
+            "*.elf",
+            "*.asm",
+            "*.o",
+            "*.vcd",
+            "*.fst",
+        )
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        else:
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst, ignore=ignore)
+        return f"copied {src_rel} to {dst_rel}"
+
 
 def tail(text: str, *, max_chars: int = 6000) -> str:
     if len(text) <= max_chars:
@@ -230,6 +259,13 @@ def patch_paths(patch_text: str) -> list[str]:
 def extract_patch(text: str) -> str:
     match = re.search(r"PATCH_BEGIN\s*(.*?)\s*PATCH_END", text, re.DOTALL)
     return match.group(1).strip() + "\n" if match else ""
+
+
+def is_dry_run_artifact(rel_path: str) -> bool:
+    return (
+        rel_path.startswith("agents/generated/runs/")
+        or rel_path.startswith("agents/generated/graph/")
+    )
 
 
 def read_yosys_summary(path: Path) -> dict[str, object]:

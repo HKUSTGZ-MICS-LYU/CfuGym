@@ -1,0 +1,15 @@
+Design a TileLink CFU for a bare-metal uint8 weighted-average workload.
+
+The workload has two 32-byte aligned uint8 arrays:
+
+    uint32_t weighted_average(const uint8_t *x, const uint8_t *w, int n) {
+        uint32_t sum = 0;
+        for (int i = 0; i < n; ++i) {
+            sum += (uint32_t)x[i] * (uint32_t)w[i];
+        }
+        return sum / (uint32_t)n;
+    }
+
+The target hot loop is the multiply-reduce body. The expected acceleration direction is a VPU-style CFU with a small vector register file or dedicated vector memory, explicit load/config/compute/read commands, and a resident intermediate product path so the vector multiply result does not have to be written back before reduction.
+
+Keep scalar fallback and cycle profiling in the generated benchmark. Estimate speedup with scalar cycles versus accelerated kernel cycles, then use Yosys hardware reports to decide whether vector width, memory width, register-file depth, or compute pipelining should change.
