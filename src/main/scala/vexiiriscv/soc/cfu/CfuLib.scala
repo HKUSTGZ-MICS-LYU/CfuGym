@@ -59,7 +59,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
 
     valid := False
     index := 0
-    data := dBus.d.data
+    if(dBus.d.data != null) data := dBus.d.data else data := 0
   }
 
   val done = Bool()

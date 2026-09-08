@@ -15,7 +15,7 @@ import spinal.lib.misc.{Elf, TilelinkClintFiber}
 import spinal.lib.misc.plic.TilelinkPlicFiber
 import spinal.lib.system.tag.MemoryConnection
 import vexiiriscv.execute.cfu.{CfuPlugin, CfuTest}
-import vexiiriscv.soc.{DmaParameter, TilelinkDmaFiber, TilelinkVexiiRiscvFiber, TilelinkCfuFiber}
+import vexiiriscv.soc.{DmaParameter, TilelinkDmaFiber, TilelinkVexiiRiscvFiber}
 import spinal.lib.bus.tilelink.coherent.{CacheFiber, HubFiber, SelfFLush}
 import spinal.lib.system.tag.PMA
 
@@ -95,6 +95,14 @@ class MiCoSoc(p : MiCoSocParam) extends Component {
       burstLoad = p.BitNetCfuBurstLoad,
       quantStandard = p.BitNetCfuQuantStandard)
 
+    val agentCfuParam = AgentCfuParameter(
+      xlen = p.AgentCfuBusWidth,
+      vlen = p.AgentCfuVlen,
+      regDepth = p.AgentCfuRegDepth,
+      withTilelink = p.AgentCfuTilelink,
+      withLoad = p.AgentCfuTilelink && p.AgentCfuLoad,
+      withStore = p.AgentCfuTilelink && p.AgentCfuStore)
+
     val cfu = p.useMiCoVpu generate new TilelinkVpuCfuFiber(vpuParam, p.vexii.xlen) {
       mainBus << bus
       bus.setDownConnection(a = StreamPipe.S2M)
@@ -110,11 +118,19 @@ class MiCoSoc(p : MiCoSocParam) extends Component {
       bus.setDownConnection(a = StreamPipe.S2M)
     }
 
+    val agentCfu = p.useAgentCfu generate new AgentCfuFiber(agentCfuParam, p.vexii.xlen) {
+      if(p.AgentCfuTilelink) {
+        mainBus << bus
+        bus.setDownConnection(a = StreamPipe.S2M)
+      }
+    }
+
     val cfuConnect = p.vexii.withCfu generate (Fiber patch new Area {
       val cpuCfuBus = cpu.logic.core.host[CfuPlugin].logic.bus
       if(p.useMiCoVpu) cfu.logic.cfuBus << cpuCfuBus
       if(p.useBitNetCfu) bitNetCfu.logic.cfuBus << cpuCfuBus
       if(p.useBitNetCfuV2) bitNetCfuV2.logic.cfuBus << cpuCfuBus
+      if(p.useAgentCfu) agentCfu.logic.cfuBus << cpuCfuBus
     })
 
     var memBus: Node = null

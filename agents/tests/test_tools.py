@@ -17,6 +17,11 @@ class ToolsTest(unittest.TestCase):
         text = self.toolbox.read_text("skills/cfu-designer/SKILL.md", limit=2000)
         self.assertTrue(text)
 
+    def test_context_includes_agent_cfu_scaffold(self) -> None:
+        context = self.toolbox.discover_context()
+        self.assertIn("src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala", context["files"])
+        self.assertIn("src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala", context["files"])
+
     def test_read_denies_generated_run(self) -> None:
         with self.assertRaises(PolicyError):
             self.toolbox.read_text("agents/generated/runs/20260729-162009/report.md")

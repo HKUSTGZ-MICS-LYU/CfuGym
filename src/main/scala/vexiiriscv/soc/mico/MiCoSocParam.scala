@@ -39,6 +39,13 @@ class MiCoSocParam {
   var BitNetCfuRfSync = true
   var BitNetCfuBurstLoad = false
   var useBitNetCfuV2 = false
+  var useAgentCfu = false
+  var AgentCfuVlen = 256
+  var AgentCfuBusWidth = 32
+  var AgentCfuRegDepth = 2
+  var AgentCfuTilelink = true
+  var AgentCfuLoad = true
+  var AgentCfuStore = true
   var BitNetCfuV2DotPipeStages = 1
   var BitNetCfuV2QuantPipeStages = 1
   var BitNetCfuV2LoadBufferDepth = 0
@@ -77,6 +84,13 @@ class MiCoSocParam {
     opt[Unit]("mico-vpu-pipe") action { (v, c) => MiCoVpuPipe = true }
     opt[Unit]("mico-bitnet-cfu") action { (v, c) => useBitNetCfu = true; vexii.withCfu = true }
     opt[Unit]("mico-bitnet-cfu-v2") action { (v, c) => useBitNetCfuV2 = true; vexii.withCfu = true }
+    opt[Unit]("mico-agent-cfu") action { (v, c) => useAgentCfu = true; vexii.withCfu = true }
+    opt[Int]("agent-cfu-vlen") action { (v, c) => AgentCfuVlen = v }
+    opt[Int]("agent-cfu-bus-width") action { (v, c) => AgentCfuBusWidth = v }
+    opt[Int]("agent-cfu-reg-depth") action { (v, c) => AgentCfuRegDepth = v }
+    opt[Unit]("agent-cfu-no-tilelink") action { (v, c) => AgentCfuTilelink = false }
+    opt[Unit]("agent-cfu-no-load") action { (v, c) => AgentCfuLoad = false }
+    opt[Unit]("agent-cfu-no-store") action { (v, c) => AgentCfuStore = false }
     opt[Int]("bitnet-cfu-len") action { (v, c) => BitNetCfuLen = v }
     opt[Int]("bitnet-cfu-width") action { (v, c) => BitNetCfuWidth = v }
     opt[Int]("bitnet-cfu-bus-width") action { (v, c) => BitNetCfuBusWidth = v }
@@ -129,19 +143,33 @@ class MiCoSocParam {
       // Sparse memory bus is wired as 64-bit in MiCoSoc; keep LSU memory width aligned.
       vexii.lsuMemDataWidthMin = vexii.lsuMemDataWidthMin max 64
     }
+    val cfuOwners = List(useMiCoVpu, useBitNetCfu, useBitNetCfuV2, useAgentCfu).count(identity)
+    require(cfuOwners <= 1, "MiCo VPU, BitNet CFU, BitNet CFU V2 and Agent CFU share the single CPU CFU bus; enable only one of them")
+
     if(useMiCoVpu){
       vexii.lsuMemDataWidthMin = vexii.lsuMemDataWidthMin max MiCoVpuBusWidth
     }
     if(useBitNetCfu){
-      require(!useMiCoVpu && !useBitNetCfuV2, "MiCo VPU, BitNet CFU and BitNet CFU V2 share the single CPU CFU bus; enable only one of them")
       vexii.lsuMemDataWidthMin = vexii.lsuMemDataWidthMin max BitNetCfuBusWidth
     }
     if(useBitNetCfuV2){
-      require(!useMiCoVpu && !useBitNetCfu, "MiCo VPU, BitNet CFU and BitNet CFU V2 share the single CPU CFU bus; enable only one of them")
       require(BitNetCfuV2DotPipeStages >= 0, "bitnet-cfu-v2-dot-pipe-stages must be non-negative")
       require(BitNetCfuV2QuantPipeStages >= 0, "bitnet-cfu-v2-quant-pipe-stages must be non-negative")
       require(BitNetCfuV2LoadBufferDepth >= 0, "bitnet-cfu-v2-load-buffer-depth must be non-negative")
       vexii.lsuMemDataWidthMin = vexii.lsuMemDataWidthMin max BitNetCfuBusWidth
+    }
+    if(useAgentCfu){
+      AgentCfuParameter(
+        xlen = AgentCfuBusWidth,
+        vlen = AgentCfuVlen,
+        regDepth = AgentCfuRegDepth,
+        withTilelink = AgentCfuTilelink,
+        withLoad = AgentCfuTilelink && AgentCfuLoad,
+        withStore = AgentCfuTilelink && AgentCfuStore
+      )
+      if(AgentCfuTilelink) {
+        vexii.lsuMemDataWidthMin = vexii.lsuMemDataWidthMin max AgentCfuBusWidth
+      }
     }
   }
 }

@@ -2,6 +2,8 @@
 
 This folder contains local agent frameworks for CfuGym workflows.
 
+The hardware starting point for new designs is `src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala` with `AgentCfuFiber.scala`. It provides a stable CfuBus contract, an algorithm-neutral Vector RegFile, optional TileLink load/store channels, and MiCoSoc CLI integration. New agents should replace the placeholder compute/config behavior while preserving those interfaces and the single CPU CFU owner rule.
+
 ## CFU Design Agent
 
 The CFU design agent turns a workload request into a run-scoped, auditable CFU design loop. It runs through the following stages, each of which writes its own artifact under the run directory:

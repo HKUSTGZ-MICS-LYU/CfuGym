@@ -32,6 +32,8 @@ DEFAULT_CONTEXT_FILES = (
     "skills/cfu-designer/references/yosys-cost-flow.md",
     "skills/cfu-designer/references/vector-rf-vpu-pattern.md",
     "src/main/scala/vexiiriscv/soc/cfu/CfuLib.scala",
+    "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala",
+    "src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala",
     "src/main/scala/vexiiriscv/soc/mico/MiCoSocParam.scala",
     "src/main/scala/vexiiriscv/soc/mico/MiCoSoc.scala",
 )
