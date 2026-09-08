@@ -1,0 +1,2 @@
+# The repo ignores *.yaml globally. These policy/template files must be tracked.
+!*.yaml

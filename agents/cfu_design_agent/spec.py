@@ -13,9 +13,12 @@ from .llm import OpenAiTextClient
 from .state import RepoContext, WorkloadSpec
 
 
+SPEC_VERSION = "1"
+SPEC_REQUIRED = ("name", "source_kind", "operation", "pattern", "validation", "unknowns")
+
 SPEC_SYSTEM_PROMPT = """You convert CFU workload requests into a normalized YAML WorkloadSpec.
 Use only facts present in the input and repo context. For missing high-impact fields, add them to `unknowns` instead of guessing.
-Return YAML only, with keys: name, source_kind, description, project_root, kernel_file, kernel_function, build_cmd, run_cmd, test_cmd, operation, pattern, element_type, signedness, output_type, vector_bytes, memory_access, alignment_bytes, cfu_style, validation, unknowns."""
+Return YAML only, with keys: spec_version, name, source_kind, description, project_root, kernel_file, kernel_function, build_cmd, run_cmd, test_cmd, operation, pattern, element_type, signedness, output_type, vector_bytes, memory_access, alignment_bytes, cfu_style, validation, unknowns."""
 
 
 def normalize_workload_spec(
@@ -81,7 +84,15 @@ def load_formatted_spec(path: Path) -> WorkloadSpec:
         data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError(f"workload spec must be a mapping: {path}")
+    data = strip_unknown_config_keys(data)
     return WorkloadSpec(**data)
+
+
+def strip_unknown_config_keys(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop config keys that are not part of the known WorkloadSpec schema."""
+    allowed = set(WorkloadSpec.__annotations__)
+    allowed.update({"spec_version", "hot_spot"})
+    return {key: value for key, value in data.items() if key in allowed}
 
 
 def llm_extract_or_fallback(
@@ -122,6 +133,7 @@ def infer_spec_from_text(text: str, *, source_kind: str, **overrides: str) -> Wo
     element_type = infer_element_type(lowered)
     vector_bytes = infer_int_after(lowered, ["vector_bytes", "vector bytes", "aligned to", "alignment"], default=32)
     spec: WorkloadSpec = {
+        "spec_version": SPEC_VERSION,
         "name": infer_name(operation),
         "source_kind": source_kind,  # type: ignore[typeddict-item]
         "description": clean_description(text),
@@ -149,6 +161,7 @@ def infer_spec_from_text(text: str, *, source_kind: str, **overrides: str) -> Wo
 
 
 def sanitize_spec(spec: WorkloadSpec) -> WorkloadSpec:
+    spec.setdefault("spec_version", SPEC_VERSION)
     spec.setdefault("name", infer_name(spec.get("operation", "cfu_workload")))
     spec.setdefault("source_kind", "natural_language")
     spec.setdefault("description", "")
@@ -159,6 +172,39 @@ def sanitize_spec(spec: WorkloadSpec) -> WorkloadSpec:
     if not isinstance(spec.get("unknowns"), list):
         spec["unknowns"] = [str(spec["unknowns"])]
     return spec
+
+
+def validate_workload_spec(spec: WorkloadSpec, *, strict: bool = False) -> list[str]:
+    """Return a sorted list of validation problems; empty means the spec is valid."""
+    errors: list[str] = []
+    for key in SPEC_REQUIRED:
+        value = spec.get(key)
+        if value is None or value == "" or value == []:
+            errors.append(f"{key} is required")
+    source_kind = spec.get("source_kind")
+    if source_kind not in {"natural_language", "formatted_spec", "c_project"}:
+        errors.append(f"source_kind must be natural_language|formatted_spec|c_project, got {source_kind!r}")
+    operation = spec.get("operation")
+    if operation == "unknown":
+        errors.append("operation is unknown; resolve before proceeding")
+    validation = spec.get("validation")
+    if not isinstance(validation, dict):
+        errors.append("validation must be a mapping")
+    if spec.get("vector_bytes") is not None and not isinstance(spec.get("vector_bytes"), int):
+        errors.append("vector_bytes must be an integer")
+    unknowns = spec.get("unknowns")
+    if unknowns is not None and not isinstance(unknowns, list):
+        errors.append("unknowns must be a list")
+    if strict and unknown_high_impact_fields(operation, spec):
+        errors.append("high-impact fields are unresolved and listed in unknowns")
+    return sorted(errors)
+
+
+def unknown_high_impact_fields(operation: str | None, spec: WorkloadSpec) -> bool:
+    op = operation or spec.get("operation", "")
+    return bool(
+        any(unknown in {"operation", "element_type", "signedness", "overflow_policy"} for unknown in spec.get("unknowns", []))
+    )
 
 
 def infer_operation(lowered: str) -> str:

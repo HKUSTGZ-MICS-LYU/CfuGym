@@ -19,6 +19,19 @@ Restart Codex after installation so the new skill is discovered. Use it in futur
 Use $cfu-designer to design, validate, and estimate hardware cost for a CfuGym CFU.
 ```
 
+## BNCFUv2 Block Exploration
+
+BNCFUv2 has a focused HW/SW exploration wrapper for the block-count path used by `sw/tests/bncfu_compare_test.c`:
+
+```bash
+python3 tools/bncfu_v2_block_explore.py \
+  --block-counts 64,128,256 \
+  --total-outputs 229 \
+  --with-yosys
+```
+
+The wrapper builds the bare-metal compare ELF, runs `MiCoSocSim` with the matching `--bitnet-cfu-v2-block-count`, parses `BNCFU_COMPARE_PROFILE`, optionally generates standalone `BitNetCfuV2` RTL, runs the Yosys cost helper, and writes `summary.md`/`summary.csv` under `benchmark_results/bncfu_v2_block_explore` by default.
+
 ## Original VexiiRiscv + MiCo Context
 
 ### VexiiRiscv + MiCo

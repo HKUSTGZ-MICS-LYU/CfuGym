@@ -15,6 +15,19 @@ sbt "runMain vexiiriscv.soc.mico.MiCoSocGen <soc args>"
 sbt "runMain vexiiriscv.soc.mico.MiCoSocSim --load-elf <elf> <soc args>"
 ```
 
+The CPU ISA must match the ELF ISA. The MiCo software target defaults to
+`rv32imc`, while `ParamMiCo` defaults to RV32I unless extensions are enabled
+on the simulator command line. For the normal bare-metal CFU tests, use:
+
+```bash
+sbt "runMain vexiiriscv.soc.mico.MiCoSocSim --load-elf <elf> --with-rvc --with-rvm --with-rdtime <soc args>"
+```
+
+Omitting `--with-rvc` or `--with-rvm` does not measure CFU behavior: the ELF
+will trap on compressed or multiply/divide instructions and can appear to
+hang at the reset trap vector. Rebuild the ELF with the same `MARCH` when
+changing the CPU ISA.
+
 If the firmware uses `rdcycle`/counter CSRs, include a CPU counter option in `<soc args>`. In this repo, use `--with-rdtime` for the minimal `zicntr` path, or `--performance-counters <n>` when extra HPM counters are required.
 
 For BNCFU-like validation, start from:
@@ -55,11 +68,23 @@ Do not infer generated hardware features from `MARCH` alone. `MARCH=..._zicsr_zi
 Reusable scripts:
 
 - `tools/bncfu_perf_explore.py`: benchmark orchestration, hardware presets, software variants, log parsing, CSV/summary output.
+- `tools/bncfu_v2_block_explore.py`: focused BNCFUv2 block-count loop. It builds `sw/tests/bncfu_compare_test.c`, runs `MiCoSocSim` with the matching `--bitnet-cfu-v2-block-count`, parses `BNCFU_COMPARE_PROFILE`, and can generate standalone `BitNetCfuV2` RTL plus a Yosys cost report.
 - `tools/bncfu_space_explore.py`: synthesis/design-space exploration pattern.
 - `tools/bncfu_e2e_kivi_benchmark.py` and `tools/bncfu_e2e_llama_benchmark.py`: end-to-end benchmark runner patterns.
 
 For quick CFU cost checks, use `references/yosys-cost-flow.md` and `scripts/yosys_cost_report.py` before a slower vendor flow.
 Use RTL emitted by `MiCoSocGen` or a standalone CFU `generateVerilog` object for this cost flow. Do not synthesize `MiCoSocSim.v` or `simWorkspace` simulation RTL for hardware-cost claims.
+
+For BNCFUv2 block-count exploration, prefer:
+
+```bash
+python3 tools/bncfu_v2_block_explore.py \
+  --block-counts 64,128,256 \
+  --total-outputs 229 \
+  --with-yosys
+```
+
+The script derives each tail count from `total_outputs % block_count` and keeps the software macros aligned with the hardware SoC parameter. Use `--set-full-count-each-block` only to compare against the older software scheduling policy.
 
 ## Acceptance Checks
 

@@ -16,9 +16,15 @@ args=(
   --max-iters "${CFU_AGENT_MAX_ITERS:-1}"
 )
 
-if [[ "${CFU_AGENT_MUTATE:-0}" != "1" ]]; then
-  args+=(--dry-run)
+if [[ "${CFU_AGENT_APPLY_PATCH:-0}" == "1" ]]; then
+  args+=(--apply-patch)
 fi
+if [[ "${CFU_AGENT_RUN_COMMANDS:-0}" == "1" ]]; then
+  args+=(--run-commands)
+fi
+# Planning is the default; the framework only runs these examples read-only
+# unless the capability flags above are set.
+args+=(--dry-run)
 if [[ "${CFU_AGENT_SKIP_SIM:-1}" == "1" ]]; then
   args+=(--skip-sim)
 fi

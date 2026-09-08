@@ -13,10 +13,23 @@ Prefer existing repo patterns: CfuPlugin/CfuBus, DirectCfuSpec or TilelinkCfuSpe
 Return concise, implementable text. Do not invent performance results."""
 
 
+SENSITIVE_PATH_MARKERS = (
+    ".git/",
+    ".env",
+    "secret",
+    "token",
+    "credential",
+    "password",
+    "agents/generated/runs/",
+)
+
+
 def context_digest(context: RepoContext) -> str:
     files = context.get("files", {})
     parts: list[str] = []
     for path, text in files.items():
+        if any(marker in path for marker in SENSITIVE_PATH_MARKERS):
+            continue
         excerpt = text[:6000]
         if len(text) > len(excerpt):
             excerpt += "\n...[truncated]"

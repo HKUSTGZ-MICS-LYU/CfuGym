@@ -27,6 +27,12 @@ case class CfuLsuParameter(
 
 class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
   require(dBus.p.dataWidth == p.dataWidth, s"CFU LSU data width ${p.dataWidth} must match TileLink width ${dBus.p.dataWidth}")
+  if(p.burstMem) {
+    val burstSize = log2Up(p.vectorBytes)
+    val maxEncodedSize = (1 << widthOf(dBus.a.size)) - 1
+    require(burstSize <= maxEncodedSize,
+      s"CFU LSU burst mode needs TileLink size=$burstSize for ${p.vectorBytes} bytes, but this bus size field only supports up to $maxEncodedSize")
+  }
 
   val beatIndexWidth = log2Up(p.beatCount) max 1
   val beatShift = log2Up(p.beatBytes)
@@ -37,9 +43,6 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
     val address = UInt(p.addressWidth bits)
     val ready = Bool()
 
-    load := False
-    store := False
-    address := 0
   }
 
   val store = new Area {
@@ -237,7 +240,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
         dBus.a.param := tilelink.Param.Hint.NO_ALLOCATE_ON_MISS
         dBus.a.source := U(0, widthOf(dBus.a.source) bits)
         dBus.a.address := baseAddr
-        dBus.a.size := log2Up(p.vectorBytes)
+        dBus.a.size := U(log2Up(p.vectorBytes), widthOf(dBus.a.size) bits)
         if(dBus.a.data != null) dBus.a.data := 0
         dBus.d.ready := True
 
@@ -340,7 +343,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
         dBus.a.param := 0
         dBus.a.source := U(0, widthOf(dBus.a.source) bits)
         dBus.a.address := baseAddr
-        dBus.a.size := log2Up(p.vectorBytes)
+        dBus.a.size := U(log2Up(p.vectorBytes), widthOf(dBus.a.size) bits)
         dBus.a.data := store.data
         dBus.d.ready := True
 

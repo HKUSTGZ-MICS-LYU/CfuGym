@@ -1,0 +1,207 @@
+version: "1"
+
+# Deny rules always take precedence over stage allow rules.
+deny:
+  - ".git/**"
+  - "**/.env"
+  - "**/.env.*"
+  - "**/*secret*"
+  - "**/*token*"
+  - "**/*password*"
+  - "**/*credential*"
+  - "**/build/**"
+  - "**/target/**"
+  - "**/simWorkspace/**"
+  - "**/*.elf"
+  - "**/*.o"
+  - "**/*.a"
+  - "**/*.so"
+  - "**/*.map"
+  - "**/*.asm"
+  - "**/*.vcd"
+  - "**/*.fst"
+
+write_roots:
+  - "agents/generated/runs"
+  - "src/main/scala/vexiiriscv/soc/mico"
+  - "src/main/scala/vexiiriscv/soc/cfu"
+  - "sw/tests"
+
+stages:
+  load_context:
+    read:
+      - "agents/specs/agent_access_policy.yaml"
+      - "agents/specs/cfu_isa_template.yaml"
+      - "skills/cfu-designer/SKILL.md"
+      - "skills/cfu-designer/references/**"
+      - "src/main/scala/vexiiriscv/execute/cfu/CfuBus.scala"
+      - "src/main/scala/vexiiriscv/execute/cfu/CfuPlugin.scala"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
+      - "sw/MiCo-Lib/targets/vexii_soc/**"
+      - "sw/tests/**"
+    write:
+      - "agents/generated/runs/**/01_context/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: [git_status]
+  ingest_input:
+    read:
+      - "agents/specs/cfu_isa_template.yaml"
+      - "agents/specs/*.spec"
+      - "agents/specs/*.yaml"
+      - "agents/examples/**"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
+      - "sw/tests/**"
+    write:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: []
+  route_input:
+    read: ["agents/generated/runs/**/02_workload/**"]
+    write:
+      - "agents/generated/runs/**/03_route/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: []
+  prepare_benchmark:
+    read:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/03_route/**"
+      - "agents/examples/**"
+      - "sw/tests/**"
+    write:
+      - "agents/generated/runs/**/04_benchmark/**"
+      - "agents/generated/runs/**/workspace/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: []
+  profile:
+    read:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/04_benchmark/**"
+      - "agents/generated/runs/**/workspace/**"
+    write:
+      - "agents/generated/runs/**/05_profile/**"
+      - "agents/generated/runs/**/workspace/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: [make_profile, project_test, soc_sim]
+  hotspot:
+    read:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/04_benchmark/**"
+      - "agents/generated/runs/**/05_profile/**"
+    write:
+      - "agents/generated/runs/**/06_hotspot/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: []
+  analysis:
+    read:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/06_hotspot/**"
+      - "skills/cfu-designer/SKILL.md"
+      - "skills/cfu-designer/references/acceleration-patterns.md"
+      - "skills/cfu-designer/references/u8-weighted-average-experiment.md"
+      - "skills/cfu-designer/references/vector-rf-vpu-pattern.md"
+      - "src/main/scala/vexiiriscv/execute/cfu/CfuBus.scala"
+      - "src/main/scala/vexiiriscv/execute/cfu/CfuPlugin.scala"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
+      - "sw/tests/**"
+    write:
+      - "agents/generated/runs/**/07_analysis/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: []
+  isa:
+    read:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/06_hotspot/**"
+      - "agents/generated/runs/**/07_analysis/**"
+      - "agents/specs/cfu_isa_template.yaml"
+      - "skills/cfu-designer/references/vexii-cfu-methodology.md"
+      - "skills/cfu-designer/references/vector-rf-vpu-pattern.md"
+      - "src/main/scala/vexiiriscv/execute/cfu/CfuBus.scala"
+      - "src/main/scala/vexiiriscv/execute/cfu/CfuPlugin.scala"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
+      - "sw/MiCo-Lib/targets/vexii_soc/custom_asm.h"
+      - "sw/tests/**"
+    write:
+      - "agents/generated/runs/**/08_isa/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: []
+  implementation:
+    read:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/07_analysis/**"
+      - "agents/generated/runs/**/08_isa/**"
+      - "skills/cfu-designer/assets/templates/**"
+      - "src/main/scala/vexiiriscv/execute/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
+      - "sw/MiCo-Lib/targets/vexii_soc/**"
+      - "sw/tests/**"
+    write:
+      - "agents/generated/runs/**/09_implementation/**"
+      - "agents/generated/runs/**/run.yaml"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "sw/tests/**"
+    commands: [git_apply_check, git_apply]
+  validation:
+    read:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/04_benchmark/**"
+      - "agents/generated/runs/**/06_hotspot/**"
+      - "agents/generated/runs/**/07_analysis/**"
+      - "agents/generated/runs/**/08_isa/**"
+      - "agents/generated/runs/**/09_implementation/**"
+      - "agents/generated/runs/**/workspace/**"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "sw/tests/**"
+    write:
+      - "agents/generated/runs/**/10_validation/**"
+      - "agents/generated/runs/**/workspace/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: [make_profile, project_test, soc_generate, soc_sim]
+  cost:
+    read:
+      - "agents/generated/runs/**/08_isa/**"
+      - "agents/generated/runs/**/09_implementation/**"
+      - "agents/generated/runs/**/10_validation/**"
+      - "agents/generated/runs/**/workspace/**"
+      - "MiCoSoc.v"
+    write:
+      - "agents/generated/runs/**/11_cost/**"
+      - "agents/generated/runs/**/workspace/**"
+      - "agents/generated/runs/**/run.yaml"
+    commands: [yosys_cost]
+  review:
+    read: ["agents/generated/runs/**/**"]
+    write: ["agents/generated/runs/**/12_review/**", "agents/generated/runs/**/report.md", "agents/generated/runs/**/run.yaml"]
+    commands: []
+
+commands:
+  git_status:
+    executable: git
+    argv_prefix: [git, status, --short]
+  make_profile:
+    executable: make
+    required_tokens: [TARGET=vexii_soc]
+  project_test:
+    executable: make
+    required_tokens: [TARGET=vexii_soc]
+  soc_generate:
+    executable: sbt
+    required_substring: "runMain vexiiriscv.soc.mico.MiCoSocGen"
+  soc_sim:
+    executable: sbt
+    required_substring: "runMain vexiiriscv.soc.mico.MiCoSocSim"
+  yosys_cost:
+    executable: python3
+    argv_prefix: [python3, skills/cfu-designer/scripts/yosys_cost_report.py]
+  git_apply_check:
+    executable: git
+    argv_prefix: [git, apply, --check, -]
+  git_apply:
+    executable: git
+    argv_prefix: [git, apply, -]

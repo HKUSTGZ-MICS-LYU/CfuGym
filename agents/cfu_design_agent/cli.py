@@ -6,8 +6,9 @@ import argparse
 import os
 from pathlib import Path
 
-from .graph import export_graph_visualization, run_agent
-from .llm import DEFAULT_MODEL
+from .graph import enable_progress, export_graph_visualization, run_agent
+from .llm import OpenAiTextClient
+from .llm_config import LlmConfigError, effective_config, list_configs
 from .state import CfuDesignState
 
 
@@ -22,9 +23,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-cmd", default="", help="Project correctness test command for the workload.")
     parser.add_argument("--workdir", default=".", help="Repo root. Defaults to the current directory.")
     parser.add_argument("--out-dir", default="agents/generated", help="Agent artifact directory.")
-    parser.add_argument("--model", default=os.environ.get("CFU_AGENT_MODEL", DEFAULT_MODEL))
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Explicit model override. If empty, the selected LLM config's `model` wins, "
+        "then CFU_AGENT_MODEL, then the built-in default.",
+    )
+    parser.add_argument(
+        "--llm-config",
+        default=os.environ.get("CFU_AGENT_LLM_CONFIG", "default"),
+        help="Named LLM config under agents/llm_configs/<name>.json (default: default).",
+    )
+    parser.add_argument(
+        "--test-api",
+        action="store_true",
+        help="Only run an API connectivity check against the selected LLM config, then exit.",
+    )
     parser.add_argument("--max-iters", type=int, default=2)
-    parser.add_argument("--dry-run", action="store_true", help="Do not mutate CFU source or run mutating commands.")
+    parser.add_argument("--dry-run", action="store_true", help="Force read-only: never mutate source or run external commands.")
+    parser.add_argument("--apply-patch", action="store_true", help="Allow an LLM patch to be applied to CFU/software allowlisted paths.")
+    parser.add_argument("--run-commands", action="store_true", help="Allow allowlisted build/simulator/Yosys commands to execute.")
+    parser.add_argument("--no-dry-run", action="store_true", help="Allow mutation and command execution (implies apply/run unless --dry-run).")
     parser.add_argument("--skip-sim", action="store_true", help="Skip SBT generation/simulation.")
     parser.add_argument("--skip-yosys", action="store_true", help="Skip Yosys cost estimation.")
     parser.add_argument("--export-graph", default="", help="Directory for Mermaid/ASCII graph visualization.")
@@ -37,8 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     workdir = Path(args.workdir).resolve()
+
+    if args.test_api:
+        return run_api_test(workdir, args)
+
     input_mode = infer_input_mode(args)
     task = args.task or default_task(args)
+    dry_run = True if args.dry_run else not (args.apply_patch or args.run_commands or args.no_dry_run)
     state: CfuDesignState = {
         "task": task,
         "input_kind": input_mode,
@@ -52,8 +76,11 @@ def main(argv: list[str] | None = None) -> int:
         "workdir": str(workdir),
         "out_dir": args.out_dir,
         "model": args.model,
-        "dry_run": args.dry_run,
-        "mode": "dry-run" if args.dry_run else "autonomous",
+        "llm_config": args.llm_config,
+        "dry_run": dry_run,
+        "apply_patch": args.apply_patch and not dry_run,
+        "run_commands": args.run_commands and not dry_run,
+        "mode": "dry-run" if dry_run else "autonomous",
         "skip_sim": args.skip_sim,
         "skip_yosys": args.skip_yosys,
         "max_iters": args.max_iters,
@@ -62,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     graph_dir = args.export_graph or str(Path(args.out_dir) / "graph")
     graph_paths = export_graph_visualization(workdir / graph_dir)
+    enable_progress()
     final_state = run_agent(
         state,
         thread_id=args.thread_id,
@@ -80,7 +108,73 @@ def main(argv: list[str] | None = None) -> int:
         print("errors:")
         for error in final_state["errors"]:
             print(f"- {error}")
-    return 0 if final_state.get("status") == "complete" else 1
+
+    _print_token_summary(final_state)
+    # planned/complete are successful planning or execution outcomes.
+    return 0 if final_state.get("status") in {"complete", "planned"} else 1
+
+
+def _print_token_summary(final_state: CfuDesignState) -> None:
+    usage = final_state.get("token_usage") or {}
+    if usage:
+        print()
+        print("token_usage:")
+        print(f"  calls       = {usage.get('calls', 0)}")
+        print(f"  input_tokens= {usage.get('input', 0)}")
+        print(f"  output_tokens={usage.get('output', 0)}")
+        print(f"  total_tokens= {usage.get('total', 0)}")
+    progress = final_state.get("progress_summary")
+    if progress:
+        print()
+        print("progress:")
+        print(f"  stages_run   = {progress.get('stages_run')}")
+        print(f"  stages_ok    = {progress.get('stages_ok')}")
+        print(f"  stages_failed= {progress.get('stages_failed')}")
+
+
+TEST_API_PROMPT = "Reply with exactly the single word: OK"
+TEST_API_FALLBACK = "API_TEST_FALLBACK"
+
+
+def run_api_test(workdir: Path, args: argparse.Namespace) -> int:
+    config_name = args.llm_config or os.environ.get("CFU_AGENT_LLM_CONFIG", "default")
+    try:
+        config = effective_config(workdir, config_name)
+    except LlmConfigError as exc:
+        print(f"llm-config-error: {exc}")
+        print(f"available-configs: {', '.join(list_configs(workdir)) or 'none'}")
+        return 1
+
+    client = OpenAiTextClient(args.model, config=config)
+    print(f"config={config['name']}")
+    print(f"model={client.model}")
+    print(f"base_url={client.base_url or '(default)'}")
+    print(f"api_mode={client.api_mode}")
+    print(f"api_key_set={bool(client.api_key)}")
+
+    if not client.available:
+        print("api-key-missing: no API key resolved; set the config's api_key_env var or OPENAI_API_KEY")
+        return 1
+
+    try:
+        result = client.complete(
+            "You are a helpful assistant.",
+            TEST_API_PROMPT,
+            fallback=TEST_API_FALLBACK,
+        )
+    except Exception as exc:
+        print(f"api-error: {exc}")
+        return 1
+
+    used = result.used_llm
+    reply = (result.text or "").strip()
+    print(f"used_llm={used}")
+    print(f"reply={reply!r}")
+    if used and reply and reply != TEST_API_FALLBACK:
+        print("api-status=OK")
+        return 0
+    print("api-status=FAILED")
+    return 1
 
 
 def infer_input_mode(args: argparse.Namespace) -> str:

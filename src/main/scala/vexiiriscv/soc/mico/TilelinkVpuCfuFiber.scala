@@ -14,6 +14,7 @@ import spinal.lib.misc._
 import scala.collection.mutable.ArrayBuffer
 
 import vexiiriscv.execute.cfu._
+import vexiiriscv.soc.cfu.{TilelinkCfuFiber, TilelinkCfuSpec}
 
 /* A Template for a Tilelink CFU (Custom Functional Unit) Fiber.
  * This fiber connects a CFU bus to CPU, allowing custom instructions
@@ -60,27 +61,20 @@ object TilelinkVpuCfuFiber {
       )
 }
 
-class TilelinkVpuCfuFiber(vpuParam: VpuCfuParameter, xlen: Int) extends Area {
+case class VpuCfuSpec(vpuParam: VpuCfuParameter) extends TilelinkCfuSpec {
+  override def m2sParameters(name: Nameable) = TilelinkVpuCfuFiber.getM2sParameters(
+    name,
+    vpuParam.xlen,
+    vpuParam.pendingSize
+  )
 
-  import TilelinkVpuCfuFiber._
+  override def cfuBusParameter(xlen: Int) = TilelinkVpuCfuFiber.getCfuBusParameters(xlen)
 
-  val bus = Node.down()
-  val dBus = bus.bus
-
-  val logic = Fiber build new Area{
-      bus.m2s forceParameters getM2sParameters(
-        TilelinkVpuCfuFiber.this, 
-        vpuParam.xlen,
-        vpuParam.pendingSize
-      )
-      bus.s2m.supported load tilelink.S2mSupport.none()
-
-      val cfuParam = getCfuBusParameters(xlen)
-
-      val cfuBus = CfuBus(cfuParam)
-      val cfu = new VpuCfu(cfuParam, dBus.p, vpuParam)
-      
-      cfu.io.bus <> cfuBus
-      cfu.io.dBus <> dBus
+  override def build(cfuParam: CfuBusParameter, cfuBus: CfuBus, dBus: tilelink.Bus) = new Area {
+    val cfu = new VpuCfu(cfuParam, dBus.p, vpuParam)
+    cfu.io.bus <> cfuBus
+    cfu.io.dBus <> dBus
   }
 }
+
+class TilelinkVpuCfuFiber(vpuParam: VpuCfuParameter, xlen: Int) extends TilelinkCfuFiber(VpuCfuSpec(vpuParam), xlen)

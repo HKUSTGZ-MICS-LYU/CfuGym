@@ -30,6 +30,7 @@ class RepoContext(TypedDict, total=False):
 
 
 class WorkloadSpec(TypedDict, total=False):
+    spec_version: str
     name: str
     source_kind: Literal["natural_language", "formatted_spec", "c_project"]
     description: str
@@ -94,12 +95,19 @@ class CfuDesignState(TypedDict, total=False):
     workdir: str
     out_dir: str
     model: str
+    llm_config: str
     mode: AgentMode
     dry_run: bool
+    apply_patch: bool
+    run_commands: bool
     skip_sim: bool
     skip_yosys: bool
     max_iters: int
     iteration: int
+    run_id: str
+    run_root: str
+    stage_jobs: str
+    scan_only: bool
     context: RepoContext
     workload_spec: WorkloadSpec
     spec_text: str
@@ -108,6 +116,11 @@ class CfuDesignState(TypedDict, total=False):
     profile_result: ProfileResult
     hot_spot: str
     workload_analysis: str
+    isa_spec: dict[str, Any]
+    isa_spec_text: str
+    isa_spec_path: str
+    isa_spec_errors: list[str]
+    isa_review: dict[str, Any]
     design_contract: str
     implementation_plan: str
     patch_text: str
@@ -116,10 +129,13 @@ class CfuDesignState(TypedDict, total=False):
     cost_results: Annotated[list[CommandResult], operator.add]
     iteration_history: Annotated[list[str], operator.add]
     final_report_path: str
-    status: Literal["initialized", "needs_iteration", "passed", "failed", "complete"]
+    status: Literal["initialized", "needs_iteration", "passed", "failed", "complete", "blocked"]
     errors: Annotated[list[str], operator.add]
     thread_id: str
     graph_events: Annotated[list[str], operator.add]
+    gates: dict[str, dict[str, Any]]
+    token_usage: dict[str, int]
+    progress_summary: dict[str, Any]
 
 
 def append_history(state: CfuDesignState, line: str) -> list[str]:

@@ -11,19 +11,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .policy import AccessPolicy, PolicyError, load_policy, normalize_repo_path
 from .state import CommandResult, RepoContext
 
 
 MAX_FILE_CHARS = 20000
 
-
+# Kept as a public compatibility constant for callers that inspect the old API.
 ALLOW_WRITE_ROOTS = (
     "agents/generated",
     "src/main/scala/vexiiriscv/soc/mico",
     "src/main/scala/vexiiriscv/soc/cfu",
     "sw/tests",
 )
-
 
 DEFAULT_CONTEXT_FILES = (
     "skills/cfu-designer/SKILL.md",
@@ -36,52 +36,62 @@ DEFAULT_CONTEXT_FILES = (
     "src/main/scala/vexiiriscv/soc/mico/MiCoSoc.scala",
 )
 
-
-PROFILE_RE = re.compile(
-    r"(?P<name>[A-Z0-9_]+_PROFILE)\s+(?P<body>.*)"
-)
+PROFILE_RE = re.compile(r"(?P<name>[A-Z0-9_]+_PROFILE)\s+(?P<body>.*)")
 
 
 @dataclass
 class RepoToolbox:
     workdir: Path
     dry_run: bool = False
+    policy: AccessPolicy | None = None
+    stage: str = "load_context"
+    run_root: str = ""
+    apply_patch: bool = False
 
     def __post_init__(self) -> None:
         self.workdir = self.workdir.resolve()
+        if self.policy is None:
+            self.policy = load_policy(self.workdir)
+
+    def normalize(self, rel_path: str | Path) -> str:
+        return normalize_repo_path(self.workdir, rel_path)
+
+    def is_read_allowed(self, rel_path: str | Path) -> bool:
+        try:
+            normalized = self.normalize(rel_path)
+        except PolicyError:
+            return False
+        return self.policy.can_read(self.stage, normalized)
 
     def resolve(self, rel_path: str | Path) -> Path:
-        path = (self.workdir / rel_path).resolve()
-        try:
-            path.relative_to(self.workdir)
-        except ValueError as exc:
-            raise ValueError(f"path escapes workdir: {rel_path}") from exc
-        return path
+        return (self.workdir / self.normalize(rel_path)).resolve()
 
     def is_write_allowed(self, rel_path: str | Path) -> bool:
-        normalized = Path(rel_path).as_posix()
-        return any(
-            normalized == root or normalized.startswith(root + "/")
-            for root in ALLOW_WRITE_ROOTS
-        )
+        try:
+            normalized = self.normalize(rel_path)
+            self.policy.check_write(self.stage, normalized)
+        except PolicyError:
+            return False
+        return True
 
     def read_text(self, rel_path: str, *, limit: int = MAX_FILE_CHARS) -> str:
-        path = self.resolve(rel_path)
+        normalized = self.normalize(rel_path)
+        self.policy.check_read(self.stage, normalized)
+        path = self.workdir / normalized
         if not path.exists() or not path.is_file():
             return ""
         text = path.read_text(errors="replace")
         return text[:limit]
 
     def write_text(self, rel_path: str, text: str) -> str:
-        if not self.is_write_allowed(rel_path):
-            raise ValueError(f"write path is not allowlisted: {rel_path}")
-        normalized = Path(rel_path).as_posix()
-        path = self.resolve(rel_path)
+        normalized = self.normalize(rel_path)
+        self.policy.check_write(self.stage, normalized)
+        path = self.workdir / normalized
         if self.dry_run and not is_dry_run_artifact(normalized):
-            return f"dry-run: would write {rel_path}"
+            return f"dry-run: would write {normalized}"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-        return f"wrote {rel_path}"
+        return f"wrote {normalized}"
 
     def discover_context(self, extra_files: Iterable[str] = ()) -> RepoContext:
         files: dict[str, str] = {}
@@ -101,11 +111,14 @@ class RepoToolbox:
         root = self.resolve(rel_root)
         if not root.exists():
             return []
-        return sorted(
-            str(path.relative_to(self.workdir))
-            for path in root.glob(pattern)
-            if path.is_file()
-        )
+        paths: list[str] = []
+        for path in root.glob(pattern):
+            if not path.is_file():
+                continue
+            rel_path = str(path.relative_to(self.workdir))
+            if self.is_read_allowed(rel_path):
+                paths.append(rel_path)
+        return sorted(paths)
 
     def git_status(self) -> str:
         result = subprocess.run(
@@ -116,28 +129,26 @@ class RepoToolbox:
             stderr=subprocess.PIPE,
             check=False,
         )
-        return result.stdout.strip()
+        visible: list[str] = []
+        for line in result.stdout.splitlines():
+            candidate = line[3:].strip() if len(line) > 3 else ""
+            try:
+                normalized = self.normalize(candidate)
+            except PolicyError:
+                continue
+            if self.policy.can_read(self.stage, normalized):
+                visible.append(f"{line[:3]}{normalized}")
+        return "\n".join(visible)
 
-    def command_allowed(self, args: list[str]) -> bool:
+    def command_allowed(self, args: list[str], *, command_id: str | None = None) -> bool:
         if not args:
             return False
-        if args[0] == "git" and args[1:] in (["status", "--short"], ["diff", "--stat"]):
-            return True
-        if args[0] in {"rg", "sed"}:
-            return True
-        if args[0] == "sbt" and len(args) >= 2:
-            joined = " ".join(args[1:])
-            return (
-                "runMain vexiiriscv.soc.mico.MiCoSocGen" in joined
-                or "runMain vexiiriscv.soc.mico.MiCoSocSim" in joined
-            )
-        if args[0] == "make":
-            return any(arg == "TARGET=vexii_soc" for arg in args)
-        if args[:2] == ["python3", "skills/cfu-designer/scripts/yosys_cost_report.py"]:
-            return True
-        if args[0] == "git" and args[1:] in (["apply", "--check", "-"], ["apply", "-"]):
-            return True
-        return False
+        try:
+            selected = command_id or infer_command_id(args, self.policy)
+            self.policy.check_command(self.stage, selected, args, self.workdir)
+        except (PolicyError, ValueError):
+            return False
+        return True
 
     def run_command(
         self,
@@ -147,16 +158,18 @@ class RepoToolbox:
         input_text: str | None = None,
         timeout: int = 1800,
         mutate: bool = False,
+        command_id: str | None = None,
+        execute: bool = True,
     ) -> CommandResult:
-        if not self.command_allowed(args):
-            raise ValueError(f"command is not allowlisted: {args}")
-        if mutate and self.dry_run:
+        selected = command_id or infer_command_id(args, self.policy)
+        self.policy.check_command(self.stage, selected, args, self.workdir)
+        if (mutate and self.dry_run) or not execute:
             return {
                 "command": " ".join(args),
                 "cwd": cwd or str(self.workdir),
-                "returncode": 0,
+                "returncode": None,
                 "skipped": True,
-                "reason": "dry-run",
+                "reason": "dry-run" if self.dry_run else "execution-disabled",
             }
 
         run_cwd = self.resolve(cwd) if cwd else self.workdir
@@ -181,19 +194,49 @@ class RepoToolbox:
 
     def apply_patch_text(self, patch_text: str) -> CommandResult:
         touched = patch_paths(patch_text)
-        blocked = [path for path in touched if not self.is_write_allowed(path)]
-        if blocked:
-            raise ValueError(f"patch touches non-allowlisted paths: {blocked}")
-        check = self.run_command(["git", "apply", "--check", "-"], input_text=patch_text)
-        if check["returncode"] != 0:
+        normalized: list[str] = []
+        for path in touched:
+            normalized.append(self.normalize(path))
+            if not self.is_write_allowed(path):
+                raise ValueError(f"patch touches non-allowlisted path: {path}")
+        check = self.run_command(
+            ["git", "apply", "--check", "-"],
+            input_text=patch_text,
+            command_id="git_apply_check",
+            mutate=False,
+        )
+        if check["returncode"] != 0 or not self.apply_patch:
+            if not self.apply_patch and check["returncode"] == 0:
+                check["skipped"] = True
+                check["reason"] = "patch-application-disabled"
+            check["parsed"] = {**check.get("parsed", {}), "touched_paths": normalized}
             return check
-        return self.run_command(["git", "apply", "-"], input_text=patch_text, mutate=True)
+        result = self.run_command(
+            ["git", "apply", "-"],
+            input_text=patch_text,
+            command_id="git_apply",
+            mutate=True,
+        )
+        result["parsed"] = {**result.get("parsed", {}), "touched_paths": normalized}
+        return result
+
+    def stage_bucket(self, stage: str) -> "RepoToolbox":
+        return RepoToolbox(
+            self.workdir,
+            dry_run=self.dry_run,
+            policy=self.policy,
+            stage=stage,
+            run_root=self.run_root,
+            apply_patch=self.apply_patch,
+        )
 
     def copy_tree(self, src_rel: str, dst_rel: str) -> str:
-        if not self.is_write_allowed(dst_rel):
-            raise ValueError(f"copy destination is not allowlisted: {dst_rel}")
-        src = self.resolve(src_rel)
-        dst = self.resolve(dst_rel)
+        src_normalized = self.normalize(src_rel)
+        dst_normalized = self.normalize(dst_rel)
+        self.policy.check_read(self.stage, src_normalized)
+        self.policy.check_write(self.stage, dst_normalized)
+        src = self.workdir / src_normalized
+        dst = self.workdir / dst_normalized
         if self.dry_run:
             return f"dry-run: would copy {src_rel} to {dst_rel}"
         ignore = shutil.ignore_patterns(
@@ -215,6 +258,20 @@ class RepoToolbox:
                 shutil.rmtree(dst)
             shutil.copytree(src, dst, ignore=ignore)
         return f"copied {src_rel} to {dst_rel}"
+
+
+def infer_command_id(args: list[str], policy: AccessPolicy) -> str:
+    for name, descriptor in policy.commands.items():
+        if not args or args[0] != descriptor.executable:
+            continue
+        if descriptor.argv_prefix and tuple(args[: len(descriptor.argv_prefix)]) != descriptor.argv_prefix:
+            continue
+        if descriptor.required_substring and descriptor.required_substring not in " ".join(args):
+            continue
+        if any(token not in args for token in descriptor.required_tokens):
+            continue
+        return name
+    raise PolicyError(f"no declared command matches argv: {args}")
 
 
 def tail(text: str, *, max_chars: int = 6000) -> str:
@@ -262,10 +319,7 @@ def extract_patch(text: str) -> str:
 
 
 def is_dry_run_artifact(rel_path: str) -> bool:
-    return (
-        rel_path.startswith("agents/generated/runs/")
-        or rel_path.startswith("agents/generated/graph/")
-    )
+    return rel_path.startswith("agents/generated/runs/") or rel_path.startswith("agents/generated/graph/")
 
 
 def read_yosys_summary(path: Path) -> dict[str, object]:

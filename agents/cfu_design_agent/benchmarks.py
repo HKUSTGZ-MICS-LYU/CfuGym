@@ -19,12 +19,15 @@ def slugify(text: str, *, default: str = "cfu_workload") -> str:
     return slug[:80] or default
 
 
-def workspace_rel(spec: WorkloadSpec, suffix: str) -> str:
-    return f"agents/generated/workspaces/{slugify(spec.get('name', 'cfu_workload'))}/{suffix}"
+def workspace_rel(spec: WorkloadSpec, suffix: str, *, run_root: str = "") -> str:
+    slug = slugify(spec.get("name", "cfu_workload"))
+    if run_root:
+        return f"{run_root}/workspace/{slug}_{suffix}"
+    return f"agents/generated/workspaces/{slug}/{suffix}"
 
 
 def prepare_generated_benchmark(toolbox: RepoToolbox, spec: WorkloadSpec) -> BenchmarkProject:
-    root = workspace_rel(spec, "benchmark")
+    root = workspace_rel(spec, "benchmark", run_root=getattr(toolbox, "run_root", ""))
     source = f"{root}/main.c"
     header = f"{root}/cfu_agent_counter.h"
     build = (
@@ -58,7 +61,7 @@ def prepare_generated_benchmark(toolbox: RepoToolbox, spec: WorkloadSpec) -> Ben
 
 
 def prepare_c_project_profile(toolbox: RepoToolbox, spec: WorkloadSpec) -> BenchmarkProject:
-    root = workspace_rel(spec, "project_profile")
+    root = workspace_rel(spec, "project_profile", run_root=getattr(toolbox, "run_root", ""))
     project_root = spec.get("project_root", "")
     kernel_file = spec.get("kernel_file", "")
     copied_project = f"{root}/project"

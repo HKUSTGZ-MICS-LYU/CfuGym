@@ -1,0 +1,122 @@
+# Reference ISA spec for the current CfuGym U8 weighted-average TileLink CFU.
+# This documents the already-implemented U8WeightedAvgCfu custom0 contract.
+spec_version: "1"
+identity:
+  name: u8_weighted_average
+  status: validated
+  opcode: custom0 (0x0B)
+  function_id_width: 3
+  reference_workload: uint8 weighted-average over aligned vectors with resident products
+
+commands:
+  - function_id: 0
+    name: reset
+    operand: none
+    result: status
+    semantics: Clear both RF slots, the accumulator, and the sum register.
+    response: status
+  - function_id: 1
+    name: load_x
+    operand: rs1 address
+    result: status
+    semantics: Load vector X from rs1 address into RF slot 0.
+    response: status
+  - function_id: 2
+    name: load_w
+    operand: rs1 address
+    result: status
+    semantics: Load vector W from rs1 address into RF slot 1.
+    response: status
+  - function_id: 3
+    name: mul
+    operand: none
+    result: status
+    semantics: Multiply slices of X and W, widen locally, and accumulate into the sum register.
+    response: status
+  - function_id: 4
+    name: sum
+    operand: none
+    result: sum
+    semantics: Return the accumulated sum as a scalar.
+    response: sum
+  - function_id: 5
+    name: avg
+    operand: none
+    result: avg
+    semantics: Return the accumulated sum shifted right by log2(vector bytes).
+    response: avg
+
+operations_contract:
+  pattern: vector_mul_reduce
+  element_type: uint8_t
+  signedness: unsigned
+  output_type: uint32_t
+  average_division: power_of_two_shift
+
+state:
+  register_slots: 2
+  slot_0: X
+  slot_1: W
+  cursor_behavior: computeOffset advances by maclen per slice
+  reset_behavior: reset command clears RF slots, accumulator, sum, and pipeline valid
+
+memory:
+  operator_owned: true
+  bus_width: 32
+  load: true
+  store: false
+  burst: false
+  alignment_bytes: 32
+  ordering: software must fence rw,rw before/after CFU loads
+
+datapath:
+  vlen: 256
+  xlen: 32
+  maclen: 32
+  accWidth: 32
+  regDepth: 2
+  rfRam: false
+  rfSync: false
+  computePipe: true
+
+software:
+  intrinsics_header: sw/tests/u8_wavg_cfu_test.c
+  intrinsic_names: [u8_wavg_reset, u8_wavg_load_x, u8_wavg_load_w, u8_wavg_mul, u8_wavg_sum, u8_wavg_avg]
+  scalar_fallback: true
+  compiler_march: rv32imc_zicsr_zifencei
+  soc_flags:
+    - --with-rvc
+    - --with-rvm
+    - --with-rdtime
+    - --mico-u8-wavg-cfu
+
+integration:
+  hardware_component: U8WeightedAvgCfu
+  hardware_fiber: TilelinkU8WeightedAvgCfuFiber
+  soc_params: [U8WeightedAvgCfuLen, U8WeightedAvgCfuBusWidth, U8WeightedAvgCfuMacLen]
+  soc_cli_flags:
+    - --mico-u8-wavg-cfu
+    - --u8-wavg-cfu-len
+    - --u8-wavg-cfu-bus-width
+    - --u8-wavg-cfu-maclen
+  bus_style: TilelinkCfuSpec
+  single_cpu_bus_owner: true
+
+validation:
+  status: implemented
+  scalar_reference: true
+  soc_simulation: true
+  cycle_profile: true
+  yosys_cost: true
+  requirements:
+    - scalar_fused and standalone reference must equal the CFU output for zero, max, and pattern cases
+    - SoC sim must emit U8_WAVG PASS and U8_WAVG_PROFILE
+    - Yosys must use generated MiCoSoc RTL at top U8WeightedAvgCfu
+    - burst mode buffers must be vector-bytes aligned
+
+assumptions:
+  avg_uses_power_of_two_shift: vector byte count is a power of two
+  rf_register_default: rfRam=false is the validated default for integrated SoC sim
+
+unknowns:
+  - exact U8_WAVG_PROFILE numbers vary with toolchain and SoC flags

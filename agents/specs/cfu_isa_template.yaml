@@ -1,0 +1,70 @@
+# CFU ISA spec template. Fill and validate before implementation.
+spec_version: "1"
+identity:
+  name: ""
+  status: draft            # draft | approved | implemented | validated
+  opcode: ""               # custom0 (0x0B) or custom1 (0x2B)
+  function_id_width: 3     # usually 3 bits (func3)
+  reference_workload: ""
+
+commands:
+  - function_id: 0
+    name: ""
+    operand: ""
+    result: ""
+    semantics: ""
+    response: status
+
+# Set to null/[] when the workload is stateless or not applicable.
+operations_contract: {}
+
+state:
+  register_slots: 0
+  cursor_behavior: ""
+  reset_behavior: ""
+
+memory:
+  operator_owned: false
+  bus_width: 0
+  load: true
+  store: false
+  burst: false
+  alignment_bytes: 0
+  ordering: ""
+
+datapath:
+  vlen: 0
+  xlen: 0
+  maclen: 0
+  accWidth: 0
+  regDepth: 2
+  rfRam: false
+  rfSync: false
+  computePipe: true
+
+software:
+  intrinsics_header: ""
+  intrinsic_names: []
+  scalar_fallback: true
+  compiler_march: ""
+  soc_flags: []
+
+integration:
+  hardware_component: ""
+  hardware_fiber: ""
+  soc_params: []
+  soc_cli_flags: []
+  bus_style: TilelinkCfuSpec
+  single_cpu_bus_owner: true
+
+validation:
+  status: draft
+  scalar_reference: false
+  soc_simulation: false
+  cycle_profile: false
+  yosys_cost: false
+  requirements: []
+
+assumptions: {}
+
+unknowns: []
