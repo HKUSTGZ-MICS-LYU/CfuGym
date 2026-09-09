@@ -9,12 +9,15 @@ from typing import Any
 
 import yaml
 
+from .embench import list_benchmarks
 from .llm import OpenAiTextClient
 from .state import RepoContext, WorkloadSpec
 
 
 SPEC_VERSION = "1"
 SPEC_REQUIRED = ("name", "source_kind", "operation", "pattern", "validation", "unknowns")
+DEFAULT_SCALE_FACTOR = 1
+DEFAULT_WARMUP_HEAT = 1
 
 SPEC_SYSTEM_PROMPT = """You convert CFU workload requests into a normalized YAML WorkloadSpec.
 Use only facts present in the input and repo context. For missing high-impact fields, add them to `unknowns` instead of guessing.
@@ -34,8 +37,13 @@ def normalize_workload_spec(
     build_cmd: str = "",
     run_cmd: str = "",
     test_cmd: str = "",
+    benchmark_name: str = "",
     llm: OpenAiTextClient | None = None,
 ) -> tuple[WorkloadSpec, str]:
+    if input_mode == "embench" or benchmark_name:
+        spec = infer_embench_spec(task, benchmark_name or infer_benchmark_name(task, workdir))
+        return sanitize_spec(spec), yaml.safe_dump(dict(spec), sort_keys=False)
+
     if input_mode == "formatted_spec":
         spec = load_formatted_spec(workdir / workload_spec_path)
         spec.setdefault("source_kind", "formatted_spec")
@@ -74,6 +82,41 @@ def normalize_workload_spec(
     spec = llm_extract_or_fallback(task, context, fallback, llm)
     spec.setdefault("source_kind", "natural_language")
     return sanitize_spec(spec), yaml.safe_dump(dict(spec), sort_keys=False)
+
+
+def infer_benchmark_name(task: str, workdir: Path) -> str:
+    """Pick a benchmark name mentioned in the task, else the first available."""
+    lowered = task.lower()
+    for name in list_benchmarks(workdir):
+        if name.lower() in lowered:
+            return name
+    return ""
+
+
+def infer_embench_spec(task: str, name: str) -> WorkloadSpec:
+    if not name:
+        raise ValueError("embench workload requires a benchmark name")
+    return WorkloadSpec(
+        spec_version=SPEC_VERSION,
+        name=name.replace("-", "_"),
+        source_kind="embench",
+        description=clean_description(task),
+        benchmark_suite="embench-iot",
+        benchmark_name=name,
+        benchmark_scale=DEFAULT_SCALE_FACTOR,
+        warmup_heat=DEFAULT_WARMUP_HEAT,
+        operation="embench_workload",
+        pattern="unknown",
+        cfu_style="tilelink_vector_rf",
+        validation={
+            "scalar_reference": True,
+            "bench_verify": True,
+            "soc_sim": True,
+            "cycle_profile": True,
+            "yosys_cost": True,
+        },
+        unknowns=[],
+    )
 
 
 def load_formatted_spec(path: Path) -> WorkloadSpec:
@@ -179,11 +222,16 @@ def validate_workload_spec(spec: WorkloadSpec, *, strict: bool = False) -> list[
     errors: list[str] = []
     for key in SPEC_REQUIRED:
         value = spec.get(key)
-        if value is None or value == "" or value == []:
+        # An empty unknowns list is a valid answer ("nothing unknown"); only a
+        # missing value is an error.
+        if value is None or value == "" or (value == [] and key != "unknowns"):
             errors.append(f"{key} is required")
     source_kind = spec.get("source_kind")
-    if source_kind not in {"natural_language", "formatted_spec", "c_project"}:
-        errors.append(f"source_kind must be natural_language|formatted_spec|c_project, got {source_kind!r}")
+    if source_kind not in {"natural_language", "formatted_spec", "c_project", "embench"}:
+        errors.append(
+            "source_kind must be natural_language|formatted_spec|c_project|embench, "
+            f"got {source_kind!r}"
+        )
     operation = spec.get("operation")
     if operation == "unknown":
         errors.append("operation is unknown; resolve before proceeding")

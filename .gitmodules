@@ -17,3 +17,9 @@
 [submodule "sw"]
 	path = sw
 	url = https://github.com/HKUSTGZ-MICS-LYU/MiCo-SW.git
+[submodule "benchmarks/embench-iot"]
+	path = benchmarks/embench-iot
+	url = git@github.com:HKUSTGZ-MICS-LYU/embench-iot-cfu.git
+[submodule "benchmarks/PolyBenchC"]
+	path = benchmarks/PolyBenchC
+	url = git@github.com:ferrandi/PolyBenchC.git

@@ -39,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only run an API connectivity check against the selected LLM config, then exit.",
     )
+    parser.add_argument(
+        "--embench",
+        default="",
+        help="Run an embench-iot benchmark as the workload, e.g. --embench crc32.",
+    )
+    parser.add_argument("--run-id", default="", help="Explicit run id; defaults to a timestamped unique id.")
     parser.add_argument("--max-iters", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true", help="Force read-only: never mutate source or run external commands.")
     parser.add_argument("--apply-patch", action="store_true", help="Allow an LLM patch to be applied to CFU/software allowlisted paths.")
@@ -67,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         "task": task,
         "input_kind": input_mode,
         "input_mode": input_mode,
+        "benchmark_name": args.embench,
         "project_root": args.project_root,
         "kernel_file": args.kernel_file,
         "kernel_function": args.kernel_function,
@@ -86,6 +93,10 @@ def main(argv: list[str] | None = None) -> int:
         "max_iters": args.max_iters,
         "iteration": 0,
         "thread_id": args.thread_id,
+        "run_id": args.run_id,
+        # This agent designs the AgentCfu scaffold only; the flag keeps the
+        # choice explicit instead of inferring it from an always-set run root.
+        "agent_cfu": True,
     }
     graph_dir = args.export_graph or str(Path(args.out_dir) / "graph")
     graph_paths = export_graph_visualization(workdir / graph_dir)
@@ -178,12 +189,16 @@ def run_api_test(workdir: Path, args: argparse.Namespace) -> int:
 
 
 def infer_input_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "embench", ""):
+        return "embench"
     if args.project_root or args.kernel_file or args.kernel_function:
         return "c_project"
     return "natural_language"
 
 
 def default_task(args: argparse.Namespace) -> str:
+    if getattr(args, "embench", ""):
+        return f"Accelerate the embench-iot benchmark {args.embench} with a CFU."
     if args.kernel_file:
         function = f" function {args.kernel_function}" if args.kernel_function else ""
         return f"Design a CFU for C workload {args.kernel_file}{function}"

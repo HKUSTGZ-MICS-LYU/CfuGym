@@ -2,7 +2,44 @@
 
 This folder contains local agent frameworks for CfuGym workflows.
 
-The hardware starting point for new designs is `src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala` with `AgentCfuFiber.scala`. It provides a stable CfuBus contract, an algorithm-neutral Vector RegFile, optional TileLink load/store channels, and MiCoSoc CLI integration. New agents should replace the placeholder compute/config behavior while preserving those interfaces and the single CPU CFU owner rule.
+## Hardware design boundary
+
+`src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala` with `AgentCfuFiber.scala` is the
+hardware starting point for new designs. It provides a stable CfuBus contract, an
+algorithm-neutral Vector RegFile, optional TileLink load/store channels, and MiCoSoc CLI
+integration.
+
+These two tracked files are **read-only defaults**. Every run seeds an isolated workspace copy:
+
+```text
+agents/generated/runs/<run_id>/workspace/design/AgentCfu.scala
+agents/generated/runs/<run_id>/workspace/design/AgentCfuFiber.scala
+```
+
+An agent may write **only** those two files for hardware; the access policy rejects any write
+to `src/main/scala/**`. A patch that names the tracked scaffold path is redirected into the run
+workspace automatically, so the repository tree is never modified by a design run.
+
+The SoC build then compiles the workspace copy *instead of* the tracked scaffold, using a
+same-package source overlay:
+
+```bash
+sbt 'set Compile/unmanagedSourceDirectories += (Compile/baseDirectory).value / "agents/generated/runs/<run_id>/workspace/design"' \
+    'set Compile/unmanagedSources := AgentCfuSourceFilter.sources((Compile/unmanagedSourceDirectories).value)' \
+    'set run / baseDirectory := (Compile/baseDirectory).value / "agents/generated/runs/<run_id>/workspace/soc"' \
+    'runMain vexiiriscv.soc.mico.MiCoSocGen --with-rvc --with-rvm --with-rdtime --mico-agent-cfu'
+```
+
+- `project/AgentCfuSourceFilter.scala` drops the two tracked scaffolds from the resolved source
+  list; Scala cannot hold two definitions of the same class in one package, so this swap is what
+  lets an agent design reach the hardware without touching the repo.
+- `run / baseDirectory` keeps `MiCoSoc.v` and `soc.h` inside the run workspace instead of the
+  repository root.
+- Run this from an environment that provides `sbt`, e.g. `conda run -n mico_env ...`.
+
+Preserve the public contract (`AgentCfuParameter`, `class AgentCfu`, the `AgentCfuFiber`
+helpers, `AgentCfuFunction` ids) and the single CPU CFU owner rule; otherwise the SoC
+integration breaks.
 
 ## CFU Design Agent
 
@@ -38,6 +75,7 @@ python3 agents/run_cfu_agent.py --task "..." --dry-run
 - Each stage has its own `read` / `write` allow lists. Secret, `.git`, build/binary (`*.elf`, `*.o`, `*.map`, `*.asm`, `*.vcd`, `*.fst`), and non-allowlisted repo source are not exposed to the agent. Historical runs under `agents/generated/runs/` are never auto-read.
 - Commands are declared by id (e.g. `make_profile`, `soc_sim`, `yosys_cost`, `git_apply`). Shell metacharacters, absolute paths, and sensitive paths in command argv are rejected; the executable and required tokens must match the declaration.
 - `use --apply-patch` without `--run-commands` is safe: it validates the patch, checks its touched paths against the policy, runs `git apply --check`, but does not apply it unless both the patch and the command allowlist permit it.
+- Hardware writes are confined to `workspace/design/AgentCfu.scala` and `workspace/design/AgentCfuFiber.scala`; `src/main/scala/**` is read-only for every stage.
 
 ### Run artifacts
 
@@ -59,13 +97,16 @@ Every run gets a unique directory `agents/generated/runs/<run_id>/` and writes:
 report.md
 run.yaml                          # manifest with per-artifact sha256
 workspace/...                     # per-run isolated benchmark/project workspace
+workspace/design/...              # isolated AgentCfu.scala + AgentCfuFiber.scala
+workspace/soc/...                 # MiCoSoc.v / soc.h generated from the overlay
 ```
 
 Each artifact records its stage, status, inputs, visible files, SHA-256, size, and timestamp. The benchmark workspace is scoped to the run so runs do not clobber each other, and C-project inputs are always copied before instrumentation so the original source tree is never modified.
 
 ### Status semantics
 
-- `planned`: a read-only planning pass completed. The report lists each gate and what was skipped because it needs execution. This is **not** a claim of correctness or execution.
+- `planned`: a planning pass completed. Either it was a read-only pass, or the execution gates were skipped (execution disabled, `--skip-sim`, `--skip-yosys`). The report lists each gate and what was skipped. This is **not** a claim of correctness or execution.
+- A gate that was skipped is recorded as `{"ok": false, "skipped": true, "reason": ...}`. Skipped gates never produce `failed` and can never produce `complete`.
 - `complete`: every gate (workload spec, ISA contract, validation, cost) produced evidence and passed. Only this is a real completion.
 - `failed`: execution ran but a required gate failed after max iterations.
 - `blocked`: an input/ISA contract could not be validated, so the loop cannot proceed honestly.
@@ -89,6 +130,39 @@ Each stage emits a live line as it runs and a second line when it finishes, e.g.
 - `(N tok)` is the total LLM tokens consumed during that stage.
 
 At the end the CLI prints a summary of cumulative token usage (`calls`, `input_tokens`, `output_tokens`, `total_tokens`) and per-stage results, and the `report.md` includes a `## Token Usage` section. Token usage is read from the OpenAI Responses / Chat Completions `usage` block and accumulated per run; everything stays in-memory and is never logged as content.
+
+### Embench-iot workloads
+
+Any embench-iot benchmark can be used as the workload input:
+
+```bash
+conda run -n mico_env python3 -B agents/run_cfu_agent.py \
+  --embench crc32 --run-commands --skip-yosys --max-iters 1
+```
+
+The run copies `benchmarks/embench-iot/{src/<bench>,support}` plus the tracked
+VexiiRiscv board (`sw/embench/`) into `<run>/workspace/embench_<bench>/` and builds
+three configurations, each with its own source tree:
+
+| config | defines | evidence |
+| --- | --- | --- |
+| reference | board only | Embench verify passes + baseline cycles |
+| profile | `-DEMBENCH_OBS` | per-function `CFU_AGENT_PROFILE <id>=<cycles>` table |
+| cfu | `-DUSE_AGENT_CFU` | verify still passes + speedup vs reference |
+
+Observation points are inserted by `embench_instrument.py` at function definitions
+(never prototypes) with a single `EMBENCH_OBS_ENTER(id)`; scope exit is handled by
+GCC cleanup attributes, so early returns are counted correctly. An LLM-supplied
+`observation_plan` selects the points; loop-level points are reported as skipped
+rather than silently ignored. Without a plan, functions containing loops are used.
+
+Correctness comes from Embench itself: `support/main.c` returns `!correct` and the
+repo `start.S` maps that to the `pass`/`fail` symbols MiCoSocSim watches. Artifacts:
+`04_benchmark/embench.yaml`, `05_profile/embench.yaml`, `10_validation/embench.yaml`
+(reference/cfu cycles and `speedup_x100`).
+
+Note: `benchmarks/embench-iot` and `sw` are git submodules; `sw/embench/` and the
+`sw/Makefile` hooks are committed inside the `sw` submodule.
 
 ### WorkloadSpec and CFU ISA spec
 
@@ -118,6 +192,8 @@ Each config may set `model`, `base_url`, `api_mode` (`auto`/`responses`/`chat`),
 
 ### Environment
 
+Run the agent and its tests from `conda run -n mico_env` (or an activated `mico_env`): that environment provides `langgraph` and `sbt`. Without `langgraph` the framework falls back to a pure-Python runner with equivalent state-merge semantics, but the LangGraph path is the primary one.
+
 - `OPENAI_API_KEY`: required only when LLM calls are enabled. Without it (or when the selected config resolves no key), the agent uses deterministic fallbacks.
 - `OPENAI_BASE_URL`: optional custom OpenAI-compatible endpoint.
 - `CFU_AGENT_MODEL`: optional default model name.
@@ -127,9 +203,12 @@ Each config may set `model`, `base_url`, `api_mode` (`auto`/`responses`/`chat`),
 ### Tests
 
 ```bash
-python3 -m unittest discover -s agents/tests
+# Use the project environment: it provides langgraph and sbt.
+conda run -n mico_env python3 -m unittest discover -s agents/tests
 ```
 
-The `unittest` suite checks path traversal, deny precedence, command allowlisting, run isolation, `WorkloadSpec`/CFU ISA validation, and dry-run flow without any external toolchain or API key.
+The `unittest` suite checks path traversal, deny precedence, command allowlisting (including the agent-overlay command and positional-path confinement), run isolation, `WorkloadSpec`/CFU ISA validation, gate honesty, iteration re-seeding, and dry-run flow without any external toolchain or API key.
+
+Run it inside `mico_env`: that environment has `langgraph`, so the LangGraph runner is the live path and its tests are not skipped. The suite also covers the pure-Python fallback runner, whose append-key merge semantics mirror LangGraph's.
 
 Ready-to-run examples are under `agents/examples/`.

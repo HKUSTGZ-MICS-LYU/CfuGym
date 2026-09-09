@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: MIT
+//
+// AgentCfuFiber - SoC-facing wrapper for the agent CFU shell.
+//
+// Like AgentCfu.scala, this is a read-only default for design agents. Agent runs
+// compile an isolated workspace copy instead; see agents/README.md.
+// Keep the stable surface: AgentCfuFiber.getCfuBusParameters(xlen),
+// getM2sParameters(name, p), dummyBusParameter(p), and
+// class AgentCfuFiber(p, xlen) exposing `logic.cfuBus` and `bus`.
 package vexiiriscv.soc.mico
 
 import spinal.core._

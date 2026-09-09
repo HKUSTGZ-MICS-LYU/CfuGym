@@ -184,5 +184,62 @@ def _render_mapping(value: Any) -> str:
     return "\n".join(f"- {key}: {item}" for key, item in value.items())
 
 
+CFU_OPCODE_CUSTOM0 = 0x0B
+
+
+def render_cfu_intrinsics(data: dict[str, Any]) -> str:
+    """Render custom0 intrinsics for an AgentCfu ISA spec.
+
+    Encoding follows the repo convention (CfuPlugin + custom_asm.h):
+    opcode | rd<<7 | func3<<12 | rs1<<15 | rs2<<20. rd/rs1/rs2 are pinned to
+    a0/a1/a2 so the emitted functions are self-contained.
+    """
+    identity = data.get("identity", {}) if isinstance(data.get("identity"), dict) else {}
+    name = str(identity.get("name", "agent_cfu") or "agent_cfu")
+    commands = [c for c in data.get("commands", []) if isinstance(c, dict)]
+    lines = [
+        "/* Generated from the CFU ISA spec. Do not edit by hand. */",
+        "#ifndef CFU_INTRINSICS_H",
+        "#define CFU_INTRINSICS_H",
+        "",
+        "#include <stdint.h>",
+        "",
+        "/* CSR 0xBC0 bit 31 enables the CFU. */",
+        "static inline void cfu_enable(void)",
+        "{",
+        '  __asm__ volatile("li t1, 0x80000000\\n\\t csrs 0xBC0, t1" ::: "t1");',
+        "}",
+        "",
+        "static inline void cfu_memory_fence(void)",
+        "{",
+        '  __asm__ volatile("fence rw, rw" ::: "memory");',
+        "}",
+        "",
+    ]
+    for command in commands:
+        func_id = command.get("function_id")
+        if not isinstance(func_id, int):
+            continue
+        cmd_name = str(command.get("name", f"op{func_id}") or f"op{func_id}")
+        symbol = "".join(ch if ch.isalnum() else "_" for ch in cmd_name).strip("_") or f"op{func_id}"
+        semantics = str(command.get("semantics", "")).replace("*/", "* /")
+        lines += [
+            f"/* function_id {func_id}: {cmd_name} - {semantics} */",
+            f"#define CFU_{symbol.upper()}_FUNC3 {func_id}",
+            f"static inline uint32_t cfu_{symbol}(uint32_t rs1, uint32_t rs2)",
+            "{",
+            '  register uint32_t rd asm("a0") = 0;',
+            '  register uint32_t r1 asm("a1") = rs1;',
+            '  register uint32_t r2 asm("a2") = rs2;',
+            "  __asm__ volatile(",
+            f'      ".word ((0x0B) | (10 << 7) | (11 << 15) | (12 << 20) | ({func_id} << 12))"',
+            '      : "+r"(rd) : "r"(r1), "r"(r2) : "memory");',
+            "  return rd;",
+            "}",
+            "",
+        ]
+    lines += [f"#endif /* CFU_INTRINSICS_H - {name} */", ""]
+    return "\n".join(lines)
+
 def render_list(value: Iterable[Any]) -> str:
     return "\n".join(f"- {item}" for item in value or [])

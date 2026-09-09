@@ -9,7 +9,8 @@ from .state import RepoContext, WorkloadSpec
 
 SYSTEM_PROMPT = """You are a hardware/software co-design agent for CfuGym.
 Use the VexiiRiscv CFU design loop: analyze workload, extract operation, define ISA contract, design SpinalHDL CFU hardware, write accelerated C kernel, validate correctness, measure cycles, estimate Yosys cost, and iterate.
-Prefer existing repo patterns: CfuPlugin/CfuBus, DirectCfuSpec or TilelinkCfuSpec, CfuLsu, MiCoSocParam CLI flags, scalar fallback tests, and generated SoC RTL for cost.
+Your hardware design surface is the AgentCfu scaffold only: AgentCfu.scala and AgentCfuFiber.scala in the run's isolated design workspace. Do not edit MiCoSoc.scala, MiCoSocParam.scala, CfuPlugin, or any other repository source; the SoC integration is fixed and the run overlay supplies your design.
+Keep the AgentCfu contract stable (AgentCfuParameter, class AgentCfu, the AgentCfuFiber helpers, AgentCfuFunction ids) and build on CfuBus and CfuLsu.
 Return concise, implementable text. Do not invent performance results."""
 
 
@@ -90,7 +91,11 @@ Repo context:
 {context_digest(context)}
 
 Produce either:
-1. A unified git patch touching only CFU allowlisted paths, or
+1. A unified git patch touching ONLY these two files (repo-relative paths are
+   redirected into the run workspace automatically):
+   - src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala
+   - src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala
+   Any other path is rejected by the access policy.
 2. A precise implementation plan if the patch would be too risky.
 
 If producing a patch, wrap it between lines PATCH_BEGIN and PATCH_END."""

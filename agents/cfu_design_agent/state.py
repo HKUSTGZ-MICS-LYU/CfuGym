@@ -8,7 +8,7 @@ from typing_extensions import TypedDict
 
 
 AgentMode = Literal["dry-run", "autonomous"]
-InputKind = Literal["natural_language", "c_project"]
+InputKind = Literal["natural_language", "c_project", "embench"]
 
 
 class CommandResult(TypedDict, total=False):
@@ -32,7 +32,12 @@ class RepoContext(TypedDict, total=False):
 class WorkloadSpec(TypedDict, total=False):
     spec_version: str
     name: str
-    source_kind: Literal["natural_language", "formatted_spec", "c_project"]
+    source_kind: Literal["natural_language", "formatted_spec", "c_project", "embench"]
+    benchmark_suite: str
+    benchmark_name: str
+    benchmark_scale: int
+    warmup_heat: int
+    observation_plan: dict[str, Any]
     description: str
     project_root: str
     kernel_file: str
@@ -55,7 +60,14 @@ class WorkloadSpec(TypedDict, total=False):
 
 
 class BenchmarkProject(TypedDict, total=False):
-    kind: Literal["generated_benchmark", "instrumented_copy", "planned"]
+    kind: Literal["generated_benchmark", "instrumented_copy", "embench_benchmark", "planned"]
+    suite: str
+    benchmark: str
+    configs: list[str]
+    elf_paths: dict[str, str]
+    verification: str
+    source_files: list[str]
+    copied_files: list[str]
     workspace: str
     source_path: str
     header_path: str
@@ -84,7 +96,7 @@ class ProfileResult(TypedDict, total=False):
 class CfuDesignState(TypedDict, total=False):
     task: str
     input_kind: InputKind
-    input_mode: Literal["natural_language", "formatted_spec", "c_project"]
+    input_mode: Literal["natural_language", "formatted_spec", "c_project", "embench"]
     workload_spec_path: str
     project_root: str
     kernel_file: str
@@ -106,21 +118,24 @@ class CfuDesignState(TypedDict, total=False):
     iteration: int
     run_id: str
     run_root: str
+    agent_cfu: bool
+    design_workspace: dict[str, Any]
+    design_files: list[str]
+    changed_design_files: list[str]
     stage_jobs: str
-    scan_only: bool
     context: RepoContext
     workload_spec: WorkloadSpec
     spec_text: str
     spec_unknowns: list[str]
     benchmark_project: BenchmarkProject
+    embench_profiles: dict[str, Any]
+    observation_report: dict[str, Any]
     profile_result: ProfileResult
     hot_spot: str
     workload_analysis: str
     isa_spec: dict[str, Any]
     isa_spec_text: str
-    isa_spec_path: str
     isa_spec_errors: list[str]
-    isa_review: dict[str, Any]
     design_contract: str
     implementation_plan: str
     patch_text: str
@@ -129,7 +144,7 @@ class CfuDesignState(TypedDict, total=False):
     cost_results: Annotated[list[CommandResult], operator.add]
     iteration_history: Annotated[list[str], operator.add]
     final_report_path: str
-    status: Literal["initialized", "needs_iteration", "passed", "failed", "complete", "blocked"]
+    status: Literal["initialized", "needs_iteration", "failed", "complete", "blocked", "planned"]
     errors: Annotated[list[str], operator.add]
     thread_id: str
     graph_events: Annotated[list[str], operator.add]

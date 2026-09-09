@@ -30,6 +30,12 @@ class CommandPolicy:
     argv_prefix: tuple[str, ...] = ()
     required_tokens: tuple[str, ...] = ()
     required_substring: str = ""
+    # Substrings that must appear anywhere in the joined argv. Used when a
+    # single argv element carries a subcommand plus its flags (sbt runMain).
+    required_substrings: tuple[str, ...] = ()
+    # Higher priority wins when several declarations match the same argv, so a
+    # stricter variant is not shadowed by a looser one declared earlier.
+    priority: int = 0
 
 
 @dataclass(frozen=True)
@@ -76,6 +82,10 @@ class AccessPolicy:
                 argv_prefix=_string_tuple(raw.get("argv_prefix", []), f"{name}.argv_prefix"),
                 required_tokens=_string_tuple(raw.get("required_tokens", []), f"{name}.required_tokens"),
                 required_substring=str(raw.get("required_substring", "")),
+                required_substrings=_string_tuple(
+                    raw.get("required_substrings", []), f"{name}.required_substrings"
+                ),
+                priority=int(raw.get("priority", 0) or 0),
             )
 
         return cls(
@@ -133,8 +143,12 @@ class AccessPolicy:
         missing = [token for token in command.required_tokens if token not in args]
         if missing:
             raise PolicyError(f"command missing required tokens for {command_id}: {missing}")
-        if command.required_substring and command.required_substring not in " ".join(args):
+        joined = " ".join(args)
+        if command.required_substring and command.required_substring not in joined:
             raise PolicyError(f"command missing required text for {command_id}: {command.required_substring}")
+        for needle in command.required_substrings:
+            if needle not in joined:
+                raise PolicyError(f"command missing required text for {command_id}: {needle}")
         _check_command_paths(args, workdir, self)
 
 
@@ -190,26 +204,37 @@ def _check_command_paths(args: list[str], workdir: Path, policy: AccessPolicy) -
     Full repo confinement is enforced by the read/write/copy layer. Here we
     reject absolute paths, deny-rule hits, and shell metacharacters so a
     declared command cannot escape policy or smuggle a second command.
+
+    Every token is inspected, not just the values of known path options: a
+    declared command may take a positional path (for example the Yosys RTL
+    argument), and that must be confined too.
     """
     path_options = {"-C", "--load-elf", "--out-dir", "--input", "--output", "--rtl"}
+    cwd = _command_cwd(args, workdir)
     next_is_path = False
-    for index, token in enumerate(args[1:], start=1):
+    for token in args[1:]:
+        if _has_shell_metachar(token):
+            raise PolicyError(f"shell syntax is not allowed in command argv: {token!r}")
         if next_is_path:
-            _check_token_path(token, policy)
+            _check_token_path(token, policy, workdir=workdir, cwd=cwd)
             next_is_path = False
             continue
         if token in path_options:
             next_is_path = True
             continue
-        if "=" in token:
-            key, value = token.split("=", 1)
-            if key in {"MAIN", "BUILD", "WORKSPACE", "OUT_DIR"} and value:
-                _check_token_path(value, policy)
-        if _has_shell_metachar(token):
-            raise PolicyError(f"shell syntax is not allowed in command argv: {token!r}")
+        _check_token_path(token, policy, workdir=workdir, cwd=cwd)
     if next_is_path:
         raise PolicyError("command path option has no value")
     _scan_embedded_absolute_paths(args)
+
+
+def _command_cwd(args: list[str], workdir: Path) -> Path:
+    """Effective working directory for a command, honouring `-C <dir>`."""
+    if "-C" in args:
+        index = args.index("-C")
+        if index + 1 < len(args):
+            return (workdir / args[index + 1]).resolve()
+    return workdir.resolve()
 
 
 def _scan_embedded_absolute_paths(args: list[str]) -> None:
@@ -236,12 +261,33 @@ COMMAND_DENY_PATTERNS = (
 )
 
 
-def _check_token_path(token: str, policy: AccessPolicy) -> None:
-    normalized = _lenient_posix(token)
-    if normalized.startswith("/"):
-        raise PolicyError(f"absolute paths are not allowed in commands: {token}")
-    if any(pattern in normalized for pattern in COMMAND_DENY_PATTERNS):
-        raise PolicyError(f"command path is denied: {normalized}")
+def _check_token_path(
+    token: str,
+    policy: AccessPolicy,
+    *,
+    workdir: Path | None = None,
+    cwd: Path | None = None,
+) -> None:
+    # Also inspect the value side of KEY=value forms (MAIN=..., OUT_DIR=...).
+    candidates = [token]
+    if "=" in token:
+        candidates.append(token.split("=", 1)[1])
+    for candidate in candidates:
+        normalized = _lenient_posix(candidate)
+        if normalized.startswith("/"):
+            raise PolicyError(f"absolute paths are not allowed in commands: {token}")
+        if any(pattern in normalized for pattern in COMMAND_DENY_PATTERNS):
+            raise PolicyError(f"command path is denied: {normalized}")
+        # A relative path may still escape the repository through "..".
+        # Resolve against the command's effective directory so the legitimate
+        # "make -C sw ... MAIN=../<repo path>" form keeps working.
+        if ".." in Path(normalized).parts and workdir is not None and cwd is not None:
+            resolved = (cwd / normalized).resolve()
+            root = workdir.resolve()
+            if resolved != root and root not in resolved.parents:
+                raise PolicyError(
+                    f"command path escapes the repository: {token} -> {resolved}"
+                )
 
 
 def _lenient_posix(path: str) -> str:

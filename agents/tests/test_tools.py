@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import unittest
 
 from agents.cfu_design_agent.policy import PolicyError
@@ -33,6 +34,25 @@ class ToolsTest(unittest.TestCase):
     def test_write_dry_run_records_without_writing_source(self) -> None:
         with self.assertRaises(PolicyError):
             self.toolbox.write_text("src/main/scala/vexiiriscv/soc/mico/NewCfu.scala", "// x")
+
+    def test_write_allows_only_the_run_design_workspace(self) -> None:
+        run_root = "agents/generated/runs/tools-test-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            workspace = RepoToolbox(
+                REPO_ROOT,
+                dry_run=True,
+                stage="implementation",
+                run_root=run_root,
+            )
+            result = workspace.write_text(f"{run_root}/workspace/design/AgentCfu.scala", "// design")
+            self.assertIn("wrote", result)
+            self.assertTrue((run_dir / "workspace/design/AgentCfu.scala").exists())
+            with self.assertRaises(PolicyError):
+                workspace.write_text(f"{run_root}/workspace/design/Extra.scala", "// nope")
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
     def test_git_status_only_exposes_visible_paths(self) -> None:
         status = self.toolbox.git_status()

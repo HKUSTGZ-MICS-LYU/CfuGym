@@ -18,12 +18,22 @@ from .state import CommandResult, RepoContext
 MAX_FILE_CHARS = 20000
 
 # Kept as a public compatibility constant for callers that inspect the old API.
+# Hardware design writes live in the per-run workspace only; the tracked
+# AgentCfu/Fiber scaffolds are read-only defaults.
 ALLOW_WRITE_ROOTS = (
     "agents/generated",
-    "src/main/scala/vexiiriscv/soc/mico",
-    "src/main/scala/vexiiriscv/soc/cfu",
     "sw/tests",
 )
+
+# The only files a design agent may write for hardware. They are seeded from the
+# tracked scaffolds and compiled over them as a same-package overlay.
+DESIGN_SOURCE_FILES = (
+    "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala",
+    "src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala",
+)
+DESIGN_SCAFFOLD_ROOT = "src/main/scala/vexiiriscv/soc/mico"
+DESIGN_WORKSPACE_SUBDIR = "workspace/design"
+SOC_WORKSPACE_SUBDIR = "workspace/soc"
 
 DEFAULT_CONTEXT_FILES = (
     "skills/cfu-designer/SKILL.md",
@@ -195,6 +205,20 @@ class RepoToolbox:
         }
 
     def apply_patch_text(self, patch_text: str) -> CommandResult:
+        # Redirect tracked scaffold targets into the run workspace before any
+        # git operation, so the repo tree is never touched.
+        redirects: list[str] = []
+        rejected: list[str] = []
+        if self.run_root:
+            patch_text, redirects, rejected = repair_patch_paths(patch_text, self.run_root)
+        if rejected:
+            raise ValueError(
+                "patch touches source paths outside the design workspace: "
+                + ", ".join(sorted(set(rejected)))
+                + "; only AgentCfu.scala and AgentCfuFiber.scala may be designed,"
+                + f" and only under {self.run_root}/{DESIGN_WORKSPACE_SUBDIR}"
+            )
+
         touched = patch_paths(patch_text)
         normalized: list[str] = []
         for path in touched:
@@ -202,7 +226,7 @@ class RepoToolbox:
             if not self.is_write_allowed(path):
                 raise ValueError(f"patch touches non-allowlisted path: {path}")
         check = self.run_command(
-            ["git", "apply", "--check", "-"],
+            ["git", "apply", "--check", "-", "--unsafe-paths"],
             input_text=patch_text,
             command_id="git_apply_check",
             mutate=False,
@@ -211,16 +235,47 @@ class RepoToolbox:
             if not self.apply_patch and check["returncode"] == 0:
                 check["skipped"] = True
                 check["reason"] = "patch-application-disabled"
-            check["parsed"] = {**check.get("parsed", {}), "touched_paths": normalized}
+            check["parsed"] = {
+                **check.get("parsed", {}),
+                "touched_paths": normalized,
+                "redirected_paths": redirects,
+            }
             return check
         result = self.run_command(
-            ["git", "apply", "-"],
+            ["git", "apply", "-", "--unsafe-paths"],
             input_text=patch_text,
             command_id="git_apply",
             mutate=True,
         )
-        result["parsed"] = {**result.get("parsed", {}), "touched_paths": normalized}
+        result["parsed"] = {
+            **result.get("parsed", {}),
+            "touched_paths": normalized,
+            "redirected_paths": redirects,
+        }
         return result
+
+    def seed_design_workspace(self) -> list[str]:
+        """Copy the tracked scaffolds into this run's design workspace.
+
+        Returns the repo-relative overlay paths that were seeded (or would be
+        seeded in dry-run mode).
+        """
+        if not self.run_root:
+            raise PolicyError("cannot seed a design workspace without a run root")
+        seeded: list[str] = []
+        for source, overlay in design_workspace_paths(self.run_root).items():
+            text = self.read_text(source, limit=1_000_000)
+            if self.dry_run:
+                seeded.append(overlay)
+                continue
+            self.write_text(overlay, text)
+            seeded.append(overlay)
+        if not self.dry_run:
+            # MiCoSocGen runs with this directory as its working directory, so
+            # it must exist before the forked JVM starts.
+            soc_dir = self.workdir / self.run_root / SOC_WORKSPACE_SUBDIR
+            soc_dir.mkdir(parents=True, exist_ok=True)
+        return seeded
 
     def stage_bucket(self, stage: str) -> "RepoToolbox":
         return RepoToolbox(
@@ -262,8 +317,70 @@ class RepoToolbox:
         return f"copied {src_rel} to {dst_rel}"
 
 
+def design_workspace_rel(run_root: str, name: str) -> str:
+    """Repo-relative path of a design file inside the run workspace."""
+    return f"{run_root.strip('/')}/{DESIGN_WORKSPACE_SUBDIR}/{name}"
+
+
+def design_workspace_paths(run_root: str) -> dict[str, str]:
+    """Map each tracked scaffold to its run-workspace overlay path."""
+    return {
+        source: design_workspace_rel(run_root, Path(source).name)
+        for source in DESIGN_SOURCE_FILES
+    }
+
+
+def design_scaffold_name(rel_path: str) -> str:
+    """Return the AgentCfu*.scala basename if rel_path points at a design file."""
+    name = Path(rel_path).name
+    if name in {Path(source).name for source in DESIGN_SOURCE_FILES}:
+        return name
+    return ""
+
+
+def repair_patch_paths(patch_text: str, run_root: str) -> tuple[str, list[str], list[str]]:
+    """Redirect scaffold patch targets into the run workspace.
+
+    An LLM naturally writes repository-relative paths for the tracked
+    scaffolds. Those must never be applied to the repo, so each such target is
+    rewritten to its workspace overlay path. Any other source path is rejected.
+
+    Returns (rewritten patch, redirected targets, rejected targets).
+    """
+    redirected: list[str] = []
+    rejected: list[str] = []
+    lines: list[str] = []
+    for line in patch_text.splitlines(keepends=True):
+        body = line.rstrip("\n")
+        newline = line[len(body):]
+        replaced = body
+        for prefix in ("--- a/", "+++ b/"):
+            if body.startswith(prefix):
+                target = body[len(prefix):]
+                name = design_scaffold_name(target)
+                if name and target in DESIGN_SOURCE_FILES:
+                    replacement = design_workspace_rel(run_root, name)
+                    replaced = f"{prefix}{replacement}"
+                    if replacement not in redirected:
+                        redirected.append(replacement)
+                elif target.startswith("src/"):
+                    rejected.append(target)
+                elif name:
+                    # An absolute/out-of-tree path naming a design file is never valid.
+                    rejected.append(target)
+        lines.append(replaced + newline)
+    return "".join(lines), redirected, rejected
+
+
 def infer_command_id(args: list[str], policy: AccessPolicy) -> str:
-    for name, descriptor in policy.commands.items():
+    """Return the best-matching declared command id for argv.
+
+    Every matching declaration is considered and the most specific one wins
+    (highest priority, then declaration order). Without this, a looser variant
+    declared earlier would silently shadow a stricter one.
+    """
+    matches: list[tuple[int, int, str]] = []
+    for index, (name, descriptor) in enumerate(policy.commands.items()):
         if not args or args[0] != descriptor.executable:
             continue
         if descriptor.argv_prefix and tuple(args[: len(descriptor.argv_prefix)]) != descriptor.argv_prefix:
@@ -272,8 +389,13 @@ def infer_command_id(args: list[str], policy: AccessPolicy) -> str:
             continue
         if any(token not in args for token in descriptor.required_tokens):
             continue
-        return name
-    raise PolicyError(f"no declared command matches argv: {args}")
+        if any(needle not in " ".join(args) for needle in descriptor.required_substrings):
+            continue
+        matches.append((-descriptor.priority, index, name))
+    if not matches:
+        raise PolicyError(f"no declared command matches argv: {args}")
+    matches.sort()
+    return matches[0][2]
 
 
 def tail(text: str, *, max_chars: int = 6000) -> str:

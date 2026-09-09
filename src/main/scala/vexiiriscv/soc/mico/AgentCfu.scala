@@ -1,3 +1,18 @@
+// SPDX-License-Identifier: MIT
+//
+// AgentCfu - the checked-in, algorithm-neutral CFU shell used by design agents.
+//
+// This file and AgentCfuFiber.scala are the ONLY hardware surface a design agent
+// may change. Agent runs never edit this repository copy: each run seeds an
+// isolated workspace copy under
+//   agents/generated/runs/<run_id>/workspace/design/
+// and the SoC build overlays that copy (see agents/README.md and
+// project/AgentCfuSourceFilter.scala). Keep the public contract stable:
+//   * AgentCfuParameter
+//   * class AgentCfu(cfuParam, busParam, p)
+//   * AgentCfuFiber.getCfuBusParameters / getM2sParameters / dummyBusParameter
+//   * AgentCfuFunction.{compute, config, load, store}
+// Changing those signatures breaks the SoC integration and every existing run.
 package vexiiriscv.soc.mico
 
 import spinal.core._

@@ -13,6 +13,8 @@ STAGE_LABELS: dict[str, str] = {
     "prepare_c_project_profile_node": "prepare C profile",
     "create_benchmark_project_node": "prepare benchmark",
     "instrument_and_profile": "profile (run)",
+    "prepare_embench_benchmark_node": "prepare embench",
+    "profile_embench": "profile embench",
     "extract_hotspot": "extract hotspot",
     "analyze_workload": "analyze workload",
     "design_contract": "design CFU ISA",
@@ -40,6 +42,8 @@ NODE_TO_STEP: dict[str, str] = {
     "prepare_c_project_profile_node": "prepare_benchmark",
     "create_benchmark_project_node": "prepare_benchmark",
     "instrument_and_profile": "profile",
+    "prepare_embench_benchmark_node": "prepare_benchmark",
+    "profile_embench": "profile",
     "extract_hotspot": "hotspot",
     "analyze_workload": "analysis",
     "design_contract": "isa",
@@ -64,7 +68,6 @@ class StageProgress:
         self.slot_by_step = {name: i for i, name in enumerate(self.stages)}
         self.count = len(self.stages)
         self.results: dict[str, dict[str, Any]] = {}
-        self._begin_total = 0
 
     def _index_of(self, name: str) -> int:
         step = NODE_TO_STEP.get(name, name)
@@ -72,7 +75,6 @@ class StageProgress:
 
     def begin(self, name: str) -> None:
         idx = self._index_of(name)
-        self._begin_total = self._running_total()
         print(
             f"[{idx + 1:>2}/{self.count:>2}] {stage_label(name)} ... running",
             flush=True,

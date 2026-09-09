@@ -21,10 +21,11 @@ deny:
   - "**/*.vcd"
   - "**/*.fst"
 
+# Hardware design writes are confined to the per-run isolated workspace.
+# The tracked AgentCfu.scala / AgentCfuFiber.scala scaffolds are read-only
+# defaults; an agent run shadows them via its run workspace overlay.
 write_roots:
   - "agents/generated/runs"
-  - "src/main/scala/vexiiriscv/soc/mico"
-  - "src/main/scala/vexiiriscv/soc/cfu"
   - "sw/tests"
 
 stages:
@@ -50,6 +51,9 @@ stages:
       - "agents/specs/*.spec"
       - "agents/specs/*.yaml"
       - "agents/examples/**"
+      - "benchmarks/embench-iot/src/**"
+      - "benchmarks/embench-iot/support/**"
+      - "sw/embench/**"
       - "src/main/scala/vexiiriscv/soc/cfu/**"
       - "src/main/scala/vexiiriscv/soc/mico/**"
       - "sw/tests/**"
@@ -68,6 +72,9 @@ stages:
       - "agents/generated/runs/**/02_workload/**"
       - "agents/generated/runs/**/03_route/**"
       - "agents/examples/**"
+      - "benchmarks/embench-iot/src/**"
+      - "benchmarks/embench-iot/support/**"
+      - "sw/embench/**"
       - "sw/tests/**"
     write:
       - "agents/generated/runs/**/04_benchmark/**"
@@ -79,11 +86,13 @@ stages:
       - "agents/generated/runs/**/02_workload/**"
       - "agents/generated/runs/**/04_benchmark/**"
       - "agents/generated/runs/**/workspace/**"
+      - "benchmarks/embench-iot/src/**"
+      - "sw/embench/**"
     write:
       - "agents/generated/runs/**/05_profile/**"
       - "agents/generated/runs/**/workspace/**"
       - "agents/generated/runs/**/run.yaml"
-    commands: [make_profile, project_test, soc_sim]
+    commands: [make_profile, project_test, embench_build, soc_sim]
   hotspot:
     read:
       - "agents/generated/runs/**/02_workload/**"
@@ -133,6 +142,7 @@ stages:
       - "agents/generated/runs/**/02_workload/**"
       - "agents/generated/runs/**/07_analysis/**"
       - "agents/generated/runs/**/08_isa/**"
+      - "agents/generated/runs/**/workspace/design/**"
       - "skills/cfu-designer/assets/templates/**"
       - "src/main/scala/vexiiriscv/execute/cfu/**"
       - "src/main/scala/vexiiriscv/soc/cfu/**"
@@ -142,8 +152,9 @@ stages:
     write:
       - "agents/generated/runs/**/09_implementation/**"
       - "agents/generated/runs/**/run.yaml"
-      - "src/main/scala/vexiiriscv/soc/mico/**"
-      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      # Only these two files may carry agent hardware design changes.
+      - "agents/generated/runs/**/workspace/design/AgentCfu.scala"
+      - "agents/generated/runs/**/workspace/design/AgentCfuFiber.scala"
       - "sw/tests/**"
     commands: [git_apply_check, git_apply]
   validation:
@@ -155,6 +166,8 @@ stages:
       - "agents/generated/runs/**/08_isa/**"
       - "agents/generated/runs/**/09_implementation/**"
       - "agents/generated/runs/**/workspace/**"
+      - "benchmarks/embench-iot/src/**"
+      - "sw/embench/**"
       - "src/main/scala/vexiiriscv/soc/mico/**"
       - "src/main/scala/vexiiriscv/soc/cfu/**"
       - "sw/tests/**"
@@ -162,7 +175,7 @@ stages:
       - "agents/generated/runs/**/10_validation/**"
       - "agents/generated/runs/**/workspace/**"
       - "agents/generated/runs/**/run.yaml"
-    commands: [make_profile, project_test, soc_generate, soc_sim]
+    commands: [make_profile, project_test, embench_build, soc_generate_agent, soc_sim]
   cost:
     read:
       - "agents/generated/runs/**/08_isa/**"
@@ -190,18 +203,33 @@ commands:
   project_test:
     executable: make
     required_tokens: [TARGET=vexii_soc]
+  # Embench build: the sw Makefile's EXTRA_* hooks carry the benchmark sources.
+  embench_build:
+    executable: make
+    required_tokens: [TARGET=vexii_soc]
+    required_substrings: ["EXTRA_SOURCES="]
+    priority: 10
   soc_generate:
     executable: sbt
     required_substring: "runMain vexiiriscv.soc.mico.MiCoSocGen"
+  # Overlay generation: compiles the run workspace design on top of the repo
+  # scaffold by shadowing the tracked AgentCfu*.scala files.
+  soc_generate_agent:
+    executable: sbt
+    required_substring: "runMain vexiiriscv.soc.mico.MiCoSocGen"
+    required_substrings: ["--mico-agent-cfu"]
+    priority: 10
   soc_sim:
     executable: sbt
     required_substring: "runMain vexiiriscv.soc.mico.MiCoSocSim"
   yosys_cost:
     executable: python3
     argv_prefix: [python3, skills/cfu-designer/scripts/yosys_cost_report.py]
+  # Design patches apply into the run workspace (git-ignored paths), which
+  # requires --unsafe-paths. The repo tree is never a patch target.
   git_apply_check:
     executable: git
-    argv_prefix: [git, apply, --check, -]
+    argv_prefix: [git, apply, --check, -, --unsafe-paths]
   git_apply:
     executable: git
-    argv_prefix: [git, apply, -]
+    argv_prefix: [git, apply, -, --unsafe-paths]
