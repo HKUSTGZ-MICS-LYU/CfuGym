@@ -21,7 +21,7 @@ import re
 from pathlib import Path
 
 from .embench_instrument import find_definition_brace
-from .tools import RepoToolbox
+from .tools import RepoToolbox, embench_cfu_rel, filter_output
 
 
 EMBENCH_ROOT = "benchmarks/embench-iot"
@@ -140,6 +140,16 @@ def config_sources(workdir: Path, run_root: str, name: str, config: str) -> list
     return sorted(str(p.relative_to(workdir)) for p in root.glob("*.c"))
 
 
+def cfu_source_targets(workdir: Path, run_root: str, name: str) -> list[tuple[str, str]]:
+    """[(cfu workspace path, current text)] for the benchmark sources."""
+    targets: list[tuple[str, str]] = []
+    for rel_src in benchmark_source_files(workdir, name):
+        target = embench_cfu_rel(run_root, name, Path(rel_src).name)
+        path = workdir / target
+        targets.append((target, path.read_text(errors="replace") if path.is_file() else ""))
+    return targets
+
+
 def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
     """Copy the benchmark, Embench support and the board into the run workspace."""
     name = str(spec.get("benchmark_name", "") or "").strip()
@@ -218,6 +228,7 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
 
 def parse_profile(text: str) -> dict[str, dict[str, int]]:
     """Collect CFU_AGENT_PROFILE lines into {id: {cycles, calls}}."""
+    text = filter_output(text)
     result: dict[str, dict[str, int]] = {}
     for match in re.finditer(r"CFU_AGENT_PROFILE\s+(?P<body>.*)", text):
         fields: dict[str, int] = {}

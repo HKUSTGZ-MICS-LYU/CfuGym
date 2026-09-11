@@ -1,5 +1,35 @@
 version: "1"
 
+# Visibility tiers gate what the agent may READ. A path matched by a level's
+# globs is readable only at that level or above; everything not listed is
+# readable at every level. `basic` is the floor and therefore has no entries.
+# This is a read-only gate: writes, command allowlists, --apply-patch and
+# --dry-run semantics are unchanged.
+#
+#   basic    - workload/integration/sw plus the AgentCfu surface only;
+#              skills and existing sibling CFU designs are hidden.
+#   standard - default: basic + skills + sibling CFU designs (Vpu/BitNet).
+#   extended - standard + the SpinalHDL source tree, for the isa and
+#              implementation stages only.
+visibility:
+  default: standard
+  levels: [basic, standard, extended]
+  gated:
+    standard:
+      - "skills/cfu-designer/**"
+      - "src/main/scala/vexiiriscv/soc/mico/VpuCfu.scala"
+      - "src/main/scala/vexiiriscv/soc/mico/TilelinkVpuCfuFiber.scala"
+      - "src/main/scala/vexiiriscv/soc/mico/BitNetCfu.scala"
+      - "src/main/scala/vexiiriscv/soc/mico/BitNetCfuV2.scala"
+      - "src/main/scala/vexiiriscv/soc/mico/BitQuant.scala"
+      - "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuFiber.scala"
+      - "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuV2Fiber.scala"
+      # Not in any stage read list today; declared so a future stage cannot
+      # accidentally expose the BitNet plugin below `standard`.
+      - "src/main/scala/vexiiriscv/execute/BitNetPlugin.scala"
+    extended:
+      - "ext/SpinalHDL/**"
+
 # Deny rules always take precedence over stage allow rules.
 deny:
   - ".git/**"
@@ -39,6 +69,9 @@ stages:
       - "src/main/scala/vexiiriscv/execute/cfu/CfuPlugin.scala"
       - "src/main/scala/vexiiriscv/soc/cfu/**"
       - "src/main/scala/vexiiriscv/soc/mico/**"
+      - "benchmarks/embench-iot/src/**"
+      - "benchmarks/embench-iot/support/**"
+      - "sw/embench/**"
       - "sw/MiCo-Lib/targets/vexii_soc/**"
       - "sw/tests/**"
     write:
@@ -71,6 +104,8 @@ stages:
     read:
       - "agents/generated/runs/**/02_workload/**"
       - "agents/generated/runs/**/03_route/**"
+      # Instrumentation reads the run's own project copy after copying it.
+      - "agents/generated/runs/**/workspace/**"
       - "agents/examples/**"
       - "benchmarks/embench-iot/src/**"
       - "benchmarks/embench-iot/support/**"
@@ -108,6 +143,7 @@ stages:
       - "agents/generated/runs/**/06_hotspot/**"
       - "skills/cfu-designer/SKILL.md"
       - "skills/cfu-designer/references/acceleration-patterns.md"
+      - "skills/cfu-designer/references/roofline-analysis.md"
       - "skills/cfu-designer/references/u8-weighted-average-experiment.md"
       - "skills/cfu-designer/references/vector-rf-vpu-pattern.md"
       - "src/main/scala/vexiiriscv/execute/cfu/CfuBus.scala"
@@ -133,6 +169,9 @@ stages:
       - "src/main/scala/vexiiriscv/soc/mico/**"
       - "sw/MiCo-Lib/targets/vexii_soc/custom_asm.h"
       - "sw/tests/**"
+      # SpinalHDL syntax/API is only exposed at the `extended` visibility level
+      # (see the `visibility` section); it is never pre-read into the prompt.
+      - "ext/SpinalHDL/**"
     write:
       - "agents/generated/runs/**/08_isa/**"
       - "agents/generated/runs/**/run.yaml"
@@ -143,18 +182,30 @@ stages:
       - "agents/generated/runs/**/07_analysis/**"
       - "agents/generated/runs/**/08_isa/**"
       - "agents/generated/runs/**/workspace/design/**"
+      # Software rung targets: the accelerated kernel lives in the run workspace.
+      - "agents/generated/runs/**/workspace/embench_*/cfu/**"
+      - "agents/generated/runs/**/workspace/*_benchmark/**"
+      - "agents/generated/runs/**/workspace/*_project_profile/**"
+      - "agents/examples/**"
       - "skills/cfu-designer/assets/templates/**"
       - "src/main/scala/vexiiriscv/execute/cfu/**"
       - "src/main/scala/vexiiriscv/soc/cfu/**"
       - "src/main/scala/vexiiriscv/soc/mico/**"
       - "sw/MiCo-Lib/targets/vexii_soc/**"
       - "sw/tests/**"
+      # SpinalHDL syntax/API is only exposed at the `extended` visibility level
+      # (see the `visibility` section); it is never pre-read into the prompt.
+      - "ext/SpinalHDL/**"
     write:
       - "agents/generated/runs/**/09_implementation/**"
       - "agents/generated/runs/**/run.yaml"
       # Only these two files may carry agent hardware design changes.
       - "agents/generated/runs/**/workspace/design/AgentCfu.scala"
       - "agents/generated/runs/**/workspace/design/AgentCfuFiber.scala"
+      # The accelerated software lives in the workload's run workspace copy.
+      - "agents/generated/runs/**/workspace/embench_*/cfu/**"
+      - "agents/generated/runs/**/workspace/*_benchmark/**"
+      - "agents/generated/runs/**/workspace/*_project_profile/**"
       - "sw/tests/**"
     commands: [git_apply_check, git_apply]
   validation:
@@ -187,7 +238,7 @@ stages:
       - "agents/generated/runs/**/11_cost/**"
       - "agents/generated/runs/**/workspace/**"
       - "agents/generated/runs/**/run.yaml"
-    commands: [yosys_cost]
+    commands: [cfu_generate_agent, yosys_cost]
   review:
     read: ["agents/generated/runs/**/**"]
     write: ["agents/generated/runs/**/12_review/**", "agents/generated/runs/**/report.md", "agents/generated/runs/**/run.yaml"]
@@ -222,6 +273,16 @@ commands:
   soc_sim:
     executable: sbt
     required_substring: "runMain vexiiriscv.soc.mico.MiCoSocSim"
+  # Standalone CFU generation: GenAgentCfu elaborates ONLY the overlaid
+  # AgentCfu class, so the cost rung can synthesize the agent CFU in isolation
+  # instead of the whole SoC. Keeping it a separate declaration (rather than
+  # widening soc_generate_agent) makes the "cost runs without a CPU" property
+  # explicit in the policy.
+  cfu_generate_agent:
+    executable: sbt
+    required_substring: "runMain vexiiriscv.soc.mico.GenAgentCfu"
+    required_substrings: ["--out-dir"]
+    priority: 10
   yosys_cost:
     executable: python3
     argv_prefix: [python3, skills/cfu-designer/scripts/yosys_cost_report.py]

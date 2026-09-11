@@ -16,6 +16,8 @@ class _FakeClient:
         self.base_url = "https://example.com/v1"
         self.api_mode = "chat"
         self.api_key = "sk-fake"
+        self.thinking = False
+        self.reasoning_effort = None
 
     @property
     def available(self) -> bool:

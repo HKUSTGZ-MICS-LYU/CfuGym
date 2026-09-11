@@ -74,6 +74,241 @@ class LlmConfigTest(unittest.TestCase):
         self.assertEqual(client.api_mode, "chat")
         self.assertTrue(client.available)
 
+    def test_json_response_format_is_forwarded_to_both_api_shapes(self) -> None:
+        from types import SimpleNamespace
+
+        response_format = {"type": "json_object"}
+        response_calls: list[dict] = []
+
+        class Responses:
+            def create(self, **kwargs):
+                response_calls.append(kwargs)
+                return SimpleNamespace(output_text="{}", usage=None)
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                response_calls.append(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+                    usage=None,
+                )
+
+        client = OpenAiTextClient(config={"model": "m", "api_key": "k"})
+        client._responses(
+            SimpleNamespace(responses=Responses()),
+            "s",
+            "u",
+            response_format=response_format,
+        )
+        client._chat(
+            SimpleNamespace(chat=SimpleNamespace(completions=ChatCompletions())),
+            "s",
+            "u",
+            response_format=response_format,
+        )
+        self.assertEqual(response_calls[0]["text"]["format"], response_format)
+        self.assertEqual(response_calls[1]["response_format"], response_format)
+
+
+class ThinkingConfigTest(unittest.TestCase):
+    def test_thinking_defaults_off(self) -> None:
+        from agents.cfu_design_agent.llm_config import resolve_config
+
+        cfg = resolve_config("default", {})
+        self.assertFalse(cfg["thinking"])
+        self.assertIsNone(cfg["reasoning_effort"])
+
+    def test_thinking_and_effort_resolution(self) -> None:
+        from agents.cfu_design_agent.llm_config import resolve_config
+
+        cases = [
+            ({"thinking": True}, True, "medium"),
+            ({"thinking": True, "reasoning_effort": "high"}, True, "high"),
+            ({"reasoning_effort": "low"}, True, "low"),          # effort implies thinking
+            ({"thinking": False, "reasoning_effort": "high"}, False, None),
+            ({"thinking": "true"}, True, "medium"),
+            ({"thinking": "off"}, False, None),
+        ]
+        for data, expected_thinking, expected_effort in cases:
+            cfg = resolve_config("c", data)
+            self.assertEqual(cfg["thinking"], expected_thinking, data)
+            self.assertEqual(cfg["reasoning_effort"], expected_effort, data)
+
+    def test_invalid_reasoning_effort_rejected(self) -> None:
+        from agents.cfu_design_agent.llm_config import resolve_config
+
+        with self.assertRaises(LlmConfigError):
+            resolve_config("c", {"thinking": True, "reasoning_effort": "bogus"})
+
+    def test_thinking_body_must_be_an_object(self) -> None:
+        from agents.cfu_design_agent.llm_config import resolve_config
+
+        with self.assertRaises(LlmConfigError):
+            resolve_config("c", {"thinking": True, "thinking_body": "nope"})
+
+    def _chat_kwargs(self, config: dict) -> dict:
+        from types import SimpleNamespace
+
+        calls: dict = {}
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                calls.update(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                    usage=None,
+                )
+
+        client = OpenAiTextClient(
+            config={"model": "m", "api_key": "k", "api_mode": "chat", **config}
+        )
+        client._chat(
+            SimpleNamespace(chat=SimpleNamespace(completions=ChatCompletions())), "s", "u"
+        )
+        return calls
+
+    def test_client_effort_implies_thinking_when_constructed_directly(self) -> None:
+        client = OpenAiTextClient(
+            config={"model": "m", "api_key": "k", "reasoning_effort": "low"}
+        )
+        self.assertTrue(client.thinking)
+        self.assertEqual(client.reasoning_effort, "low")
+
+    def test_thinking_off_sends_no_reasoning_parameters(self) -> None:
+        kwargs = self._chat_kwargs({})
+        self.assertNotIn("extra_body", kwargs)
+        self.assertNotIn("reasoning_effort", kwargs)
+
+    def test_thinking_on_sends_gateway_switch_and_effort(self) -> None:
+        kwargs = self._chat_kwargs({"thinking": True, "reasoning_effort": "high"})
+        self.assertEqual(kwargs["extra_body"]["reasoning_effort"], "high")
+        self.assertIn("thinking", kwargs["extra_body"])
+
+    def test_custom_thinking_body_overrides_the_switch_shape(self) -> None:
+        kwargs = self._chat_kwargs(
+            {"thinking": True, "thinking_body": {"enable_thinking": True}}
+        )
+        self.assertEqual(kwargs["extra_body"]["enable_thinking"], True)
+        self.assertNotIn("thinking", kwargs["extra_body"])
+
+    def test_env_only_config_reads_thinking_env(self) -> None:
+        import os
+        from unittest import mock
+
+        from agents.cfu_design_agent.llm_config import env_only_config
+
+        with mock.patch.dict(
+            os.environ,
+            {"CFU_AGENT_THINKING": "true", "CFU_AGENT_REASONING_EFFORT": "low"},
+        ):
+            cfg = env_only_config("default")
+        self.assertTrue(cfg["thinking"])
+        self.assertEqual(cfg["reasoning_effort"], "low")
+
+    def test_chat_result_records_observability(self) -> None:
+        from types import SimpleNamespace
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="stop",
+                            message=SimpleNamespace(
+                                content="ANSWER", reasoning_content="thought"
+                            ),
+                        )
+                    ],
+                    usage=None,
+                )
+
+        client = OpenAiTextClient(
+            config={"model": "m", "api_key": "k", "api_mode": "chat", "thinking": True}
+        )
+        result = client._chat(
+            SimpleNamespace(chat=SimpleNamespace(completions=ChatCompletions())), "s", "u"
+        )
+        self.assertEqual(result.api_mode_used, "chat")
+        self.assertEqual(result.finish_reason, "stop")
+        self.assertEqual(result.reasoning_source, "message.reasoning_content")
+        self.assertEqual(result.reasoning, "thought")
+        self.assertEqual(result.text, "ANSWER")
+        self.assertIn("reasoning_content", result.extra_keys)
+
+    def test_responses_api_receives_reasoning_effort(self) -> None:
+        from types import SimpleNamespace
+
+        calls: dict = {}
+
+        class Responses:
+            def create(self, **kwargs):
+                calls.update(kwargs)
+                return SimpleNamespace(output_text="ok", usage=None)
+
+        client = OpenAiTextClient(
+            config={"model": "m", "api_key": "k", "api_mode": "responses",
+                    "thinking": True, "reasoning_effort": "low"}
+        )
+        client._responses(SimpleNamespace(responses=Responses()), "s", "u")
+        self.assertEqual(calls["reasoning"], {"effort": "low"})
+
+
+class ReasoningSplitTest(unittest.TestCase):
+    def test_split_reasoning_handles_common_formats(self) -> None:
+        from agents.cfu_design_agent.llm import split_reasoning
+
+        lt, gt = chr(60), chr(62)
+        cases = [
+            (f"{lt}think{gt}draft{lt}/think{gt}\nANSWER", "ANSWER", "draft"),
+            (f"{lt}thinking{gt}secret{lt}/thinking{gt}ANSWER", "ANSWER", "secret"),
+            (f"PRE\n{lt}reasoning{gt}r1{lt}/reasoning{gt}\nAFTER", "PRE\n\n\nAFTER", "r1"),
+            ("```thinking\nsecret\n```\nANSWER", "ANSWER", "secret"),
+            ("plain answer", "plain answer", ""),
+        ]
+        for raw, expected_text, expected_reason in cases:
+            text, reason = split_reasoning(raw)
+            self.assertEqual(text, expected_text)
+            self.assertEqual(reason, expected_reason)
+
+    def test_unclosed_thinking_tag_is_treated_as_reasoning(self) -> None:
+        from agents.cfu_design_agent.llm import split_reasoning
+
+        lt, gt = chr(60), chr(62)
+        text, reason = split_reasoning(f"ANSWER?\n{lt}thinking{gt}cut off mid-thought")
+        self.assertEqual(text, "ANSWER?")
+        self.assertEqual(reason, "cut off mid-thought")
+
+    def test_chat_reasoning_field_is_split_from_the_answer(self) -> None:
+        from types import SimpleNamespace
+
+        from agents.cfu_design_agent.llm import OpenAiTextClient
+
+        lt, gt = chr(60), chr(62)
+        seen: dict = {}
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                seen.update(kwargs)
+                message = SimpleNamespace(
+                    content=f"{lt}thinking{gt}inline draft{lt}/thinking{gt}\nFINAL",
+                    reasoning_content="separate reasoning",
+                )
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=message)], usage=None
+                )
+
+        client = OpenAiTextClient(config={"model": "m", "api_key": "k", "api_mode": "chat"})
+        result = client._chat(
+            SimpleNamespace(chat=SimpleNamespace(completions=ChatCompletions())),
+            "s",
+            "u",
+        )
+        self.assertEqual(result.text, "FINAL")
+        self.assertIn("separate reasoning", result.reasoning)
+        self.assertIn("inline draft", result.reasoning)
+        # The configured response_format must still reach the request.
+        self.assertNotIn("thinking", result.text)
+
 
 if __name__ == "__main__":
     unittest.main()

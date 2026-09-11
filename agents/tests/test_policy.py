@@ -137,6 +137,99 @@ class PolicyTest(unittest.TestCase):
                 "validation", "soc_generate", ["sbt", "runMain vexiiriscv.soc.mico.MiCoSocGen"], REPO_ROOT
             )
 
+    def test_standalone_cfu_cost_generation_is_declared_and_stage_scoped(self) -> None:
+        # The cost rung synthesizes the CFU alone, so its generator must be a
+        # declared command, allowed in `cost`, require --out-dir, and stay out of
+        # the SoC/validation stages.
+        self.assertIn("cfu_generate_agent", self.policy.commands)
+        self.assertIn("cfu_generate_agent", self.policy.stage("cost").commands)
+        for stage in ("validation", "implementation", "isa"):
+            self.assertNotIn("cfu_generate_agent", self.policy.stage(stage).commands)
+
+        argv = [
+            "sbt",
+            "set Compile/unmanagedSourceDirectories += (Compile/baseDirectory).value / "
+            '"agents/generated/runs/x/workspace/design"',
+            "set Compile/unmanagedSources := "
+            "AgentCfuSourceFilter.sources((Compile/unmanagedSourceDirectories).value)",
+            "runMain vexiiriscv.soc.mico.GenAgentCfu --out-dir "
+            "agents/generated/runs/x/11_cost/cfu_rtl --agent-cfu-vlen 64",
+        ]
+        self.policy.check_command("cost", "cfu_generate_agent", argv, REPO_ROOT)
+
+        # --out-dir is mandatory so RTL cannot land in an arbitrary directory...
+        without_out = [argv[0], *argv[1:-1], "runMain vexiiriscv.soc.mico.GenAgentCfu"]
+        with self.assertRaises(PolicyError):
+            self.policy.check_command("cost", "cfu_generate_agent", without_out, REPO_ROOT)
+        # ...and the command is not reachable from another stage.
+        with self.assertRaises(PolicyError):
+            self.policy.check_command("validation", "cfu_generate_agent", argv, REPO_ROOT)
+
+
+class VisibilityPolicyTest(unittest.TestCase):
+    """The optional visibility tiers gate reads only."""
+
+    SKILL = "skills/cfu-designer/SKILL.md"
+    VPU = "src/main/scala/vexiiriscv/soc/mico/VpuCfu.scala"
+    AGENT_CFU = "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"
+    SPINAL = "ext/SpinalHDL/core/src/main/scala/spinal/core/Bits.scala"
+
+    def test_default_level_is_standard(self) -> None:
+        self.assertEqual(load_policy(REPO_ROOT).visibility, "standard")
+
+    def test_basic_hides_skills_siblings_and_spinalhdl(self) -> None:
+        policy = load_policy(REPO_ROOT, visibility="basic")
+        for stage, path in (
+            ("load_context", self.SKILL),
+            ("load_context", self.VPU),
+            ("implementation", "src/main/scala/vexiiriscv/soc/mico/BitNetCfu.scala"),
+            ("implementation", self.SPINAL),
+        ):
+            self.assertFalse(policy.can_read(stage, path), path)
+        for stage, path in (
+            ("load_context", self.AGENT_CFU),
+            ("load_context", "src/main/scala/vexiiriscv/soc/cfu/CfuLib.scala"),
+            ("load_context", "agents/specs/cfu_isa_template.yaml"),
+            ("load_context", "benchmarks/embench-iot/src/matmult-int/matmult-int.c"),
+        ):
+            self.assertTrue(policy.can_read(stage, path), path)
+
+    def test_standard_adds_skills_and_siblings_but_not_spinalhdl(self) -> None:
+        policy = load_policy(REPO_ROOT, visibility="standard")
+        self.assertTrue(policy.can_read("load_context", self.SKILL))
+        self.assertTrue(policy.can_read("implementation", self.VPU))
+        self.assertFalse(policy.can_read("implementation", self.SPINAL))
+        self.assertFalse(policy.can_read("isa", self.SPINAL))
+
+    def test_extended_allows_spinalhdl_in_isa_and_implementation_only(self) -> None:
+        policy = load_policy(REPO_ROOT, visibility="extended")
+        self.assertTrue(policy.can_read("isa", self.SPINAL))
+        self.assertTrue(policy.can_read("implementation", self.SPINAL))
+        # `analysis` does not list ext/SpinalHDL in its stage read set.
+        self.assertFalse(policy.can_read("analysis", self.SPINAL))
+
+    def test_check_read_names_the_blocking_level(self) -> None:
+        policy = load_policy(REPO_ROOT, visibility="basic")
+        with self.assertRaises(PolicyError) as ctx:
+            policy.check_read("load_context", self.SKILL)
+        self.assertIn("requires visibility level 'standard'", str(ctx.exception))
+        self.assertIn("current: basic", str(ctx.exception))
+
+    def test_unknown_level_is_rejected(self) -> None:
+        with self.assertRaises(PolicyError):
+            load_policy(REPO_ROOT, visibility="nope")
+
+    def test_writes_are_never_gated(self) -> None:
+        for level in ("basic", "standard", "extended"):
+            policy = load_policy(REPO_ROOT, visibility=level)
+            self.assertTrue(
+                policy.can_write(
+                    "implementation",
+                    "agents/generated/runs/x/workspace/design/AgentCfu.scala",
+                ),
+                level,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

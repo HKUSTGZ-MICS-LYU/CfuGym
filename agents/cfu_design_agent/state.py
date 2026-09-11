@@ -9,6 +9,7 @@ from typing_extensions import TypedDict
 
 AgentMode = Literal["dry-run", "autonomous"]
 InputKind = Literal["natural_language", "c_project", "embench"]
+Visibility = Literal["basic", "standard", "extended"]
 
 
 class CommandResult(TypedDict, total=False):
@@ -20,6 +21,9 @@ class CommandResult(TypedDict, total=False):
     parsed: dict[str, Any]
     skipped: bool
     reason: str
+    # Validation-ladder rung that produced this result: hw_build/sw_build/sim.
+    rung: str
+    timed_out: bool
 
 
 class RepoContext(TypedDict, total=False):
@@ -27,6 +31,9 @@ class RepoContext(TypedDict, total=False):
     git_status: str
     cfu_entrypoints: list[str]
     software_tests: list[str]
+    # Selected visibility tier and the context files it withheld from the agent.
+    visibility: str
+    withheld: list[str]
 
 
 class WorkloadSpec(TypedDict, total=False):
@@ -98,6 +105,8 @@ class CfuDesignState(TypedDict, total=False):
     input_kind: InputKind
     input_mode: Literal["natural_language", "formatted_spec", "c_project", "embench"]
     workload_spec_path: str
+    benchmark_name: str
+    observation_plan: dict[str, Any]
     project_root: str
     kernel_file: str
     kernel_function: str
@@ -112,6 +121,10 @@ class CfuDesignState(TypedDict, total=False):
     dry_run: bool
     apply_patch: bool
     run_commands: bool
+    agent_tools: bool
+    max_tool_rounds: int
+    # Read-only file visibility tier: basic | standard | extended.
+    visibility: Visibility
     skip_sim: bool
     skip_yosys: bool
     max_iters: int
@@ -137,12 +150,24 @@ class CfuDesignState(TypedDict, total=False):
     isa_spec_text: str
     isa_spec_errors: list[str]
     design_contract: str
-    implementation_plan: str
-    patch_text: str
-    implementation_summary: str
+    hardware_plan: str
+    software_plan: str
+    hardware_patch: str
+    software_patch: str
+    implementation_hw_summary: str
+    implementation_sw_summary: str
+    changed_sw_files: list[str]
     validation_results: Annotated[list[CommandResult], operator.add]
     cost_results: Annotated[list[CommandResult], operator.add]
     iteration_history: Annotated[list[str], operator.add]
+    # Validation-ladder bookkeeping. ``attempts`` counts repairs per rung (the
+    # simulation escalation reads ``attempts["sim"]``), ``repairs_used`` is the
+    # global repair budget consumed, and ``last_repair_target`` records the most
+    # recent repair for reporting.
+    attempts: dict[str, int]
+    repairs_used: int
+    last_repair_target: str
+    stopped_at: str
     final_report_path: str
     status: Literal["initialized", "needs_iteration", "failed", "complete", "blocked", "planned"]
     errors: Annotated[list[str], operator.add]
@@ -150,6 +175,10 @@ class CfuDesignState(TypedDict, total=False):
     graph_events: Annotated[list[str], operator.add]
     gates: dict[str, dict[str, Any]]
     token_usage: dict[str, int]
+    # Run-relative paths of the exact text returned by each LLM call.
+    llm_raw_outputs: Annotated[list[str], operator.add]
+    # One summary entry per agent tool call (read_file/list_dir/search_text).
+    tool_calls: Annotated[list[dict], operator.add]
     progress_summary: dict[str, Any]
 
 

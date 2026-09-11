@@ -159,6 +159,13 @@ class RunArtifacts:
             self.manifest.setdefault("errors", []).append(error)
         self._write_manifest(stage)
 
+    def set_manifest_metadata(self, stage: str, key: str, value: Any) -> None:
+        """Record run-level metadata (for example the resolved LLM request)."""
+        if self.manifest.get(key) == value:
+            return
+        self.manifest[key] = value
+        self._write_manifest(stage)
+
     def _write(
         self,
         stage: str,

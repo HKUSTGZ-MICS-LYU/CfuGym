@@ -45,13 +45,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run an embench-iot benchmark as the workload, e.g. --embench crc32.",
     )
     parser.add_argument("--run-id", default="", help="Explicit run id; defaults to a timestamped unique id.")
-    parser.add_argument("--max-iters", type=int, default=2)
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=2,
+        help="Total repair budget for the validation ladder: N-1 repair rounds. "
+        "1 disables repair, so the first failing rung stops the run.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Force read-only: never mutate source or run external commands.")
     parser.add_argument("--apply-patch", action="store_true", help="Allow an LLM patch to be applied to CFU/software allowlisted paths.")
     parser.add_argument("--run-commands", action="store_true", help="Allow allowlisted build/simulator/Yosys commands to execute.")
     parser.add_argument("--no-dry-run", action="store_true", help="Allow mutation and command execution (implies apply/run unless --dry-run).")
     parser.add_argument("--skip-sim", action="store_true", help="Skip SBT generation/simulation.")
     parser.add_argument("--skip-yosys", action="store_true", help="Skip Yosys cost estimation.")
+    parser.add_argument(
+        "--agent-tools",
+        dest="agent_tools",
+        action="store_true",
+        default=True,
+        help="Let the agent call read-only tools (read_file/list_dir/search_text) before answering (default: on).",
+    )
+    parser.add_argument(
+        "--no-agent-tools",
+        dest="agent_tools",
+        action="store_false",
+        help="Disable the agent tool loop (one-shot prompting only).",
+    )
+    parser.add_argument(
+        "--max-tool-rounds",
+        type=int,
+        default=6,
+        help="Maximum tool-calling rounds per agent step (default: 6).",
+    )
+    parser.add_argument(
+        "--visibility",
+        choices=("basic", "standard", "extended"),
+        default=os.environ.get("CFU_AGENT_VISIBILITY", "standard"),
+        help="Read-only file visibility tier. basic: workload/integration/AgentCfu only "
+        "(no skills, no sibling CFU designs); standard: adds skills and sibling designs; "
+        "extended: adds ext/SpinalHDL for the isa and implementation stages. Default: standard.",
+    )
     parser.add_argument("--export-graph", default="", help="Directory for Mermaid/ASCII graph visualization.")
     parser.add_argument("--checkpoint", action="store_true", help="Compile with an in-memory LangGraph checkpointer.")
     parser.add_argument("--thread-id", default="", help="Thread id used when checkpointing a graph run.")
@@ -85,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
         "model": args.model,
         "llm_config": args.llm_config,
         "dry_run": dry_run,
+        "agent_tools": args.agent_tools,
+        "max_tool_rounds": args.max_tool_rounds,
+        "visibility": args.visibility,
         "apply_patch": args.apply_patch and not dry_run,
         "run_commands": args.run_commands and not dry_run,
         "mode": "dry-run" if dry_run else "autonomous",
@@ -108,6 +144,9 @@ def main(argv: list[str] | None = None) -> int:
         stream=args.stream,
     )
     print(f"status={final_state.get('status')}")
+    print(f"visibility={final_state.get('visibility', '')}")
+    if final_state.get("stopped_at"):
+        print(f"stopped_at={final_state['stopped_at']}")
     print(f"report={final_state.get('final_report_path')}")
     print(f"graph_mermaid={graph_paths.get('mermaid')}")
     print(f"graph_ascii={graph_paths.get('ascii')}")
@@ -162,6 +201,8 @@ def run_api_test(workdir: Path, args: argparse.Namespace) -> int:
     print(f"base_url={client.base_url or '(default)'}")
     print(f"api_mode={client.api_mode}")
     print(f"api_key_set={bool(client.api_key)}")
+    print(f"thinking={getattr(client, 'thinking', False)}")
+    print(f"reasoning_effort={getattr(client, 'reasoning_effort', None)}")
 
     if not client.available:
         print("api-key-missing: no API key resolved; set the config's api_key_env var or OPENAI_API_KEY")
@@ -180,6 +221,11 @@ def run_api_test(workdir: Path, args: argparse.Namespace) -> int:
     used = result.used_llm
     reply = (result.text or "").strip()
     print(f"used_llm={used}")
+    print(f"api_mode_used={result.api_mode_used or '(none)'}")
+    print(f"finish_reason={result.finish_reason or '(none)'}")
+    print(f"reasoning_source={result.reasoning_source or '(none)'}")
+    print(f"reasoning_chars={len(result.reasoning or '')}")
+    print(f"response_extra_keys={list(result.extra_keys)}")
     print(f"reply={reply!r}")
     if used and reply and reply != TEST_API_FALLBACK:
         print("api-status=OK")

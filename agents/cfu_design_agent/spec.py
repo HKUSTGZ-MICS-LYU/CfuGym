@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
 from .embench import list_benchmarks
-from .llm import OpenAiTextClient
+from .llm import LlmResult, OpenAiTextClient, clean_llm_text
 from .state import RepoContext, WorkloadSpec
 
 
@@ -21,6 +21,7 @@ DEFAULT_WARMUP_HEAT = 1
 
 SPEC_SYSTEM_PROMPT = """You convert CFU workload requests into a normalized YAML WorkloadSpec.
 Use only facts present in the input and repo context. For missing high-impact fields, add them to `unknowns` instead of guessing.
+Preserve facts needed for later Roofline analysis, including hot function/loop, trip count, operation convention, data movement, reuse, alignment, and memory boundary. Never invent compute or bandwidth ceilings; unresolved Roofline inputs belong in `unknowns`.
 Return YAML only, with keys: spec_version, name, source_kind, description, project_root, kernel_file, kernel_function, build_cmd, run_cmd, test_cmd, operation, pattern, element_type, signedness, output_type, vector_bytes, memory_access, alignment_bytes, cfu_style, validation, unknowns."""
 
 
@@ -39,6 +40,7 @@ def normalize_workload_spec(
     test_cmd: str = "",
     benchmark_name: str = "",
     llm: OpenAiTextClient | None = None,
+    llm_result_sink: Callable[[str, LlmResult], None] | None = None,
 ) -> tuple[WorkloadSpec, str]:
     if input_mode == "embench" or benchmark_name:
         spec = infer_embench_spec(task, benchmark_name or infer_benchmark_name(task, workdir))
@@ -63,7 +65,7 @@ def normalize_workload_spec(
             run_cmd=run_cmd,
             test_cmd=test_cmd,
         )
-        spec = llm_extract_or_fallback(task, context, fallback, llm)
+        spec = llm_extract_or_fallback(task, context, fallback, llm, llm_result_sink=llm_result_sink)
         spec.update(
             {
                 "source_kind": "c_project",
@@ -143,6 +145,8 @@ def llm_extract_or_fallback(
     context: RepoContext,
     fallback: WorkloadSpec,
     llm: OpenAiTextClient | None,
+    *,
+    llm_result_sink: Callable[[str, LlmResult], None] | None = None,
 ) -> WorkloadSpec:
     if llm is None or not llm.available:
         return fallback
@@ -157,7 +161,11 @@ Fallback heuristic spec:
 {yaml.safe_dump(dict(fallback), sort_keys=False)}
 
 Return the normalized YAML WorkloadSpec."""
-    result = llm.complete(SPEC_SYSTEM_PROMPT, prompt, fallback=yaml.safe_dump(dict(fallback), sort_keys=False))
+    result = clean_llm_text(
+        llm.complete(SPEC_SYSTEM_PROMPT, prompt, fallback=yaml.safe_dump(dict(fallback), sort_keys=False))
+    )
+    if llm_result_sink is not None:
+        llm_result_sink("spec", result)
     try:
         parsed = yaml.safe_load(result.text)
     except yaml.YAMLError:

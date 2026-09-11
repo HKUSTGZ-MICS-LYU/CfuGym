@@ -69,7 +69,7 @@ class StageProgressTest(unittest.TestCase):
         progress = StageProgress(order)
         self.assertEqual(progress._index_of("load_context"), 0)
         self.assertEqual(progress._index_of("instrument_and_profile"), 4)
-        self.assertEqual(progress._index_of("review_and_route_python"), 11)
+        self.assertEqual(progress._index_of("review_and_route"), 11)
         self.assertEqual(progress._index_of("final_report"), 12)
         # Unknown node falls back to the end of the list (count), not negative.
         self.assertEqual(progress._index_of("bogus"), len(order))

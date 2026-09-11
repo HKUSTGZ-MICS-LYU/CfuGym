@@ -109,5 +109,62 @@ class OverlayCommandTest(unittest.TestCase):
             shutil.rmtree(run_dir, ignore_errors=True)
 
 
+class RepairFeedbackTest(unittest.TestCase):
+    """A hardware repair must see every failing rung's exact error log."""
+
+    def test_hardware_repair_feedback_labels_each_source(self) -> None:
+        from agents.cfu_design_agent.graph import hardware_repair_feedback
+
+        state = {
+            "validation_results": [
+                {
+                    "rung": "hw_build",
+                    "returncode": 1,
+                    "command": "sbt ... MiCoSocGen",
+                    "stdout_tail": "BUILD_ERROR_MARKER",
+                    "stderr_tail": "",
+                },
+                {
+                    "rung": "sim",
+                    "returncode": 1,
+                    "command": "sbt ... MiCoSocSim",
+                    "stdout_tail": "SIM_ERROR_MARKER",
+                    "stderr_tail": "",
+                },
+                {
+                    "rung": "hw_build",
+                    "returncode": 0,
+                    "command": "sbt ... MiCoSocGen",
+                    "stdout_tail": "IGNORED_SUCCESS",
+                    "stderr_tail": "",
+                },
+            ],
+            "cost_results": [
+                {
+                    "returncode": 1,
+                    "command": "python3 yosys_cost_report.py",
+                    "stdout_tail": "COST_ERROR_MARKER",
+                    "stderr_tail": "",
+                }
+            ],
+            "gates": {"implementation_hw": {"errors": ["no usable patch"]}},
+        }
+        feedback = hardware_repair_feedback(state)
+        self.assertIn("hw_build (SoC generation) errors", feedback)
+        self.assertIn("sim (simulation) errors", feedback)
+        self.assertIn("cost (Yosys) errors", feedback)
+        self.assertIn("implementation_hw rejection", feedback)
+        self.assertIn("BUILD_ERROR_MARKER", feedback)
+        self.assertIn("SIM_ERROR_MARKER", feedback)
+        self.assertIn("COST_ERROR_MARKER", feedback)
+        self.assertIn("no usable patch", feedback)
+        self.assertNotIn("IGNORED_SUCCESS", feedback)
+
+    def test_hardware_repair_feedback_is_empty_without_failures(self) -> None:
+        from agents.cfu_design_agent.graph import hardware_repair_feedback
+
+        self.assertEqual(hardware_repair_feedback({}), "")
+
+
 if __name__ == "__main__":
     unittest.main()

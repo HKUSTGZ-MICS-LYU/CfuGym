@@ -126,6 +126,11 @@ class EmbenchDiscoveryTest(unittest.TestCase):
         self.assertEqual(parsed["fn_a"]["calls"], 3)
         self.assertEqual(embench.hotspot_from_profile(parsed, exclude=("crc32",)), "fn_a")
 
+    def test_profile_parsing_strips_terminal_ansi_sequences(self) -> None:
+        text = "\x1b[0mCFU_AGENT_PROFILE crc32=15503563\x1b[0m\x1b[0J\n"
+        parsed = embench.parse_profile(text)
+        self.assertEqual(parsed["crc32"]["cycles"], 15503563)
+
 
 class EmbenchPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -186,6 +191,17 @@ class IntrinsicsRenderTest(unittest.TestCase):
         self.assertIn("static inline uint32_t cfu_compute(", text)
         self.assertIn("(1 << 12)", text)
 
+    def test_renderer_skips_function_ids_that_do_not_fit_func3(self) -> None:
+        # A wider id would overwrite the rs1 field; never emit it.
+        text = render_cfu_intrinsics(
+            {
+                "identity": {"name": "wavg"},
+                "commands": [{"function_id": 8, "name": "compute", "semantics": "mac"}],
+            }
+        )
+        self.assertNotIn("(8 << 12)", text)
+        self.assertNotIn("cfu_compute", text)
+
 
 class PrepareWorkspaceTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -244,6 +260,125 @@ class EmbenchHotspotTest(unittest.TestCase):
             graph.embench_instrumented_profile({"reference": {"crc32": {"cycles": 1}}}),
             {"crc32": {"cycles": 1}},
         )
+
+class EmbenchPatchRedirectTest(unittest.TestCase):
+    def test_benchmark_source_patch_redirects_to_cfu_tree(self) -> None:
+        from agents.cfu_design_agent.tools import repair_patch_paths
+
+        patch = (
+            "--- a/benchmarks/embench-iot/src/crc32/crc_32.c\n"
+            "+++ b/benchmarks/embench-iot/src/crc32/crc_32.c\n"
+            "@@ -1,1 +1,1 @@\n-x\n+y\n"
+        )
+        rewritten, redirected, rejected = repair_patch_paths(
+            patch, "agents/generated/runs/r1", embench_benchmark="crc32"
+        )
+        self.assertEqual(rejected, [])
+        expected = "agents/generated/runs/r1/workspace/embench_crc32/cfu/src/crc_32.c"
+        self.assertIn(expected, redirected)
+        self.assertIn("+++ b/" + expected, rewritten)
+
+    def test_other_benchmark_source_is_rejected(self) -> None:
+        from agents.cfu_design_agent.tools import repair_patch_paths
+
+        patch = (
+            "--- a/benchmarks/embench-iot/src/md5sum/md5.c\n"
+            "+++ b/benchmarks/embench-iot/src/md5sum/md5.c\n"
+        )
+        _, _, rejected = repair_patch_paths(
+            patch, "agents/generated/runs/r1", embench_benchmark="crc32"
+        )
+        self.assertTrue(rejected)
+
+    def test_cfu_tree_is_writable(self) -> None:
+        policy = load_policy(REPO_ROOT)
+        self.assertTrue(
+            policy.can_write(
+                "implementation",
+                "agents/generated/runs/r1/workspace/embench_crc32/cfu/src/crc_32.c",
+            )
+        )
+
+    def test_apply_patch_targets_cfu_copy(self) -> None:
+        from agents.cfu_design_agent.tools import RepoToolbox
+
+        run_id = "embench-cfu-patch-0001"
+        run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
+        shutil.rmtree(run_dir, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        prep = RepoToolbox(
+            REPO_ROOT,
+            dry_run=False,
+            stage="prepare_benchmark",
+            run_root=f"agents/generated/runs/{run_id}",
+        )
+        embench.prepare_embench_benchmark(prep, {"benchmark_name": "crc32"})
+        cfu = REPO_ROOT / f"agents/generated/runs/{run_id}/workspace/embench_crc32/cfu/src/crc_32.c"
+        original_text = cfu.read_text()
+        target = "#define LOCAL_SCALE_FACTOR 170"
+        self.assertIn(target, original_text)
+        idx = original_text.splitlines().index(target)
+        context = original_text.splitlines()[idx - 1 : idx + 2]
+        patch = "\n".join(
+            [
+                "--- a/benchmarks/embench-iot/src/crc32/crc_32.c",
+                "+++ b/benchmarks/embench-iot/src/crc32/crc_32.c",
+                f"@@ -{idx},3 +{idx},3 @@",
+                " " + context[0],
+                "-" + context[1],
+                "+" + context[1] + " /* agent kernel target */",
+                " " + context[2],
+                "",
+            ]
+        )
+        toolbox = RepoToolbox(
+            REPO_ROOT,
+            dry_run=False,
+            stage="implementation",
+            run_root=f"agents/generated/runs/{run_id}",
+            embench_benchmark="crc32",
+            apply_patch=True,
+        )
+        result = toolbox.apply_patch_text(patch)
+        self.assertEqual(result["returncode"], 0, result.get("stderr_tail"))
+        self.assertIn("agent kernel target", cfu.read_text())
+        original = REPO_ROOT / "benchmarks/embench-iot/src/crc32/crc_32.c"
+        self.assertNotIn("agent kernel target", original.read_text())
+
+class FileBlockProtocolTest(unittest.TestCase):
+    def test_extract_file_blocks(self) -> None:
+        from agents.cfu_design_agent.tools import extract_file_blocks
+
+        text = "chat\nFILE_BEGIN benchmarks/embench-iot/src/crc32/crc_32.c\nint x;\nFILE_END\ntail"
+        blocks = extract_file_blocks(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0][0], "benchmarks/embench-iot/src/crc32/crc_32.c")
+        self.assertEqual(blocks[0][1], "int x;\n")
+
+    def test_file_block_redirect_and_write(self) -> None:
+        from agents.cfu_design_agent.tools import RepoToolbox
+
+        run_id = "embench-fileblock-0001"
+        run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
+        shutil.rmtree(run_dir, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, run_dir, True)
+        prep = RepoToolbox(
+            REPO_ROOT, dry_run=False, stage="prepare_benchmark", run_root=f"agents/generated/runs/{run_id}"
+        )
+        embench.prepare_embench_benchmark(prep, {"benchmark_name": "crc32"})
+        toolbox = RepoToolbox(
+            REPO_ROOT,
+            dry_run=False,
+            stage="implementation",
+            run_root=f"agents/generated/runs/{run_id}",
+            embench_benchmark="crc32",
+        )
+        resolved = toolbox.resolve_target("benchmarks/embench-iot/src/crc32/crc_32.c")
+        self.assertEqual(
+            resolved, f"agents/generated/runs/{run_id}/workspace/embench_crc32/cfu/src/crc_32.c"
+        )
+        with self.assertRaises(ValueError):
+            toolbox.resolve_target("src/main/scala/vexiiriscv/soc/mico/MiCoSoc.scala")
 
 
 if __name__ == "__main__":

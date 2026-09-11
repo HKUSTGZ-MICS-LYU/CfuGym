@@ -3,7 +3,7 @@ spec_version: "1"
 identity:
   name: ""
   status: draft            # draft | approved | implemented | validated
-  opcode: ""               # custom0 (0x0B) or custom1 (0x2B)
+  opcode: ""               # custom0 (0x0B); custom1 (0x2B) is rejected by generated intrinsics
   function_id_width: 3     # usually 3 bits (func3)
   reference_workload: ""
 
@@ -17,6 +17,23 @@ commands:
 
 # Set to null/[] when the workload is stateless or not applicable.
 operations_contract: {}
+
+# Roofline conclusion carried from workload analysis into architecture decisions.
+roofline:
+  memory_boundary: ""
+  operations: ""
+  operation_convention: ""
+  bytes: ""
+  arithmetic_intensity: ""
+  compute_peak: {value: "", basis: ""}
+  bandwidth_peak: {value: "", basis: ""}
+  ridge_point: ""
+  predicted_ceiling: ""
+  bottleneck: ""
+  gap_to_ceiling: ""
+  design_action: ""
+  verification_metric: ""
+  unknowns: []
 
 state:
   register_slots: 0
@@ -32,12 +49,15 @@ memory:
   alignment_bytes: 0
   ordering: ""
 
+# Independent, optional hardware parameters. Use 0, null, or "unused" when a
+# dimension is not part of this CFU. Any required width/alignment relationship
+# is checked by the concrete hardware implementation, not the generic ISA lint.
 datapath:
   vlen: 0
   xlen: 0
   maclen: 0
   accWidth: 0
-  regDepth: 2
+  regDepth: 0
   rfRam: false
   rfSync: false
   computePipe: true

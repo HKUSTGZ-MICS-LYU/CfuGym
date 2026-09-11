@@ -98,16 +98,20 @@ Use separate parameters for independent design axes:
 - `computePipe`: whether extraction and compute are separated by `StageLink`.
 - `noWaitCompute`: whether the first compute slice can be launched in the accept cycle.
 
-Add compile-time checks:
+Add compile-time checks only when the selected implementation uses these dimensions:
 
 ```scala
-require(vlen % xlen == 0)
-require(vlen % maclen == 0)
-require(maclen % elemWidth == 0)
-require(regDepth >= 2)
+if (usesVectorRf) require(regDepth > 0)
+if (usesTilelink) require(vlen > 0 && xlen > 0 && vlen % xlen == 0)
+if (usesMacSlices) require(maclen > 0 && vlen % maclen == 0)
+if (usesMacSlices && usesElementConfig) require(maclen % elemWidth == 0)
 ```
 
-If the CFU supports multiple runtime element widths, check all supported widths at elaboration and guard illegal runtime config in hardware.
+A direct scalar CFU may set `vlen`, `maclen`, and `regDepth` to zero or leave them
+unspecified. `regDepth = 0` explicitly means no CFU-owned vector register. Do not
+make `vlen/xlen/maclen/regDepth` globally required or force relationships between
+unused dimensions. If the CFU supports multiple runtime element widths, check all
+supported widths at elaboration and guard illegal runtime config in hardware.
 
 ## Pipelining Pattern
 

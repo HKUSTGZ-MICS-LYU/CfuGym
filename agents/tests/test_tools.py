@@ -22,6 +22,7 @@ class ToolsTest(unittest.TestCase):
         context = self.toolbox.discover_context()
         self.assertIn("src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala", context["files"])
         self.assertIn("src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala", context["files"])
+        self.assertIn("skills/cfu-designer/references/roofline-analysis.md", context["files"])
 
     def test_read_denies_generated_run(self) -> None:
         with self.assertRaises(PolicyError):
@@ -68,6 +69,217 @@ class ToolsTest(unittest.TestCase):
         self.assertFalse(
             self.toolbox.command_allowed(["rm", "-rf", "/"], command_id="git_status"),
         )
+
+    def test_filter_output_removes_terminal_formatting_and_controls(self) -> None:
+        from agents.cfu_design_agent.tools import filter_output
+
+        text = "\x1b[31mERROR\x1b[0m\rprogress\b!\x1b]8;;https://example.test\x07link\x1b]8;;\x07\n"
+        self.assertEqual(filter_output(text), "ERROR\nprogress!link\n")
+
+    def test_parse_command_output_filters_ansi_before_parsing(self) -> None:
+        from agents.cfu_design_agent.tools import parse_command_output
+
+        parsed = parse_command_output("\x1b[32mCFU_AGENT_PROFILE crc32=42\x1b[0m\n")
+        self.assertEqual(parsed["profiles"][0]["crc32"], 42)
+
+    def test_resolve_target_accepts_run_workspace_software_paths(self) -> None:
+        run_root = "agents/generated/runs/tools-target-00000000"
+        workspace = RepoToolbox(
+            REPO_ROOT,
+            dry_run=True,
+            stage="implementation",
+            run_root=run_root,
+        )
+        self.assertEqual(
+            workspace.resolve_target(f"{run_root}/workspace/cfu_benchmark/main.c"),
+            f"{run_root}/workspace/cfu_benchmark/main.c",
+        )
+        self.assertEqual(
+            workspace.resolve_target(
+                "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"
+            ),
+            f"{run_root}/workspace/design/AgentCfu.scala",
+        )
+        with self.assertRaises(ValueError):
+            workspace.resolve_target(f"{run_root}/workspace/design/Extra.scala")
+
+
+class CodeFenceTest(unittest.TestCase):
+    def test_strips_markdown_fences_around_a_file_body(self) -> None:
+        from agents.cfu_design_agent.tools import extract_file_blocks, strip_code_fences
+
+        self.assertEqual(strip_code_fences("```scala\nobject A\n```"), "object A\n")
+        self.assertEqual(strip_code_fences("object A\n"), "object A\n")
+        # Only leading/trailing fences are removed; interior content is kept.
+        self.assertEqual(strip_code_fences("a\n```\nb\n"), "a\n```\nb\n")
+        blocks = extract_file_blocks(
+            "FILE_BEGIN path/A.scala\n```scala\nobject A\n```\nFILE_END\n"
+        )
+        self.assertEqual(blocks, [("path/A.scala", "object A\n")])
+
+    def test_extract_patch_strips_fences(self) -> None:
+        from agents.cfu_design_agent.tools import extract_patch
+
+        text = "PATCH_BEGIN\n```diff\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n```\nPATCH_END"
+        patch = extract_patch(text)
+        self.assertTrue(patch.startswith("--- a/x"))
+        self.assertNotIn("```", patch)
+
+
+class EditBlockTest(unittest.TestCase):
+    """Targeted SEARCH/REPLACE edits: parsing, matching, and policy reuse."""
+
+    def test_extract_edit_blocks_parses_multiple_pairs(self) -> None:
+        from agents.cfu_design_agent.tools import extract_edit_blocks
+
+        text = (
+            "prose\n"
+            "EDIT_BEGIN path/A.scala\n"
+            "<<<<<<< SEARCH\nold one\n=======\nnew one\n>>>>>>> REPLACE\n"
+            "<<<<<<< SEARCH\nold two\n=======\nnew two\n>>>>>>> REPLACE\n"
+            "EDIT_END\n"
+        )
+        blocks = extract_edit_blocks(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0][0], "path/A.scala")
+        self.assertEqual(blocks[0][1], [("old one", "new one"), ("old two", "new two")])
+
+    def test_apply_edit_pairs_requires_a_unique_match(self) -> None:
+        from agents.cfu_design_agent.tools import apply_edit_pairs
+
+        updated, errors = apply_edit_pairs("a\nb\n", [("b", "c")])
+        self.assertEqual(errors, [])
+        self.assertEqual(updated, "a\nc\n")
+
+        _updated, errors = apply_edit_pairs("a\nb\na\nb\n", [("a\nb", "x")])
+        self.assertTrue(any("ambiguous" in problem for problem in errors))
+
+        _updated, errors = apply_edit_pairs("a\nb\n", [("zzz", "x")])
+        self.assertTrue(any("not found" in problem for problem in errors))
+
+    def test_apply_edit_pairs_tolerates_trailing_whitespace_only(self) -> None:
+        from agents.cfu_design_agent.tools import apply_edit_pairs
+
+        updated, errors = apply_edit_pairs("  keep me   \nnext\n", [("  keep me", "  changed")])
+        self.assertEqual(errors, [])
+        self.assertEqual(updated, "  changed\nnext\n")
+
+    def test_toolbox_applies_edits_to_a_run_workspace_file(self) -> None:
+        run_root = "agents/generated/runs/tools-edit-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(target, "int main(void) {\n  return 1;\n}\n")
+            result = toolbox.apply_edit_blocks([(target, [("  return 1;", "  return 0;")])])
+            self.assertEqual(result["returncode"], 0, result)
+            self.assertEqual(result["parsed"]["touched_paths"], [target])
+            self.assertIn("return 0;", toolbox.read_text(target))
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_toolbox_rejects_an_unmatched_edit_without_writing(self) -> None:
+        run_root = "agents/generated/runs/tools-edit-bad-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(target, "int main(void) {\n  return 1;\n}\n")
+            result = toolbox.apply_edit_blocks([(target, [("  return 99;", "  return 0;")])])
+            self.assertEqual(result["returncode"], 1)
+            self.assertIn("not found", result["stderr_tail"])
+            self.assertIn("return 1;", toolbox.read_text(target))
+            self.assertEqual(result["parsed"]["touched_paths"], [])
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_apply_edit_blocks_is_atomic_across_targets(self) -> None:
+        # When a later target fails, an earlier validated target must not be
+        # half-applied: the whole response is rejected together.
+        run_root = "agents/generated/runs/tools-edit-atomic-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            good = f"{run_root}/workspace/cfu_benchmark/main.c"
+            bad = f"{run_root}/workspace/cfu_benchmark/helper.c"
+            toolbox.write_text(good, "int main(void) {\n  return 1;\n}\n")
+            toolbox.write_text(bad, "int helper(void) {\n  return 2;\n}\n")
+            edits = [
+                (good, [("  return 1;", "  return 0;")]),
+                (bad, [("  return 99;", "  return 9;")]),  # not present -> rejects
+            ]
+            result = toolbox.apply_edit_blocks(edits)
+            self.assertEqual(result["returncode"], 1, result)
+            self.assertEqual(result["parsed"]["touched_paths"], [])
+            # Neither file changed: the validated good edit was rolled back.
+            self.assertIn("return 1;", toolbox.read_text(good))
+            self.assertNotIn("return 0;", toolbox.read_text(good))
+            self.assertIn("return 2;", toolbox.read_text(bad))
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_multiple_edit_sections_for_one_file_are_composed(self) -> None:
+        # Several EDIT_BEGIN sections may target the same file: they apply in
+        # order to the evolving content.
+        run_root = "agents/generated/runs/tools-edit-multi-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(
+                target, "int main(void) {\n  int a = 1;\n  int b = 2;\n  return a + b;\n}\n"
+            )
+            edits = [
+                (target, [("  int a = 1;", "  int a = 10;")]),
+                (target, [("  int b = 2;", "  int b = 20;")]),
+            ]
+            result = toolbox.apply_edit_blocks(edits)
+            self.assertEqual(result["returncode"], 0, result)
+            self.assertEqual(result["parsed"]["touched_paths"], [target])
+            text = toolbox.read_text(target)
+            self.assertIn("int a = 10;", text)
+            self.assertIn("int b = 20;", text)
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_overlapping_edit_sections_fail_atomically(self) -> None:
+        # A later section must match the file after the earlier sections; a
+        # section that re-searches a region an earlier one replaced is reported
+        # with its section number and nothing is written.
+        run_root = "agents/generated/runs/tools-edit-overlap-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(target, "int main(void) {\n  return 1;\n}\n")
+            edits = [
+                (target, [("  return 1;", "  return 0;")]),
+                (target, [("  return 1;", "  return 2;")]),
+            ]
+            result = toolbox.apply_edit_blocks(edits)
+            self.assertEqual(result["returncode"], 1, result)
+            self.assertIn("section 2/2", result["stderr_tail"])
+            self.assertIn("SEARCH block not found", result["stderr_tail"])
+            self.assertEqual(result["parsed"]["touched_paths"], [])
+            self.assertIn("return 1;", toolbox.read_text(target))
+            self.assertNotIn("return 0;", toolbox.read_text(target))
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

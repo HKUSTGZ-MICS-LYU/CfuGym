@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
@@ -11,6 +11,8 @@ import yaml
 
 
 DEFAULT_POLICY_PATH = "agents/specs/agent_access_policy.yaml"
+DEFAULT_VISIBILITY_LEVELS: tuple[str, ...] = ("basic", "standard", "extended")
+DEFAULT_VISIBILITY = "standard"
 
 
 class PolicyError(ValueError):
@@ -45,9 +47,14 @@ class AccessPolicy:
     write_roots: tuple[str, ...]
     stages: dict[str, StagePolicy]
     commands: dict[str, CommandPolicy]
+    # Visibility tiers are an ordered ladder (lowest first). A path matched by
+    # ``visibility_gated[level]`` may only be read at that level or above.
+    visibility: str = DEFAULT_VISIBILITY
+    visibility_levels: tuple[str, ...] = DEFAULT_VISIBILITY_LEVELS
+    visibility_gated: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @classmethod
-    def from_file(cls, path: Path) -> "AccessPolicy":
+    def from_file(cls, path: Path, visibility: str = "") -> "AccessPolicy":
         try:
             data = yaml.safe_load(path.read_text(errors="replace"))
         except OSError as exc:
@@ -88,13 +95,44 @@ class AccessPolicy:
                 priority=int(raw.get("priority", 0) or 0),
             )
 
+        levels, gated, default_level = _parse_visibility(data.get("visibility", {}))
+
         return cls(
             version=str(data.get("version", "1")),
             deny=_string_tuple(data.get("deny", []), "deny"),
             write_roots=_string_tuple(data.get("write_roots", []), "write_roots"),
             stages=stages,
             commands=commands,
+            visibility=_resolve_visibility(visibility or default_level, levels),
+            visibility_levels=levels,
+            visibility_gated=gated,
         )
+
+    def level_index(self, level: str) -> int:
+        try:
+            return self.visibility_levels.index(level)
+        except ValueError as exc:
+            raise PolicyError(
+                f"unknown visibility level {level!r}; expected one of "
+                f"{', '.join(self.visibility_levels)}"
+            ) from exc
+
+    def required_visibility(self, rel_path: str) -> str:
+        """The lowest level allowed to read ``rel_path`` ("" when ungated)."""
+        required = ""
+        for level, patterns in self.visibility_gated.items():
+            if self._matches(rel_path, patterns):
+                # Several levels may match; the strictest wins.
+                if not required or self.level_index(level) > self.level_index(required):
+                    required = level
+        return required
+
+    def visibility_block(self, rel_path: str) -> str:
+        """Name the level that blocks ``rel_path`` now, or "" when readable."""
+        required = self.required_visibility(rel_path)
+        if required and self.level_index(self.visibility) < self.level_index(required):
+            return required
+        return ""
 
     def stage(self, name: str) -> StagePolicy:
         try:
@@ -110,16 +148,28 @@ class AccessPolicy:
 
     def can_read(self, stage: str, rel_path: str) -> bool:
         stage_policy = self.stage(stage)
-        return not self.is_denied(rel_path) and self._matches(rel_path, stage_policy.read)
+        if self.is_denied(rel_path) or not self._matches(rel_path, stage_policy.read):
+            return False
+        return not self.visibility_block(rel_path)
 
     def can_write(self, stage: str, rel_path: str) -> bool:
         stage_policy = self.stage(stage)
         return not self.is_denied(rel_path) and self._matches(rel_path, stage_policy.write)
 
     def check_read(self, stage: str, rel_path: str) -> None:
-        if not self.can_read(stage, rel_path):
-            reason = "denied by deny rule" if self.is_denied(rel_path) else "not allowlisted for stage"
-            raise PolicyError(f"read path is {reason}: {stage}: {rel_path}")
+        if self.can_read(stage, rel_path):
+            return
+        if self.is_denied(rel_path):
+            reason = "denied by deny rule"
+        elif not self._matches(rel_path, self.stage(stage).read):
+            reason = "not allowlisted for stage"
+        else:
+            blocked = self.visibility_block(rel_path)
+            reason = (
+                f"requires visibility level {blocked!r} "
+                f"(current: {self.visibility})"
+            )
+        raise PolicyError(f"read path is {reason}: {stage}: {rel_path}")
 
     def check_write(self, stage: str, rel_path: str) -> None:
         if not self.can_write(stage, rel_path):
@@ -152,13 +202,17 @@ class AccessPolicy:
         _check_command_paths(args, workdir, self)
 
 
-def load_policy(workdir: Path, path: str = DEFAULT_POLICY_PATH) -> AccessPolicy:
+def load_policy(
+    workdir: Path,
+    path: str = DEFAULT_POLICY_PATH,
+    visibility: str = "",
+) -> AccessPolicy:
     policy_path = (workdir / path).resolve()
     try:
         policy_path.relative_to(workdir.resolve())
     except ValueError as exc:
         raise PolicyError(f"policy path escapes workdir: {path}") from exc
-    return AccessPolicy.from_file(policy_path)
+    return AccessPolicy.from_file(policy_path, visibility=visibility)
 
 
 def normalize_repo_path(workdir: Path, raw_path: str | Path) -> str:
@@ -184,6 +238,48 @@ def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise PolicyError(f"{field} must be a list of strings")
     return tuple(value)
+
+
+def _parse_visibility(raw: Any) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]], str]:
+    """Parse the optional top-level ``visibility`` section."""
+    if raw in (None, {}):
+        return DEFAULT_VISIBILITY_LEVELS, {}, DEFAULT_VISIBILITY
+    if not isinstance(raw, dict):
+        raise PolicyError("visibility must be a mapping")
+
+    levels = _string_tuple(raw.get("levels", list(DEFAULT_VISIBILITY_LEVELS)), "visibility.levels")
+    if not levels:
+        raise PolicyError("visibility.levels must list at least one level")
+    if len(set(levels)) != len(levels):
+        raise PolicyError("visibility.levels must not contain duplicates")
+
+    default_level = str(raw.get("default", "") or levels[0])
+    if default_level not in levels:
+        raise PolicyError(
+            f"visibility.default {default_level!r} is not in visibility.levels "
+            f"({', '.join(levels)})"
+        )
+
+    raw_gated = raw.get("gated", {})
+    if not isinstance(raw_gated, dict):
+        raise PolicyError("visibility.gated must be a mapping of level -> patterns")
+    gated: dict[str, tuple[str, ...]] = {}
+    for level, patterns in raw_gated.items():
+        if level not in levels:
+            raise PolicyError(
+                f"visibility.gated level {level!r} is not in visibility.levels "
+                f"({', '.join(levels)})"
+            )
+        gated[level] = _string_tuple(patterns, f"visibility.gated.{level}")
+    return levels, gated, default_level
+
+
+def _resolve_visibility(requested: str, levels: tuple[str, ...]) -> str:
+    if requested not in levels:
+        raise PolicyError(
+            f"unknown visibility level {requested!r}; expected one of {', '.join(levels)}"
+        )
+    return requested
 
 
 def _glob_matches(path: str, pattern: str) -> bool:
