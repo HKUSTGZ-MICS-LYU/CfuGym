@@ -119,9 +119,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=_flag_env("CFU_AGENT_LOOP"),
         help="Keep optimizing after a fully passing run: while --max-iters budget "
-        "remains, review lets the agent start another hardware or software round to "
-        "raise speedup or reduce the synthesized CFU cost (PPA).",
+        "remains, review explores hardware, software or append-only ISA rounds. "
+        "Premature stops are reconsidered once; patience and total budget bound exploration.",
     )
+    parser.add_argument("--loop-policy", choices=("explore", "conservative"), default="explore",
+                        help="Explore reconsiders a stop once and allows append-only ISA extensions (default).")
+    parser.add_argument("--loop-patience", type=int, default=3,
+                        help="Stop after this many consecutive non-improving measured optimization rounds (default: 3).")
     parser.add_argument(
         "--software-change",
         choices=("auto", "always"),
@@ -191,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
         "max_tool_calls": args.max_tool_calls,
         "profile_cache": args.profile_cache,
         "loop_optimize": args.loop_optimize,
+        "loop_policy": args.loop_policy,
+        "loop_patience": max(1, args.loop_patience),
         "repair_routing": args.repair_routing,
         "software_change": args.software_change,
         "stream_llm": args.stream_llm,
@@ -305,7 +311,7 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
             if entry.get("round") == best_round:
                 marker = " (best)"
             elif entry.get("improved") is False and entry.get("measured"):
-                marker = " (regressed)"
+                marker = " (not improved)"
             print(
                 f"    round {entry.get('round')}: {entry.get('target')} "
                 + graph._round_metrics_text(entry)
@@ -320,8 +326,11 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
         ):
             print(
                 f"    WARNING: the final round is not the best (round {best_round}); "
-                "the delivered files are the final round"
+                "the workspace is the final experiment (not necessarily a strict regression)"
             )
+    candidate = final_state.get("best_candidate") or {}
+    if candidate:
+        print(f"  selected_source = round {candidate.get('round')}: {candidate.get('manifest')}")
 
 
 def _print_token_summary(final_state: CfuDesignState) -> None:

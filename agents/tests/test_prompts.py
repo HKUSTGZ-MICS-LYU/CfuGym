@@ -7,6 +7,7 @@ import unittest
 from agents.cfu_design_agent.graph import _isa_from_template, deterministic_roofline_analysis
 from agents.cfu_design_agent.isa import render_isa_markdown
 from agents.cfu_design_agent.prompts import (
+    HARDWARE_TARGETS,
     contract_prompt,
     embench_instructions,
     hardware_prompt,
@@ -70,9 +71,49 @@ class RooflinePromptTest(unittest.TestCase):
 
         isa = _isa_from_template("", self.spec, "")
         self.assertEqual(isa["datapath"]["regDepth"], 0)
-        self.assertEqual(isa["datapath"]["maclen"], 0)
+        self.assertNotIn("maclen", isa["datapath"])
+        self.assertNotIn("accWidth", isa["datapath"])
+        self.assertEqual(isa["datapath"]["implementation"], {})
         self.assertIn("roofline", isa)
+        import yaml
+        from agents.tests.common import REPO_ROOT
+        template = yaml.safe_load((REPO_ROOT / "agents/specs/cfu_isa_template.yaml").read_text())
+        for field in ("maclen", "accWidth", "computePipe", "rfRam", "rfSync"):
+            self.assertNotIn(field, template["datapath"])
+        self.assertEqual(template["datapath"]["implementation"], {})
+        instruction_prompt = contract_prompt("crc32", self.spec, self.analysis, self.context)
+        self.assertNotIn("maclen", instruction_prompt)
+        self.assertNotIn("accWidth", instruction_prompt)
+        self.assertIn("datapath.implementation", instruction_prompt)
         self.assertIn("unknown", render_isa_markdown(isa).lower())
+
+    def test_resource_contract_is_explicit_for_new_commands(self) -> None:
+        prompt = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
+        for term in ("CfuResource", "cpu_value", "legacy_register_number", "resources",
+                     "CPU rd OR vector vd", "completion response", "void intrinsic"):
+            self.assertIn(term, prompt)
+        hw = hardware_prompt("accelerate it", self.spec, self.analysis, "contract", self.context)
+        for term in ("CfuResource", "VS1/VS2", "ctx.read", "ctx.complete",
+                     "vector source snapshots", "LegacyRegisterNumber",
+                     "AgentCfuLib.scala", "AgentCfuBase", "read-only platform",
+                     "import AgentCfuBase.CfuResource._"):
+            self.assertIn(term, hw)
+        # The platform is read-only and must not be presented as an edit target.
+        self.assertIn("Never edit,", hw)
+        self.assertEqual(
+            [path for path in HARDWARE_TARGETS if "AgentCfuLib" in path], [],
+        )
+        sw = software_prompt("accelerate it", self.spec, self.analysis, "contract", self.context,
+                             targets=[("agents/generated/runs/test/main.c", "")])
+        for term in ("return void", "rd=x0", "vector/memory effects"):
+            self.assertIn(term, sw)
+        isa = _isa_from_template("", self.spec, "")
+        for command in isa["commands"]:
+            self.assertEqual(command["resources"], [
+                {"storage": "cpu", "access": "read", "role": "rs1"},
+                {"storage": "cpu", "access": "read", "role": "rs2"},
+                {"storage": "cpu", "access": "write", "role": "rd"},
+            ])
 
     def test_downstream_prompts_preserve_roofline_decision(self) -> None:
         prompts = (

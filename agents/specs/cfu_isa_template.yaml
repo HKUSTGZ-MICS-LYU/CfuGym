@@ -4,16 +4,37 @@ identity:
   name: ""
   status: draft            # draft | approved | implemented | validated
   opcode: ""               # custom0 (0x0B); custom1 (0x2B) is rejected by generated intrinsics
-  function_id_width: 3     # usually 3 bits (func3)
+  function_id_width: 3     # bus stays 3 bits (funct3)
+  subfunction_id_width: 7  # funct7, raw instruction bits 31:25; omitted means 7
   reference_workload: ""
 
 commands:
-  - function_id: 0
+  # Encoding uniqueness is (function_id, subfunction_id), not function_id alone.
+  # Legacy compute/config/load/store use function ids 1/2/4/5, sub-operation 0.
+  - function_id: 1
+    subfunction_id: 0       # 0..127; omitted means legacy zero
+    kind: compute           # compute | control | load | store
     name: ""
     operand: ""
     result: ""
     semantics: ""
-    response: status
+    response: value
+    # CfuResource declarations: CPU register VALUES, not raw register numbers.
+    # Use [] for an acknowledgement-only operation. Omission is legacy mode only.
+    resources:
+      - {storage: cpu, access: read, role: rs1}
+      - {storage: cpu, access: read, role: rs2}
+      - {storage: cpu, access: write, role: rd}
+    # Vector example (replace the CPU resources, do not blindly append):
+    # - {storage: vector, access: read, role: vs1,
+    #    index: {source: cpu_value, register: rs1}}
+    # - {storage: vector, access: read, role: vs2,
+    #    index: {source: cpu_value, register: rs2}}
+    # - {storage: vector, access: write, role: vd,
+    #    index: {source: cpu_value, register: rs1}}  # explicit in-place write
+    # Index alternatives: {source: constant, value: 0}, or compatibility-only
+    # {source: legacy_register_number, register: rs1|rs2}. No implicit truncation
+    # for cpu_value indices. At most one data write (CPU rd OR vector vd).
 
 # Set to null/[] when the workload is stateless or not applicable.
 operations_contract: {}
@@ -49,18 +70,14 @@ memory:
   alignment_bytes: 0
   ordering: ""
 
-# Independent, optional hardware parameters. Use 0, null, or "unused" when a
-# dimension is not part of this CFU. Any required width/alignment relationship
-# is checked by the concrete hardware implementation, not the generic ISA lint.
+# Optional generic scaffold dimensions only. No operation, accumulator, storage
+# implementation or pipeline is assumed. Concrete designs validate their own
+# relationships; algorithm-specific parameters belong in implementation below.
 datapath:
   vlen: 0
   xlen: 0
-  maclen: 0
-  accWidth: 0
   regDepth: 0
-  rfRam: false
-  rfSync: false
-  computePipe: true
+  implementation: {}
 
 software:
   intrinsics_header: ""

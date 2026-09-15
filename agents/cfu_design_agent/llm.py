@@ -870,7 +870,11 @@ class OpenAiTextClient:
                 else:
                     try:
                         observation = tool_runner(name, arguments)
-                        ok = True
+                        # Keep the string runner API, but do not count error text
+                        # as a successful tool observation.
+                        ok = not observation.startswith((
+                            "error:", "tool error:", "denied by access policy:", "skipped:",
+                        ))
                     except Exception as exc:  # pragma: no cover - tools report their own errors
                         observation = f"tool error: {type(exc).__name__}: {exc}"
                         ok = False

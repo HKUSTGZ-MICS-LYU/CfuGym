@@ -52,7 +52,9 @@ deny:
 
 # Hardware design writes are confined to the per-run isolated workspace.
 # The tracked AgentCfu.scala / AgentCfuFiber.scala scaffolds are read-only
-# defaults; an agent run shadows them via its run workspace overlay.
+# defaults; an agent run shadows them via its run workspace overlay. The shared
+# AgentCfuLib.scala platform is read-only and is never overlaid, so it cannot be
+# replaced or deleted by a run.
 write_roots:
   - "agents/generated/runs"
   # Cross-run measurement cache (git-ignored). Only the profile stage uses it.
@@ -303,8 +305,9 @@ commands:
   yosys_cost:
     executable: python3
     argv_prefix: [python3, skills/cfu-designer/scripts/yosys_cost_report.py]
-  # Design patches apply into the run workspace (git-ignored paths), which
-  # requires --unsafe-paths. The repo tree is never a patch target.
+  # Retain the legacy descriptor for compatibility. RepoToolbox validates all
+  # text-patch targets and strips --unsafe-paths before invoking Git; ignored
+  # workspace paths do not require unsafe path execution.
   git_apply_check:
     executable: git
     argv_prefix: [git, apply, --check, -, --unsafe-paths]

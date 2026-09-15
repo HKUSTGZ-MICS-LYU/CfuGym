@@ -29,8 +29,8 @@ commands:
 datapath:
   vlen: 256
   xlen: 32
-  maclen: 32
-  accWidth: 32
+  implementation:
+    result_width_bits: 32
   regDepth: 2
 software:
   intrinsics_header: cfu_intrinsics.h
@@ -148,11 +148,25 @@ class IsaValidationTest(unittest.TestCase):
         spec["datapath"] = {
             "vlen": 255,
             "xlen": 32,
-            "maclen": 0,
-            "accWidth": None,
+            "implementation": {"result_width_bits": None},
             "regDepth": 0,
         }
         self.assertEqual(validate_isa_spec(spec), [])
+
+    def test_legacy_algorithm_metadata_remains_readable(self) -> None:
+        from agents.cfu_design_agent.isa import validate_isa_spec
+        spec = _valid_isa()
+        spec["datapath"] = {"maclen": 32, "accWidth": 64}
+        self.assertEqual(validate_isa_spec(spec), [])
+
+    def test_algorithm_specific_metadata_is_optional_and_namespaced(self) -> None:
+        from agents.cfu_design_agent.isa import validate_isa_spec
+        for parameters in ({}, {"crc_polynomial": "0x04c11db7"}, {"permutation_width_bits": 32}):
+            spec = _valid_isa()
+            spec["datapath"] = {"implementation": parameters}
+            self.assertEqual(validate_isa_spec(spec), [])
+        spec["datapath"]["implementation"] = 32
+        self.assertIn("datapath.implementation must be a mapping when provided", validate_isa_spec(spec))
 
     def test_datapath_mapping_can_be_empty_for_scalar_cfu(self) -> None:
         from agents.cfu_design_agent.isa import validate_isa_spec

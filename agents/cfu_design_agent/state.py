@@ -136,6 +136,14 @@ class CfuDesignState(TypedDict, total=False):
     software_change: str
     # --loop: a passing run may spend leftover budget on optimization rounds.
     loop_optimize: bool
+    # explore reconsiders a premature stop; conservative retains one-shot routing.
+    loop_policy: str
+    loop_patience: int
+    isa_revision: int
+    isa_extension_base: dict[str, Any]
+    isa_added_symbols: list[str]
+    best_candidate: dict[str, Any]
+    delivered_round: int
     # The optimization round currently being executed ({} outside --loop).
     optimization_plan: dict[str, Any]
     # Index of the round whose measurements the sim/cost gates carry.

@@ -33,7 +33,9 @@ ALLOW_WRITE_ROOTS = (
 )
 
 # The only files a design agent may write for hardware. They are seeded from the
-# tracked scaffolds and compiled over them as a same-package overlay.
+# tracked scaffolds and compiled over them as a same-package overlay. The shared
+# AgentCfuLib.scala platform is deliberately absent: it is compiled from the
+# repository copy and cannot be overlaid, replaced or deleted by a run.
 DESIGN_SOURCE_FILES = (
     "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala",
     "src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala",
@@ -89,7 +91,14 @@ class RepoToolbox:
             normalized = self.normalize(rel_path)
         except PolicyError:
             return False
-        return self.policy.can_read(self.stage, normalized)
+        return self.is_current_run_path(normalized) and self.policy.can_read(self.stage, normalized)
+
+    def is_current_run_path(self, normalized: str) -> bool:
+        """Only run artifacts are scoped; tracked sources/cache remain unchanged."""
+        if not self.run_root or not normalized.startswith("agents/generated/runs/"):
+            return True
+        root = self.run_root.strip("/")
+        return normalized == root or normalized.startswith(root + "/")
 
     def resolve(self, rel_path: str | Path) -> Path:
         return (self.workdir / self.normalize(rel_path)).resolve()
@@ -104,12 +113,16 @@ class RepoToolbox:
 
     def read_text(self, rel_path: str, *, limit: int = MAX_FILE_CHARS) -> str:
         normalized = self.normalize(rel_path)
+        if not self.is_current_run_path(normalized):
+            raise PolicyError(f"read path belongs to another run: {normalized}")
         self.policy.check_read(self.stage, normalized)
         path = self.workdir / normalized
         if not path.exists() or not path.is_file():
             return ""
-        text = path.read_text(errors="replace")
-        return text[:limit]
+        if limit < 0:
+            raise ValueError("read limit must be non-negative")
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            return handle.read(limit)
 
     def write_text(self, rel_path: str, text: str) -> str:
         normalized = self.normalize(rel_path)
@@ -201,8 +214,13 @@ class RepoToolbox:
             }
 
         run_cwd = self.resolve(cwd) if cwd else self.workdir
+        # Legacy policy descriptors include --unsafe-paths; validate that
+        # descriptor unchanged, but never grant Git the unsafe execution flag.
+        execution_args = [arg for arg in args if arg != "--unsafe-paths"] if selected in {
+            "git_apply", "git_apply_check"
+        } else args
         result = subprocess.run(
-            args,
+            execution_args,
             cwd=run_cwd,
             input=input_text,
             text=True,
@@ -223,12 +241,11 @@ class RepoToolbox:
     def apply_patch_text(self, patch_text: str) -> CommandResult:
         # Redirect tracked scaffold targets into the run workspace before any
         # git operation, so the repo tree is never touched.
-        redirects: list[str] = []
+        targets = validate_text_patch(patch_text)
+        redirects = [self.resolve_target(path) for path in targets]
+        mapping = dict(zip(targets, redirects))
+        patch_text = rewrite_text_patch(patch_text, mapping)
         rejected: list[str] = []
-        if self.run_root:
-            patch_text, redirects, rejected = repair_patch_paths(
-                patch_text, self.run_root, embench_benchmark=self.embench_benchmark
-            )
         if rejected:
             allowed = "AgentCfu.scala, AgentCfuFiber.scala"
             if self.embench_benchmark:
@@ -305,6 +322,9 @@ class RepoToolbox:
         if not resolved and self._is_run_workspace_target(target):
             resolved = self.normalize(target)
         if not resolved:
+            raise ValueError(f"path is not a writable design target: {target}")
+        resolved = self.normalize(resolved)
+        if not resolved.startswith(f"{self.run_root.strip('/')}/workspace/") or not self.is_write_allowed(resolved):
             raise ValueError(f"path is not a writable design target: {target}")
         return resolved
 
@@ -390,10 +410,12 @@ class RepoToolbox:
                 parsed={"touched_paths": []},
             )
 
-        applied: list[str] = []
-        for resolved, updated in pending.items():
-            self.write_text(resolved, updated)
-            applied.append(resolved)
+        try:
+            self._commit_files(pending)
+        except OSError as exc:
+            return CommandResult(command="edit", cwd=str(self.workdir), returncode=1,
+                                 stdout_tail="", stderr_tail=str(exc), parsed={"touched_paths": []})
+        applied = list(pending)
         return CommandResult(
             command="edit",
             cwd=str(self.workdir),
@@ -402,6 +424,43 @@ class RepoToolbox:
             stderr_tail="" if applied else "no edit blocks were supplied",
             parsed={"touched_paths": applied},
         )
+
+    def _commit_files(self, pending: dict[str, str]) -> None:
+        """Rollback on in-process I/O failure; not a crash-atomic transaction."""
+        before = {name: ((self.workdir / name).read_bytes() if (self.workdir / name).exists() else None)
+                  for name in pending}
+        attempted: list[str] = []
+        try:
+            for name, text in pending.items():
+                attempted.append(name)
+                self.write_text(name, text)
+        except OSError:
+            for name in reversed(attempted):
+                path = self.workdir / name
+                if before[name] is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(before[name])
+            raise
+
+    def apply_file_blocks(self, blocks: list[tuple[str, str]]) -> CommandResult:
+        """Prevalidate every FILE target, then commit with in-process rollback."""
+        pending: dict[str, str] = {}
+        try:
+            for target, content in blocks:
+                resolved = self.resolve_target(target)
+                self.policy.check_write(self.stage, resolved)
+                if resolved in pending:
+                    raise ValueError(f"duplicate FILE target: {target}")
+                pending[resolved] = content
+            if not pending:
+                raise ValueError("no file blocks supplied")
+            self._commit_files(pending)
+        except (ValueError, PolicyError, OSError) as exc:
+            return CommandResult(command="file", cwd=str(self.workdir), returncode=1,
+                                 stdout_tail="", stderr_tail=str(exc), parsed={"touched_paths": []})
+        return CommandResult(command="file", cwd=str(self.workdir), returncode=0,
+                             stdout_tail="", stderr_tail="", parsed={"touched_paths": list(pending)})
 
     def stage_bucket(self, stage: str) -> "RepoToolbox":
         return RepoToolbox(
@@ -414,6 +473,11 @@ class RepoToolbox:
         )
 
     def copy_tree(self, src_rel: str, dst_rel: str) -> str:
+        for raw in (src_rel, dst_rel):
+            candidate = self.workdir / raw
+            if candidate.is_symlink() or any(parent.is_symlink() for parent in candidate.parents
+                                              if parent != self.workdir):
+                raise PolicyError("copy does not permit symbolic links")
         src_normalized = self.normalize(src_rel)
         dst_normalized = self.normalize(dst_rel)
         self.policy.check_read(self.stage, src_normalized)
@@ -433,13 +497,43 @@ class RepoToolbox:
             "*.vcd",
             "*.fst",
         )
-        if src.is_file():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-        else:
+        # Validate *every* source before touching the destination. Never follow
+        # aliases: normal-looking symlink names could launder denied contents.
+        files: list[tuple[Path, Path]] = []
+        stack = [(src, dst)]
+        visited = 0
+        while stack:
+            source, target = stack.pop()
+            visited += 1
+            if visited > 10000:
+                raise PolicyError("copy enumeration budget exceeded")
+            if source.is_symlink() or target.is_symlink():
+                raise PolicyError("copy does not permit symbolic links")
+            source_rel = self.normalize(source.relative_to(self.workdir))
+            target_rel = self.normalize(target.relative_to(self.workdir))
+            self.policy.check_read(self.stage, source_rel)
+            self.policy.check_write(self.stage, target_rel)
+            if source.is_dir():
+                with os.scandir(source) as entries:
+                    for entry in entries:
+                        if entry.is_symlink():
+                            raise PolicyError("copy does not permit symbolic links")
+                        if ignore(str(source), [entry.name]):
+                            continue
+                        stack.append((Path(entry.path), target / entry.name))
+                        if len(stack) + visited > 10000:
+                            raise PolicyError("copy enumeration budget exceeded")
+            elif source.is_file():
+                files.append((source, target))
+            else:
+                raise PolicyError("copy source is not a regular file or directory")
+        if src.is_dir():
             if dst.exists():
                 shutil.rmtree(dst)
-            shutil.copytree(src, dst, ignore=ignore)
+            dst.mkdir(parents=True, exist_ok=True)
+        for source, target in files:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
         return f"copied {src_rel} to {dst_rel}"
 
 
@@ -895,6 +989,90 @@ def parse_command_output(text: str) -> dict[str, object]:
     if "FAILURE" in text or " FAIL" in text:
         parsed["fail"] = True
     return parsed
+
+
+def validate_text_patch(text: str) -> list[str]:
+    """Accept only unambiguous regular-file unified diffs (no Git side effects)."""
+    targets: list[str] = []
+    git_pair = None
+    old = None
+    new = None
+    has_hunk = False
+    in_hunk = False
+
+    def path(value: str, prefix: str) -> str:
+        if value == "/dev/null":
+            return value
+        if not value.startswith(prefix) or re.search(r'[\s"\\\\]', value):
+            raise ValueError("unsupported quoted or ambiguous patch path")
+        value = value[len(prefix):]
+        if not value or value.startswith("/") or any(p in {"", ".", ".."} for p in value.split("/")):
+            raise ValueError("unsafe patch path")
+        return value
+
+    def finish() -> None:
+        if old is None and new is None and git_pair is None:
+            return
+        if old is None or new is None or not has_hunk:
+            raise ValueError("patch requires paired file headers and a text hunk")
+        target = new if old == "/dev/null" else old
+        if target == "/dev/null" or (new != "/dev/null" and old != "/dev/null" and old != new):
+            raise ValueError("rename or ambiguous patch headers are unsupported")
+        if git_pair is not None and git_pair != (target, target):
+            raise ValueError("diff --git and file headers disagree")
+        if target in targets:
+            raise ValueError("duplicate patch target")
+        targets.append(target)
+
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            finish()
+            old = new = None
+            has_hunk = in_hunk = False
+            fields = line.split(" ")
+            if len(fields) != 4:
+                raise ValueError("ambiguous diff --git header")
+            git_pair = (path(fields[2], "a/"), path(fields[3], "b/"))
+        elif line.startswith("--- "):
+            if old is not None:
+                finish()
+                git_pair = None
+                new = None
+                has_hunk = False
+            old = path(line[4:], "a/")
+            in_hunk = False
+        elif line.startswith("+++ ") and not in_hunk:
+            if old is None or new is not None:
+                raise ValueError("unpaired or duplicate patch header")
+            new = path(line[4:], "b/")
+        elif line.startswith("@@ "):
+            if old is None or new is None or not re.match(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", line):
+                raise ValueError("invalid text hunk header")
+            has_hunk = in_hunk = True
+        elif in_hunk and (line.startswith((" ", "+", "-")) or line == "\\ No newline at end of file"):
+            continue
+        elif re.fullmatch(r"index [0-9a-fA-F]+\.\.[0-9a-fA-F]+(?: 100644)?", line) and git_pair and old is None:
+            continue
+        elif line:
+            raise ValueError("unsupported patch metadata or content: " + line[:100])
+    finish()
+    if not targets:
+        raise ValueError("patch has no text targets")
+    return targets
+
+
+def rewrite_text_patch(text: str, mapping: dict[str, str]) -> str:
+    lines = []
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        if body.startswith("diff --git "):
+            _, _, a, b = body.split(" ")
+            body = f"diff --git a/{mapping[a[2:]]} b/{mapping[b[2:]]}"
+        elif body.startswith(("--- a/", "+++ b/")):
+            body = body[:6] + mapping[body[6:]]
+        lines.append(body + ending)
+    return "".join(lines)
 
 
 def patch_paths(patch_text: str) -> list[str]:

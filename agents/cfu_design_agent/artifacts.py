@@ -182,6 +182,18 @@ class RunArtifacts:
         self.policy.check_write(stage, rel_path)
         path = self.workdir / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(data).hexdigest()
+        # Keep immutable bytes as well as the backwards-compatible latest path.
+        # Version files stay inside this stage's already-authorized directory.
+        version_parent = path.parent.relative_to(self.workdir).as_posix()
+        if version_parent == self.root_rel:
+            version_parent += "/12_review"  # report.md lives at run root.
+        version_rel = f"{version_parent}/versions/{path.name}.{digest}"
+        self.policy.check_write(stage, version_rel)
+        version_path = self.workdir / version_rel
+        version_path.parent.mkdir(parents=True, exist_ok=True)
+        if not version_path.exists():
+            _atomic_write(version_path, data)
         _atomic_write(path, data)
         ref: dict[str, Any] = {
             "schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -191,7 +203,8 @@ class RunArtifacts:
             "status": status,
             "inputs": inputs,
             "visible_files": visible_files,
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "sha256": digest,
+            "immutable_path": version_rel,
             "size_bytes": len(data),
             "created_at": _now(),
         }

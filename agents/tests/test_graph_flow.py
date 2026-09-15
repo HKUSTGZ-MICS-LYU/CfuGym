@@ -150,11 +150,11 @@ class RepairFeedbackTest(unittest.TestCase):
             "gates": {"implementation_hw": {"errors": ["no usable patch"]}},
         }
         feedback = hardware_repair_feedback(state)
-        self.assertIn("hw_build (SoC generation) errors", feedback)
+        self.assertNotIn("hw_build (SoC generation) errors", feedback)
         self.assertIn("sim (simulation) errors", feedback)
         self.assertIn("cost (Yosys) errors", feedback)
         self.assertIn("implementation_hw rejection", feedback)
-        self.assertIn("BUILD_ERROR_MARKER", feedback)
+        self.assertNotIn("BUILD_ERROR_MARKER", feedback)
         self.assertIn("SIM_ERROR_MARKER", feedback)
         self.assertIn("COST_ERROR_MARKER", feedback)
         self.assertIn("no usable patch", feedback)

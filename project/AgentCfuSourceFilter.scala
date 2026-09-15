@@ -12,6 +12,10 @@ import sbt._
  * list; the workspace copies then provide the class. Filtering the resolved
  * source list is deterministic and needs no shell metacharacters in the sbt
  * command line, which keeps the agent command policy check meaningful.
+ *
+ * AgentCfuLib.scala is deliberately NOT in this list: the shared platform is
+ * read-only for the agent and is always compiled from the tracked repository
+ * copy, so a workspace overlay cannot replace or delete it.
  */
 object AgentCfuSourceFilter {
   private val scaffoldSuffixes = Seq(

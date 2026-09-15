@@ -103,8 +103,8 @@ The design is checked by the tool that owns each artifact **immediately after it
 - Hardware-target reads are redirected to the run-workspace overlay: `read_file`/`search_text` on `src/main/scala/vexiiriscv/soc/mico/AgentCfu*.scala` return the run's live copy (the same bytes the prompt shows and an edit targets), so a repair sees its own previous change instead of the pristine tracked scaffold. The redirect only applies where the stage may read the overlay, so the analysis rung still reads the tracked scaffold.
 - The build rungs are guarded by the implementation rung that feeds them: if `implementation_hw` applied nothing, `hw_build` fails without invoking `sbt` (the seeded scaffold would otherwise compile and "pass" while validating nothing) and repairs `implement_hw`; if `implementation_sw` applied nothing, `sw_build` fails without invoking `make` and repairs `implement_sw`.
 - A failed `sim` is routed by the agent, not by a fixed order: one extra LLM call (stage `route_repair`) receives the failure attribution, the measured reference/CFU cycles, the ISA contract, both implementation summaries, and the simulation-log tail, and returns `{"repair_target": "implement_sw"|"implement_hw", "root_cause", "reason"}`. Only those two targets are accepted; anything else (or no model at all) falls back to the deterministic escalation, which is keyed to simulation repairs only: the first `sim` failure retries software, the next escalates to hardware. An unrelated earlier repair (for example a `sw_build` retry) does not skip the software retry. `--repair-routing fixed` (env `CFU_AGENT_REPAIR_ROUTING`) pins the old deterministic behavior and never calls the router. The decision is written to `10_validation/sim_repair_decision.yaml` (`target`, `root_cause`, `reason`, `source` = `llm`/`fallback`/`fixed`, and the deterministic `advisory`), recorded as `repair_decision` on the `sim` gate, added to the iteration history, and the router's raw answer is kept as `10_validation/llm_raw/repair_route_*.txt`. The named root cause is also injected into the chosen rung's repair feedback as a routing-decision line, so the retry works on the identified defect instead of re-deriving it from the log.
-- After a successful `hw_build` the ladder does not have to re-write the software. The agent may decide that the kernel already in the run workspace still matches the new hardware, in which case the `implementation_sw` rung is **reused** and the run goes straight to `sw_build` → `simulate` with the existing kernel and the freshly generated `cfu_intrinsics.h`. The decision has a deterministic honesty guard: it is only taken when the current kernel bytes call a CFU datapath intrinsic **and** the ISA contract digest recorded when that kernel was written still equals the current one — a moved ABI (renamed command, new operand layout) forces the software rung. Only real datapath calls count: `cfu_enable()`, `cfu_memory_fence()` (enable/fence only) and the generated harness's `cfu_agent_counter_read()`/`cfu_agent_counter_elapsed()` cycle helpers do not, unless the ISA contract itself declares one of those names. Only when the guard passes is one LLM call (stage `route_software`) made, with the ISA contract, both design summaries and the exact intrinsic call sites, to answer `{"software_change": "required"|"not_required", "reason"}`. Any failure (no model, unusable answer, or `--software-change always`, env `CFU_AGENT_SOFTWARE_CHANGE`) runs the software rung as before. The decision is written to `09_implementation/software_decision.yaml` (`software_change`, `reason`, `source` = `llm`/`guard`/`fallback`/`fixed`, `evidence`, `files`, `calls`), recorded as `software_decision` on the `hw_build` gate and as `{"ok": true, "reused": true, ...}` on the `implementation_sw` gate, added to the iteration history, and the router's raw answer is kept as `09_implementation/llm_raw/software_route_*.txt`. Reuse is never a way to skip validation: `sw_build` still compiles the kernel and `sim` still has to pass the correctness oracle and the speedup floor.
-- With `--loop` a run does not have to stop when it succeeds. If every gate passes **and** the `--max-iters` budget still has room, the review node asks the agent (stage `optimize`, one JSON call) whether another round is worth spending on: `{"continue": true|false, "target": "implement_hw"|"implement_sw", "focus": "performance"|"cost", "reason": ...}`. A round re-enters the normal ladder (`implement_hw` → `generate_soc` → software reuse-or-rewrite → `build_sw` → `simulate` → `estimate_cost` → review, or `implement_sw` → `build_sw` → …), so it can never skip verify, the 1.05x speedup floor, or a build rung. An optimization round is budgeted like a repair: `--max-iters N` stays the single bound on the whole run, and a round with no budget left, a `continue: false`, an unusable target, or a missing "concrete change" reason stops the loop deterministically (no model answer can extend a run). The chosen rung receives an `=== OPTIMIZATION ROUND ===` block (not a `*_REPAIR MODE` block) with the current measured result, the focus, and the rule that the ISA contract is frozen — so it improves the design instead of redesigning it or reshaping the ABI. Every round that produced its own measurement is recorded in `12_review/optimization_rounds.yaml` (speedup, reference/CFU cycles, Yosys cells/wires/memories), and `simulate`/`estimate_cost` stamp their gates with the round they ran in, so a round that failed before measuring is listed as `not measured` instead of repeating the previous round's numbers. The report's `## Optimization Rounds` section and the end-of-run CLI `summary:` each print one line per round with the change against the previous measured round — for example `round 1: implement_hw speedup=2.50x cells=1300 (+0.50x, +100 cells) (best)` — so the whole progression of speedup and cost is traceable; the first round is the initial ladder. A round counts as an improvement only when it is Pareto-better than the best round so far (not slower, not larger, better on at least one axis); a final measured round that regresses is reported with an explicit warning in the report and in the CLI summary. `--loop` is off by default (env `CFU_AGENT_LOOP`); without it, review stops as before.
+- After a successful `hw_build` the ladder does not have to re-write the software. The agent may decide that the kernel already in the run workspace still matches the new hardware, in which case the `implementation_sw` rung is **reused** and the run goes straight to `sw_build` → `simulate` with the existing kernel and the freshly generated `cfu_intrinsics.h`. The decision has a deterministic honesty guard: it is only taken when the current kernel bytes call a CFU datapath intrinsic **and** the ISA contract digest recorded when that kernel was written still equals the current one — a moved ABI (renamed command, new operand layout) forces the software rung. Only real datapath calls count: `cfu_enable()`, `cfu_memory_fence()` (enable/fence only) and the generated harness's `cfu_agent_counter_read()`/`cfu_agent_counter_elapsed()` cycle helpers do not; those helper names are now reserved by the ISA linter. Declared control-only operations do not count as datapath usage either. Only when the guard passes is one LLM call (stage `route_software`) made, with the ISA contract, both design summaries and the exact intrinsic call sites, to answer `{"software_change": "required"|"not_required", "reason"}`. Any failure (no model, unusable answer, or `--software-change always`, env `CFU_AGENT_SOFTWARE_CHANGE`) runs the software rung as before. The decision is written to `09_implementation/software_decision.yaml` (`software_change`, `reason`, `source` = `llm`/`guard`/`fallback`/`fixed`, `evidence`, `files`, `calls`), recorded as `software_decision` on the `hw_build` gate and as `{"ok": true, "reused": true, ...}` on the `implementation_sw` gate, added to the iteration history, and the router's raw answer is kept as `09_implementation/llm_raw/software_route_*.txt`. Reuse is never a way to skip validation: `sw_build` still compiles the kernel and `sim` still has to pass the correctness oracle and the speedup floor.
+- With `--loop` a run does not have to stop when it succeeds (see **Multi-instruction ISA evolution** below for the current exploration and delivery rules). If every gate passes **and** the `--max-iters` budget still has room, the review node asks the agent (stage `optimize`, plus at most one stop reconsideration) whether another round is worth spending on: `{"continue": true|false, "target": "implement_hw"|"implement_sw"|"extend_isa", "focus": "performance"|"cost", "reason": ...}`. A round re-enters the normal ladder (`implement_hw` → `generate_soc` → software reuse-or-rewrite → `build_sw` → `simulate` → `estimate_cost` → review, or `implement_sw` → `build_sw` → …), so it can never skip verify, the 1.05x speedup floor, or a build rung. An optimization round is budgeted like a repair: `--max-iters N` stays the single bound on the whole run, and a round with no budget left, an unusable target, or a missing "concrete change" reason stops the loop deterministically; in default explore mode a `continue: false` is reconsidered once before the framework accepts it (no model answer can extend a run). The chosen rung receives an `=== OPTIMIZATION ROUND ===` block (not a `*_REPAIR MODE` block) with the current measured result, the focus, and the rule that the accepted ISA revision is frozen during implementation; only `extend_isa` may append compatible commands before re-entering hardware and software validation. Every round that produced its own measurement is recorded in `12_review/optimization_rounds.yaml` (speedup, reference/CFU cycles, Yosys cells/wires/memories), and `simulate`/`estimate_cost` stamp their gates with the round they ran in, so a round that failed before measuring is listed as `not measured` instead of repeating the previous round's numbers. The report's `## Optimization Rounds` section and the end-of-run CLI `summary:` each print one line per round with the change against the previous measured round — for example `round 1: implement_hw speedup=2.50x cells=1300 (+0.50x, +100 cells) (best)` — so the whole progression of speedup and cost is traceable; the first round is the initial ladder. A round counts as an improvement only when it is Pareto-better than the best round so far (not slower, not larger, better on at least one axis); a final measured round that regresses is reported with an explicit warning in the report and in the CLI summary. `--loop` is off by default (env `CFU_AGENT_LOOP`); without it, review stops as before.
 - The cost rung synthesizes the CFU **in isolation** rather than the whole SoC: `GenAgentCfu` (a tracked, non-agent-editable entry point) elaborates only the overlaid `AgentCfu` class into `11_cost/cfu_rtl/AgentCfu.v`, and Yosys runs `synth -top AgentCfu` on it. Cost numbers therefore track the agent's CFU design instead of the CPU/SoC, and the cost rung needs no CPU build. If the standalone generation produces no RTL, the cost rung fails and repairs `implement_hw`.
 - The simulation rung also fails when no design change was applied, so a benchmark whose cfu build is byte-identical to the reference cannot be reported as an accelerated result.
 - A rung that was skipped (`--dry-run`, `--skip-sim`, execution disabled) never repairs and can never produce `complete`.
@@ -161,6 +161,262 @@ to `workspace/design/AgentCfu*.scala` still applies at every level.
 - `extended` never pre-reads `ext/SpinalHDL` (925 sources); it only makes the tree readable so
   the agent can look up the exact API on demand. With `--no-agent-tools` the tree is
   unreachable, and the prompt says so.
+
+### AgentCfu design file vs. read-only platform
+
+The scaffold is split so an agent only reads and rewrites the design it owns:
+
+- `src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala` — **agent-owned design file.**
+  It keeps the public contract (`AgentCfuParameter`, `AgentCfuFunction`,
+  `class AgentCfu(cfuParam, busParam, p)`) and the
+  `override protected def instructionTable: Seq[Instruction]` design. Nothing else.
+- `src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala` — **read-only platform.**
+  `AgentCfuBase` (the bus shell, vector RF, response buffer, CfuLsu/FSM and the
+  instruction dispatcher) plus the `CfuResource` vocabulary.
+- `src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala` — agent-owned, changed
+  only when the fiber contract genuinely must change.
+
+Consequences:
+
+- A whole-file rewrite of `AgentCfu.scala` (the `FILE_BEGIN` protocol) cannot delete
+  the bus shell or the dispatcher, because they are no longer in that file.
+- `AgentCfuLib.scala` is not a write target: it is absent from `DESIGN_SOURCE_FILES`,
+  the run-workspace overlay, and the implementation write policy. The overlay's
+  `AgentCfuSourceFilter` removes only the two tracked design files, so the platform
+  is always compiled from the repository copy.
+- The platform is not pre-read into the hardware prompt. The design file shows the
+  working API and the prompt lists it; the agent may read
+  `AgentCfuLib.scala` on demand for an exact signature.
+- `CfuResource` lives in the `AgentCfuBase` companion object, so an older run
+  workspace that still inlines a top-level `CfuResource` keeps compiling against the
+  current repository platform.
+
+The dispatcher is built during the platform constructor. It has to be: the CfuLsu
+state machine consumes its registered `whenIsActive` tasks exactly once, at prePop
+time, and `fsm.goto` is only legal while that build runs. Scala assigns
+primary-constructor parameter fields before the superclass body executes, so
+`AgentCfu.instructionTable` may read its own constructor parameters (`p`,
+`cfuParam`) and the platform members. It must not read a `val` declared in the
+subclass body, which is assigned only after the platform has called the table;
+allocate design state inside the table body instead.
+
+### Declarative CFU instruction table
+
+The scaffold borrows VexiiRiscv's **declare encodings, register implementations,
+generate common decode** pattern, not its CPU scheduling machinery:
+
+- `src/main/scala/vexiiriscv/riscv/Rvi.scala` declares `TypeR(M"...")` encodings.
+- `execute/IntAluPlugin.scala` registers operations with `add(...).srcs(...).decode(...)`.
+- `execute/ExecutionUnitElementSimple.scala` records the operation and decode payloads;
+  CPU decode/execute plugins generate the shared controls.
+- `execute/cfu/CfuPlugin.scala` already passes function_id, raw instruction, operands
+  and request ID over the standard interface. None of these interfaces is modified.
+
+`AgentCfu.scala` now overrides `protected def instructionTable: Seq[Instruction]`,
+declared in the platform `AgentCfuBase`. An entry declares name, function, subop,
+optional Scala `enabled`, combinational `ready`, `start`, optional multicycle `tick`,
+and `resources`. The dispatcher is the single source
+for decode, supported instructions and handshake. Adding/removing an entry does
+not require updating separate `isCompute`, `isSupported` or central execution branches.
+The default table contains the legacy compute/config no-ops and enabled load/store
+handlers; replace no-ops with actual operations for an accelerated design.
+
+#### Explicit operand and writeback resources
+
+Like Vexii's `MicroOp.resources` / `RfResource(rf, access)`, an instruction now
+carries `resources: Option[Seq[CfuResource]]`. `CfuResource` is defined in
+`AgentCfu.scala` itself so the existing two-file run overlay remains sufficient.
+It is an internal hardware declaration, not an extension to CfuBus.
+
+```scala
+import CfuResource._
+
+Instruction("add", function = 1, subop = 1,
+  resources = Some(Seq(CpuRead(RS1), CpuRead(RS2), CpuWriteRD)),
+  start = ctx => ctx.complete(
+    (ctx.read(RS1).asUInt + ctx.read(RS2).asUInt).asBits))
+
+Instruction("vector_xor_inplace", function = 1, subop = 2,
+  resources = Some(Seq(
+    VectorRead(VS1, CpuValue(RS1)),
+    VectorRead(VS2, CpuValue(RS2)),
+    VectorWrite(VD, CpuValue(RS1)))),
+  start = ctx => ctx.complete(ctx.read(VS1) ^ ctx.read(VS2)))
+```
+
+The handler computes a result; the resource declaration determines where that
+result goes. `ctx.complete` does not guess from result width. `ctx.complete()`
+is for acknowledgement-only commands. `ctx.fail()` completes with an error and no
+vector write; `ctx.complete(result, status)` suppresses vector writeback when status
+is nonzero. The unchanged CPU plugin still writes response data to a nonzero rd:
+fail/invalid-index responses contain zero, not a promise to preserve the old CPU RD.
+The same limitation applies to CPU-result error completions; status is not a CPU
+writeback-cancel signal. First-version resources allow **at most
+one data write**: CPU RD or vector VD, not an ambiguous simultaneous write.
+
+| Resource | Value / effect in generated custom0 instructions |
+|---|---|
+| `CpuRead(RS1)` | CPU `X[rs1]` value, not the number of rs1 |
+| `CpuRead(RS2)` | CPU `X[rs2]` value, not the number of rs2 |
+| `CpuWriteRD` | result through CFU response; CPU writes this instruction's rd |
+| `VectorRead(VS1, CpuValue(RS1))` | CFU `V[X[rs1]]`, vector width |
+| `VectorRead(VS2, Constant(1))` | CFU `V[1]`, vector width |
+| `VectorWrite(VD, CpuValue(RS1))` | write result to CFU `V[X[rs1]]` |
+| `LegacyRegisterNumber(RS2)` index | instruction[24:20], legacy index-width truncation; **not** `X[rs2]` |
+
+VS1/VS2/VD are roles, not additional bus fields. Vector index sources may be
+`CpuValue(RS1/RS2)`, `Constant(n)`, or compatibility-only
+`LegacyRegisterNumber(RS1/RS2)`. CPU-value indices are checked at full width
+against regDepth before a handler runs; invalid indices return an error without
+side effects. Constants are checked at elaboration. A vector index implicitly
+consumes the selected CPU input; it does not require an extra CpuRead declaration.
+A new instruction cannot invent a third CPU input or implicitly reuse CPU rd as VD.
+Use explicit in-place or constant destinations; packed/configured index sources
+are not supported by this first resource schema.
+
+`regDepth = 1` is supported and is the natural choice for a single accumulator
+slot. The platform addresses that one slot statically instead of through a dynamic
+`Vec` index: SpinalHDL addresses a `Vec` with `log2Up(size)` bits, so a one-element
+`Vec` would need a zero-width address while the generic slot index is one bit wide,
+and the deferred path's latched index register carries no auto-resize tag. A
+one-element `Vec` read at a static index is exactly one register, so storage stays
+uniform for every `regDepth`. `CpuValue` indices must then be 0; anything else is
+rejected as an out-of-range index.
+
+An operation with vector writeback still sends a CFU completion response. Its
+software intrinsic returns `void` and encodes CPU `rd=x0`; it does not write its
+vector result into CPU RD. `response_id` correlates requests and is not a register
+number. With CpuWriteRD, the intrinsic returns `uint32_t`. New signatures take only
+CPU values needed by declared reads or index sources, in rs1/rs2 order; use the
+generated header rather than assuming the old two-argument ABI.
+
+The matching ISA fragment is:
+
+```yaml
+commands:
+  - name: vector_xor_inplace
+    function_id: 1
+    subfunction_id: 2
+    kind: compute
+    semantics: bitwise XOR two resident vectors, overwriting the first
+    response: status
+    resources:
+      - {storage: vector, access: read, role: vs1,
+         index: {source: cpu_value, register: rs1}}
+      - {storage: vector, access: read, role: vs2,
+         index: {source: cpu_value, register: rs2}}
+      - {storage: vector, access: write, role: vd,
+         index: {source: cpu_value, register: rs1}}
+```
+
+CPU resources use `{storage: cpu, access: read, role: rs1}` (or rs2), and
+`{storage: cpu, access: write, role: rd}`. Alternative vector indices are
+`{source: constant, value: 0}` and legacy-only
+`{source: legacy_register_number, register: rs1}` (or rs2).
+The schema rejects unknown fields/roles, duplicate roles and multiple data writes.
+Resource changes are semantic ABI changes and remain frozen in append-only rounds.
+
+**Legacy compatibility is explicit:** omitted YAML resources / Scala `None`
+preserve the old two-argument, CPU-returning interface and handler API.
+`resources: []` / `Some(Seq.empty)` instead mean no operand/data-write resources,
+with mandatory acknowledgement. Legacy intrinsics still bind a1/a2 and return a0.
+The scaffold's old load/store index comes from raw rs2's register number (fixed
+x12 for those legacy intrinsics), not their second C argument's value. New designs
+should use CpuValue rather than copying that historical encoding convention.
+The legacy load/store entries now declare these address/slot resources explicitly,
+but their existing LSU still owns beat writes, memory completion and error status;
+they do not also invoke the generic complete(result) vector-write path.
+
+Use `ctx.defer()` with a tick callback for multicycle work. Resource reads and
+vector destination indices are captured on acceptance, including vector source
+snapshots; tick does not observe later RF writes or live input changes. Use
+`ctx.read(role)` and `ctx.complete` rather than bypassing resource routing with
+raw input/vector helpers. CPU/raw instruction/state/CFU/request metadata remain
+latched for deferred contexts. Individual handlers must not drive bus ready/valid
+or bypass the response buffer. Allocate shared registers/Areas inside the table
+method or lazily: overriding it with a subclass `val` is unsafe during construction.
+Callbacks build conditional hardware during elaboration; they are not runtime Scala.
+
+Exact `(funct3, funct7)` pairs deliberately avoid wildcard priority ambiguity.
+Elaboration rejects out-of-range encodings, duplicate names, duplicate pairs and
+`defer()` without a tick callback; disabled declarations are still checked for
+encoding/name mistakes. Removing/disabling an entry makes it unsupported, including
+when the table is empty. A `ready` callback is combinational and must not depend on
+`cmd.ready` itself (which would create a combinational loop).
+No new CPU MicroOp, pipeline, CSR or CfuBus field is introduced. Matching still uses
+the existing projected function/suboperation fields, not a new custom0-only mask,
+so the native CPU custom1 routing is not silently changed (the agent's generated
+register-register intrinsics remain custom0-only).
+
+### Multi-instruction ISA evolution
+
+`AgentCfu` keeps its three-bit `function_id` bus contract and decodes a seven-bit
+`subfunction_id` from `raw_insn[31:25]` (funct7). The custom0 CPU decoder already
+accepts these bits. `matches(function, operation = 0)` matches the complete pair;
+legacy compute/config/load/store retain suboperation 0. Unknown suboperations
+return the CFU error status rather than silently executing a legacy operation.
+The scaffold remains algorithm-neutral: agents implement the operations they declare.
+
+Each ISA command may declare `subfunction_id: 0..127` (default 0) and
+`kind: compute|control|load|store`. Function IDs remain 0..7. The pair must be unique,
+as must generated intrinsic names/macros; enable/fence/counter helper names are
+reserved. Generated custom0 intrinsics encode `subfunction_id << 25`. Existing
+specs without this field retain their original instruction words.
+
+With `--loop`, the optimizer can select `extend_isa` as well as `implement_hw` or
+`implement_sw`. An extension returns a complete candidate contract with at least
+one new command. Old commands, encodings and all their fields remain unchanged;
+shared state, memory, datapath, integration, assumptions and software ABI remain
+frozen (the intrinsic name list may grow). This is deliberately conservative:
+state-layout or reset-semantic migrations are not yet supported. Rejected candidates
+do not replace the incumbent ISA. Accepted revisions are recorded under
+`08_isa/revisions/` and extension attempts under `08_isa/extensions/`.
+
+An accepted extension always traverses HW build, regenerated intrinsics, SW
+adaptation, SW build, correctness/performance simulation and cost. Software must
+call at least one new instruction as well as exercise the datapath; a control-only
+kernel cannot satisfy datapath usage. Static call-site checks are preliminary
+checks, not proof of dynamic execution or general correctness.
+
+`--loop-policy explore` is the default. A model stop recommendation receives one
+bounded reconsideration request covering batching, instruction extensions,
+packing/transfers and area reduction. `--loop-policy conservative` retains the
+one-shot stop behavior. `--loop-patience N` (default 3) stops after N consecutive
+non-improving optimization results, and `--max-iters` remains the global repair/
+optimization bound. A second stop, an unusable plan or provider failure ends
+exploration with an explicit reason; exploration is not an unlimited loop.
+
+Candidate selection compares exact reference/CFU cycle ratios and cell counts;
+`speedup_x100` is only the legacy display metric. Only fully validated rounds can
+improve the incumbent. Immutable source snapshots, ISA and gate evidence for each
+new best are kept under `12_review/candidates/<round>/candidate.yaml`. The report
+identifies that selected source delivery separately from the final experiment.
+The mutable workspace and binaries are NOT silently restored: a failed final
+experiment remains failed, while the earlier validated source candidate stays
+available and can be rebuilt from its manifest.
+
+All newly written stage artifacts retain an `immutable_path` content-addressed
+copy beside the latest view, allowing earlier manifest hashes to be retrieved.
+Historical runs are not rewritten. FILE and EDIT prevalidate every target and
+roll back in-process I/O failures; this is not a crash-atomic filesystem transaction.
+PATCH accepts text-content patches only and rejects unsupported Git metadata;
+all delivery protocols confine targets to the current run workspace. Mixed
+protocols are rejected. Directory copies reject symlinks and check every item.
+Tool error strings are recorded as failed calls; reads and directory enumeration
+are bounded, and regex search uses a conservative safe subset. With a run_root,
+read/list/search also reject other runs rather than merely omitting them from prompts.
+The scaffold and ISA extension regression can be run without a paid model request:
+
+```bash
+conda run -n mico_env python -m unittest discover -s agents/tests -t .
+conda run -n mico_env sbt 'Test / runMain vexiiriscv.soc.mico.AgentCfuSuboperationSim'
+```
+
+Current limits: the static software call check is not a full C preprocessor or
+execution trace; candidate snapshots retain editable source inputs rather than a
+hermetic toolchain/build cache; simultaneous writers to the same run are unsupported.
+Full context-token budgeting, structured ToolResult migration and architecture/state
+ABI migrations remain separate follow-up work.
 
 ### Access and command policy
 
@@ -362,7 +618,7 @@ Note: `benchmarks/embench-iot` and `sw` are git submodules; `sw/embench/` and th
 
 ### WorkloadSpec and CFU ISA spec
 
-`agents/specs/cfu_isa_template.yaml` remains the human-readable CFU ISA contract template. The ISA LLM stage returns one JSON object and requests API-level JSON mode; the agent then writes the normalized contract as `08_isa/cfu_isa.yaml` and `08_isa/cfu_isa.md`. `agents/cfu_design_agent/isa.py` validates both the JSON protocol and legacy YAML/fenced responses, enforcing a single opcode/function-id space, consistent datapath (`vlen`/`xlen`/`maclen`/`accWidth`), state/reset semantics, memory/ordering rules, software intrinsics, scalar fallback, integration (component/fiber, SoC params and CLI flags), and validation requirements. The `isa` rung is the first ladder check: an invalid contract is repaired (or stops the run) before any hardware is designed.
+`agents/specs/cfu_isa_template.yaml` remains the human-readable CFU ISA contract template. The ISA LLM stage returns one JSON object and requests API-level JSON mode; the agent then writes the normalized contract as `08_isa/cfu_isa.yaml` and `08_isa/cfu_isa.md`. `agents/cfu_design_agent/isa.py` validates both the JSON protocol and legacy YAML/fenced responses, checking the supported opcode and unique `(function_id, subfunction_id)` encodings, command names, basic metadata shapes, software intrinsics/scalar fallback, integration presence, and validation requirements. Generic scaffold dimensions (`vlen`, `xlen`, `regDepth`) are optional; workload-specific choices belong in `datapath.implementation` (for example, a CRC polynomial or permutation width with its rationale, rather than universal MAC-width fields). The generic schema does not assume a MAC, accumulator, RF storage type or pipeline. Legacy flat metadata remains readable, but it is not injected into new contracts. Structural lint is not proof of state/reset or memory-ordering correctness; implementation, simulation and explicit compatibility checks provide those additional gates. The `isa` rung is the first ladder check: an invalid contract is repaired (or stops the run) before any hardware is designed.
 
 `agents/specs/u8_weighted_average.spec` is an example normalized `WorkloadSpec` input model (the tracked reference copy may be absent in a pruned checkout). It has a versioned schema; unknown high-impact fields must be declared in `unknowns` instead of being silently guessed.
 

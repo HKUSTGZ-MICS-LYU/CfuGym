@@ -29,7 +29,7 @@ Use the VexiiRiscv CFU design loop: analyze workload, extract operation, define 
 {ROOFLINE_GUIDANCE}
 Your hardware design surface is the AgentCfu scaffold only: AgentCfu.scala and AgentCfuFiber.scala in the run's isolated design workspace. Do not edit MiCoSoc.scala, MiCoSocParam.scala, CfuPlugin, or any other repository source; the SoC integration is fixed and the run overlay supplies your design.
 Keep the AgentCfu contract stable (AgentCfuParameter, class AgentCfu, the AgentCfuFiber helpers, AgentCfuFunction ids) and build on CfuBus and CfuLsu.
-The accelerated (CFU) build must actually execute CFU instructions for the hot operation. Calling cfu_enable() and then running the scalar loop, or calling an intrinsic and discarding its result, is not acceleration and is rejected.
+The accelerated (CFU) build must actually execute CFU instructions for the hot operation. Calling cfu_enable() and then running the scalar loop, or calling an intrinsic and discarding both its CPU result and its declared vector/memory effects, is not acceleration and is rejected.
 Only files your visibility tier exposes are readable; a denied reference returns a policy error. Never assume or fabricate the contents of a document you were not shown.
 Return concise, implementable text. Do not invent performance results."""
 
@@ -489,10 +489,37 @@ hardware or software implementation. The YAML must contain these top-level keys:
 Copy the Roofline conclusion into `roofline`, including the selected boundary, intensity,
 ceiling provenance, bottleneck, and the architecture rationale used by the contract.
 Include ISA function IDs, operand/result semantics, and the datapath parameters when they
-are used. Treat `xlen`, `vlen`, `maclen`, and `regDepth` as independent optional knobs:
+are used. Each command may declare function_id (funct3, 0..7), subfunction_id
+(funct7, 0..127; default 0), and kind (compute/control/load/store). Multiple commands
+may share function_id only when subfunction_id differs. Keep names and generated C
+symbols unique; cfu_enable, cfu_memory_fence and counter helpers are reserved.
+Use multiple compute/control operations when they reduce measured end-to-end overhead;
+the hardware receives funct7 through raw_insn and must decode the complete pair.
+Every NEW command must declare a `resources` list matching hardware CfuResource:
+CPU reads: {{storage: cpu, access: read, role: rs1|rs2}}; CPU write:
+{{storage: cpu, access: write, role: rd}}; vector reads: {{storage: vector,
+access: read, role: vs1|vs2, index: {{source: cpu_value, register: rs1|rs2}}}};
+vector write: same vector/index structure with access: write, role: vd.
+Index may instead be {{source: constant, value: N}}. `cpu_value` means the CPU
+register CONTENT is a vector slot index; it is never the raw register NUMBER.
+Compatibility-only index {{source: legacy_register_number, register: rs1|rs2}}
+uses the instruction's register number and legacy truncation; do not choose it
+for new designs. At most one data write is supported (CPU rd OR vector vd).
+An explicit empty resources list means acknowledgement only; omitted resources
+means legacy ABI and must not be silently added to existing frozen commands.
+Vector indices consume the selected CPU input without requiring another CPU-read
+resource. Declare in-place VD explicitly, or use a constant index; do not invent
+an independent third CPU input, packed index convention or config-index resource.
+All operations require a completion response. No CPU write means software rd=x0
+and a void intrinsic, not a missing CFU response. Keep prose semantics consistent
+with these resources and use the generated intrinsic signature.
+Treat generic scaffold dimensions `xlen`, `vlen`, and `regDepth` as independent optional knobs:
 `0`, `null`, or `unused` means that dimension is not used (including `regDepth: 0` for
-no CFU-owned vector register). Do not require divisibility, positivity, or a MAC slice
-when the contract does not use it; state any implementation-specific constraints in
+no CFU-owned vector register). Do not assume a multiply-accumulate operation,
+accumulator, register-file implementation or pipeline. Put only justified algorithm-
+specific parameters under `datapath.implementation` with names, units and rationale
+appropriate to this workload. Omit unused parameters rather than filling in zeros
+for unrelated algorithms. State implementation-specific constraints in
 `assumptions`/`unknowns`. Explain how the hot function will call the intrinsics. The SoC
 integration is fixed; do not invent new SoC parameters."""
 
@@ -590,6 +617,52 @@ Repo context:
 {embench_instructions(spec)}{tools_block}
 This is the HARDWARE rung only. Design the SpinalHDL CFU datapath; the
 accelerated software is written in a later step and must not appear here.
+The scaffold is split. AgentCfu.scala is YOUR design file; it holds only
+AgentCfuParameter, AgentCfuFunction and the
+`override protected def instructionTable: Seq[Instruction]` design. The bus shell,
+vector RF, response buffer, CfuLsu/FSM, the CfuResource vocabulary and the
+dispatcher live in the read-only platform
+`src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala` (`AgentCfuBase`). Never edit,
+rename or re-declare that platform file; read it with your tools only when you need
+an exact signature. A whole-file rewrite of AgentCfu.scala cannot delete the
+platform, so keep this file limited to the design itself.
+Declare each instruction once in `instructionTable`: name, function/subop pair,
+optional `enabled`, combinational `ready`, `start`, optional multicycle `tick`, and
+its `resources`. Decode, unsupported commands, acceptance, response backpressure and
+writeback routing are derived from the table; do not add separate supported/decode/
+FSM branches. Register only instructions in the accepted ISA, and remove or disable
+unused entries. Existing ISA encodings must remain compatible in an
+optimization/repair round.
+Platform API (defined in AgentCfuLib.scala):
+- `Instruction(name, function, subop = 0, enabled = true, ready, start, tick = None,
+  resources = None)`.
+- `import AgentCfuBase.CfuResource._` then `CpuRead(RS1)`, `CpuRead(RS2)`,
+  `CpuWriteRD`, `VectorRead(VS1|VS2, index)`, `VectorWrite(VD, index)`; a vector
+  index is `CpuValue(RS1|RS2)` the CPU VALUE, `Constant(n)`, or the
+  compatibility-only `LegacyRegisterNumber(RS1|RS2)` register NUMBER.
+- Context: `ctx.read(role)`, `ctx.index(vectorRole)`, `ctx.complete(result, status)`,
+  `ctx.complete()` for acknowledgement, `ctx.fail()`, `ctx.defer()`, and the latched
+  `rawInstruction`/`stateIndex`/`cfuIndex`/`requestId`.
+New instructions must declare resources: CPU RS1/RS2 are register VALUES; VS1/VS2 are
+vector reads with explicit index sources; RD is CPU response writeback and VD is
+vector writeback. At most one data write (CPU RD or vector VD) is allowed, and a
+vector index consumes the selected CPU input without an extra CpuRead. Use
+`ctx.read`/`ctx.complete` so the platform resolves reads, full-width checks indices
+and routes the single write; do not bypass this with `ctx.input`/`ctx.reply` or the
+raw vectorRead/vectorWrite helpers in a resource-aware instruction. Use `ctx.defer`
+plus `tick` for multicycle work; request operands, vector sources and the destination
+index are captured on acceptance, including vector source snapshots. CPU-value
+indices are never silently truncated. `LegacyRegisterNumber` is a compatibility
+exception for the historical load/store encodings, not a new default. A vector write
+still needs a completion response but has no CPU result. Do not drive the standard bus
+handshake from individual handlers. Allocate design state inside `instructionTable`
+(or use lazy vals); do not read an uninitialized subclass `val`.
+SpinalHDL width pitfall: `>>` and `<<` on `UInt`/`Bits` CHANGE the result width
+(`UInt.>>` is `ShiftRightByInt`), so a shift inside a fixed-width expression
+silently becomes narrower and fails with `WIDTH MISMATCH (32 bits <- 31 bits)`.
+Use `|>>`/`|<<`, or `resize` the shifted value, whenever the width must stay fixed.
+Keep CfuBus,
+AgentCfuFiber and the CPU decoder interface unchanged.
 {ROOFLINE_DECISION_RULE}
 Use the Roofline result to justify direct versus TileLink, vector width, RF
 residency, lane count, pipeline initiation interval, and command granularity.
@@ -638,7 +711,7 @@ Optimization rounds so far (newest last):
 
 Optimization budget left: {budget_left} round(s).
 
-CFU ISA contract (frozen for this run — do not add, remove or rename commands):
+Workload specification (existing command encodings/semantics must remain compatible):
 {spec_digest(spec)}
 
 ISA spec:
@@ -659,6 +732,14 @@ Decide whether another round is worth spending budget on, and where.
 - `implement_sw` improves the accelerated kernel (packing, blocking, loop
   structure, intrinsic granularity, residual scalar work, fences). The hardware
   is untouched and the design is recompiled and re-simulated.
+- `extend_isa` appends new compute/control instructions, including different
+  subfunction_id values under the same function_id. Keep every old encoding,
+  operand/result semantic, shared state/memory/datapath/assumptions contract and
+  integration/software ABI unchanged (intrinsic_names may be appended).
+  It re-enters ISA validation, hardware build and software adaptation before any
+  measurement. Name the new operation and how software will use it; adding an
+  unused instruction is not an optimization. Do not assume the ISA is frozen
+  when considering this target.
 Prefer `{focus}` unless the evidence clearly points at the other side.
 
 Answer `continue: true` only when you can name a concrete change that should beat
@@ -667,12 +748,15 @@ minimum speedup floor enforced by the simulation gate, and a successful
 synthesis). Do not repeat a change that
 already ran and did not improve; a round that makes the result worse is a real
 regression in the delivered design, not a free experiment.
-Answer `continue: false` when the design is already at a reasonable point for
-this budget, or when you have no concrete improvement left.
+A reasonable speedup alone is not a reason to stop exploring. Consider instruction
+batching, retained intermediates within the existing state contract, control/result
+operations, packing/transfer overhead and area reduction before proposing a stop.
+Answer `continue: false` only when you have no distinct, concrete candidate left;
+the framework owns the budget and may ask you to reconsider this recommendation.
 
 Return exactly one JSON object and nothing else:
 {{"continue": true or false,
-  "target": "implement_hw" or "implement_sw",
+  "target": "implement_hw" or "implement_sw" or "extend_isa",
   "focus": "performance" or "cost",
   "reason": "<the concrete change you would make, or why you stop>"}}"""
 
@@ -771,12 +855,20 @@ Repo context:
 {embench_instructions(spec)}
 This is the SOFTWARE rung only. The hardware design is already fixed and
 already passed SoC generation; do not propose hardware changes here.
+Follow each command's CfuResource/resources declarations and the exact generated
+intrinsic signature. CPU rs1/rs2 arguments are values, or vector slot indices when
+selected by a cpu_value index resource; never pass a physical register number in
+place of a slot value. CPU rd writes return uint32_t; vector writes and ack-only
+commands return void and encode rd=x0. Vector-only operations must feed a later
+vector read/store or another useful operation; their lack of a C return value is
+not grounds for fabricating one. Omitted resources denote the legacy two-argument
+ABI; do not silently change legacy encodings or the frozen command contract.
 {ROOFLINE_DECISION_RULE}
 The CFU build (#ifdef USE_AGENT_CFU) must call the generated CFU intrinsic(s)
 for the hot operation and derive its result from them. A branch that only calls
 cfu_enable() and then computes with the scalar loop, or that calls an intrinsic
-and ignores its result, is rejected: it exercises no CFU datapath and produces
-no acceleration. Keep the scalar loop only in the #else (reference) branch.
+and ignores both its CPU result and any declared vector/memory effects, is
+rejected: it contributes no CFU datapath result to the workload. Keep the scalar loop only in the #else (reference) branch.
 Use the Roofline result to guide packing, blocking, data reuse, load/store
 traffic, fences, intrinsic granularity, and residual scalar work. Preserve the
 scalar fallback and report how the kernel should change achieved operations/cycle

@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: MIT
 //
-// AgentCfu - the checked-in, algorithm-neutral CFU shell used by design agents.
+// AgentCfu - the checked-in, algorithm-neutral CFU design used by design agents.
 //
 // This file and AgentCfuFiber.scala are the ONLY hardware surface a design agent
 // may change. Agent runs never edit this repository copy: each run seeds an
 // isolated workspace copy under
 //   agents/generated/runs/<run_id>/workspace/design/
 // and the SoC build overlays that copy (see agents/README.md and
-// project/AgentCfuSourceFilter.scala). Keep the public contract stable:
+// project/AgentCfuSourceFilter.scala).
+//
+// The bus shell, the CfuResource/Instruction vocabulary, the vector RF, the
+// response buffer, CfuLsu/FSM and the instruction dispatcher live in the
+// read-only AgentCfuLib.scala. A whole-file rewrite of this file therefore cannot
+// delete them, and this file stays limited to the design itself. Keep the public
+// contract stable:
 //   * AgentCfuParameter
 //   * class AgentCfu(cfuParam, busParam, p)
 //   * AgentCfuFiber.getCfuBusParameters / getM2sParameters / dummyBusParameter
@@ -16,13 +22,9 @@
 package vexiiriscv.soc.mico
 
 import spinal.core._
-import spinal.lib._
-import spinal.lib.bus.tilelink
 import spinal.lib.bus.tilelink._
-import spinal.lib.fsm._
 
 import vexiiriscv.execute.cfu._
-import vexiiriscv.soc.cfu.{CfuLsu, CfuLsuParameter}
 
 /** Parameters for the algorithm-neutral CFU surface used by design agents. */
 case class AgentCfuParameter(
@@ -58,183 +60,71 @@ object AgentCfuFunction {
 }
 
 /**
- * Minimal stateful CFU shell.
- *
- * The RF and memory protocol are functional, while compute/config are deliberate
- * no-op extension points. New agents can replace those extension points without
- * changing the CPU or SoC integration contract.
- */
+  * The agent-owned CFU design.
+  *
+  * Everything shared lives in [[AgentCfuBase]]; this class only declares which
+  * instructions exist and what each one does. Add or remove one `Instruction` entry
+  * (and its local handler) to grow or shrink the ISA: decode, unsupported commands,
+  * acceptance, response backpressure and writeback routing are all derived from the
+  * table, so no separate supported/decode/FSM branch needs editing.
+  *
+  * Operand and writeback resources are explicit `CfuResource` declarations, never
+  * implicit handler behavior:
+  *   CpuRead(RS1)                            - the CPU X[rs1] value, not its number
+  *   CpuRead(RS2) / CpuWriteRD               - the CPU X[rs2] value / CPU rd result
+  *   VectorRead(VS1, CpuValue(RS1))          - CFU V[X[rs1]], vector width
+  *   VectorRead(VS2, Constant(1))            - CFU V[1]
+  *   VectorWrite(VD, CpuValue(RS1))          - write the result to CFU V[X[rs1]]
+  *   LegacyRegisterNumber(RS2)               - instruction[24:20] with legacy
+  *                                             index-width truncation, not X[rs2]
+  * A vector index implicitly consumes the selected CPU input; it needs no separate
+  * CpuRead. `LegacyRegisterNumber` exists only to keep the historical load/store
+  * encodings, so new instructions should use `CpuValue`/`Constant`. At most one
+  * data write (CPU RD or vector VD) is allowed. `resources = None` is the legacy
+  * two-argument interface; `Some(Seq.empty)` acknowledges with no data write.
+  *
+  * Handlers read through `ctx.read(role)` and finish with `ctx.complete(result)`,
+  * `ctx.complete()` for an acknowledgement, or `ctx.fail()` for an error. Use
+  * `ctx.defer()` plus a `tick` handler for a multicycle operation; the context
+  * captures request inputs, vector sources and the destination index on acceptance,
+  * so a deferred handler never observes a later bus or register-file change. This
+  * class may not use the legacy `ctx.input`/`ctx.reply` for a resource-aware entry.
+  *
+  * The table runs while the platform is still being constructed, so use only
+  * this class's constructor parameters (`p`, `cfuParam`), the platform members, and
+  * state allocated inside the table itself. Do not read a `val` declared in the
+  * class body: Scala assigns those after the platform has already called the table.
+  */
 class AgentCfu(
     cfuParam: CfuBusParameter,
     busParam: BusParameter,
     p: AgentCfuParameter
-) extends Component {
-  require(!p.withTilelink || busParam.dataWidth == p.xlen,
-    "AgentCfu TileLink width must match AgentCfu xlen")
+) extends AgentCfuBase(cfuParam, busParam, p) {
+  import AgentCfuBase.CfuResource._
 
-  val io = new Bundle {
-    val bus = slave(CfuBus(cfuParam))
-    val dBus = p.withTilelink generate master(tilelink.Bus(busParam))
-  }
-
-  private val regIndexWidth = p.regIndexWidth
-  private val beatIndexWidth = p.beatIndexWidth
-  private val beatShift = log2Up(p.xlen)
-
-  // Register-backed first implementation: simple to inspect and deterministic to
-  // elaborate. Agents may replace this storage with banked or synchronous RAM.
-  val vectorRegs = Vec(Reg(Bits(p.vlen bits)) init (0), p.regDepth)
-
-  def vectorRead(addr: UInt): Bits = vectorRegs(addr)
-
-  def vectorReadBeat(addr: UInt, index: UInt): Bits = {
-    val offset = (index.resize(log2Up(p.vlen)) << beatShift).resize(log2Up(p.vlen))
-    vectorRegs(addr)(offset, p.xlen bits)
-  }
-
-  def vectorWrite(addr: UInt, data: Bits): Unit = {
-    vectorRegs(addr) := data
-  }
-
-  def vectorWriteBeat(addr: UInt, index: UInt, data: Bits): Unit = {
-    val offset = (index.resize(log2Up(p.vlen)) << beatShift).resize(log2Up(p.vlen))
-    vectorRegs(addr)(offset, p.xlen bits) := data
-  }
-
-  val func3 = io.bus.cmd.function_id
-  val isCompute = func3 === U(AgentCfuFunction.compute, cfuParam.CFU_FUNCTION_ID_W bits)
-  val isConfig = func3 === U(AgentCfuFunction.config, cfuParam.CFU_FUNCTION_ID_W bits)
-  val isLoad = if (p.withLoad) {
-    func3 === U(AgentCfuFunction.load, cfuParam.CFU_FUNCTION_ID_W bits)
-  } else {
-    False
-  }
-  val isStore = if (p.withStore) {
-    func3 === U(AgentCfuFunction.store, cfuParam.CFU_FUNCTION_ID_W bits)
-  } else {
-    False
-  }
-  val isSupported = isCompute || isConfig || isLoad || isStore
-
-  val decode = new Area {
-    val rs1 = io.bus.cmd.raw_insn(19 downto 15).asUInt.resize(regIndexWidth)
-    val rs2 = io.bus.cmd.raw_insn(24 downto 20).asUInt.resize(regIndexWidth)
-  }
-
-  val responsePending = RegInit(False)
-  val responseId = Reg(UInt(cfuParam.CFU_REQ_RESP_ID_W bits)) init (0)
-  val responseData = Reg(Bits(cfuParam.CFU_OUTPUT_DATA_W bits)) init (0)
-  val responseStatus = cfuParam.CFU_WITH_STATUS generate Reg(Bits(3 bits)) init (0)
-
-  io.bus.rsp.valid := responsePending
-  io.bus.rsp.response_id := responseId
-  io.bus.rsp.outputs(0) := responseData
-  if (cfuParam.CFU_WITH_STATUS) io.bus.rsp.status := responseStatus
-
-  when (io.bus.rsp.fire) {
-    responsePending := False
-  }
-
-  def enqueueResponse(id: UInt, data: Bits, status: Bits): Unit = {
-    responseId := id
-    responseData := data.resize(cfuParam.CFU_OUTPUT_DATA_W)
-    if (cfuParam.CFU_WITH_STATUS) responseStatus := status
-    responsePending := True
-  }
-
-  val loadDestination = Reg(UInt(regIndexWidth bits)) init (0)
-  val storeSource = Reg(UInt(regIndexWidth bits)) init (0)
-  val commandRequestId = Reg(UInt(cfuParam.CFU_REQ_RESP_ID_W bits)) init (0)
-
-  val lsu = if (p.withTilelink) {
-    new CfuLsu(
-      io.dBus,
-      CfuLsuParameter(
-        dataWidth = p.xlen,
-        vectorBytes = p.vectorBytes,
-        addressWidth = p.addressWidth,
-        withLoad = p.withLoad,
-        withStore = p.withStore
-      )
-    )
-  } else {
-    null
-  }
-
-  if (p.withTilelink) {
-    lsu.cmd.load := False
-    lsu.cmd.store := False
-    lsu.cmd.address := io.bus.cmd.inputs(0).asUInt.resize(p.addressWidth)
-    lsu.store.data := vectorReadBeat(storeSource, lsu.store.index)
-
-    when (lsu.load.valid) {
-      vectorWriteBeat(loadDestination, lsu.load.index, lsu.load.data)
-    }
-  }
-
-  val fsm = new StateMachine {
-    val IDLE = new State with EntryPoint
-    val LOAD = new State
-    val STORE = new State
-
-    IDLE.whenIsActive {
-      when (io.bus.cmd.fire) {
-        commandRequestId := io.bus.cmd.request_id
-        if (p.withTilelink) {
-          when (isLoad) {
-            loadDestination := decode.rs2
-            lsu.cmd.load := True
-            goto(LOAD)
-          } elsewhen (isStore) {
-            storeSource := decode.rs2
-            lsu.cmd.store := True
-            goto(STORE)
-          } otherwise {
-            // Compute/config are intentionally inert. Unsupported function IDs
-            // receive the generic CFU error status instead of hanging the CPU.
-            val status = isSupported.mux(B"000", B"001")
-            enqueueResponse(io.bus.cmd.request_id, B(0, cfuParam.CFU_OUTPUT_DATA_W bits), status)
-          }
-        } else {
-          // Direct mode keeps the same response contract but has no memory
-          // commands. Compute/config remain algorithm-neutral no-ops.
-          val status = isSupported.mux(B"000", B"001")
-          enqueueResponse(io.bus.cmd.request_id, B(0, cfuParam.CFU_OUTPUT_DATA_W bits), status)
-        }
-      }
-    }
-
-    if (p.withTilelink && p.withLoad) {
-      LOAD.whenIsActive {
-        when (lsu.done) {
-          enqueueResponse(
-            commandRequestId,
-            B(0, cfuParam.CFU_OUTPUT_DATA_W bits),
-            lsu.error.mux(B"001", B"000")
-          )
-          goto(IDLE)
-        }
-      }
-    }
-
-    if (p.withTilelink && p.withStore) {
-      STORE.whenIsActive {
-        when (lsu.done) {
-          enqueueResponse(
-            commandRequestId,
-            B(0, cfuParam.CFU_OUTPUT_DATA_W bits),
-            lsu.error.mux(B"001", B"000")
-          )
-          goto(IDLE)
-        }
-      }
-    }
-  }
-
-  val memoryReady = if (p.withTilelink) {
-    !isLoad && !isStore || lsu.cmd.ready
-  } else {
-    True
-  }
-  io.bus.cmd.ready := fsm.isActive(fsm.IDLE) && !responsePending && memoryReady
+  /** The design surface: one entry per ISA operation. */
+  override protected def instructionTable: Seq[Instruction] = Seq(
+    Instruction("compute", AgentCfuFunction.compute,
+      start = ctx => ctx.reply(B(0, cfuParam.CFU_OUTPUT_DATA_W bits))),
+    Instruction("config", AgentCfuFunction.config,
+      start = ctx => ctx.reply(B(0, cfuParam.CFU_OUTPUT_DATA_W bits))),
+    Instruction("load", AgentCfuFunction.load, enabled = p.withTilelink && p.withLoad,
+      ready = () => lsu.cmd.ready,
+      resources = Some(Seq(CpuRead(RS1), VectorWrite(VD, LegacyRegisterNumber(RS2)))),
+      start = ctx => {
+        lsu.cmd.address := ctx.read(RS1).asUInt.resize(p.addressWidth)
+        loadDestination := ctx.index(VD)
+        lsu.cmd.load := True
+        fsm.goto(fsm.LOAD)
+      }),
+    Instruction("store", AgentCfuFunction.store, enabled = p.withTilelink && p.withStore,
+      ready = () => lsu.cmd.ready,
+      resources = Some(Seq(CpuRead(RS1), VectorRead(VS1, LegacyRegisterNumber(RS2)))),
+      start = ctx => {
+        lsu.cmd.address := ctx.read(RS1).asUInt.resize(p.addressWidth)
+        storeSource := ctx.index(VS1)
+        lsu.cmd.store := True
+        fsm.goto(fsm.STORE)
+      })
+  )
 }

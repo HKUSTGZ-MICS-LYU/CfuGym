@@ -44,10 +44,13 @@ from .embench import (
 from .embench_instrument import instrument_sources
 from .isa import (
     IsaLintError,
+    command_kind,
+    command_symbol,
     intrinsic_symbols,
     render_cfu_intrinsics,
     render_isa_markdown,
     validate_isa_text,
+    validate_isa_extension,
 )
 from .llm import (
     DEFAULT_MAX_TOOL_CALLS,
@@ -141,6 +144,7 @@ _NODE_TO_GATE: dict[str, str] = {
     "profile_embench": "profile",
     "extract_hotspot": "hotspot",
     "design_contract": "isa",
+    "extend_isa": "isa",
     "implement_hw": "implementation_hw",
     "generate_soc": "hw_build",
     "implement_sw": "implementation_sw",
@@ -239,6 +243,7 @@ def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: igno
     graph.add_node("extract_hotspot", _wrap_node(extract_hotspot))
     graph.add_node("analyze_workload", _wrap_node(analyze_workload))
     graph.add_node("design_contract", _wrap_node(design_contract))
+    graph.add_node("extend_isa", _wrap_node(extend_isa))
     graph.add_node("implement_hw", _wrap_node(implement_hw))
     graph.add_node("generate_soc", _wrap_node(generate_soc))
     graph.add_node("implement_sw", _wrap_node(implement_sw))
@@ -282,6 +287,10 @@ def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: igno
         _route_after_isa,
         _identity_map("design_contract", "implement_hw", "review_and_route"),
     )
+    graph.add_conditional_edges(
+        "extend_isa", _route_after_isa,
+        _identity_map("extend_isa", "implement_hw", "review_and_route"),
+    )
     graph.add_edge("implement_hw", "generate_soc")
     graph.add_conditional_edges(
         "generate_soc",
@@ -307,7 +316,7 @@ def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: igno
     graph.add_conditional_edges(
         "review_and_route",
         _route_after_review,
-        _identity_map("final_report", "implement_hw", "implement_sw"),
+        _identity_map("final_report", "implement_hw", "implement_sw", "extend_isa"),
     )
     graph.add_edge("final_report", END)
     return graph.compile(checkpointer=checkpointer, debug=debug, name="cfu_design_agent")
@@ -419,7 +428,7 @@ def run_agent_python(initial_state: CfuDesignState) -> CfuDesignState:
     guard = 0
     while node is not None:
         guard += 1
-        if guard > 200:  # pragma: no cover - defensive: routers must terminate
+        if guard > recursion_limit(int(state.get("max_iters", 2))):  # both runners share the bound
             raise RuntimeError(f"python runner did not terminate at node {node!r}")
         fn = nodes[node]
         _merge_state_update(state, _wrapped(fn)(state))
@@ -445,6 +454,7 @@ def python_nodes() -> dict[str, Any]:
         "extract_hotspot": extract_hotspot,
         "analyze_workload": analyze_workload,
         "design_contract": design_contract,
+        "extend_isa": extend_isa,
         "implement_hw": implement_hw,
         "generate_soc": generate_soc,
         "implement_sw": implement_sw,
@@ -593,6 +603,7 @@ def _record_llm_output(
         "ingest_input": ("ingest_input", "02_workload"),
         "analyze_workload": ("analysis", "07_analysis"),
         "design_contract": ("isa", "08_isa"),
+        "extend_isa": ("isa", "08_isa"),
         "implement_hw": ("implementation", "09_implementation"),
         "implement_sw": ("implementation", "09_implementation"),
         "route_repair": ("validation", "10_validation"),
@@ -1193,6 +1204,136 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
     }
 
 
+# sbt/SpinalHDL print the diagnostic BEFORE a long stack trace. Keeping only the
+# tail of the output then retains dozens of "at ..." frames while dropping the one
+# line that explains the failure, which makes a hardware repair loop blind.
+#
+# Observed shapes (from real run logs and the SpinalHDL sources):
+#   elaboration error          [error] Exception in thread "main" spinal.core.SpinalExit:
+#                              [error]  Error detected in phase PhaseNormalizeNodeInputs
+#                              [error] ********************  (banner, dropped)
+#                              [error] WIDTH MISMATCH (32 bits <- 31 bits) on ...
+#                              [error] - Left  operand : (UInt -> Bits of 31 bits)
+#                              [error] - Right operand : (toplevel/... : Bits[32 bits])
+#                              [error]   at
+#                              [error]     at <design>.scala:155   <- first source location
+#                              ... ~100 more frames             <- dropped
+#                              [error] Design's errors are listed above.
+#   pending error              [error] Vec address width mismatch.
+#                              [error] - Vec : vectorRegs : Vec of 1 elements
+#                              [error] - Address width : 1
+#   Scala compile error        [error] /path/File.scala:14:46: not found: type X
+#                              [error]   <source echo>             <- context, window only
+#                              [error] one error found
+#   simulation assertion       [info] [Error] Simulation failed at time=421
+#                              [error] Exception in thread "main" java.lang.AssertionError: ...
+#   yosys                      [error] ERROR: ...
+# The sbt level prefix is not reliable ([info] [Error] ... is a real simulation
+# failure), and SpinalHDL error text is often lower case ("... mismatch."), so the
+# classifier keys on the message body, not only on the level tag.
+_SBT_LEVEL_RE = re.compile(r"^\[(?:error|warn|info|success)\]\s?")
+_ERROR_LEVEL_RE = re.compile(r"^\[(?:error|warn)\]")
+_INNER_ERROR_RE = re.compile(r"\[(?:Error|Warning)\]|\bERROR:")
+_STACK_FRAME_RE = re.compile(r"^\s*at\s")
+_SPINAL_BANNER_RE = re.compile(r"^\*{8,}$")
+_SOURCE_LOCATION_RE = re.compile(r"\S+\.(?:scala|java):\d+(?::\d+)?")
+_SPINAL_TOKEN_RE = re.compile(
+    r"WIDTH MISMATCH|ASSIGNMENT OVERLAP|OVERLAP|UNASSIGNED|NO DRIVER|"
+    r"LATCH DETECTED|COMBINATIONAL LOOP|HIERARCHY VIOLATION|NAME CONFLICT|"
+    r"Error detected in phase|Elaboration failed|Design's errors are listed above|"
+    r"SpinalExit|SpinalError|PendingError"
+)
+_SPINAL_DETAIL_RE = re.compile(r"^-\s+\S.*")
+_GENERIC_DIAGNOSTIC_RE = re.compile(
+    r"mismatch|not found|does not|cannot|undefined|overlap|no such|missing|"
+    r"rejected|invalid|failed|failure|assertion|Exception in thread|Caused by:",
+    re.IGNORECASE,
+)
+_SBT_SUMMARY_RE = re.compile(r"errors? found|Compilation failed|Nonzero exit code")
+_YOSYS_ERROR_RE = re.compile(r"\bERROR:")
+_DIAGNOSTIC_LINE_MAX = 400
+_DIAGNOSTIC_CHARS_MAX = 1400
+# Files a design agent cannot edit. When a failure points at one of these, the only
+# actionable move is to change the design (or report a platform defect), so say so.
+_READ_ONLY_PLATFORM_FILES = ("AgentCfuLib.scala",)
+_READ_ONLY_NOTE = (
+    "read-only platform note: this failure references {name}, which is a read-only "
+    "platform file and cannot be edited. Fix the instruction table or datapath in "
+    "AgentCfu.scala (or AgentCfuFiber.scala); if the platform itself is wrong, "
+    "report the defect instead of editing it."
+)
+
+
+def _read_only_note(text: str) -> str:
+    for name in _READ_ONLY_PLATFORM_FILES:
+        if name in text:
+            return _READ_ONLY_NOTE.format(name=name)
+    return ""
+
+
+def output_excerpt(text: str, limit: int = 2500) -> str:
+    """Excerpt a failed command's output for the repair prompt.
+
+    Prioritises the diagnostic lines over the stack trace, so a long failure keeps
+    its cause even when the tail window cannot hold it, and always reports the first
+    source location (the frame that names the offending file and line). A failure
+    located in the read-only platform is labelled as such.
+    """
+    text = str(text or "")
+    note = _read_only_note(text)
+    if len(text) <= limit:
+        return f"{text}\n\n{note}" if note else text
+    diagnostics: list[str] = []
+    frames: list[str] = []
+    for raw in text.splitlines():
+        if not (_ERROR_LEVEL_RE.match(raw) or _INNER_ERROR_RE.search(raw)):
+            continue
+        body = _SBT_LEVEL_RE.sub("", raw).strip()
+        if not body or _SPINAL_BANNER_RE.match(body):
+            continue
+        if _STACK_FRAME_RE.match(body):
+            if _SOURCE_LOCATION_RE.search(body):
+                frames.append(body)
+            continue
+        if not (
+            _SPINAL_TOKEN_RE.search(body)
+            or _SPINAL_DETAIL_RE.match(body)
+            or _GENERIC_DIAGNOSTIC_RE.search(body)
+            or _SOURCE_LOCATION_RE.search(body)
+            or _SBT_SUMMARY_RE.search(body)
+            or _YOSYS_ERROR_RE.search(body)
+        ):
+            continue
+        line = body[:_DIAGNOSTIC_LINE_MAX]
+        if line not in diagnostics:
+            diagnostics.append(line)
+
+    def frame_rank(frame: str) -> int:
+        """Prefer the frame in project code over framework and stdlib frames."""
+        owner = frame[3:].strip() if frame.startswith("at ") else frame
+        if re.match(r"^(?:scala|java|javax|sun|sbt|xsbt)\.", owner):
+            return 3
+        if owner.startswith(("spinal.core.", "spinal.lib.")):
+            return 2
+        return 1
+
+    location = min(frames, key=frame_rank) if frames else ""
+    head_length = limit // 2
+    window = f"{text[:head_length]}\n...[truncated]...\n{text[-(limit - head_length):]}"
+    parts: list[str] = []
+    if diagnostics:
+        block = "\n".join(diagnostics)
+        if len(block) > _DIAGNOSTIC_CHARS_MAX:
+            block = block[:_DIAGNOSTIC_CHARS_MAX] + "\n...[more diagnostics truncated]"
+        parts.append("key diagnostics:\n" + block)
+    if location:
+        parts.append(f"first source location: {location}")
+    if note:
+        parts.append(note)
+    parts.append(window)
+    return "\n\n".join(parts)
+
+
 def check_feedback(state: CfuDesignState, rung: str, *, limit: int = 2) -> str:
     """Tail of the failing commands of one validation rung.
 
@@ -1204,11 +1345,14 @@ def check_feedback(state: CfuDesignState, rung: str, *, limit: int = 2) -> str:
     for result in (state.get("validation_results") or []):
         if result.get("rung") != rung:
             continue
-        if result.get("returncode") in (0, None):
+        if result.get("returncode") == 0 and not result.get("skipped"):
+            chunks.clear()  # A successful recheck resolves earlier build failures.
+            continue
+        if result.get("returncode") is None:
             continue
         command = str(result.get("command", ""))[:200]
-        stdout = str(result.get("stdout_tail", ""))[-2500:]
-        stderr = str(result.get("stderr_tail", ""))[-1500:]
+        stdout = output_excerpt(result.get("stdout_tail", ""), 2500)
+        stderr = output_excerpt(result.get("stderr_tail", ""), 1500)
         chunks.append(f"$ {command}\n{stdout}\n{stderr}".strip())
     return "\n\n".join(chunks[-limit:])
 
@@ -1222,11 +1366,14 @@ def cost_feedback(state: CfuDesignState, *, limit: int = 2) -> str:
     """
     chunks: list[str] = []
     for result in (state.get("cost_results") or []):
-        if result.get("returncode") in (0, None):
+        if result.get("returncode") == 0 and not result.get("skipped"):
+            chunks.clear()
+            continue
+        if result.get("returncode") is None:
             continue
         command = str(result.get("command", ""))[:200]
-        stdout = str(result.get("stdout_tail", ""))[-2500:]
-        stderr = str(result.get("stderr_tail", ""))[-1500:]
+        stdout = output_excerpt(result.get("stdout_tail", ""), 2500)
+        stderr = output_excerpt(result.get("stderr_tail", ""), 1500)
         chunks.append(f"$ {command}\n{stdout}\n{stderr}".strip())
     return "\n\n".join(chunks[-limit:])
 
@@ -1472,6 +1619,7 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
     )
     update = {
         "isa_spec": isa_spec,
+        "isa_revision": 0,
         "isa_spec_text": _yaml_str(isa_spec),
         "isa_spec_errors": problems,
         "design_contract": result.text,
@@ -1483,6 +1631,66 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
         },
         "iteration_history": append_history(state, "Produced CFU ISA/integration contract."),
     }
+    return _apply_transition(update, extra)
+
+
+def extend_isa(state: CfuDesignState) -> CfuDesignState:
+    """Append commands without replacing the incumbent contract on rejection."""
+    previous = state.get("isa_extension_base") or state.get("isa_spec", {})
+    feedback = isa_repair_feedback(state)
+    prompt = contract_prompt(
+        state["task"], state.get("workload_spec", {}),
+        state.get("workload_analysis", ""), state.get("context", {}),
+        profile=state.get("embench_profiles"), feedback=feedback,
+    ) + (
+        "\n=== APPEND-ONLY ISA EXTENSION ===\n"
+        "Return the COMPLETE candidate contract, preserving every existing command, "
+        "encoding, operand/result semantic and shared state/memory/datapath/integration/assumptions "
+        "and software ABI contract (only intrinsic_names may grow). "
+        "Append at least one useful command with a unique (function_id, subfunction_id). "
+        "subfunction_id is funct7 (0..127), default 0; function_id stays funct3 (0..7). "
+        "Old command names cannot be reassigned. New control operations must obey the "
+        "existing state/reset contract. The next rungs implement hardware AND software "
+        "that calls the new operation, then validate correctness and measure cost/cycles.\n"
+        f"Optimization proposal: {(state.get('optimization_plan') or {}).get('reason', '')}\n"
+        f"Incumbent contract:\n{_yaml_str(previous)}"
+    )
+    result, raw = _complete_llm(
+        state, "extend_isa", "isa_extension", SYSTEM_PROMPT, prompt,
+        _yaml_str(previous), response_format={"type": "json_object"},
+    )
+    try:
+        candidate, problems = validate_isa_text(result.text)
+        if not problems:
+            problems = validate_isa_extension(previous, candidate)
+    except (IsaLintError, TypeError, AttributeError) as exc:
+        candidate, problems = previous, [f"ISA extension rejected: {exc}"]
+    ok = not problems and bool(result.used_llm)
+    if not result.used_llm:
+        problems = [*problems, "ISA extension requires a model-authored candidate"]
+    extra, next_node = _ladder_transition(
+        state, "isa", ok=ok, default="implement_hw", repair_target="extend_isa",
+    )
+    revision = int(state.get("isa_revision", 0)) + (1 if ok else 0)
+    artifacts = _artifacts_for_stage(state, "isa")
+    artifacts.write_yaml("isa", f"08_isa/extensions/attempt_{len(state.get('llm_raw_outputs', [])):03d}.yaml",
+                         {"candidate": candidate, "problems": problems, "accepted": ok,
+                          "base_hash": _isa_digest({"isa_spec": previous}), "revision": revision})
+    update = {
+        "isa_extension_base": previous, "isa_spec_errors": problems,
+        "llm_raw_outputs": [raw],
+        "gates": {**state.get("gates", {}), "isa": {"ok": ok, "problems": problems,
+                    "next": next_node, "revision": revision}},
+        "iteration_history": [f"ISA extension {'accepted' if ok else 'rejected'} (revision {revision})."],
+    }
+    if ok:
+        _write_isa_artifact(state, candidate, [])
+        artifacts = _artifacts_for_stage(state, "isa")
+        artifacts.write_yaml("isa", f"08_isa/revisions/{revision:03d}.yaml", candidate)
+        update.update(isa_spec=candidate, isa_spec_text=_yaml_str(candidate),
+                      design_contract=_yaml_str(candidate), isa_revision=revision,
+                      isa_added_symbols=sorted(set(intrinsic_symbols(candidate)) - set(intrinsic_symbols(previous))),
+                      stage_jobs="implement_hw")
     return _apply_transition(update, extra)
 
 
@@ -1509,13 +1717,18 @@ def _apply_agent_output(
     summary = text
     errors: list[str] = []
     apply_result: dict | None = None
-    applied_files: list[str] = []
     dry_run = bool(state.get("dry_run", False))
     # ``--apply-patch`` is the explicit opt-in for writing LLM-authored content
     # into the run workspace. Without it, every delivery protocol stays a
     # proposal even when external commands are allowed to run.
     apply_patch = bool(state.get("apply_patch", False))
     allow_apply = apply_patch and not dry_run
+    protocol_count = sum(bool(value) for value in (edit_blocks, file_blocks, patch_text))
+    if protocol_count > 1 or unterminated_edit_blocks(text):
+        reason = "mixed delivery protocols" if protocol_count > 1 else "the response opened an EDIT_BEGIN section but the block was not closed (missing EDIT_END)"
+        return {"patch": patch_text, "summary": text + "\n\nRejected: " + reason,
+                "errors": [reason], "applied": False, "files": [], "apply_result": None,
+                "gate_ok": False, "proposed": False}
 
     if edit_blocks and allow_apply:
         try:
@@ -1529,20 +1742,13 @@ def _apply_agent_output(
         except (PolicyError, ValueError) as exc:
             errors.append(f"targeted edits failed: {exc}")
     elif file_blocks and allow_apply:
-        for target, content in file_blocks:
-            try:
-                resolved = toolbox.resolve_target(target)
-                if not toolbox.is_write_allowed(resolved):
-                    raise ValueError(f"path is not writable: {target}")
-                toolbox.write_text(resolved, content)
-                applied_files.append(resolved)
-                summary += f"\n\nWrote {resolved} ({len(content)} bytes)"
-            except (PolicyError, ValueError) as exc:
-                errors.append(f"file block rejected ({target}): {exc}")
-        apply_result = {
-            "returncode": 0 if applied_files and not errors else 1,
-            "parsed": {"touched_paths": applied_files},
-        }
+        try:
+            apply_result = toolbox.apply_file_blocks(file_blocks)
+            summary += "\n\nFile result:\n" + str(apply_result)
+            if apply_result.get("returncode") != 0:
+                errors.append(f"file blocks rejected: {apply_result.get('stderr_tail', '')}")
+        except (PolicyError, ValueError) as exc:
+            errors.append(f"file blocks rejected: {exc}")
     elif patch_text and allow_apply:
         try:
             apply_result = toolbox.apply_patch_text(patch_text)
@@ -1723,6 +1929,7 @@ def _write_tool_calls_artifact(
         {
             "rounds": max((int(call.get("round", 0) or 0) for call in tool_calls), default=0),
             "call_count": len(tool_calls),
+            "transcript": tool_calls,  # Exact observations, not only the display excerpt.
             "calls": [
                 {**_tool_call_summary(call), "result_excerpt": str(call.get("result", ""))[:2000]}
                 for call in tool_calls
@@ -2046,6 +2253,11 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
         uses_cfu, cfu_problem = _software_exercises_cfu(state, toolbox, targets)
         if not uses_cfu:
             errors.append(cfu_problem)
+        if (state.get("optimization_plan") or {}).get("target") == "extend_isa":
+            added = set(state.get("isa_added_symbols") or [])
+            called = {call["name"] for call in _cfu_call_sites(state, toolbox, targets, include_control=True, max_sites=None)}
+            if not added.intersection(called):
+                errors.append("ISA extension software must call a newly added instruction: " + ", ".join(sorted(added)))
     summary = outcome["summary"]
     if intrinsics_path:
         summary += f"\n\nWrote {intrinsics_path} from the CFU ISA spec."
@@ -2124,10 +2336,44 @@ CFU_NON_DATAPATH_HELPERS = (
 MAX_CFU_CALL_SITES = 25
 
 
+def _cfu_source_text(text: str) -> str:
+    """Remove non-code and simple inactive CFU branches (not a C preprocessor)."""
+    text = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+                  lambda m: "\n" * m.group(0).count("\n") or " ", text, flags=re.DOTALL)
+    stack: list[tuple[bool, bool | None]] = []
+    active = True
+    lines = []
+    for line in text.splitlines():
+        directive = re.match(r"\s*#\s*(if|ifdef|ifndef|else|elif|endif)\b(.*)", line)
+        if directive:
+            op, expr = directive.group(1), directive.group(2).strip()
+            if op in {"if", "ifdef", "ifndef"}:
+                condition = None
+                if op == "if" and expr in {"0", "1"}:
+                    condition = expr == "1"
+                elif expr == "USE_AGENT_CFU" and op in {"ifdef", "ifndef"}:
+                    condition = op == "ifdef"
+                stack.append((active, condition))
+                active = active and condition is not False
+            elif op == "else" and stack:
+                parent, condition = stack[-1]
+                active = parent and condition is not True
+            elif op == "elif" and stack:
+                parent, condition = stack[-1]
+                active = parent and condition is not True and expr != "0"
+            elif op == "endif" and stack:
+                active, _ = stack.pop()
+            lines.append("")
+        else:
+            lines.append(line if active else "")
+    return "\n".join(lines)
+
+
 def _cfu_call_sites(
     state: CfuDesignState,
     toolbox: RepoToolbox,
     targets: list[tuple[str, str]],
+    *, include_control: bool = False, max_sites: int | None = MAX_CFU_CALL_SITES,
 ) -> list[dict[str, Any]]:
     """CFU datapath intrinsic calls in the current bytes of ``targets``.
 
@@ -2139,6 +2385,9 @@ def _cfu_call_sites(
     ``_software_exercises_cfu`` has always accepted.
     """
     expected = set(intrinsic_symbols(state.get("isa_spec", {}) or {}))
+    control = {f"cfu_{command_symbol(c, c.get('function_id', 0))}" for c in
+               (state.get("isa_spec", {}).get("commands") or [])
+               if isinstance(c, dict) and command_kind(c) == "control"}
     sites: list[dict[str, Any]] = []
     for path, _ in targets:
         try:
@@ -2147,15 +2396,16 @@ def _cfu_call_sites(
             continue
         if not text:
             continue
-        stripped = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-        stripped = re.sub(r"//[^\n]*", " ", stripped)
+        stripped = _cfu_source_text(text)
         for lineno, line in enumerate(stripped.splitlines(), start=1):
             for match in re.finditer(r"\b(cfu_\w+)\s*\(", line):
                 name = match.group(1)
                 if name in CFU_NON_DATAPATH_HELPERS and name not in expected:
                     continue
+                if not include_control and name in control:
+                    continue
                 sites.append({"file": path, "line": lineno, "name": name, "text": line.strip()})
-                if len(sites) >= MAX_CFU_CALL_SITES:
+                if max_sites is not None and len(sites) >= max_sites:
                     # Enough evidence for a boolean check and for the decision
                     # artifact; unbounded call lists would only bloat the run.
                     return sites
@@ -2213,6 +2463,8 @@ def _software_reuse_evidence(
     targets = _software_targets(state, toolbox)
     if not targets:
         return False, "no software target exists for this workload", [], []
+    if (state.get("optimization_plan") or {}).get("target") == "extend_isa":
+        return False, "ISA extension requires software adaptation and use of a new instruction", [p for p, _ in targets], []
     files = [path for path, _ in targets]
     calls = _cfu_call_sites(state, toolbox, targets)
     if not calls:
@@ -3051,6 +3303,50 @@ def estimate_cost(state: CfuDesignState) -> CfuDesignState:
     return _apply_transition(update, extra)
 
 
+def _snapshot_candidate(state: CfuDesignState, entry: dict) -> dict:
+    """Preserve verified source inputs; failed later experiments cannot overwrite them."""
+    toolbox = _toolbox_for_stage(state, "implementation")
+    artifacts = _artifacts_for_stage(state, "review")
+    paths = set(state.get("design_files") or [])
+    paths.update(path for path, _ in _software_targets(state, toolbox))
+    # Retain every model-writable textual dependency, not only the hot kernel.
+    workspace = toolbox.workdir / state.get("run_root", "") / "workspace"
+    if workspace.is_dir():
+        for root, dirs, files in os.walk(workspace):
+            dirs[:] = [name for name in dirs if name not in {"build", "target", ".git", "soc"}]
+            for name in files:
+                path = Path(root) / name
+                rel = path.relative_to(toolbox.workdir).as_posix()
+                if path.suffix in {".c", ".h", ".cpp", ".hpp", ".scala", ".S", ".mk"} or name == "Makefile":
+                    if toolbox.is_read_allowed(rel) and toolbox.is_write_allowed(rel):
+                        paths.add(rel)
+    header = _rung_gate(state, "implementation_sw").get("intrinsics_header")
+    if header:
+        paths.add(header)
+    records = []
+    prefix = f"12_review/candidates/{entry['round']:03d}"
+    for index, path in enumerate(sorted(paths)):
+        source = toolbox.resolve(path)
+        if not source.is_file():
+            raise ValueError(f"validated candidate source missing: {path}")
+        content = toolbox.read_text(path, limit=2_000_001)
+        if len(content) > 2_000_000 or source.stat().st_size > 8_000_000:
+            raise ValueError(f"validated candidate source exceeds snapshot limit: {path}")
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        if hashlib.sha256(content.encode("utf-8")).hexdigest() != source_hash:
+            raise ValueError(f"validated candidate source changed or is not UTF-8: {path}")
+        ref = artifacts.write_text("review", f"{prefix}/sources/{index:03d}_{Path(path).name}",
+                                   content, inputs=[path], kind="validated_source")
+        records.append({"source": path, "snapshot": ref["path"], "sha256": ref["sha256"]})
+    candidate = {"round": entry["round"], "isa_revision": state.get("isa_revision", 0),
+                 "isa_spec": state.get("isa_spec", {}), "metrics": entry,
+                 "benchmark_project": state.get("benchmark_project", {}),
+                 "workload_spec": state.get("workload_spec", {}),
+                 "files": records, "gates": state.get("gates", {})}
+    ref = artifacts.write_yaml("review", f"{prefix}/candidate.yaml", candidate)
+    return {"round": entry["round"], "manifest": ref["path"], "files": records}
+
+
 def review_and_route(state: CfuDesignState) -> CfuDesignState:
     """Terminal decision node, plus the optional optimization loop.
 
@@ -3078,6 +3374,15 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
         entry["improved"] = _round_improved(entry, _best_round(rounds))
         rounds.append(entry)
 
+    best_candidate = state.get("best_candidate") or {}
+    if state.get("loop_optimize") and status == "complete" and rounds and rounds[-1].get("improved"):
+        try:
+            best_candidate = _snapshot_candidate(state, rounds[-1])
+        except (OSError, ValueError, PolicyError) as exc:
+            # Preserve the previous verified delivery and expose snapshot failure.
+            rounds[-1]["snapshot_error"] = str(exc)
+            status = "failed"
+            decision = "final_report"
     target, optimization, raw_output = ("", {}, "")
     if status == "complete":
         target, optimization, raw_output = _choose_optimization(state, rounds)
@@ -3090,6 +3395,8 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
         "status": status,
         "stage_jobs": "final_report",
         "optimization_rounds": rounds,
+        "best_candidate": best_candidate,
+        "delivered_round": best_candidate.get("round", rounds[-1]["round"] if rounds else 0),
         "optimization_plan": {},
         "gates": {
             **state.get("gates", {}),
@@ -3100,9 +3407,13 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
                 "optimization": optimization,
             },
         },
-        "llm_raw_outputs": [raw_output] if raw_output else [],
+        "llm_raw_outputs": optimization.get("raw_outputs") or ([raw_output] if raw_output else []),
         "iteration_history": append_history(state, note),
     }
+    if target == "extend_isa":
+        update["isa_extension_base"] = state.get("isa_spec", {})
+        update["isa_added_symbols"] = []
+        update["isa_spec_errors"] = []
     if target:
         focus = str(optimization.get("focus", "") or "performance")
         attempts = dict(state.get("attempts", {}) or {})
@@ -3235,14 +3546,14 @@ def deterministic_analysis(task: str, spec: dict) -> str:
         f"Known element type: {spec.get('element_type', '') or 'unknown'}.\n"
         f"Unknowns: {', '.join(spec.get('unknowns', [])) or 'none'}.\n"
         f"Roofline: {roofline}.\n"
-        "Likely CFU shape: extend AgentCfu's placeholder compute/config function ids; keep the Vector RegFile and CfuLsu for memory-backed vectors or multi-operation reuse, and keep the CfuBus response contract."
+        "Likely CFU shape: register workload-specific operations in AgentCfu's instruction table; retain Vector RegFile and CfuLsu only where memory-backed data/reuse needs them, and preserve the CfuBus response contract."
     )
 
 
 def deterministic_contract(task: str, spec: dict, analysis: str) -> str:
     operation = spec.get("operation", "")
     if operation in {"weighted_average", "dot_product"}:
-        op_line = "For weighted average/dot product, use CFU-owned vector registers and `maclen` slices only if the Roofline analysis shows resident-vector reuse is worthwhile; otherwise use a direct or streamed datapath, widen locally, and accumulate into the required scalar result."
+        op_line = "For weighted average/dot product, use CFU-owned vector registers and operation-specific parallelism only if the Roofline analysis shows resident-vector reuse is worthwhile; otherwise use a direct or streamed datapath, widen locally, and accumulate into the required scalar result."
     elif operation == "elementwise_add":
         op_line = "For element-wise add, use CFU RF slots only when reuse justifies them; otherwise process direct packed operands, and store the packed result through the shared LSU only when the output must escape."
     else:
@@ -3672,7 +3983,7 @@ def _choose_repair_target(
 # the speedup floor, or the build rungs; it can only be slower than the round
 # before, which the ledger records (see 12_review/optimization_rounds.yaml).
 
-OPTIMIZATION_TARGETS = ("implement_hw", "implement_sw")
+OPTIMIZATION_TARGETS = ("implement_hw", "implement_sw", "extend_isa")
 
 
 def _cost_metric(state: CfuDesignState) -> dict[str, int]:
@@ -3732,7 +4043,9 @@ def _score_snapshot(
         "target": target,
         "source": source,
         "reason": str(reason or "")[:400],
-        "measured": bool(reference or cfu),
+        "measured": bool(reference and cfu),
+        "validated": _is_complete(state) and fresh_sim and fresh_cost,
+        "isa_revision": int(state.get("isa_revision", 0)),
         "speedup_x100": int(sim.get("speedup_x100", 0) or 0) if fresh_sim else 0,
         "reference_cycles": reference,
         "cfu_cycles": cfu,
@@ -3781,7 +4094,7 @@ def _round_improved(entry: dict[str, Any], best: dict[str, Any] | None) -> bool:
     Not slower, not larger, and better on at least one of the two axes, so an
     "optimization" that trades speed for nothing can never be recorded as one.
     """
-    if not entry.get("measured", True):
+    if not entry.get("validated", True) or not entry.get("measured", True):
         # A round with no measurement of its own cannot be an improvement.
         return False
     if not best:
@@ -3790,11 +4103,17 @@ def _round_improved(entry: dict[str, Any], best: dict[str, Any] | None) -> bool:
     best_speed = int(best.get("speedup_x100", 0) or 0)
     cells = int((entry.get("cost") or {}).get("cells", 0) or 0)
     best_cells = int((best.get("cost") or {}).get("cells", 0) or 0)
-    if best_speed and speed < best_speed:
+    # Compare exact ratios by integer cross multiplication; display rounding
+    # must not hide small real improvements (e.g. the depthconv 1.85x rounds).
+    ref, cycles = int(entry.get("reference_cycles", 0)), int(entry.get("cfu_cycles", 0))
+    best_ref, best_cycles = int(best.get("reference_cycles", 0)), int(best.get("cfu_cycles", 0))
+    exact = min(ref, cycles, best_ref, best_cycles) > 0
+    slower = ref * best_cycles < best_ref * cycles if exact else bool(best_speed) and speed < best_speed
+    if slower:
         return False
-    if best_cells and cells and cells > best_cells:
+    if best_cells and (not cells or cells > best_cells):
         return False
-    faster = bool(best_speed) and speed > best_speed
+    faster = ref * best_cycles > best_ref * cycles if exact else bool(best_speed) and speed > best_speed
     smaller = bool(best_cells and cells) and cells < best_cells
     return faster or smaller
 
@@ -3814,6 +4133,8 @@ def _rounds_digest(rounds: list[dict[str, Any]]) -> str:
         lines.append(
             f"- round {entry.get('round')}: target={entry.get('target')} "
             f"{_round_metrics_text(entry)} "
+            f"reference_cycles={entry.get('reference_cycles', 'n/a')} "
+            f"cfu_cycles={entry.get('cfu_cycles', 'n/a')} "
             f"improved={bool(entry.get('improved'))} "
             f"reason={entry.get('reason', '') or 'n/a'}"
         )
@@ -3835,7 +4156,11 @@ def optimization_directive(state: CfuDesignState) -> str:
         f"Current validated result: {optimization_score(state)}\n"
         f"Planner's reason: {plan.get('reason', '')}\n"
         "Change one thing and keep everything the software already relies on: the ISA "
-        "contract is frozen for this run, so do not add, rename or reshape a command."
+        "contract is frozen for this implementation attempt; only the extend_isa node "
+        "may append commands before hardware/software implementation. Do not alter the "
+        "accepted contract here. "
+        + ("Implement and use the new instruction(s): " + ", ".join(state.get("isa_added_symbols") or [])
+           if plan.get("target") == "extend_isa" else "")
     )
 
 
@@ -3865,6 +4190,15 @@ def _choose_optimization(
             "source": "budget",
             "reason": "no iteration budget is left for another round",
         }, ""
+    patience = max(1, int(state.get("loop_patience", 3)))
+    stale = 0
+    for item in reversed(rounds):
+        if item.get("target") == "baseline" or item.get("improved"):
+            break
+        stale += 1
+    if stale >= patience:
+        return "", {"continue": False, "source": "patience",
+                    "reason": f"{stale} consecutive optimization rounds did not improve the validated incumbent"}, ""
     plan = state.get("optimization_plan") or {}
     focus = str(plan.get("focus", "") or "performance")
     fallback = json.dumps(
@@ -3914,6 +4248,42 @@ def _choose_optimization(
                 else "the optimization router did not return a usable decision"
             ),
         }, raw_output
+    planner_outputs = [raw_output] if raw_output else []
+    reconsidered = False
+    if not _as_bool(parsed.get("continue")) and state.get("loop_policy", "explore") == "explore":
+        # A stop is a recommendation, not proof that the design space is exhausted.
+        # One additional planner request is bounded independently of build rounds.
+        reconsidered = True
+        try:
+            second, second_raw = _complete_llm(
+                state, "optimize", "optimize_reconsider", SYSTEM_PROMPT,
+                optimization_prompt(
+                    state.get("task", ""), state.get("workload_spec", {}),
+                    optimization_score(state), _rounds_digest(rounds), state.get("isa_spec", {}),
+                    str(state.get("implementation_hw_summary", "")),
+                    str(state.get("implementation_sw_summary", "")), remaining, focus,
+                ) + "\n=== RECONSIDER EARLY STOP ===\n"
+                + f"Previous recommendation: {result.text}\n"
+                + "The budget is not exhausted. Propose a distinct testable candidate, "
+                  "including append-only ISA extensions (batching, control/result operations), "
+                  "packing/transfer reductions or area improvements. Old commands and their "
+                  "state/reset semantics must remain compatible. Do not repeat failed changes. "
+                  "If none is defensible, explicitly explain the exhausted alternatives; "
+                  "a reasonable current speedup is not sufficient evidence to stop.",
+                fallback, response_format={"type": "json_object"},
+            )
+            if second_raw:
+                planner_outputs.append(second_raw)
+            revised = parse_yaml_mapping(second.text)
+            if second.used_llm and isinstance(revised, dict):
+                parsed = revised
+                raw_output = second_raw
+            else:
+                return "", {"continue": False, "source": "fallback", "reconsidered": True,
+                            "reason": "reconsideration returned no usable candidate"}, second_raw
+        except Exception as exc:
+            return "", {"continue": False, "source": "fallback", "reconsidered": True,
+                        "reason": f"optimization reconsideration failed: {exc}"}, raw_output
     target = str(parsed.get("target", "") or "").strip()
     reason = str(parsed.get("reason", "") or "").strip()
     focus = str(parsed.get("focus", "") or focus)
@@ -3925,6 +4295,8 @@ def _choose_optimization(
                 "focus": focus,
                 "reason": reason[:400],
                 "source": "llm",
+                "reconsidered": reconsidered,
+                "raw_outputs": planner_outputs,
             }, raw_output
         if not reason:
             return "", {
@@ -3945,8 +4317,10 @@ def _choose_optimization(
         "continue": False,
         "target": target,
         "focus": focus,
-        "reason": reason[:400] or "the optimizer chose to stop",
-        "source": "llm",
+        "reason": reason[:400] or "no concrete candidate after bounded reconsideration",
+        "source": "planner_exhausted" if reconsidered else "llm",
+        "reconsidered": reconsidered,
+        "raw_outputs": planner_outputs,
     }, raw_output
 
 
@@ -3974,6 +4348,7 @@ PY_ROUTERS: dict[str, Any] = {
     "create_benchmark_project": _route_after_prepare,
     "prepare_embench_benchmark": _route_after_prepare,
     "design_contract": _route_after_isa,
+    "extend_isa": _route_after_isa,
     "generate_soc": _route_after_hw_build,
     "build_sw": _route_after_sw_build,
     "simulate": _route_after_sim,
@@ -4041,7 +4416,15 @@ def _isa_from_template(template: str, spec: dict, analysis: str) -> dict:
     if not isinstance(roofline, dict):
         roofline = deterministic_roofline_analysis(spec)
     commands = [
-        {"function_id": i, "name": f"op_{i}", "operand": "", "result": "", "semantics": f"{operation} step {i}", "response": "status"}
+        {
+            "function_id": i, "name": f"op_{i}", "operand": "CPU rs1/rs2 values",
+            "result": "CPU rd", "semantics": f"{operation} step {i}", "response": "value",
+            "resources": [
+                {"storage": "cpu", "access": "read", "role": "rs1"},
+                {"storage": "cpu", "access": "read", "role": "rs2"},
+                {"storage": "cpu", "access": "write", "role": "rd"},
+            ],
+        }
         for i in range(1, 4)
     ]
     return {
@@ -4059,13 +4442,12 @@ def _isa_from_template(template: str, spec: dict, analysis: str) -> dict:
         "state": template_data.get("state", {}),
         "memory": {"operator_owned": False, "load": True, "store": False},
         # Keep fallback datapath metadata conservative. These are independent
-        # optional knobs; do not invent a vector RF or MAC slice for a scalar CFU.
+        # optional knobs; do not invent algorithm-specific dimensions.
         "datapath": {
             "vlen": 0,
             "xlen": 0,
-            "maclen": 0,
-            "accWidth": 0,
             "regDepth": 0,
+            "implementation": {},
         },
         "software": {"intrinsics_header": "cfu_intrinsics.h", "scalar_fallback": True},
         "integration": {
@@ -4382,8 +4764,9 @@ def render_report(state: CfuDesignState) -> str:
             # no measurement of its own shows up as "not measured" and the run's
             # status already reports that it failed.
             lines.append(
-                "- WARNING: the final round is not the best round; the delivered files "
-                "belong to the final round, so this run regressed against its own best result"
+                "- WARNING: the final round is not the best round; it may be equivalent, "
+                "worse, or a speed/area tradeoff. The workspace belongs to the final experiment; "
+                "use the validated candidate snapshot below for the selected source delivery."
             )
         for index, entry in enumerate(rounds):
             lines.append(
@@ -4396,6 +4779,12 @@ def render_report(state: CfuDesignState) -> str:
                 + (f" — {entry.get('reason')}" if entry.get("reason") else "")
             )
         lines.append("")
+    candidate = state.get("best_candidate") or {}
+    if candidate:
+        lines.extend(["## Selected Validated Candidate",
+                      f"- delivered source round: {candidate.get('round')}",
+                      f"- manifest (ISA, source hashes and validation evidence): {candidate.get('manifest')}",
+                      "- These are immutable validated source inputs, not a claim that the final workspace/binaries were restored.", ""])
     lines.append("## Normalized WorkloadSpec")
     lines.append("```yaml")
     lines.append(state.get("spec_text", "").strip())

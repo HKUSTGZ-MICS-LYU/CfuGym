@@ -35,8 +35,8 @@ commands:
 datapath:
   vlen: 256
   xlen: 32
-  maclen: 32
-  accWidth: 32
+  implementation:
+    result_width_bits: 32
   regDepth: 2
 software:
   intrinsics_header: cfu_intrinsics.h
@@ -579,6 +579,46 @@ class LadderTest(unittest.TestCase):
             [],
         )
 
+    def test_loop_extends_isa_and_revalidates_both_implementations(self) -> None:
+        import json
+        import yaml
+        from agents.cfu_design_agent.llm import LlmResult
+
+        class ExtendingLlm(_LoopingLlm):
+            def complete(self, system, user, *, fallback, response_format=None):
+                if "APPEND-ONLY ISA EXTENSION" in user:
+                    self.prompts.append(user)
+                    candidate = yaml.safe_load(VALID_ISA)
+                    candidate["commands"].append({"function_id": 1, "subfunction_id": 1,
+                                                   "name": "batch", "semantics": "batch updates"})
+                    return LlmResult(json.dumps(candidate), used_llm=True)
+                if "This is the ISA-CONTRACT stage only" in user:
+                    self.prompts.append(user)
+                    return LlmResult(VALID_ISA, used_llm=True)
+                if "Decide whether another round is worth spending budget on" in user:
+                    self.optimize_prompts.append(user)
+                    return LlmResult('{"continue":true,"target":"extend_isa","reason":"batch updates"}', used_llm=True)
+                result = super().complete(system, user, fallback=fallback, response_format=response_format)
+                if "This is the SOFTWARE rung only" in user and "cfu_batch" in user:
+                    result.text = result.text.replace("cfu_compute(rs1, rs2)", "cfu_batch(rs1, rs2)")
+                return result
+
+        for runner in ([graph.run_agent_python, graph.run_agent] if graph._LANGRAPH_AVAILABLE else [graph.run_agent_python]):
+            with self.subTest(runner=runner.__name__):
+                final, commands, llm = self._run(
+                    {"soc_generate_agent": [0], "yosys_cost": [0]}, max_iters=2,
+                    benchmark_name="crc32", input_mode="embench", llm=ExtendingLlm(),
+                    loop_optimize=True, runner=runner,
+                )
+                self.assertEqual(final["status"], "complete", repr(final.get("gates")))
+                self.assertEqual(final["isa_revision"], 1)
+                self.assertEqual(len(final["isa_spec"]["commands"]), 2)
+                self.assertEqual(commands.ladder.count("soc_generate_agent"), 2)
+                self.assertEqual(commands.ladder.count("soc_sim"), 2)
+                self.assertEqual(len(llm.software_prompts()), 2)
+                self.assertFalse(final["gates"]["sw_build"]["software_reused"])
+                self.assertTrue(final["best_candidate"]["manifest"])
+
     def test_loop_keeps_optimizing_a_passing_run(self) -> None:
         # --loop: the run already passes, and the agent uses the leftover budget
         # for one more hardware round that improves the measured speedup.
@@ -618,7 +658,8 @@ class LadderTest(unittest.TestCase):
         self.assertEqual(final["repairs_used"], 1)
         self.assertEqual(final["attempts"]["optimize"], 1)
         # An optimization round is not a repair and not a software rewrite.
-        self.assertEqual(len(llm.optimize_prompts), 2)
+        # The stop recommendation gets one bounded reconsideration in explore mode.
+        self.assertEqual(len(llm.optimize_prompts), 3)
         self.assertEqual(len(llm.software_prompts()), 1)
         self.assertEqual(len(llm.software_need_prompts), 1)
         hardware = llm.hardware_prompts()

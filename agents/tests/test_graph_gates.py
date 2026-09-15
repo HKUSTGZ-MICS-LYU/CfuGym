@@ -488,8 +488,8 @@ commands:
 datapath:
   vlen: 256
   xlen: 32
-  maclen: 32
-  accWidth: 32
+  implementation:
+    result_width_bits: 32
   regDepth: 2
 software:
   intrinsics_header: sw/tests/u8_wavg_cfu_test.c
@@ -1121,7 +1121,7 @@ class SoftwareChangeRoutingTest(unittest.TestCase):
         self.assertFalse(graph._software_exercises_cfu(state, toolbox, targets)[0])
         self.assertFalse(graph._software_reuse_evidence(state, toolbox)[0])
 
-    def test_a_declared_intrinsic_named_like_a_helper_still_counts(self) -> None:
+    def test_control_intrinsic_named_like_a_helper_does_not_count(self) -> None:
         self._write_kernel("int kernel(void) { return cfu_enable(); }\n")
         isa = {
             **self.ISA,
@@ -1139,7 +1139,7 @@ class SoftwareChangeRoutingTest(unittest.TestCase):
         state = self._state(isa_spec=isa)
         toolbox = graph._toolbox_for_stage(state, "implementation")
         targets = graph._software_targets(state, toolbox)
-        self.assertTrue(graph._software_exercises_cfu(state, toolbox, targets)[0])
+        self.assertFalse(graph._software_exercises_cfu(state, toolbox, targets)[0])
 
     def test_a_broken_router_never_breaks_the_ladder(self) -> None:
         self._write_kernel(self.CFU_KERNEL)
@@ -1316,9 +1316,9 @@ class LoopOptimizationTest(unittest.TestCase):
         self.assertEqual(decision["focus"], "cost")
         self.assertTrue(raw)
 
-    def test_the_agent_may_stop(self) -> None:
+    def test_the_agent_may_stop_in_conservative_mode(self) -> None:
         target, decision, _ = self._choose(
-            self._state(), '{"continue": false, "reason": "no concrete change left"}'
+            self._state(loop_policy="conservative"), '{"continue": false, "reason": "no concrete change left"}'
         )
         self.assertEqual(target, "")
         self.assertFalse(decision["continue"])

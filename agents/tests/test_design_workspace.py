@@ -11,7 +11,9 @@ from agents.cfu_design_agent.policy import PolicyError, load_policy
 from agents.cfu_design_agent.tools import (
     DESIGN_SOURCE_FILES,
     RepoToolbox,
+    design_scaffold_name,
     design_workspace_rel,
+    redirect_target,
     repair_patch_paths,
 )
 from agents.tests.common import REPO_ROOT
@@ -75,11 +77,28 @@ class DesignWorkspaceTest(unittest.TestCase):
         for rel in (
             "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala",
             "src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala",
+            "src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala",
             "src/main/scala/vexiiriscv/soc/mico/MiCoSoc.scala",
             "src/main/scala/vexiiriscv/soc/cfu/CfuLib.scala",
         ):
             with self.assertRaises(PolicyError, msg=rel):
                 self.policy.check_write("implementation", rel)
+
+    def test_read_only_platform_is_not_an_overlay_target(self) -> None:
+        # AgentCfuLib.scala holds the framework. It must never be seeded, redirected
+        # or writable, otherwise a run could replace the shared platform.
+        self.assertNotIn(
+            "src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala", DESIGN_SOURCE_FILES,
+        )
+        self.assertFalse(design_scaffold_name("src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala"))
+        self.assertEqual(
+            redirect_target(
+                "src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala", RUN_ROOT,
+            ),
+            "",
+        )
+        seeded = self.toolbox().seed_design_workspace()
+        self.assertFalse(any("AgentCfuLib" in path for path in seeded), seeded)
 
     def test_policy_allows_only_design_files_in_workspace(self) -> None:
         for name in ("AgentCfu.scala", "AgentCfuFiber.scala"):

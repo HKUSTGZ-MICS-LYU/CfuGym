@@ -146,7 +146,7 @@ class RunSummaryTest(unittest.TestCase):
         self.assertIn("loop:", text)
         self.assertIn("round 0: baseline speedup=2.00x cells=1200", text)
         self.assertIn("round 1: implement_hw speedup=2.50x cells=1300 (+0.50x, +100 cells) (best)", text)
-        self.assertIn("round 2: implement_sw speedup=2.10x cells=1300 (-0.40x, +0 cells) (regressed)", text)
+        self.assertIn("round 2: implement_sw speedup=2.10x cells=1300 (-0.40x, +0 cells) (not improved)", text)
         self.assertIn("WARNING: the final round is not the best (round 1)", text)
 
     def test_an_optimization_round_without_a_result_says_so(self) -> None:
