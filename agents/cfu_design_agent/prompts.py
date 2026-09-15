@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Iterable
+
 import yaml
 
 from .state import RepoContext, WorkloadSpec
@@ -72,6 +74,13 @@ sections when several files change. You may also open several EDIT_BEGIN
 sections for the same file: they are applied in order, and each SEARCH must
 match the file *after* the earlier sections. Prefer one section per file unless
 the change genuinely needs to be split.
+
+Span only the code you actually change. Do NOT wrap large comment blocks, banner
+comments, or long prose in a SEARCH: a single mis-transcribed character rejects
+the whole response. If a comment must be part of the replaced region, copy it
+byte-for-byte from the current file content shown above — never retype it from
+memory or paraphrase it. If a SEARCH is rejected, do not resend the same block:
+shrink it to a few unique code lines, or switch that file to Protocol B.
 
 Never include a superseded draft, an alternative approach, or a second attempt
 at the same region in one response: decide on the final change and emit only
@@ -144,13 +153,29 @@ def visibility_guidance(level: str) -> str:
     return f"## Visibility: {level}\n{text}"
 
 
-def context_digest(context: RepoContext) -> str:
+def context_digest(context: RepoContext, skip: Iterable[str] = ()) -> str:
+    """Render the repo context, omitting files shown verbatim elsewhere.
+
+    ``skip`` holds the rung's own targets: they are rendered in full in the
+    "Exact current contents" block, and repeating a truncated copy here only
+    wastes tokens and invites the model to copy the truncated text.
+    """
     files = context.get("files", {})
+    skipped = {str(path) for path in skip}
+    omitted = [path for path in files if path in skipped]
     parts: list[str] = []
     guidance = visibility_guidance(str(context.get("visibility", "") or ""))
     if guidance:
         parts.append(guidance)
+    if omitted:
+        parts.append(
+            "## target files\n"
+            + "\n".join(f"- {path}" for path in omitted)
+            + "\n(shown in full under \"Exact current contents\" below)"
+        )
     for path, text in files.items():
+        if path in skipped:
+            continue
         if any(marker in path for marker in SENSITIVE_PATH_MARKERS):
             continue
         excerpt = text[:6000]
@@ -213,8 +238,178 @@ def embench_instructions(spec: WorkloadSpec) -> str:
         "- The scalar path belongs in the #else branch (the reference build). The\n"
         "  #ifdef USE_AGENT_CFU branch must call the generated CFU intrinsic(s) for the\n"
         "  hot operation: cfu_enable() followed by the scalar loop is not acceleration\n"
-        "  and will be rejected by the CFU-usage check and the speedup gate.\n"
+        "  and will be rejected by the CFU-usage check and the speedup gate.\n\n"
+        "Simulation log semantics (how to read a failure):\n"
+        "- MiCoSocSim stops when the CPU reaches the `pass` or `fail` symbol, which the\n"
+        "  startup code selects from main()'s return value.\n"
+        "- `Software reached the fail symbol` means main() returned non-zero, i.e.\n"
+        "  verify_benchmark() rejected the result: the accelerated kernel computed a\n"
+        "  WRONG VALUE. It is a correctness bug, not a build error, a crash, or a\n"
+        "  harness problem, so do not rewrite the build or the benchmark oracle.\n"
+        "- The build also prints `EMBENCH_VERIFY_FAIL benchmark=<name> verify=<code>\n"
+        "  result=<value>` (or `..._PASS` on success) from the harness-owned main.c.\n"
+        "  Embench's `verify_benchmark()` returns NON-ZERO when the result is correct\n"
+        "  and 0 on a mismatch, so `verify=0` is a failure; `result` is main()'s scalar\n"
+        "  return where the benchmark uses one.\n"
+        "- Neither symbol appearing before the timeout means a hang: an unfinished\n"
+        "  TileLink transaction, a wait on a fence, or a non-terminating loop.\n"
+        "- After a verify failure, re-check the CFU branch against the scalar reference:\n"
+        "  packed-lane sign/size and truncation, `input_offset` handling, any `>>`/scale\n"
+        "  left in software, tail and boundary elements, accumulator width/overflow, and\n"
+        "  the order in which the intrinsic writes its result.\n"
     )
+
+
+def software_need_prompt(
+    task: str,
+    spec: WorkloadSpec,
+    isa_spec: dict | None,
+    hardware_summary: str,
+    software_summary: str,
+    calls: list[dict],
+    evidence: str,
+) -> str:
+    """Ask whether the software rung must run after the hardware was built.
+
+    The deterministic guard has already established that the current kernel
+    bytes call a CFU datapath intrinsic and that the ISA contract is unchanged,
+    so both answers are defensible; the model decides whether the hardware
+    change still needs a matching software change.
+    """
+    call_lines = "\n".join(
+        f"- {item.get('file', '')}:{item.get('line', '')}: {str(item.get('text', '')).strip()}"
+        for item in calls
+    )
+    return f"""Task:
+{task}
+
+Decide whether the software rung must run again before this hardware is compiled
+and simulated. The CFU hardware has been designed and the SoC generates from it.
+
+CFU ISA contract (the intrinsics the hardware promises):
+{spec_digest(spec)}
+
+ISA spec:
+{yaml.safe_dump(isa_spec, sort_keys=False).strip() if isa_spec else "n/a"}
+
+Hardware design summary:
+{hardware_summary or "n/a"}
+
+Software design summary so far:
+{software_summary or "n/a"}
+
+Deterministic evidence about the current software:
+{evidence}
+{call_lines}
+
+Answer `required` when the software must change for this hardware to work at all:
+the ISA contract added, removed or renamed a command, changed an operand/result
+layout, offset, granularity or response value, and the current kernel does not
+already drive the new contract.
+Answer `not_required` when the existing kernel already exercises every command
+this design needs with the current calling convention, so re-writing it would
+only risk breaking working software.
+
+Return exactly one JSON object and nothing else:
+{{"software_change": "required" or "not_required",
+  "reason": "<why the existing kernel is or is not sufficient>"}}"""
+
+
+def agent_tools_block(agent_tools: bool, tool_rounds: int = 0, deliverable: str = "") -> str:
+    """Read-only tool-loop description shared by every rung that enables tools."""
+    if not agent_tools:
+        return ""
+    budget = (
+        f"You have a bounded tool budget of at most {tool_rounds} tool rounds"
+        if tool_rounds
+        else "You have a bounded tool budget"
+    )
+    what = deliverable or "the final deliverable required by this rung"
+    return (
+        "\nYou have read-only tools: `read_file`, `list_dir`, `search_text`. "
+        f"{budget}. The repo context above already contains the design targets and "
+        "the workload source; read additional files only when it is insufficient. "
+        "Reading is subject to the stage access policy; a denied path returns a policy "
+        "error rather than content. "
+        f"When the budget runs out the tools are withdrawn and your next reply must be {what}, "
+        "so reserve time for it: do not spend every round reading. Never answer with only a "
+        "promise to read or inspect something: either call a tool now, or emit the final "
+        "deliverable from the context already shown.\n"
+    )
+
+
+def repair_routing_prompt(
+    task: str,
+    attribution: str,
+    sim_log: str,
+    spec: WorkloadSpec,
+    profile: dict | None = None,
+    isa_spec: dict | None = None,
+    hardware_summary: str = "",
+    software_summary: str = "",
+    sim_repairs: int = 0,
+) -> str:
+    """Ask which side (software or hardware) should repair a failed simulation.
+
+    Both branches are real, and the sim log alone rarely names the side, so the
+    model decides from the attribution, the design summaries and the measured
+    numbers instead of a fixed software-first escalation.
+    """
+    return f"""Task:
+{task}
+
+The SoC simulation of the CFU build failed. Choose which rung repairs it:
+- `implement_sw`: the accelerated kernel that drives the CFU (packing, loop
+  structure, offsets, tails, scaling, intrinsic granularity). The hardware is
+  left untouched and only the software changes.
+- `implement_hw`: the AgentCfu datapath/protocol (lane handling, sign/width,
+  response value, TileLink/command handshake). The SoC is regenerated and the
+  software is re-checked against the new hardware: it is kept when it still
+  drives it, and updated as well when the new hardware needs it. Choose this when
+  the defect is (or may be) in the hardware — a purely software bug is cheaper to
+  fix through `implement_sw`, which does not re-elaborate the SoC.
+
+Authoritative failure attribution:
+{attribution or "n/a"}
+
+Measured reference/CFU cycles:
+{profile_digest(profile)}
+
+CFU ISA contract (what the hardware promises):
+{spec_digest(spec)}
+
+ISA spec:
+{yaml.safe_dump(isa_spec, sort_keys=False).strip() if isa_spec else "n/a"}
+
+Hardware design summary:
+{hardware_summary or "n/a"}
+
+Software design summary:
+{software_summary or "n/a"}
+
+Simulation log tail:
+```text
+{sim_log[-4000:]}
+```
+
+Decide by where the defect actually is:
+- Wrong result (Embench verify failed): if the kernel extracts/packs operands,
+  applies the offset, handles tails, or shifts/scales wrongly, choose software;
+  if the CFU datapath's signedness, width, lane order, or returned value is wrong,
+  choose hardware.
+- Not meaningfully faster: usually software (packing, blocking, intrinsic
+  granularity, residual scalar work) unless the CFU design itself cannot reduce
+  the operation count or stall time, in which case choose hardware.
+- No pass/fail symbol before the timeout (hang): usually hardware (unfinished
+  TileLink transaction, missing response, waiting on a fence), unless the kernel
+  never issues or never terminates.
+- {sim_repairs} simulation repair(s) already ran. Do not pick a side that was
+  already tried unless the new evidence points there with a concrete reason.
+
+Return exactly one JSON object and nothing else:
+{{"repair_target": "implement_sw" or "implement_hw",
+  "root_cause": "<one sentence naming the defect>",
+  "reason": "<why this side is the one that must change>"}}"""
 
 
 def workload_prompt(
@@ -222,7 +417,12 @@ def workload_prompt(
     spec: WorkloadSpec,
     context: RepoContext,
     profile: dict | None = None,
+    agent_tools: bool = False,
+    tool_rounds: int = 0,
 ) -> str:
+    tools_block = agent_tools_block(
+        agent_tools, tool_rounds, "the final YAML analysis mapping"
+    )
     return f"""Task:
 {task}
 
@@ -234,7 +434,7 @@ Measured profile:
 
 Repo context:
 {context_digest(context)}
-
+{tools_block}
 {embench_instructions(spec)}
 {ROOFLINE_GUIDANCE}
 Analyze the workload. Classify the acceleration pattern, identify hardware/software state, data movement, expected bottlenecks, and the minimum validation needed.
@@ -311,18 +511,14 @@ def hardware_prompt(
     context: RepoContext,
     profile: dict | None = None,
     feedback: str = "",
+    optimization: str = "",
     agent_tools: bool = False,
+    tool_rounds: int = 0,
 ) -> str:
     """Prompt for the hardware rung: AgentCfu.scala / AgentCfuFiber.scala only."""
-    tools_block = ""
-    if agent_tools:
-        tools_block = (
-            "\nYou have read-only tools: `read_file`, `list_dir`, `search_text`. "
-            "Use them to inspect the current workspace, headers, and related sources "
-            "before you answer. Reading is subject to the stage access policy; a denied "
-            "path returns a policy error rather than content. When you have enough "
-            "information, reply with the final deliverable and no tool call.\n"
-        )
+    tools_block = agent_tools_block(
+        agent_tools, tool_rounds, "the final EDIT/FILE/PATCH deliverable"
+    )
     visibility = str(context.get("visibility", "") or "")
     if visibility == "extended":
         if agent_tools:
@@ -371,6 +567,7 @@ def hardware_prompt(
             "\nThis is the first hardware attempt. Do not present a repair diagnosis; design "
             "from the workload, contract, and current scaffold.\n"
         )
+    optimization_block = _optimization_block(optimization)
     targets = "\n".join(f"   - {path}" for path in HARDWARE_TARGETS)
     return f"""Task:
 {task}
@@ -388,8 +585,8 @@ Contract:
 {contract}
 
 Repo context:
-{context_digest(context)}
-{feedback_block}
+{context_digest(context, skip=HARDWARE_TARGETS)}
+{optimization_block}{feedback_block}
 {embench_instructions(spec)}{tools_block}
 This is the HARDWARE rung only. Design the SpinalHDL CFU datapath; the
 accelerated software is written in a later step and must not appear here.
@@ -413,6 +610,86 @@ repository source. Only fall back to a plan if a required target file is
 genuinely absent."""
 
 
+def optimization_prompt(
+    task: str,
+    spec: WorkloadSpec,
+    score: str,
+    rounds: str,
+    isa_spec: dict | None,
+    hardware_summary: str,
+    software_summary: str,
+    budget_left: int,
+    focus: str,
+) -> str:
+    """Ask whether another round should improve speed or hardware cost (PPA).
+
+    Only called when the run already passes every gate and the iteration budget
+    still has room, so both answers are legitimate: keep optimizing, or stop with
+    the current validated design.
+    """
+    return f"""Task:
+{task}
+
+The run already passes every gate. Measured result of the current design:
+{score}
+
+Optimization rounds so far (newest last):
+{rounds or "none yet: this would be the first optimization round"}
+
+Optimization budget left: {budget_left} round(s).
+
+CFU ISA contract (frozen for this run — do not add, remove or rename commands):
+{spec_digest(spec)}
+
+ISA spec:
+{yaml.safe_dump(isa_spec, sort_keys=False).strip() if isa_spec else "n/a"}
+
+Hardware design summary:
+{hardware_summary or "n/a"}
+
+Software design summary:
+{software_summary or "n/a"}
+
+Decide whether another round is worth spending budget on, and where.
+
+- `implement_hw` improves the AgentCfu datapath (lane count, width, pipelining,
+  register/stream handling, command granularity, TileLink usage). It regenerates
+  the SoC; the software is re-checked and only rewritten if the new hardware
+  needs it.
+- `implement_sw` improves the accelerated kernel (packing, blocking, loop
+  structure, intrinsic granularity, residual scalar work, fences). The hardware
+  is untouched and the design is recompiled and re-simulated.
+Prefer `{focus}` unless the evidence clearly points at the other side.
+
+Answer `continue: true` only when you can name a concrete change that should beat
+the current numbers and keep every gate passing (the correctness oracle, the
+minimum speedup floor enforced by the simulation gate, and a successful
+synthesis). Do not repeat a change that
+already ran and did not improve; a round that makes the result worse is a real
+regression in the delivered design, not a free experiment.
+Answer `continue: false` when the design is already at a reasonable point for
+this budget, or when you have no concrete improvement left.
+
+Return exactly one JSON object and nothing else:
+{{"continue": true or false,
+  "target": "implement_hw" or "implement_sw",
+  "focus": "performance" or "cost",
+  "reason": "<the concrete change you would make, or why you stop>"}}"""
+
+
+def _optimization_block(optimization: str) -> str:
+    """A passing design is being improved on purpose, not repaired."""
+    if not optimization:
+        return ""
+    return (
+        "\n=== OPTIMIZATION ROUND ===\n"
+        "Every gate already passes, so this is not a repair: keep the parts that work and\n"
+        "make one focused change that improves the measured result below.\n"
+        + optimization
+        + "\n"
+    )
+
+
 def software_prompt(
     task: str,
     spec: WorkloadSpec,
@@ -423,6 +700,7 @@ def software_prompt(
     intrinsics: str = "",
     targets: list[tuple[str, str]] | None = None,
     feedback: str = "",
+    optimization: str = "",
 ) -> str:
     """Prompt for the software rung: the accelerated kernel using the intrinsics.
 
@@ -462,11 +740,15 @@ def software_prompt(
         feedback_block = (
             "\nThis is the first software attempt. Do not present a repair diagnosis; "
             "implement the kernel from the contract and intrinsics.\n"
+            if not optimization
+            else "\nThe kernel is already written and passing; improve it as described above.\n"
         )
     target_contents = "\n\n".join(
         f"### {path}\n```c\n{text}\n```" for path, text in targets if text
     )
     target_list = "\n".join(f"   - {path}" for path, _ in targets)
+    target_paths = [path for path, _ in targets]
+    optimization_block = _optimization_block(optimization)
     return f"""Task:
 {task}
 
@@ -483,9 +765,9 @@ Contract:
 {contract}
 
 Repo context:
-{context_digest(context)}
+{context_digest(context, skip=target_paths)}
 {intrinsics_block}
-{feedback_block}
+{optimization_block}{feedback_block}
 {embench_instructions(spec)}
 This is the SOFTWARE rung only. The hardware design is already fixed and
 already passed SoC generation; do not propose hardware changes here.

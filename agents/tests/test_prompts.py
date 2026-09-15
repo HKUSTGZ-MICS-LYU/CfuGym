@@ -8,7 +8,10 @@ from agents.cfu_design_agent.graph import _isa_from_template, deterministic_roof
 from agents.cfu_design_agent.isa import render_isa_markdown
 from agents.cfu_design_agent.prompts import (
     contract_prompt,
+    embench_instructions,
     hardware_prompt,
+    repair_routing_prompt,
+    software_need_prompt,
     software_prompt,
     workload_prompt,
 )
@@ -196,6 +199,85 @@ class EditProtocolPromptTest(unittest.TestCase):
             )
             # The old behavior forced full rewrites; the fallback must be scoped.
             self.assertIn("only for a new file or a large restructure", prompt)
+
+
+class SearchBlockGuidanceTest(unittest.TestCase):
+    """A large, comment-heavy SEARCH block must be discouraged explicitly."""
+
+    def _context(self, target: str) -> dict:
+        return {"files": {target: "LIVE_BYTES", "other.c": "KEEP"}, "visibility": "standard"}
+
+    def test_context_digest_omits_the_rungs_own_targets(self) -> None:
+        from agents.cfu_design_agent.prompts import context_digest
+
+        target = "agents/generated/runs/x/workspace/design/AgentCfu.scala"
+        digest = context_digest(self._context(target), skip=[target])
+        self.assertNotIn("LIVE_BYTES", digest)
+        self.assertIn("KEEP", digest)
+        self.assertIn("shown in full under", digest)
+
+    def test_target_file_is_rendered_exactly_once(self) -> None:
+        target = "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"
+        prompt = hardware_prompt("t", {}, "", "", self._context(target))
+        self.assertEqual(prompt.count("LIVE_BYTES"), 1)
+
+        benchmark = "agents/generated/runs/x/workspace/embench_b/cfu/src/b.c"
+        prompt = software_prompt(
+            "t", {}, "", "", self._context(benchmark), targets=[(benchmark, "LIVE_BYTES")]
+        )
+        self.assertEqual(prompt.count("LIVE_BYTES"), 1)
+
+    def test_delivery_protocols_warn_about_large_comment_search_blocks(self) -> None:
+        from agents.cfu_design_agent.prompts import DELIVERY_PROTOCOLS
+
+        self.assertIn("Do NOT wrap large comment blocks", DELIVERY_PROTOCOLS)
+        self.assertIn("copy it\nbyte-for-byte", DELIVERY_PROTOCOLS)
+        self.assertIn("do not resend the same block", DELIVERY_PROTOCOLS)
+
+
+class EmbenchSimLogGuidanceTest(unittest.TestCase):
+    def test_embench_instructions_explain_the_sim_log(self) -> None:
+        text = embench_instructions({"source_kind": "embench", "benchmark_name": "depthconv"})
+        self.assertIn("fail symbol", text)
+        self.assertIn("EMBENCH_VERIFY_FAIL", text)
+        self.assertIn("correctness bug", text)
+        self.assertIn("hang", text)
+
+    def test_non_embench_workloads_get_no_embench_guidance(self) -> None:
+        self.assertEqual(embench_instructions({"source_kind": "natural_language"}), "")
+
+
+class RouterPromptTest(unittest.TestCase):
+    """Both routers must state what each answer actually changes."""
+
+    ISA = {
+        "identity": {"name": "depthconv_cfu"},
+        "commands": [{"function_id": 1, "name": "compute"}],
+    }
+
+    def test_repair_routing_explains_the_consequence_of_each_target(self) -> None:
+        text = repair_routing_prompt(
+            "accelerate it", "verify failed", "log", {"name": "depthconv"}, isa_spec=self.ISA
+        )
+        # Software only: the hardware is not rebuilt.
+        self.assertIn("hardware is\n  left untouched and only the software changes", text)
+        # Hardware: the software is re-checked, so both sides may change.
+        self.assertIn("software is re-checked against the new hardware", text)
+        self.assertIn("updated as well when the new hardware needs it", text)
+
+    def test_software_need_prompt_explains_both_answers(self) -> None:
+        text = software_need_prompt(
+            "accelerate it",
+            {"name": "depthconv"},
+            self.ISA,
+            hardware_summary="hw",
+            software_summary="sw",
+            calls=[{"file": "a.c", "line": 3, "name": "cfu_compute", "text": "cfu_compute(1,2);"}],
+            evidence="the current kernel already calls cfu_compute",
+        )
+        self.assertIn('"software_change": "required" or "not_required"', text)
+        self.assertIn("a.c:3", text)
+        self.assertIn("only risk breaking working software", text)
 
 
 if __name__ == "__main__":

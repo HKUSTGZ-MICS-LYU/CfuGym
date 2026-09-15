@@ -16,7 +16,12 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .llm import DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, VALID_REASONING_EFFORTS
+from .llm import (
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    DEFAULT_REASONING_SUMMARY,
+    VALID_REASONING_EFFORTS,
+)
 
 VALID_API_MODES = ("auto", "responses", "chat")
 
@@ -112,6 +117,23 @@ def resolve_config(name: str, data: dict[str, Any]) -> dict[str, Any]:
     if thinking_body is not None and not isinstance(thinking_body, dict):
         raise LlmConfigError(f"thinking_body must be a JSON object, got {type(thinking_body).__name__}")
 
+    # OpenAI/Azure reasoning models expose only a summary through the Responses
+    # API, and only when it is requested; default to "auto" while thinking is on.
+    summary_raw = data.get("reasoning_summary")
+    if summary_raw is not None and not isinstance(summary_raw, str):
+        raise LlmConfigError(
+            f"reasoning_summary must be a string, got {type(summary_raw).__name__}"
+        )
+    summary = (summary_raw or "").strip()
+    if not thinking:
+        summary = ""
+    elif not summary:
+        summary = DEFAULT_REASONING_SUMMARY
+
+    # Token streaming: config may opt out; unset keeps the client default (on).
+    stream_raw = data.get("stream")
+    stream = None if stream_raw in (None, "") else _coerce_bool(stream_raw, "stream")
+
     return {
         "name": name,
         "description": data.get("description", ""),
@@ -123,6 +145,8 @@ def resolve_config(name: str, data: dict[str, Any]) -> dict[str, Any]:
         "timeout": int(timeout) if isinstance(timeout, (int, float)) else 120,
         "thinking": thinking,
         "reasoning_effort": effort,
+        "reasoning_summary": summary or None,
+        "stream": stream,
         "thinking_body": dict(thinking_body) if isinstance(thinking_body, dict) else None,
     }
 
@@ -151,6 +175,7 @@ def env_only_config(name: str) -> dict[str, Any]:
             "api_mode": os.environ.get("CFU_AGENT_LLM_API", "auto"),
             "thinking": os.environ.get("CFU_AGENT_THINKING", ""),
             "reasoning_effort": os.environ.get("CFU_AGENT_REASONING_EFFORT", ""),
+            "reasoning_summary": os.environ.get("CFU_AGENT_REASONING_SUMMARY", ""),
             "description": "Environment-only config (no JSON file).",
         },
     )

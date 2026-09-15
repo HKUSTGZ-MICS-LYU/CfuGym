@@ -229,6 +229,30 @@ class PrepareWorkspaceTest(unittest.TestCase):
         self.assertEqual(project["verification"], "bench_verify")
         self.assertEqual(set(project["elf_paths"]), {"reference", "profile", "cfu"})
 
+    def test_generated_main_c_carries_the_verify_diagnostic(self) -> None:
+        toolbox = RepoToolbox(
+            REPO_ROOT,
+            dry_run=False,
+            stage="prepare_benchmark",
+            run_root=f"agents/generated/runs/{self.run_id}",
+        )
+        project = embench.prepare_embench_benchmark(toolbox, {"benchmark_name": "crc32"})
+        main = (REPO_ROOT / project["workspace"] / "reference/embench_main.c").read_text()
+        self.assertIn("EMBENCH_VERIFY_", main)
+        self.assertIn("EMBENCH_STRINGIFY", main)
+        # Embench verify_benchmark() returns non-zero when correct, so a PASS is
+        # `correct` non-zero (main returns !correct and start.S passes on 0).
+        self.assertIn('correct ? "PASS" : "FAIL"', main)
+
+    def test_main_instrumentation_is_a_noop_without_the_verify_call(self) -> None:
+        self.assertEqual(embench.instrument_embench_main("int main(void){return 0;}\n"), (
+            "int main(void){return 0;}\n"
+        ))
+        injected = embench.instrument_embench_main(
+            "  correct = verify_benchmark (result);\n  return (!correct);\n"
+        )
+        self.assertIn("EMBENCH_VERIFY_", injected)
+
     def test_unknown_benchmark_rejected(self) -> None:
         toolbox = RepoToolbox(
             REPO_ROOT,

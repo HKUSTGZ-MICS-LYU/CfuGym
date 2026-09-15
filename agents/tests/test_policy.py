@@ -230,6 +230,28 @@ class VisibilityPolicyTest(unittest.TestCase):
                 level,
             )
 
+    def test_workload_source_shown_in_context_stays_tool_readable(self) -> None:
+        # The workload source is loaded into the prompt at load_context, so the
+        # isa/implementation/analysis tool loops must not be denied the same file.
+        workload = "benchmarks/embench-iot/src/depthconv/depthconv.c"
+        policy = load_policy(REPO_ROOT, visibility="extended")
+        for stage in ("load_context", "analysis", "isa", "implementation"):
+            self.assertTrue(policy.can_read(stage, workload), stage)
+
+    def test_analysis_can_read_asm_but_build_asm_stays_denied(self) -> None:
+        policy = load_policy(REPO_ROOT, visibility="extended")
+        # The profile build's disassembly is useful analysis input.
+        for path in (
+            "agents/generated/runs/x/workspace/embench_depthconv/reference/embench_main.asm",
+            "agents/generated/runs/x/workspace/embench_depthconv/profile/embench_main.asm",
+            "sw/tests/latency_lane_cfu_test.asm",
+        ):
+            self.assertTrue(policy.can_read("analysis", path), path)
+        # .asm is no longer globally denied, but build noise still is.
+        self.assertFalse(policy.is_denied("agents/generated/runs/x/workspace/a.asm"))
+        self.assertTrue(policy.is_denied("sw/build/foo.asm"))
+        self.assertFalse(policy.can_read("analysis", "sw/build/foo.asm"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from agents.cfu_design_agent import graph
-from agents.cfu_design_agent.tools import RepoToolbox
+from agents.cfu_design_agent.tools import RepoToolbox, parse_command_output
 from agents.tests.common import REPO_ROOT
 
 VALID_ISA = """spec_version: "1"
@@ -133,6 +133,54 @@ class _NoHardwarePatchLlm(_ScriptedLlm):
         return super().complete(system, user, fallback=fallback, response_format=response_format)
 
 
+class _ReuseSoftwareLlm(_ScriptedLlm):
+    """The software router keeps the kernel the first pass already wrote."""
+
+    def complete(self, system: str, user: str, *, fallback: str, response_format=None):
+        if "Decide whether the software rung must run again" in user:
+            from agents.cfu_design_agent.llm import LlmResult
+
+            self.prompts.append(user)
+            return LlmResult(
+                '{"software_change": "not_required", '
+                '"reason": "the current kernel already calls cfu_compute"}',
+                used_llm=True,
+            )
+        return super().complete(system, user, fallback=fallback, response_format=response_format)
+
+
+class _LoopingLlm(_ScriptedLlm):
+    """One extra hardware round after a passing run, then stop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.optimize_prompts: list[str] = []
+        self.software_need_prompts: list[str] = []
+
+    def complete(self, system: str, user: str, *, fallback: str, response_format=None):
+        from agents.cfu_design_agent.llm import LlmResult
+
+        if "Decide whether another round is worth spending budget on" in user:
+            self.optimize_prompts.append(user)
+            if len(self.optimize_prompts) == 1:
+                return LlmResult(
+                    '{"continue": true, "target": "implement_hw", "focus": "cost", '
+                    '"reason": "shrink the vector register file"}',
+                    used_llm=True,
+                )
+            return LlmResult(
+                '{"continue": false, "reason": "the datapath is small enough now"}',
+                used_llm=True,
+            )
+        if "Decide whether the software rung must run again" in user:
+            self.software_need_prompts.append(user)
+            return LlmResult(
+                '{"software_change": "not_required", "reason": "the kernel still drives the CFU"}',
+                used_llm=True,
+            )
+        return super().complete(system, user, fallback=fallback, response_format=response_format)
+
+
 class _ScalarFallbackLlm(_ScriptedLlm):
     """Software reverts to scalar inside the CFU build to pass verification."""
 
@@ -206,13 +254,14 @@ class _ScriptedCommands:
             # Profiling is setup, not a ladder rung: it always succeeds and does
             # not consume the scripted ladder plan. It still reports the profile
             # lines the real board prints, so the reference cycle count exists.
+            stdout = self.sim_stdout(args) if command_id == "soc_sim" else ""
             return {
                 "command": " ".join(args),
                 "cwd": str(toolbox.workdir),
                 "returncode": 0,
-                "stdout_tail": self.sim_stdout(args) if command_id == "soc_sim" else "",
+                "stdout_tail": stdout,
                 "stderr_tail": "",
-                "parsed": {},
+                "parsed": parse_command_output(stdout),
             }
         queue = self.plan.setdefault(command_id, [])
         code = queue.pop(0) if queue else 0
@@ -242,8 +291,10 @@ class _ScriptedCommands:
                     elf = (toolbox.workdir / "sw" / f"{token.split('=', 1)[1]}.elf").resolve()
                     elf.parent.mkdir(parents=True, exist_ok=True)
                     elf.write_text("elf")
-        if code == 0 and command_id == "soc_sim":
+        if command_id == "soc_sim":
+            # A simulator prints its log whether or not the software passed.
             result["stdout_tail"] = self.sim_stdout(args)
+            result["parsed"] = parse_command_output(result["stdout_tail"])
         return result
 
 
@@ -283,6 +334,8 @@ class LadderTest(unittest.TestCase):
             "skip_yosys": skip_yosys,
             "max_iters": max_iters,
             "run_id": self.run_id,
+            # Tests use scripted builds; never read or write the shared profile cache.
+            "profile_cache": "off",
         }
         state.update(overrides)
         def fake_run_command(toolbox, args, **kwargs):
@@ -480,6 +533,126 @@ class LadderTest(unittest.TestCase):
         self.assertTrue(timed_out, final["validation_results"])
         self.assertIn("timed out", timed_out[0]["stderr_tail"])
 
+    def test_a_hardware_repair_may_reuse_the_software(self) -> None:
+        # Pass 1 writes the kernel and simulates. The cost rung then fails and
+        # repairs the hardware, so the second hardware build runs with the kernel
+        # already in the workspace: the agent may keep it instead of paying for
+        # another software rewrite.
+        final, scripted, llm = self._run(
+            {"soc_generate_agent": [0], "yosys_cost": [1, 0]},
+            llm=_ReuseSoftwareLlm(),
+        )
+        self.assertEqual(final["status"], "complete")
+        # The software rung ran once (the first pass) and was reused afterwards.
+        self.assertEqual(len(llm.software_prompts()), 1)
+        self.assertTrue(final["gates"]["implementation_sw"]["reused"])
+        self.assertTrue(final["gates"]["implementation_sw"]["ok"])
+        self.assertEqual(final["gates"]["hw_build"]["next"], "build_sw")
+        self.assertEqual(final["gates"]["hw_build"]["software_decision"]["source"], "llm")
+        self.assertTrue(final["gates"]["sw_build"]["software_reused"])
+        self.assertTrue(final["gates"]["sw_build"]["ok"])
+        # The reused kernel is still compiled and simulated twice: reuse skips the
+        # rewrite, never the validation.
+        self.assertEqual(scripted.ladder.count("soc_sim"), 2)
+        self.assertIn("Software reused unchanged", "\n".join(final["iteration_history"]))
+        decision_path = self.run_dir / "09_implementation/software_decision.yaml"
+        self.assertTrue(decision_path.is_file())
+        self.assertIn("not_required", decision_path.read_text())
+        router_prompts = [p for p in llm.prompts if "Decide whether the software rung must run again" in p]
+        self.assertEqual(len(router_prompts), 1)
+        self.assertIn("cfu_compute", router_prompts[0])
+
+    def test_a_pristine_harness_does_not_count_as_driving_the_cfu(self) -> None:
+        # The generated benchmark's own wrapper calls cfu_agent_counter_read(),
+        # which reports cycles and is not datapath evidence. A build that only
+        # calls it must not be treated as an accelerated kernel.
+        final, _scripted, llm = self._run(
+            {"soc_generate_agent": [0], "yosys_cost": [0]},
+            llm=_ReuseSoftwareLlm(),
+        )
+        self.assertEqual(final["status"], "complete")
+        self.assertFalse(final["gates"]["implementation_sw"].get("reused", False))
+        self.assertEqual(len(llm.software_prompts()), 1)
+        # No hardware repair, so the software router was never consulted.
+        self.assertEqual(
+            [p for p in llm.prompts if "Decide whether the software rung must run again" in p],
+            [],
+        )
+
+    def test_loop_keeps_optimizing_a_passing_run(self) -> None:
+        # --loop: the run already passes, and the agent uses the leftover budget
+        # for one more hardware round that improves the measured speedup.
+        cfu_runs = {"n": 0}
+
+        def sim_stdout(args: list[str]) -> str:
+            joined = " ".join(args)
+            if "/reference/" in joined:
+                return (
+                    "CFU_AGENT_PROFILE crc32=100\n"
+                    "CFU_AGENT_PROFILE scalar_kernel=100\n"
+                    "CFU_AGENT_PASS\n"
+                )
+            if "/cfu/" in joined:
+                cfu_runs["n"] += 1
+                cycles = 50 if cfu_runs["n"] == 1 else 40
+                return (
+                    f"CFU_AGENT_PROFILE crc32={cycles}\n"
+                    f"CFU_AGENT_PROFILE scalar_kernel={cycles}\n"
+                    "CFU_AGENT_PASS\n"
+                )
+            return "CFU_AGENT_PROFILE scalar_kernel=100\nCFU_AGENT_PASS\n"
+
+        final, scripted, llm = self._run(
+            {"soc_generate_agent": [0], "yosys_cost": [0]},
+            benchmark_name="crc32",
+            input_mode="embench",
+            max_iters=3,
+            sim_stdout=sim_stdout,
+            llm=_LoopingLlm(),
+            loop_optimize=True,
+        )
+        self.assertEqual(final["status"], "complete")
+        # One initial ladder pass plus exactly one optimization round.
+        self.assertEqual(scripted.ladder.count("soc_generate_agent"), 2)
+        self.assertEqual(scripted.ladder.count("soc_sim"), 2)
+        self.assertEqual(final["repairs_used"], 1)
+        self.assertEqual(final["attempts"]["optimize"], 1)
+        # An optimization round is not a repair and not a software rewrite.
+        self.assertEqual(len(llm.optimize_prompts), 2)
+        self.assertEqual(len(llm.software_prompts()), 1)
+        self.assertEqual(len(llm.software_need_prompts), 1)
+        hardware = llm.hardware_prompts()
+        self.assertEqual(len(hardware), 2)
+        self.assertIn("=== OPTIMIZATION ROUND ===", hardware[1])
+        self.assertIn("reduce the synthesized CFU cost", hardware[1])
+        self.assertIn("shrink the vector register file", hardware[1])
+        self.assertNotIn("HARDWARE REPAIR MODE", hardware[1])
+        rounds = final["optimization_rounds"]
+        self.assertEqual([entry["round"] for entry in rounds], [0, 1])
+        self.assertEqual(rounds[0]["target"], "baseline")
+        self.assertEqual(rounds[0]["speedup_x100"], 200)
+        self.assertEqual(rounds[1]["target"], "implement_hw")
+        self.assertEqual(rounds[1]["speedup_x100"], 250)
+        self.assertTrue(rounds[1]["improved"])
+        self.assertFalse(final["optimization_plan"])
+        ledger = self.run_dir / "12_review/optimization_rounds.yaml"
+        self.assertTrue(ledger.is_file())
+        self.assertIn("implement_hw", ledger.read_text())
+
+    def test_loop_without_budget_stops_after_the_first_pass(self) -> None:
+        final, scripted, llm = self._run(
+            {"soc_generate_agent": [0], "yosys_cost": [0]},
+            max_iters=1,
+            llm=_LoopingLlm(),
+            loop_optimize=True,
+        )
+        self.assertEqual(final["status"], "complete")
+        self.assertEqual(scripted.ladder.count("soc_generate_agent"), 1)
+        self.assertEqual(final["gates"]["review"]["optimization"]["source"], "budget")
+        self.assertEqual(final["gates"]["review"]["next"], "final_report")
+        self.assertEqual(len(final["optimization_rounds"]), 1)
+        self.assertNotIn("repairs_used", final)
+
     def test_skipped_ladder_is_planned_without_repairs(self) -> None:
         final, scripted, _llm = self._run(dry_run=True)
         self.assertEqual(final["status"], "planned")
@@ -521,6 +694,31 @@ class LadderTest(unittest.TestCase):
         self.assertTrue(
             (self.run_dir / "workspace/embench_crc32/cfu/include/cfu_intrinsics.h").is_file()
         )
+
+    def test_verify_failure_is_attributed_and_fed_back_to_the_repair(self) -> None:
+        def sim_stdout(args):
+            return (
+                "CFU_AGENT_PROFILE crc32=120 calls=1\n"
+                "EMBENCH_VERIFY_FAIL benchmark=crc32 verify=0 result=0\n"
+                "SimFailure: Software reached the fail symbol :(\n"
+            )
+
+        final, _scripted, llm = self._run(
+            {"soc_generate_agent": [0], "embench_build": [0], "soc_sim": [1]},
+            max_iters=2,
+            input_mode="embench",
+            benchmark_name="crc32",
+            sim_stdout=sim_stdout,
+        )
+        gate = final["gates"]["sim"]
+        self.assertFalse(gate["ok"])
+        self.assertIn("verify failed for crc32", gate["attribution"])
+        # The attribution reaches the software repair prompt, not just the report.
+        self.assertTrue(
+            any("verify failed for crc32" in prompt for prompt in llm.software_prompts())
+        )
+        artifact = (self.run_dir / "10_validation/embench.yaml").read_text()
+        self.assertIn("attribution:", artifact)
 
     def test_c_project_ladder_compiles_the_copied_kernel(self) -> None:
         project = "agents/examples/c_project_u8_wavg"
@@ -632,6 +830,43 @@ class LadderTest(unittest.TestCase):
             any("not meaningfully faster" in error for error in final.get("errors", [])),
             final.get("errors"),
         )
+
+    @unittest.skipUnless(graph._LANGRAPH_AVAILABLE, "langgraph is not installed")
+    def test_langgraph_loop_keeps_optimizing_a_passing_run(self) -> None:
+        cfu_runs = {"n": 0}
+
+        def sim_stdout(args: list[str]) -> str:
+            joined = " ".join(args)
+            if "/reference/" in joined:
+                return (
+                    "CFU_AGENT_PROFILE crc32=100\n"
+                    "CFU_AGENT_PROFILE scalar_kernel=100\n"
+                    "CFU_AGENT_PASS\n"
+                )
+            if "/cfu/" in joined:
+                cfu_runs["n"] += 1
+                cycles = 50 if cfu_runs["n"] == 1 else 40
+                return (
+                    f"CFU_AGENT_PROFILE crc32={cycles}\n"
+                    f"CFU_AGENT_PROFILE scalar_kernel={cycles}\n"
+                    "CFU_AGENT_PASS\n"
+                )
+            return "CFU_AGENT_PROFILE scalar_kernel=100\nCFU_AGENT_PASS\n"
+
+        final, scripted, llm = self._run(
+            {"soc_generate_agent": [0], "yosys_cost": [0]},
+            benchmark_name="crc32",
+            input_mode="embench",
+            max_iters=3,
+            sim_stdout=sim_stdout,
+            llm=_LoopingLlm(),
+            loop_optimize=True,
+            runner=graph.run_agent,
+        )
+        self.assertEqual(final["status"], "complete")
+        self.assertEqual(scripted.ladder.count("soc_generate_agent"), 2)
+        self.assertEqual([entry["round"] for entry in final["optimization_rounds"]], [0, 1])
+        self.assertTrue(final["optimization_rounds"][1]["improved"])
 
     @unittest.skipUnless(graph._LANGRAPH_AVAILABLE, "langgraph is not installed")
     def test_langgraph_ladder_repairs_and_stops(self) -> None:

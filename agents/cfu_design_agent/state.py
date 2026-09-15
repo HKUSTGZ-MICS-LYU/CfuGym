@@ -123,6 +123,25 @@ class CfuDesignState(TypedDict, total=False):
     run_commands: bool
     agent_tools: bool
     max_tool_rounds: int
+    # Cumulative cap on tool calls per agent step (0 = unlimited).
+    max_tool_calls: int
+    # Reference/profile measurement cache: on | off | refresh.
+    profile_cache: str
+    # Stream provider output tokens (live progress + per-chunk read timeout).
+    stream_llm: bool
+    # Failed-simulation repair routing: auto (LLM decides sw/hw) | fixed.
+    repair_routing: str
+    # Whether the software rung must run after the hardware build:
+    # auto (the agent may reuse a kernel that already drives the CFU) | always.
+    software_change: str
+    # --loop: a passing run may spend leftover budget on optimization rounds.
+    loop_optimize: bool
+    # The optimization round currently being executed ({} outside --loop).
+    optimization_plan: dict[str, Any]
+    # Index of the round whose measurements the sim/cost gates carry.
+    optimization_round: int
+    # One measured result per round, for the ledger and the report.
+    optimization_rounds: list[dict[str, Any]]
     # Read-only file visibility tier: basic | standard | extended.
     visibility: Visibility
     skip_sim: bool
@@ -179,6 +198,9 @@ class CfuDesignState(TypedDict, total=False):
     llm_raw_outputs: Annotated[list[str], operator.add]
     # One summary entry per agent tool call (read_file/list_dir/search_text).
     tool_calls: Annotated[list[dict], operator.add]
+    # (response_hash, error_hash) per software attempt; two identical consecutive
+    # entries mean the repair prompt produced the same answer again.
+    sw_attempts: Annotated[list[dict], operator.add]
     progress_summary: dict[str, Any]
 
 

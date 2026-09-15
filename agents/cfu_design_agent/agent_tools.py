@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .policy import PolicyError
-from .tools import RepoToolbox
+from .tools import RepoToolbox, redirect_target
 
 
 READ_FILE_SCHEMA: dict[str, Any] = {
@@ -123,6 +123,36 @@ class ReadOnlyToolset:
     def _rel(self, path: Path) -> str:
         return path.relative_to(self.toolbox.workdir).as_posix()
 
+    def _live_path(self, rel_path: str) -> str:
+        """Route a repo path to its live run-workspace copy when one exists.
+
+        The hardware prompt shows, and an edit targets, the run-workspace
+        overlay under the tracked repo path. The tool must read the same bytes:
+        otherwise a repair reads the pristine scaffold instead of the model's
+        previous change and "corrects" a file it never sees.
+        """
+        try:
+            normalized = self.toolbox.normalize(rel_path)
+        except PolicyError:
+            return rel_path
+        if not self.toolbox.run_root:
+            return rel_path
+        redirected = redirect_target(
+            normalized,
+            self.toolbox.run_root,
+            self.toolbox.embench_benchmark,
+        )
+        # Only follow a stage that may read the overlay: some stages (for
+        # example analysis) are allowed the tracked scaffold but not the design
+        # workspace, and must keep reading the tracked path there.
+        if (
+            redirected
+            and (self.toolbox.workdir / redirected).is_file()
+            and self.toolbox.is_read_allowed(redirected)
+        ):
+            return redirected
+        return rel_path
+
     def _check_glob(self, glob: str) -> str:
         glob = (glob or "").strip() or "*"
         if glob.startswith("/") or glob.startswith("\\") or ".." in Path(glob).parts:
@@ -147,7 +177,7 @@ class ReadOnlyToolset:
         path = str(args.get("path", "") or "").strip()
         if not path:
             return "error: path is required"
-        text = self.toolbox.read_text(path, limit=self.max_file_bytes)
+        text = self.toolbox.read_text(self._live_path(path), limit=self.max_file_bytes)
         if not text:
             return "(empty file, missing file, or not visible to this stage)"
         lines = text.split("\n")
@@ -192,7 +222,7 @@ class ReadOnlyToolset:
                 continue
             rel = self._rel(path)
             try:
-                text = self.toolbox.read_text(rel, limit=self.max_file_bytes)
+                text = self.toolbox.read_text(self._live_path(rel), limit=self.max_file_bytes)
             except PolicyError:
                 continue
             if not text:

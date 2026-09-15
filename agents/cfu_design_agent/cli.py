@@ -12,6 +12,21 @@ from .llm_config import LlmConfigError, effective_config, list_configs
 from .state import CfuDesignState
 
 
+def _stream_default() -> bool | None:
+    """CFU_AGENT_STREAM_LLM as a tri-state default (None keeps the config value)."""
+    raw = os.environ.get("CFU_AGENT_STREAM_LLM", "").strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    if raw in ("0", "false", "off", "no"):
+        return False
+    return None
+
+
+def _flag_env(name: str) -> bool:
+    """Optional boolean default for a store_true flag."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CfuGym CFU design agent.")
     parser.add_argument("--task", default="", help="Natural-language workload or CFU design request.")
@@ -78,6 +93,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum tool-calling rounds per agent step (default: 6).",
     )
     parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=24,
+        help="Maximum tool calls per agent step, across all rounds (default: 24; 0 disables the cap).",
+    )
+    parser.add_argument(
+        "--profile-cache",
+        choices=("on", "off", "refresh"),
+        default=os.environ.get("CFU_AGENT_PROFILE_CACHE", "on"),
+        help="Reuse the cross-run reference/profile measurement when its inputs "
+        "match: on (default), off, or refresh to recompute and overwrite.",
+    )
+    parser.add_argument(
+        "--repair-routing",
+        choices=("auto", "fixed"),
+        default=os.environ.get("CFU_AGENT_REPAIR_ROUTING", "auto"),
+        help="Who repairs a failed simulation: auto lets the agent choose software vs "
+        "hardware from the failure evidence (default); fixed keeps the deterministic "
+        "software-then-hardware escalation.",
+    )
+    parser.add_argument(
+        "--loop",
+        dest="loop_optimize",
+        action="store_true",
+        default=_flag_env("CFU_AGENT_LOOP"),
+        help="Keep optimizing after a fully passing run: while --max-iters budget "
+        "remains, review lets the agent start another hardware or software round to "
+        "raise speedup or reduce the synthesized CFU cost (PPA).",
+    )
+    parser.add_argument(
+        "--software-change",
+        choices=("auto", "always"),
+        default=os.environ.get("CFU_AGENT_SOFTWARE_CHANGE", "auto"),
+        help="Whether the software rung must run after the hardware is built: auto lets "
+        "the agent keep the existing kernel when it already drives the CFU and the ISA "
+        "contract is unchanged (default); always re-writes the software every iteration.",
+    )
+    parser.add_argument(
+        "--stream-llm",
+        dest="stream_llm",
+        action="store_true",
+        default=_stream_default(),
+        help="Stream model output tokens: prints live output-token progress and avoids a "
+        "whole-response timeout on a slow generation (default: on unless the config or "
+        "CFU_AGENT_STREAM_LLM disables it).",
+    )
+    parser.add_argument(
+        "--no-stream-llm",
+        dest="stream_llm",
+        action="store_false",
+        help="Disable provider token streaming (single non-streaming completion).",
+    )
+    parser.add_argument(
         "--visibility",
         choices=("basic", "standard", "extended"),
         default=os.environ.get("CFU_AGENT_VISIBILITY", "standard"),
@@ -120,6 +188,12 @@ def main(argv: list[str] | None = None) -> int:
         "dry_run": dry_run,
         "agent_tools": args.agent_tools,
         "max_tool_rounds": args.max_tool_rounds,
+        "max_tool_calls": args.max_tool_calls,
+        "profile_cache": args.profile_cache,
+        "loop_optimize": args.loop_optimize,
+        "repair_routing": args.repair_routing,
+        "software_change": args.software_change,
+        "stream_llm": args.stream_llm,
         "visibility": args.visibility,
         "apply_patch": args.apply_patch and not dry_run,
         "run_commands": args.run_commands and not dry_run,
@@ -159,9 +233,95 @@ def main(argv: list[str] | None = None) -> int:
         for error in final_state["errors"]:
             print(f"- {error}")
 
+    _print_run_summary(final_state)
     _print_token_summary(final_state)
     # planned/complete are successful planning or execution outcomes.
     return 0 if final_state.get("status") in {"complete", "planned"} else 1
+
+
+def _graph_module():
+    """The graph module, imported lazily so CLI tests can stub it cleanly."""
+    from . import graph
+
+    return graph
+
+
+def _sim_gate(final_state: CfuDesignState) -> dict:
+    gate = (final_state.get("gates") or {}).get("sim")
+    return gate if isinstance(gate, dict) else {}
+
+
+def _cost_summary(final_state: CfuDesignState) -> dict:
+    """The structured Yosys cost of the last successful estimator run."""
+    for result in reversed(final_state.get("cost_results") or []):
+        parsed = result.get("parsed") or {}
+        cost = parsed.get("cost") if isinstance(parsed, dict) else None
+        if isinstance(cost, dict):
+            return cost
+    return {}
+
+
+def _print_run_summary(final_state: CfuDesignState) -> None:
+    """Headline results: reference/CFU cycles, speedup, and Yosys cost."""
+    sim = _sim_gate(final_state)
+    reference = int(sim.get("reference_cycles", 0) or 0)
+    cfu = int(sim.get("cfu_cycles", 0) or 0)
+    speedup_x100 = int(sim.get("speedup_x100", 0) or 0)
+    cost = _cost_summary(final_state)
+
+    print()
+    print("summary:")
+    if reference and cfu:
+        print(f"  cycles_before = {reference}")
+        print(f"  cycles_after  = {cfu}")
+        print(f"  speedup       = {speedup_x100 / 100:.2f}x")
+    else:
+        reason = str(sim.get("reason", "") or ("skipped" if sim.get("skipped") else "not measured"))
+        print("  cycles_before = n/a")
+        print("  cycles_after  = n/a")
+        print(f"  speedup       = n/a ({reason})")
+    if cost:
+        print(
+            "  yosys_cost    = top={top} cells={cells} wire_bits={wire_bits} "
+            "memories={memories} memory_bits={memory_bits}".format(**cost)
+        )
+    else:
+        print("  yosys_cost    = n/a")
+    cache = (final_state.get("gates") or {}).get("profile") or {}
+    cache = cache.get("profile_cache") if isinstance(cache, dict) else None
+    if isinstance(cache, dict) and cache.get("status"):
+        key = str(cache.get("key", ""))[:12]
+        suffix = f" (key {key})" if key else ""
+        print(f"  profile_cache = {cache['status']}{suffix}")
+    rounds = final_state.get("optimization_rounds") or []
+    if len(rounds) > 1 or final_state.get("loop_optimize"):
+        graph = _graph_module()
+        best = next((item for item in reversed(rounds) if item.get("improved")), None)
+        best_round = (best or {}).get("round")
+        final_round = rounds[-1].get("round") if rounds else None
+        print("  loop:")
+        for index, entry in enumerate(rounds):
+            marker = ""
+            if entry.get("round") == best_round:
+                marker = " (best)"
+            elif entry.get("improved") is False and entry.get("measured"):
+                marker = " (regressed)"
+            print(
+                f"    round {entry.get('round')}: {entry.get('target')} "
+                + graph._round_metrics_text(entry)
+                + graph._metric_deltas(entry, graph._previous_measured(rounds, index))
+                + marker
+            )
+        if (
+            best_round is not None
+            and final_round is not None
+            and best_round != final_round
+            and rounds[-1].get("measured")
+        ):
+            print(
+                f"    WARNING: the final round is not the best (round {best_round}); "
+                "the delivered files are the final round"
+            )
 
 
 def _print_token_summary(final_state: CfuDesignState) -> None:
@@ -203,6 +363,7 @@ def run_api_test(workdir: Path, args: argparse.Namespace) -> int:
     print(f"api_key_set={bool(client.api_key)}")
     print(f"thinking={getattr(client, 'thinking', False)}")
     print(f"reasoning_effort={getattr(client, 'reasoning_effort', None)}")
+    print(f"reasoning_summary={getattr(client, 'reasoning_summary', None)}")
 
     if not client.available:
         print("api-key-missing: no API key resolved; set the config's api_key_env var or OPENAI_API_KEY")

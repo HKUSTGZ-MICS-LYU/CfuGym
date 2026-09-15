@@ -55,6 +55,10 @@ class LoadContextVisibilityTest(unittest.TestCase):
         manifest = (run_dir / "01_context/manifest.yaml").read_text()
         self.assertIn("visibility: basic", manifest)
         self.assertIn("withheld_files", manifest)
+        # The tool budget is part of run.yaml so a failed attempt is reproducible.
+        run_yaml = (run_dir / "run.yaml").read_text()
+        self.assertIn("tool_policy:", run_yaml)
+        self.assertIn("max_calls_per_round:", run_yaml)
 
     def test_standard_loads_skills_and_withholds_nothing(self) -> None:
         final, _ = self._load("standard")

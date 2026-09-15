@@ -33,6 +33,40 @@ DEFAULT_MARCH = "rv32imc_zicsr_zifencei"
 DEFAULT_WARMUP_HEAT = 1
 DEFAULT_GLOBAL_SCALE_FACTOR = 1
 
+# The SoC harness stops on the pass/fail symbol, which only says main() returned
+# non-zero. The harness owns the generated embench_main.c, so it adds one
+# machine-readable line that makes a verify failure attributable in the sim log
+# without touching Embench's oracle or its read-only tree.
+VERIFY_CALL = "correct = verify_benchmark (result);"
+VERIFY_PREAMBLE = """/* Injected by the CFU agent harness (verify diagnostics). */
+#include <stdio.h>
+#ifndef EMBENCH_NAME
+#define EMBENCH_NAME unknown
+#endif
+#ifndef EMBENCH_STRINGIFY
+#define EMBENCH_STRINGIFY_(x) #x
+#define EMBENCH_STRINGIFY(x) EMBENCH_STRINGIFY_(x)
+#endif
+"""
+VERIFY_DIAGNOSTIC = """
+  /* Harness diagnostic. Embench's verify_benchmark() returns non-zero when the
+     result is CORRECT and 0 on a mismatch; main() returns !correct and the
+     startup code branches to `pass` iff that return is 0. So correct != 0 is a
+     PASS and correct == 0 is a FAIL. */
+  printf ("EMBENCH_VERIFY_%s benchmark=%s verify=%d result=%d\\n",
+          correct ? "PASS" : "FAIL", EMBENCH_STRINGIFY (EMBENCH_NAME), correct,
+          (int) result);
+"""
+
+
+def instrument_embench_main(text: str) -> str:
+    """Add a machine-readable verify pass/fail line to the generated main.c."""
+    if VERIFY_CALL not in text:
+        return text
+    injected = text.replace(VERIFY_CALL, VERIFY_CALL + VERIFY_DIAGNOSTIC, 1)
+    return VERIFY_PREAMBLE + injected
+
+
 
 def benchmark_dir(name: str) -> str:
     return f"{EMBENCH_ROOT}/src/{name}"
@@ -183,7 +217,7 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
         fname: toolbox.read_text(f"{BOARD_ROOT}/{fname}", limit=2_000_000)
         for fname in BOARD_FILES
     }
-    main_text = support_texts.get("main.c", "")
+    main_text = instrument_embench_main(support_texts.get("main.c", ""))
 
     for config in CONFIGS:
         cfg = config_workspace(run_root, name, config)

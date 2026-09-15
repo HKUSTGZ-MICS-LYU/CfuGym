@@ -47,7 +47,6 @@ deny:
   - "**/*.a"
   - "**/*.so"
   - "**/*.map"
-  - "**/*.asm"
   - "**/*.vcd"
   - "**/*.fst"
 
@@ -56,6 +55,8 @@ deny:
 # defaults; an agent run shadows them via its run workspace overlay.
 write_roots:
   - "agents/generated/runs"
+  # Cross-run measurement cache (git-ignored). Only the profile stage uses it.
+  - "agents/generated/cache"
   - "sw/tests"
 
 stages:
@@ -121,12 +122,14 @@ stages:
       - "agents/generated/runs/**/02_workload/**"
       - "agents/generated/runs/**/04_benchmark/**"
       - "agents/generated/runs/**/workspace/**"
+      - "agents/generated/cache/**"
       - "benchmarks/embench-iot/src/**"
       - "sw/embench/**"
     write:
       - "agents/generated/runs/**/05_profile/**"
       - "agents/generated/runs/**/workspace/**"
       - "agents/generated/runs/**/run.yaml"
+      - "agents/generated/cache/**"
     commands: [make_profile, project_test, embench_build, soc_sim]
   hotspot:
     read:
@@ -141,6 +144,11 @@ stages:
     read:
       - "agents/generated/runs/**/02_workload/**"
       - "agents/generated/runs/**/06_hotspot/**"
+      # The profile build's disassembly, so the analysis can read the real
+      # instructions of the hot loop instead of inferring them from C.
+      - "agents/generated/runs/**/workspace/**/*.asm"
+      - "benchmarks/embench-iot/src/**"
+      - "benchmarks/embench-iot/support/**"
       - "skills/cfu-designer/SKILL.md"
       - "skills/cfu-designer/references/acceleration-patterns.md"
       - "skills/cfu-designer/references/roofline-analysis.md"
@@ -169,6 +177,10 @@ stages:
       - "src/main/scala/vexiiriscv/soc/mico/**"
       - "sw/MiCo-Lib/targets/vexii_soc/custom_asm.h"
       - "sw/tests/**"
+      # Same reasoning as the implementation stage: the workload source shown in
+      # the context must stay readable when the ISA contract is drafted.
+      - "benchmarks/embench-iot/src/**"
+      - "benchmarks/embench-iot/support/**"
       # SpinalHDL syntax/API is only exposed at the `extended` visibility level
       # (see the `visibility` section); it is never pre-read into the prompt.
       - "ext/SpinalHDL/**"
@@ -187,6 +199,11 @@ stages:
       - "agents/generated/runs/**/workspace/*_benchmark/**"
       - "agents/generated/runs/**/workspace/*_project_profile/**"
       - "agents/examples/**"
+      # The workload source is shown in the prompt context at load_context, so
+      # it must also be readable here: otherwise the tool loop is denied a file
+      # the model can already see.
+      - "benchmarks/embench-iot/src/**"
+      - "benchmarks/embench-iot/support/**"
       - "skills/cfu-designer/assets/templates/**"
       - "src/main/scala/vexiiriscv/execute/cfu/**"
       - "src/main/scala/vexiiriscv/soc/cfu/**"

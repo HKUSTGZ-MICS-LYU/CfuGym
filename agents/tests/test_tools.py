@@ -82,6 +82,77 @@ class ToolsTest(unittest.TestCase):
         parsed = parse_command_output("\x1b[32mCFU_AGENT_PROFILE crc32=42\x1b[0m\n")
         self.assertEqual(parsed["profiles"][0]["crc32"], 42)
 
+    def test_parse_command_output_extracts_the_yosys_cost_line(self) -> None:
+        from agents.cfu_design_agent.tools import parse_command_output
+
+        parsed = parse_command_output(
+            "Wrote out/summary.md\ncost top=AgentCfu cells=3845 wire_bits=4402 "
+            "memories=0 memory_bits=0\n"
+        )
+        self.assertEqual(
+            parsed["cost"],
+            {
+                "top": "AgentCfu",
+                "cells": 3845,
+                "wire_bits": 4402,
+                "memories": 0,
+                "memory_bits": 0,
+            },
+        )
+        self.assertNotIn("cost", parse_command_output("no cost summary here\n"))
+
+    def test_parse_command_output_extracts_the_verify_diagnostic(self) -> None:
+        from agents.cfu_design_agent.tools import parse_command_output
+
+        # Embench: verify_benchmark() != 0 means correct; 0 means a mismatch.
+        parsed = parse_command_output(
+            "EMBENCH_VERIFY_FAIL benchmark=depthconv verify=0 result=0\n"
+        )
+        self.assertEqual(
+            parsed["verify"],
+            {"status": "fail", "benchmark": "depthconv", "verify": 0, "result": 0},
+        )
+        passed = parse_command_output("EMBENCH_VERIFY_PASS benchmark=crc32 verify=1 result=0\n")
+        self.assertEqual(passed["verify"]["status"], "pass")
+        self.assertNotIn("verify", parse_command_output("no verify line here\n"))
+
+    def test_edit_end_tolerates_trailing_sampler_junk(self) -> None:
+        from agents.cfu_design_agent.tools import (
+            extract_edit_blocks,
+            unterminated_edit_blocks,
+        )
+
+        # Observed in a real run: "EDIT_END સલ" discarded an otherwise valid edit.
+        text = (
+            "REPAIR_DIAGNOSIS\n- Observed errors: x\n\n"
+            "EDIT_BEGIN src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala\n"
+            "<<<<<<< SEARCH\n"
+            "    val input = a.asSInt\n"
+            "=======\n"
+            "    val input = a.intoSInt\n"
+            ">>>>>>> REPLACE\n"
+            "EDIT_END સલ\n"
+        )
+        blocks = extract_edit_blocks(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(
+            blocks[0][1], [("    val input = a.asSInt", "    val input = a.intoSInt")]
+        )
+        self.assertEqual(unterminated_edit_blocks(text), 0)
+
+    def test_unterminated_edit_block_is_counted(self) -> None:
+        from agents.cfu_design_agent.tools import (
+            extract_edit_blocks,
+            unterminated_edit_blocks,
+        )
+
+        text = (
+            "EDIT_BEGIN src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala\n"
+            "<<<<<<< SEARCH\n    a\n=======\n    b\n>>>>>>> REPLACE\n"
+        )
+        self.assertEqual(extract_edit_blocks(text), [])
+        self.assertEqual(unterminated_edit_blocks(text), 1)
+
     def test_resolve_target_accepts_run_workspace_software_paths(self) -> None:
         run_root = "agents/generated/runs/tools-target-00000000"
         workspace = RepoToolbox(
@@ -163,6 +234,32 @@ class EditBlockTest(unittest.TestCase):
         updated, errors = apply_edit_pairs("  keep me   \nnext\n", [("  keep me", "  changed")])
         self.assertEqual(errors, [])
         self.assertEqual(updated, "  changed\nnext\n")
+
+    def test_mismatch_names_the_first_differing_line(self) -> None:
+        from agents.cfu_design_agent.tools import apply_edit_pairs
+
+        # A paraphrased comment (the depthconv failure mode) must be localized.
+        content = "a\n// is a int8_t\nc\n"
+        search = "a\n// is an int8_t\nc"
+        _updated, errors = apply_edit_pairs(content, [(search, "x")])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("First difference: SEARCH line 2 of 3", errors[0])
+        self.assertIn("is an int8_t", errors[0])  # the model's line
+        self.assertIn("is a int8_t", errors[0])  # the current file line
+
+    def test_mismatch_reports_when_an_earlier_pair_changed_the_region(self) -> None:
+        from agents.cfu_design_agent.tools import apply_edit_pairs
+
+        _updated, errors = apply_edit_pairs(
+            "alpha\nbeta\n", [("alpha", "ALPHA"), ("alpha", "omega")]
+        )
+        self.assertIn("an earlier section or pair changed that region", errors[0])
+
+    def test_mismatch_without_an_anchor_says_to_rebuild_from_the_prompt(self) -> None:
+        from agents.cfu_design_agent.tools import apply_edit_pairs
+
+        _updated, errors = apply_edit_pairs("a\nb\n", [("totally absent\ntext", "x")])
+        self.assertIn("does not appear in the current file", errors[0])
 
     def test_toolbox_applies_edits_to_a_run_workspace_file(self) -> None:
         run_root = "agents/generated/runs/tools-edit-00000000"

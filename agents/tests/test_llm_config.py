@@ -250,7 +250,163 @@ class ThinkingConfigTest(unittest.TestCase):
                     "thinking": True, "reasoning_effort": "low"}
         )
         client._responses(SimpleNamespace(responses=Responses()), "s", "u")
-        self.assertEqual(calls["reasoning"], {"effort": "low"})
+        # Azure/OpenAI hide chain-of-thought; a summary must be requested.
+        self.assertEqual(calls["reasoning"], {"effort": "low", "summary": "auto"})
+
+    def test_responses_summary_can_be_disabled_or_tuned(self) -> None:
+        from types import SimpleNamespace
+
+        def reasoning_for(config: dict) -> dict:
+            calls: dict = {}
+
+            class Responses:
+                def create(self, **kwargs):
+                    calls.update(kwargs)
+                    return SimpleNamespace(output_text="ok", usage=None)
+
+            client = OpenAiTextClient(config={"model": "m", "api_key": "k",
+                                              "api_mode": "responses", **config})
+            client._responses(SimpleNamespace(responses=Responses()), "s", "u")
+            return calls.get("reasoning")
+
+        self.assertEqual(
+            reasoning_for({"thinking": True, "reasoning_summary": "detailed"}),
+            {"effort": "medium", "summary": "detailed"},
+        )
+        self.assertEqual(
+            reasoning_for({"thinking": True, "reasoning_summary": ""}),
+            {"effort": "medium"},
+        )
+        self.assertIsNone(reasoning_for({"thinking": False}))
+
+    def test_responses_retries_without_summary_when_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        attempts: list[dict] = []
+
+        class Responses:
+            def create(self, **kwargs):
+                attempts.append(dict(kwargs.get("reasoning") or {}))
+                if "summary" in (kwargs.get("reasoning") or {}):
+                    raise RuntimeError("summary not supported")
+                return SimpleNamespace(output_text="ok", usage=None)
+
+        client = OpenAiTextClient(
+            config={"model": "m", "api_key": "k", "api_mode": "responses", "thinking": True}
+        )
+        result = client._responses(SimpleNamespace(responses=Responses()), "s", "u")
+        self.assertEqual(result.text, "ok")
+        # The first attempt asks for a summary; the successful retry drops it.
+        self.assertEqual(attempts[0].get("summary"), "auto")
+        self.assertNotIn("summary", attempts[-1])
+
+    def test_chat_reads_reasoning_items_when_content_is_empty(self) -> None:
+        from types import SimpleNamespace
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="stop",
+                            message=SimpleNamespace(
+                                content="ANSWER",
+                                reasoning_content="",
+                                reasoning_items=[{"type": "reasoning_text", "text": "item thought"}],
+                            ),
+                        )
+                    ],
+                    usage=None,
+                )
+
+        client = OpenAiTextClient(
+            config={"model": "m", "api_key": "k", "api_mode": "chat", "thinking": True}
+        )
+        result = client._chat(
+            SimpleNamespace(chat=SimpleNamespace(completions=ChatCompletions())), "s", "u"
+        )
+        self.assertEqual(result.reasoning, "item thought")
+        self.assertEqual(result.reasoning_source, "message.reasoning_items")
+
+    def test_chat_reads_provider_specific_reasoning(self) -> None:
+        from types import SimpleNamespace
+
+        # litellm-backed gateways (e.g. GLM/Kimi here) expose the chain of
+        # thought under provider_specific_fields.reasoning.
+        message = SimpleNamespace(
+            content="ANSWER",
+            model_extra={"provider_specific_fields": {"reasoning": "provider thought"}},
+        )
+        from agents.cfu_design_agent.llm import _extract_chat_reasoning
+
+        text, source = _extract_chat_reasoning(message)
+        self.assertEqual(text, "provider thought")
+        self.assertEqual(source, "provider_specific_fields.reasoning")
+
+    def test_chat_ignores_a_null_provider_reasoning(self) -> None:
+        from types import SimpleNamespace
+
+        from agents.cfu_design_agent.llm import _extract_chat_reasoning
+
+        # DeepSeek on this gateway reports provider_specific_fields.reasoning: None.
+        message = SimpleNamespace(
+            content="ANSWER",
+            model_extra={"provider_specific_fields": {"reasoning": None, "refusal": None}},
+        )
+        self.assertEqual(_extract_chat_reasoning(message), ("", ""))
+
+    def test_auto_fallback_to_chat_records_why_responses_was_unavailable(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        class Responses:
+            def create(self, **kwargs):
+                raise RuntimeError("404: no /responses route for this model")
+
+        class Completions:
+            def create(self, **kwargs):
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="stop",
+                            message=SimpleNamespace(content="ANSWER", tool_calls=None),
+                        )
+                    ],
+                    usage=None,
+                )
+
+        fake = SimpleNamespace(responses=Responses(), chat=SimpleNamespace(completions=Completions()))
+        client = OpenAiTextClient(config={"model": "m", "api_key": "k", "api_mode": "auto"})
+        with mock.patch("openai.OpenAI", return_value=fake):
+            result = client.complete("s", "u", fallback="FB")
+        self.assertEqual(result.api_mode_used, "chat")
+        self.assertEqual(result.text, "ANSWER")
+        self.assertIn("responses unavailable", result.fallback_reason)
+
+    def test_responses_reads_the_reasoning_summary(self) -> None:
+        from types import SimpleNamespace
+
+        class Responses:
+            def create(self, **kwargs):
+                return SimpleNamespace(
+                    output_text="ok",
+                    usage=None,
+                    output=[
+                        SimpleNamespace(
+                            type="reasoning",
+                            summary=[SimpleNamespace(type="summary_text", text="summary thought")],
+                            content=[],
+                        ),
+                        SimpleNamespace(type="message"),
+                    ],
+                )
+
+        client = OpenAiTextClient(
+            config={"model": "m", "api_key": "k", "api_mode": "responses", "thinking": True}
+        )
+        result = client._responses(SimpleNamespace(responses=Responses()), "s", "u")
+        self.assertEqual(result.reasoning, "summary thought")
+        self.assertEqual(result.reasoning_source, "responses.output.reasoning")
 
 
 class ReasoningSplitTest(unittest.TestCase):
@@ -308,6 +464,178 @@ class ReasoningSplitTest(unittest.TestCase):
         self.assertIn("inline draft", result.reasoning)
         # The configured response_format must still reach the request.
         self.assertNotIn("thinking", result.text)
+
+
+class StreamingTest(unittest.TestCase):
+    """Provider token streaming: accumulation, live progress and fallbacks."""
+
+    def _client(self, **config):
+        base = {"model": "m", "api_key": "k", "api_mode": "chat", "thinking": True}
+        base.update(config)
+        return OpenAiTextClient(config=base)
+
+    @staticmethod
+    def _chunk(content=None, reasoning=None, tool_calls=None, usage=None, finish=None):
+        from types import SimpleNamespace
+
+        delta = SimpleNamespace(
+            content=content, reasoning_content=reasoning, tool_calls=tool_calls
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=finish)], usage=usage
+        )
+
+    def test_chat_stream_accumulates_content_reasoning_and_usage(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from agents.cfu_design_agent import llm
+
+        chunks = [
+            self._chunk(reasoning="think-"),
+            self._chunk(reasoning="more "),
+            self._chunk(content="HEL"),
+            self._chunk(content="LO"),
+            self._chunk(
+                finish="stop",
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+            ),
+        ]
+
+        class Completions:
+            def create(self, **kwargs):
+                return iter(chunks)
+
+        seen: list[dict] = []
+        with mock.patch.object(llm, "_STREAM_EMIT_INTERVAL", 0.0):
+            llm.set_stream_callback(seen.append)
+            try:
+                result = self._client()._chat(
+                    SimpleNamespace(chat=SimpleNamespace(completions=Completions())), "s", "u"
+                )
+            finally:
+                llm.set_stream_callback(None)
+        self.assertEqual(result.text, "HELLO")
+        self.assertEqual(result.reasoning, "think-more")
+        self.assertEqual(result.reasoning_source, "stream.reasoning_content")
+        self.assertEqual(
+            (result.input_tokens, result.output_tokens, result.total_tokens), (10, 4, 14)
+        )
+        self.assertIn("stream", result.extra_keys)
+        self.assertTrue(seen, "the live progress callback must be called")
+        self.assertGreater(seen[-1]["chars"], 0)
+
+    def test_chat_stream_accumulates_tool_call_fragments(self) -> None:
+        from types import SimpleNamespace
+
+        def fragment(index, call_id, name, arguments):
+            return SimpleNamespace(
+                index=index,
+                id=call_id,
+                function=SimpleNamespace(name=name, arguments=arguments),
+            )
+
+        chunks = [
+            self._chunk(tool_calls=[fragment(0, "call_1", "read_", '{"pa')]),
+            self._chunk(tool_calls=[fragment(0, None, "file", 'th": "a"}')]),
+            self._chunk(finish="tool_calls"),
+        ]
+
+        class Completions:
+            def create(self, **kwargs):
+                return iter(chunks)
+
+        client = self._client()
+        round_ = client._chat_round(
+            SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
+            [{"role": "user", "content": "x"}],
+            allow_tools=True,
+            tools=[{"type": "function", "function": {"name": "read_file"}}],
+        )
+        calls = list(round_.message.tool_calls)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].id, "call_1")
+        self.assertEqual(calls[0].function.name, "read_file")
+        self.assertEqual(calls[0].function.arguments, '{"path": "a"}')
+        self.assertEqual(round_.finish_reason, "tool_calls")
+
+    def test_chat_stream_falls_back_when_streaming_is_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        class Completions:
+            def create(self, **kwargs):
+                if kwargs.get("stream"):
+                    raise RuntimeError("Unsupported parameter: stream_options")
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="stop",
+                            message=SimpleNamespace(content="PLAIN", tool_calls=None),
+                        )
+                    ],
+                    usage=None,
+                )
+
+        result = self._client()._chat(
+            SimpleNamespace(chat=SimpleNamespace(completions=Completions())), "s", "u"
+        )
+        self.assertEqual(result.text, "PLAIN")
+        self.assertIn("streaming unavailable", result.fallback_reason)
+
+    def test_streaming_can_be_disabled(self) -> None:
+        from types import SimpleNamespace
+
+        requests: list[dict] = []
+
+        class Completions:
+            def create(self, **kwargs):
+                requests.append(kwargs)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="stop",
+                            message=SimpleNamespace(content="ANS", tool_calls=None),
+                        )
+                    ],
+                    usage=None,
+                )
+
+        client = self._client(stream=False)
+        result = client._chat(
+            SimpleNamespace(chat=SimpleNamespace(completions=Completions())), "s", "u"
+        )
+        self.assertEqual(result.text, "ANS")
+        self.assertNotIn("stream", requests[0])
+
+    def test_responses_stream_accumulates_text_and_summary(self) -> None:
+        from types import SimpleNamespace
+
+        events = [
+            SimpleNamespace(type="response.reasoning_summary_text.delta", delta="think "),
+            SimpleNamespace(type="response.output_text.delta", delta="HE"),
+            SimpleNamespace(type="response.output_text.delta", delta="LLO"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed",
+                    usage=SimpleNamespace(input_tokens=3, output_tokens=5, total_tokens=8),
+                ),
+            ),
+        ]
+
+        class Responses:
+            def create(self, **kwargs):
+                assert kwargs.get("stream") is True
+                return iter(events)
+
+        client = OpenAiTextClient(
+            config={"model": "m", "api_key": "k", "api_mode": "responses", "thinking": True}
+        )
+        result = client._responses(SimpleNamespace(responses=Responses()), "s", "u")
+        self.assertEqual(result.text, "HELLO")
+        self.assertEqual(result.reasoning, "think")
+        self.assertEqual(result.reasoning_source, "responses.reasoning_summary.delta")
+        self.assertEqual((result.input_tokens, result.output_tokens), (3, 5))
 
 
 if __name__ == "__main__":

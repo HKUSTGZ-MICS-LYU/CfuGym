@@ -9,15 +9,18 @@ LangGraph-backed path.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 import time
 from typing import Any, Callable
 
+from . import profile_cache
 from .agent_tools import ReadOnlyToolset
 from .artifacts import RunArtifacts
 from .benchmarks import (
@@ -47,20 +50,27 @@ from .isa import (
     validate_isa_text,
 )
 from .llm import (
+    DEFAULT_MAX_TOOL_CALLS,
+    DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     LlmResult,
     OpenAiTextClient,
     clean_llm_text,
+    looks_like_tool_intent,
     reset_usage_log,
     set_stage,
+    set_stream_callback,
     usage_totals,
 )
 from .llm_config import effective_config, LlmConfigError
 from .policy import PolicyError, load_policy, normalize_repo_path
-from .progress import StageProgress
+from .progress import StageProgress, stage_label
 from .prompts import (
     SYSTEM_PROMPT,
     contract_prompt,
     hardware_prompt,
+    optimization_prompt,
+    repair_routing_prompt,
+    software_need_prompt,
     software_prompt,
     workload_prompt,
 )
@@ -78,6 +88,7 @@ from .tools import (
     extract_patch,
     filter_output,
     infer_command_id,
+    unterminated_edit_blocks,
 )
 
 try:  # pragma: no cover - optional dependency
@@ -104,11 +115,14 @@ def enable_progress(stages: list[str] | None = None) -> None:
     global _PROGRESS
     reset_usage_log()
     _PROGRESS = StageProgress(list(stages) if stages else list(STAGE_ORDER))
+    set_stream_callback(_log_stream_progress)
 
 
 def disable_progress() -> None:
     global _PROGRESS
+    _LIVE_LINE.clear()
     _PROGRESS = None
+    set_stream_callback(None)
 
 
 def progress() -> StageProgress | None:
@@ -177,6 +191,7 @@ def _wrap_node(fn):
         try:
             update = fn(state)
         except Exception as exc:
+            _LIVE_LINE.clear()
             _PROGRESS.end(
                 name,
                 ok=False,
@@ -188,6 +203,7 @@ def _wrap_node(fn):
         added_errors = 0
         if isinstance(effective, dict):
             added_errors = len(effective.get("errors") or []) - prior_errors
+        _LIVE_LINE.clear()
         _PROGRESS.end(
             name,
             ok=_node_ok(update, name) and added_errors <= 0,
@@ -270,7 +286,7 @@ def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: igno
     graph.add_conditional_edges(
         "generate_soc",
         _route_after_hw_build,
-        _identity_map("implement_sw", "implement_hw", "review_and_route"),
+        _identity_map("implement_sw", "build_sw", "implement_hw", "review_and_route"),
     )
     graph.add_edge("implement_sw", "build_sw")
     graph.add_conditional_edges(
@@ -288,7 +304,11 @@ def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: igno
         _route_after_cost,
         _identity_map("review_and_route", "implement_hw"),
     )
-    graph.add_edge("review_and_route", "final_report")
+    graph.add_conditional_edges(
+        "review_and_route",
+        _route_after_review,
+        _identity_map("final_report", "implement_hw", "implement_sw"),
+    )
     graph.add_edge("final_report", END)
     return graph.compile(checkpointer=checkpointer, debug=debug, name="cfu_design_agent")
 
@@ -304,6 +324,8 @@ APPEND_STATE_KEYS = (
     "graph_events",
     "llm_raw_outputs",
     "tool_calls",
+    # (response_hash, error_hash) per software attempt, to detect a stuck retry.
+    "sw_attempts",
 )
 
 
@@ -337,7 +359,12 @@ def run_agent(
     if not _LANGRAPH_AVAILABLE:
         return run_agent_python(initial_state)
     app = build_graph(checkpointer=InMemorySaver() if checkpoint else None)
-    config = graph_config(thread_id) if checkpoint or thread_id else None
+    max_iters = int(initial_state.get("max_iters", 2) or 2)
+    config = (
+        graph_config(thread_id, max_iters=max_iters)
+        if checkpoint or thread_id
+        else {"recursion_limit": recursion_limit(max_iters)}
+    )
     if not stream:
         return _finalize(app.invoke(initial_state, config=config))
     final_state: CfuDesignState = {}
@@ -486,8 +513,21 @@ def fallback_ascii_graph() -> str:
     )
 
 
-def graph_config(thread_id: str) -> dict[str, dict[str, str]]:
-    return {"configurable": {"thread_id": (thread_id or "cfu-design-agent")[:255]}}
+def recursion_limit(max_iters: int = 2) -> int:
+    """Graph step budget.
+
+    The ladder is a cycle (repairs and --loop optimization rounds), so the step
+    limit has to grow with --max-iters instead of using LangGraph's default of 25,
+    which a long --loop run would exceed.
+    """
+    return 60 + 12 * max(1, int(max_iters or 2))
+
+
+def graph_config(thread_id: str, *, max_iters: int = 2) -> dict[str, Any]:
+    return {
+        "configurable": {"thread_id": (thread_id or "cfu-design-agent")[:255]},
+        "recursion_limit": recursion_limit(max_iters),
+    }
 
 
 def _policy(state: CfuDesignState):
@@ -515,6 +555,13 @@ def _llm(state: CfuDesignState) -> OpenAiTextClient:
         # Fall back to the environment-based client so a bad config name
         # does not silently disable the LLM path.
         config = effective_config(workdir, "default")
+    # Token streaming is a run-level switch: it drives the live token log line
+    # and keeps a slow generation from hitting the whole-response timeout. An
+    # explicit CLI flag wins; otherwise the config's `stream` (or the default) is
+    # kept as-is.
+    stream = state.get("stream_llm")
+    if stream is not None:
+        config = {**config, "stream": bool(stream)}
     return OpenAiTextClient(state.get("model"), config=config)
 
 
@@ -526,7 +573,9 @@ def _llm_request_info(client) -> dict[str, Any]:
         "api_mode": getattr(client, "api_mode", "") or "",
         "thinking": bool(getattr(client, "thinking", False)),
         "reasoning_effort": getattr(client, "reasoning_effort", None),
+        "reasoning_summary": getattr(client, "reasoning_summary", None),
         "thinking_body": getattr(client, "thinking_body", None),
+        "stream": bool(getattr(client, "stream", False)),
         "available": bool(getattr(client, "available", False)),
     }
 
@@ -546,6 +595,9 @@ def _record_llm_output(
         "design_contract": ("isa", "08_isa"),
         "implement_hw": ("implementation", "09_implementation"),
         "implement_sw": ("implementation", "09_implementation"),
+        "route_repair": ("validation", "10_validation"),
+        "route_software": ("implementation", "09_implementation"),
+        "optimize": ("review", "12_review"),
     }
     artifact_stage, stage_dir = stage_info.get(stage, (None, None))
     if artifact_stage is None or stage_dir is None:
@@ -577,6 +629,11 @@ def _record_llm_output(
         "reasoning_source": str(getattr(result, "reasoning_source", "") or ""),
         "reasoning_chars": len(reasoning),
         "response_extra_keys": list(getattr(result, "extra_keys", ()) or ()),
+        # Non-empty when a requested tool loop degraded to a plain completion.
+        "degraded_reason": str(getattr(result, "degraded_reason", "") or ""),
+        # Non-empty when api_mode=auto fell back from responses to chat.
+        "fallback_reason": str(getattr(result, "fallback_reason", "") or ""),
+        "tool_rounds": int(getattr(result, "tool_rounds", 0) or 0),
     }
     info_client = client
     if info_client is None:
@@ -602,6 +659,18 @@ def _record_llm_output(
             reasoning,
             kind="llm_reasoning_output",
             metadata={**metadata, "kind": "reasoning"},
+        )
+    if _PROGRESS is not None:
+        _LIVE_LINE.clear()
+        note = ""
+        if metadata["fallback_reason"]:
+            note = " (streaming fell back)"
+        elif metadata["degraded_reason"]:
+            note = " (tools degraded)"
+        print(
+            f"    [llm] {label} -> {metadata['output_tokens']} output tok"
+            f" ({metadata['api_mode_used']}, {metadata['finish_reason'] or 'n/a'}){note}",
+            flush=True,
         )
     return str(ref["path"])
 
@@ -696,6 +765,16 @@ def load_context(state: CfuDesignState) -> CfuDesignState:
         "load_context",
         "visibility",
         {"level": policy.visibility, "withheld": withheld},
+    )
+    artifacts.set_manifest_metadata(
+        "load_context",
+        "tool_policy",
+        {
+            "agent_tools": bool(state.get("agent_tools", True)),
+            "max_rounds": int(state.get("max_tool_rounds", 6) or 6),
+            "max_calls": int(state.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS) or 0),
+            "max_calls_per_round": DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
+        },
     )
     return {
         "context": {
@@ -961,45 +1040,118 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
 
     toolbox = _toolbox_for_stage(state, "profile")
 
-    if "profile" in configs:
-        sources = {
-            rel: toolbox.read_text(rel, limit=2_000_000)
-            for rel in config_sources(toolbox.workdir, run_root, name, "profile")
-        }
-        instrumented, report = instrument_sources(sources, state.get("observation_plan"))
-        observation = report.to_dict()
-        for rel, text in instrumented.items():
-            toolbox.write_text(rel, text)
+    # The reference/profile configurations are scalar and are simulated on the
+    # seeded scaffold (profiling runs before any hardware edit), so the
+    # measurement is design-independent and deterministic. Reuse it when every
+    # input that shapes the ELF or the SoC matches.
+    cache_mode = str(state.get("profile_cache", "on") or "on")
+    cache_info = profile_cache.build_key(
+        toolbox.workdir,
+        run_root=run_root,
+        benchmark=name,
+        configs=configs,
+        build_commands={
+            config: embench_build_command(run_root, name, config) for config in configs
+        },
+        cpu_flags=agent_cfu_gen_flags(state.get("isa_spec", {}) or {}),
+        observation_plan=state.get("observation_plan"),
+    )
+    cache_key = str(cache_info["key"])
+    cache_rel = profile_cache.cache_relpath(cache_key)
+    cached: dict | None = None
+    if cache_mode == "on":
+        try:
+            cache_text = toolbox.read_text(cache_rel, limit=5_000_000)
+        except PolicyError:
+            cache_text = ""
+        if cache_text:
+            cached = profile_cache.parse(cache_text, cache_key)
 
-    for config in configs:
-        build = toolbox.run_command(
-            embench_build_command(run_root, name, config),
-            command_id="embench_build",
-            timeout=1800,
-            mutate=True,
-            execute=True,
-        )
-        results.append(build)
-        if build.get("returncode") not in (0, None):
-            errors.append(f"embench {config} build failed")
-            continue
-        elf = embench_elf_path(run_root, name, config)
-        sim_commands = agent_cfu_sim_commands(state, state.get("isa_spec", {}) or {}, elf=elf)
-        for sim_command in sim_commands:
-            sim = toolbox.run_command(
-                sim_command, command_id="soc_sim", timeout=3600, mutate=False, execute=True
+    if cached is not None:
+        profiles = {
+            config: dict(regions)
+            for config, regions in (cached.get("profiles") or {}).items()
+        }
+        observation = dict(cached.get("observation") or {})
+
+    if cached is None:
+        if "profile" in configs:
+            sources = {
+                rel: toolbox.read_text(rel, limit=2_000_000)
+                for rel in config_sources(toolbox.workdir, run_root, name, "profile")
+            }
+            instrumented, report = instrument_sources(sources, state.get("observation_plan"))
+            observation = report.to_dict()
+            for rel, text in instrumented.items():
+                toolbox.write_text(rel, text)
+
+        for config in configs:
+            build = toolbox.run_command(
+                embench_build_command(run_root, name, config),
+                command_id="embench_build",
+                timeout=1800,
+                mutate=True,
+                execute=True,
             )
-            results.append(sim)
-            text = "\n".join([sim.get("stdout_tail", ""), sim.get("stderr_tail", "")])
-            profiles[config] = parse_embench_profile(text)
-            if sim.get("returncode") not in (0, None):
-                errors.append(f"embench {config} simulation failed (Embench verify did not pass)")
+            results.append(build)
+            if build.get("returncode") not in (0, None):
+                errors.append(f"embench {config} build failed")
+                continue
+            elf = embench_elf_path(run_root, name, config)
+            sim_commands = agent_cfu_sim_commands(state, state.get("isa_spec", {}) or {}, elf=elf)
+            for sim_command in sim_commands:
+                sim = toolbox.run_command(
+                    sim_command, command_id="soc_sim", timeout=3600, mutate=False, execute=True
+                )
+                results.append(sim)
+                text = "\n".join([sim.get("stdout_tail", ""), sim.get("stderr_tail", "")])
+                profiles[config] = parse_embench_profile(text)
+                if sim.get("returncode") not in (0, None):
+                    errors.append(
+                        f"embench {config} simulation failed (Embench verify did not pass)"
+                    )
 
     reference = profiles.get("reference", {})
     instrumented = embench_instrumented_profile(profiles)
     hot = hotspot_from_profile(instrumented, exclude=(name,)) or name
     candidates = [region for region in instrumented if region != name]
     ok = bool(reference) and not errors
+
+    saved = False
+    if ok and cache_mode in ("on", "refresh"):
+        try:
+            toolbox.write_text(
+                cache_rel,
+                profile_cache.serialize(
+                    cache_key,
+                    benchmark=name,
+                    configs=configs,
+                    profiles=profiles,
+                    observation=observation,
+                    inputs=cache_info["inputs"],
+                ),
+            )
+            saved = True
+        except PolicyError:
+            saved = False
+
+    if cached is not None:
+        cache_status = "hit"
+    elif cache_mode == "off":
+        cache_status = "disabled"
+    elif cache_mode == "refresh":
+        cache_status = "refresh"
+    else:
+        cache_status = "miss"
+    cache_report: dict[str, Any] = {
+        "status": cache_status,
+        "key": cache_key,
+        "saved": saved,
+        "benchmark": name,
+    }
+    if cached is not None:
+        cache_report["created_at"] = str(cached.get("created_at", ""))
+
     profile = {
         "status": "profiled" if ok else "failed",
         "command_results": results,
@@ -1010,19 +1162,34 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
         "hot_spot": hot,
         "summary": summarize_embench_profiles(profiles, name),
         "configs": sorted(profiles),
+        "profile_cache": cache_report,
     }
-    _write_embench_profile_artifact(state, name, profiles, results, "", observation)
+    _write_embench_profile_artifact(state, name, profiles, results, "", observation, cache_report)
+    _artifacts_for_stage(state, "profile").set_manifest_metadata(
+        "profile", "profile_cache", cache_report
+    )
+    history = (
+        f"Reused the cached reference/profile measurement for {name} "
+        f"(key {cache_key[:12]}, saved 2 builds + 2 simulations)."
+        if cached is not None
+        else "Profiled embench " + name + " (" + ", ".join(sorted(profiles)) + ")"
+    )
     return {
         "profile_result": profile,
         "embench_profiles": profiles,
         "observation_report": observation,
         "stage_jobs": "hotspot",
         "errors": errors,
-        "gates": {**state.get("gates", {}), "profile": {"ok": ok, "skipped": False, "configs": sorted(profiles)}},
-        "iteration_history": append_history(
-            state,
-            "Profiled embench " + name + " (" + ", ".join(sorted(profiles)) + ")",
-        ),
+        "gates": {
+            **state.get("gates", {}),
+            "profile": {
+                "ok": ok,
+                "skipped": False,
+                "configs": sorted(profiles),
+                "profile_cache": cache_report,
+            },
+        },
+        "iteration_history": append_history(state, history),
     }
 
 
@@ -1080,7 +1247,7 @@ def hardware_repair_feedback(state: CfuDesignState) -> str:
     """
     parts = [
         labeled_feedback("hw_build (SoC generation) errors", check_feedback(state, "hw_build")),
-        labeled_feedback("sim (simulation) errors", check_feedback(state, "sim")),
+        sim_feedback(state),
         labeled_feedback("cost (Yosys) errors", cost_feedback(state)),
         labeled_feedback(
             "implementation_hw rejection", implementation_feedback(state, "implementation_hw")
@@ -1122,6 +1289,7 @@ def _write_embench_profile_artifact(
     results: list[dict],
     reason: str,
     observation: dict | None = None,
+    profile_cache: dict | None = None,
 ) -> None:
     artifacts = _artifacts_for_stage(state, "profile")
     artifacts.write_yaml(
@@ -1132,6 +1300,7 @@ def _write_embench_profile_artifact(
             "reason": reason,
             "profiles": profiles,
             "observation": observation or {},
+            "profile_cache": profile_cache or {},
             "commands": [dict(item) for item in results],
         },
         status="planned" if reason else "produced",
@@ -1225,18 +1394,29 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
         "unknowns": state.get("workload_spec", {}).get("unknowns", []),
         "roofline": deterministic_roofline_analysis(state.get("workload_spec", {})),
     }
-    result, raw_output = _complete_llm(
+    toolbox = _toolbox_for_stage(state, "analysis")
+    client = _llm(state)
+    tools_enabled = _tools_enabled(state, client)
+    user = workload_prompt(
+        task,
+        state.get("workload_spec", {}),
+        state.get("context", {}),
+        profile=state.get("embench_profiles"),
+        agent_tools=tools_enabled,
+        tool_rounds=int(state.get("max_tool_rounds", 6) or 6),
+    )
+    result, raw_output, tool_calls = _run_agent_step(
         state,
-        "analyze_workload",
-        "analysis",
-        SYSTEM_PROMPT,
-        workload_prompt(
-            task,
-            state.get("workload_spec", {}),
-            state.get("context", {}),
-            profile=state.get("embench_profiles"),
-        ),
-        _yaml_str(fallback),
+        toolbox,
+        stage="analyze_workload",
+        label="analysis",
+        artifact_stage="analysis",
+        tool_calls_relpath="07_analysis/analysis_tool_calls.yaml",
+        system=SYSTEM_PROMPT,
+        user=user,
+        fallback=_yaml_str(fallback),
+        client=client,
+        deliverable_hint="the final YAML analysis mapping with the required Roofline fields",
     )
     analysis = parse_yaml_mapping(result.text) or fallback
     note = "Analyzed workload with LLM." if result.used_llm else "Analyzed workload with deterministic fallback."
@@ -1244,6 +1424,7 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
     return {
         "workload_analysis": _yaml_str(analysis),
         "llm_raw_outputs": [raw_output],
+        "tool_calls": [_tool_call_summary(call) for call in tool_calls],
         "stage_jobs": "isa",
         "iteration_history": append_history(state, note),
     }
@@ -1341,7 +1522,9 @@ def _apply_agent_output(
             apply_result = toolbox.apply_edit_blocks(edit_blocks)
             summary += "\n\nEdit result:\n" + str(apply_result)
             if apply_result.get("returncode") not in (0, None):
-                reason = str(apply_result.get("stderr_tail", "")).strip()[:400]
+                # Keep the localized mismatch report intact: it names the exact
+                # line the model mis-copied, which is what breaks the retry loop.
+                reason = str(apply_result.get("stderr_tail", "")).strip()[:1500]
                 errors.append(f"targeted edits did not apply: {reason}")
         except (PolicyError, ValueError) as exc:
             errors.append(f"targeted edits failed: {exc}")
@@ -1379,7 +1562,17 @@ def _apply_agent_output(
                 "modify the run workspace"
             )
         else:
-            summary += "\n\nNo edit, file block, or patch was produced; this rung remains a design proposal."
+            note = (
+                "the answer contained no EDIT_BEGIN/FILE_BEGIN/PATCH_BEGIN "
+                "deliverable; nothing was applied"
+            )
+            if unterminated_edit_blocks(text):
+                note += (
+                    " (the response opened an EDIT_BEGIN section but the block was not "
+                    "closed: the terminator must be a line equal to EDIT_END)"
+                )
+            summary += f"\n\n{note}."
+            errors.append(note)
 
     applied = bool(apply_result) and apply_result.get("returncode") == 0 and not apply_result.get("skipped")
     files: list[str] = []
@@ -1426,10 +1619,77 @@ def _hardware_context(state: CfuDesignState, toolbox: RepoToolbox) -> dict:
     return context
 
 
+# Live streaming progress is drawn as ONE line rewritten in place on a terminal.
+# When stdout is redirected (CI logs, `tee`) intermediate updates are suppressed
+# so the log only gets the final per-call token line.
+class _LiveLine:
+    def __init__(self) -> None:
+        self.active = False
+        self.width = 0
+
+    @staticmethod
+    def is_tty() -> bool:
+        try:
+            return bool(sys.stdout.isatty())
+        except Exception:  # pragma: no cover - exotic stdout replacements
+            return False
+
+    def update(self, text: str) -> None:
+        if not self.is_tty():
+            return
+        pad = max(0, self.width - len(text))
+        sys.stdout.write("\r" + text + " " * pad)
+        sys.stdout.flush()
+        self.width = max(self.width, len(text))
+        self.active = True
+
+    def clear(self) -> None:
+        if self.active and self.is_tty():
+            sys.stdout.write("\r" + " " * self.width + "\r")
+            sys.stdout.flush()
+        self.active = False
+        self.width = 0
+
+
+_LIVE_LINE = _LiveLine()
+_LAST_STREAM_CHARS = 0
+
+
+def _log_stream_progress(payload: dict[str, Any]) -> None:
+    """Rewrite one live line while an LLM response streams.
+
+    Keeping it to a single in-place line means a slow generation is visibly
+    alive without scrolling the terminal, and a long reasoning phase reports
+    growing ``think chars`` instead of repeating ``0 chars``.
+    """
+    global _LAST_STREAM_CHARS
+    if _PROGRESS is None:
+        return
+    if str(payload.get("phase", "")) == "start":
+        _LAST_STREAM_CHARS = 0
+        return
+    chars = int(payload.get("chars", 0) or 0)
+    thinking = int(payload.get("thinking_chars", 0) or 0)
+    total = chars + thinking
+    if total <= _LAST_STREAM_CHARS:
+        return
+    _LAST_STREAM_CHARS = total
+    stage = stage_label(str(payload.get("stage", "") or "llm"))
+    tokens = int(payload.get("tokens", 0) or 0) + int(payload.get("thinking_tokens", 0) or 0)
+    if thinking and chars:
+        detail = f"{chars} out + {thinking} think chars (~{tokens} tok)"
+    elif thinking:
+        detail = f"{thinking} think chars (~{tokens} tok)"
+    else:
+        detail = f"{chars} chars (~{tokens} tok)"
+    _LIVE_LINE.update(f"    [llm] {stage} streaming ... {detail}")
+
+
 def _log_tool_call(record: dict[str, Any]) -> None:
     """Print each tool call while a run is in progress (CLI log)."""
     if _PROGRESS is None:
         return
+    _LIVE_LINE.clear()
     arguments = record.get("arguments") or {}
     rendered = ", ".join(f"{key}={value!r}" for key, value in list(arguments.items())[:4])
     status = "ok" if record.get("ok") else "ERROR"
@@ -1450,11 +1710,16 @@ def _tool_call_summary(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _write_tool_calls_artifact(state: CfuDesignState, label: str, tool_calls: list[dict]) -> None:
-    artifacts = _artifacts_for_stage(state, "implementation")
+def _write_tool_calls_artifact(
+    state: CfuDesignState,
+    artifact_stage: str,
+    relative: str,
+    tool_calls: list[dict],
+) -> None:
+    artifacts = _artifacts_for_stage(state, artifact_stage)
     artifacts.write_yaml(
-        "implementation",
-        f"09_implementation/{label}_tool_calls.yaml",
+        artifact_stage,
+        relative,
         {
             "rounds": max((int(call.get("round", 0) or 0) for call in tool_calls), default=0),
             "call_count": len(tool_calls),
@@ -1467,13 +1732,123 @@ def _write_tool_calls_artifact(state: CfuDesignState, label: str, tool_calls: li
     )
 
 
+def _tools_enabled(state: CfuDesignState, client) -> bool:
+    return bool(state.get("agent_tools", True)) and getattr(client, "available", False)
+
+
+def _has_delivery_block(text: str) -> bool:
+    """True when the response carries an edit, file block, or patch."""
+    return bool(extract_edit_blocks(text) or extract_file_blocks(text) or extract_patch(text))
+
+
+def _run_agent_step(
+    state: CfuDesignState,
+    toolbox: RepoToolbox,
+    *,
+    stage: str,
+    label: str,
+    artifact_stage: str,
+    tool_calls_relpath: str,
+    system: str,
+    user: str,
+    fallback: str,
+    client=None,
+    response_format: dict[str, Any] | None = None,
+    deliverable_hint: str = "",
+    require_delivery: bool = False,
+) -> tuple[LlmResult, str, list[dict]]:
+    """Run one LLM step, optionally inside the bounded read-only tool loop.
+
+    Shared by every rung that can consult files: tools are offered only when
+    enabled and the client is available, the loop is bounded by
+    ``--max-tool-rounds``/``--max-tool-calls``, and any tool-loop failure
+    degrades to a single completion so enabling tools can never break a run.
+    Returns the result, the persisted raw-output path, and the transcript.
+    """
+    client = client or _llm(state)
+    if not _tools_enabled(state, client):
+        result, raw_output = _complete_llm(
+            state,
+            stage,
+            label,
+            system,
+            user,
+            fallback,
+            response_format=response_format,
+            client=client,
+        )
+        return result, raw_output, []
+    toolset = ReadOnlyToolset(toolbox)
+    try:
+        result = clean_llm_text(
+            client.complete_with_tools(
+                system,
+                user,
+                tools=toolset.schemas(),
+                tool_runner=toolset.run,
+                max_rounds=int(state.get("max_tool_rounds", 6) or 6),
+                max_total_calls=int(state.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS) or 0),
+                fallback=fallback,
+                response_format=response_format,
+                deliverable_hint=deliverable_hint,
+                is_deliverable=_has_delivery_block if require_delivery else None,
+                on_tool_call=_log_tool_call,
+            )
+        )
+    except Exception as exc:
+        # Tool calling must never break the rung: degrade to a plain call.
+        result, raw_output = _complete_llm(
+            state,
+            stage,
+            label,
+            system,
+            user,
+            fallback,
+            response_format=response_format,
+            client=client,
+        )
+        _write_tool_calls_artifact(
+            state,
+            artifact_stage,
+            tool_calls_relpath,
+            [
+                {
+                    "round": 0,
+                    "name": "(tool loop failed)",
+                    "arguments": {"error": str(exc)},
+                    "result": "",
+                    "ok": False,
+                }
+            ],
+        )
+        return clean_llm_text(result), raw_output, []
+    raw_output = _record_llm_output(state, stage, label, result, client=client)
+    tool_calls = list(getattr(result, "tool_calls", ()) or ())
+    degraded = str(getattr(result, "degraded_reason", "") or "")
+    if degraded:
+        # The endpoint refused the tools payload, so the model answered without
+        # them. Surface it instead of failing silently later.
+        tool_calls.append(
+            {
+                "round": 0,
+                "name": "(tools unavailable)",
+                "arguments": {"error": degraded},
+                "result": "tool calling failed; the model answered without tools",
+                "ok": False,
+            }
+        )
+    if tool_calls:
+        _write_tool_calls_artifact(state, artifact_stage, tool_calls_relpath, tool_calls)
+    return result, raw_output, tool_calls
+
+
 def implement_hw(state: CfuDesignState) -> CfuDesignState:
     """Hardware rung: design AgentCfu.scala / AgentCfuFiber.scala only."""
     toolbox = _toolbox_for_stage(state, "implementation")
     feedback = hardware_repair_feedback(state)
     system = SYSTEM_PROMPT
     client = _llm(state)
-    tools_enabled = bool(state.get("agent_tools", True)) and getattr(client, "available", False)
+    tools_enabled = _tools_enabled(state, client)
     user = hardware_prompt(
         state["task"],
         state.get("workload_spec", {}),
@@ -1482,50 +1857,37 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         _hardware_context(state, toolbox),
         profile=state.get("embench_profiles"),
         feedback=feedback,
+        optimization=optimization_directive(state),
         agent_tools=tools_enabled,
+        tool_rounds=int(state.get("max_tool_rounds", 6) or 6),
     )
     fallback = deterministic_hardware_plan(state["task"], state.get("design_contract", ""))
-    tool_calls: list[dict] = []
-    if tools_enabled:
-        toolset = ReadOnlyToolset(toolbox)
-        try:
-            result = clean_llm_text(
-                client.complete_with_tools(
-                    system,
-                    user,
-                    tools=toolset.schemas(),
-                    tool_runner=toolset.run,
-                    max_rounds=int(state.get("max_tool_rounds", 6) or 6),
-                    fallback=fallback,
-                    on_tool_call=_log_tool_call,
-                )
-            )
-        except Exception as exc:
-            # Tool calling must never break the rung: degrade to a plain call.
-            result, raw_output = _complete_llm(
-                state, "implement_hw", "hardware", system, user, fallback, client=client
-            )
-            result = clean_llm_text(result)
-            _write_tool_calls_artifact(
-                state, "hw", [{"round": 0, "name": "(tool loop failed)", "arguments": {"error": str(exc)},
-                               "result": "", "ok": False}]
-            )
-        else:
-            raw_output = _record_llm_output(
-                state, "implement_hw", "hardware", result, client=client
-            )
-            tool_calls = list(getattr(result, "tool_calls", ()) or ())
-            if tool_calls:
-                _write_tool_calls_artifact(state, "hw", tool_calls)
-    else:
-        result, raw_output = _complete_llm(
-            state, "implement_hw", "hardware", system, user, fallback, client=client
-        )
+    result, raw_output, tool_calls = _run_agent_step(
+        state,
+        toolbox,
+        stage="implement_hw",
+        label="hardware",
+        artifact_stage="implementation",
+        tool_calls_relpath="09_implementation/hw_tool_calls.yaml",
+        system=system,
+        user=user,
+        fallback=fallback,
+        client=client,
+        require_delivery=True,
+        deliverable_hint=(
+            "the EDIT_BEGIN/SEARCH/REPLACE, FILE_BEGIN/FILE_END, or "
+            "PATCH_BEGIN/PATCH_END block required by the delivery protocol"
+        ),
+    )
     outcome = _apply_agent_output(
         state,
         result.text,
         toolbox=toolbox,
     )
+    intent_error = tool_intent_error(result.text, str(getattr(result, "degraded_reason", "") or ""))
+    if intent_error and not outcome["applied"]:
+        outcome["errors"].append(intent_error)
+        outcome["summary"] += "\n\n" + intent_error
     _write_hardware_artifact(state, result.text, outcome, feedback)
     return {
         "hardware_plan": result.text,
@@ -1545,6 +1907,7 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
                 "files": outcome["files"],
                 "repair": bool(feedback),
                 "tool_calls": len(tool_calls),
+                "tools_degraded": str(getattr(result, "degraded_reason", "") or ""),
                 "repair_diagnosis": ("REPAIR_DIAGNOSIS" in result.text) if feedback else None,
                 "errors": outcome["errors"],
             },
@@ -1553,6 +1916,56 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
             state, "Completed the hardware rung (AgentCfu.scala/AgentCfuFiber.scala)."
         ),
     }
+
+
+def _attempt_digest(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def tool_intent_error(text: str, degraded_reason: str = "") -> str:
+    """Explain a response that only announced reading a file.
+
+    This is the shape a tools-enabled model produces when the endpoint refused
+    the tools payload (or dropped the tool_calls): the prompt promised tools, so
+    it says "Let me read ..." and stops. Without this the rung fails with only a
+    generic "no deliverable" message and the repair repeats the same answer.
+    """
+    if not looks_like_tool_intent(text):
+        return ""
+    reason = f" (tool calling failed: {degraded_reason})" if degraded_reason else ""
+    return (
+        "the answer was a tool-intent preamble: it announced reading a file but emitted no "
+        f"deliverable and no tool call{reason}. Emit the EDIT_BEGIN/FILE_BEGIN/PATCH_BEGIN "
+        "block now, using the content already shown in the prompt."
+    )
+
+
+def software_stuck_directive(state: CfuDesignState) -> str:
+    """A blunt instruction when the last two software attempts were identical.
+
+    A rejected response leaves the workspace unchanged, so an unchanged prompt
+    can make the model repeat the same answer until the repair budget is gone.
+    Detecting that here forces a different delivery strategy on the next try.
+    """
+    attempts = [item for item in (state.get("sw_attempts") or []) if isinstance(item, dict)]
+    if len(attempts) < 2:
+        return ""
+    last, previous = attempts[-1], attempts[-2]
+    if (
+        last.get("response_hash") != previous.get("response_hash")
+        or last.get("error_hash") != previous.get("error_hash")
+    ):
+        return ""
+    return (
+        "=== REPEATED IDENTICAL ATTEMPT DETECTED ===\n"
+        "Your previous two responses were byte-identical and failed with the identical "
+        "rejection. Sending the same edit again wastes the remaining repair budget. Change "
+        "strategy now:\n"
+        "- Prefer Protocol B (FILE_BEGIN) with the complete new file content, or\n"
+        "- shrink every SEARCH block to a few unique code lines copied verbatim from the "
+        "target content above (no long comment blocks), or\n"
+        "- if a SEARCH failed on a comment, use the exact current comment text from above."
+    )
 
 
 def implement_sw(state: CfuDesignState) -> CfuDesignState:
@@ -1592,8 +2005,9 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
     feedback = "\n\n".join(
         part
         for part in (
+            software_stuck_directive(state),
             labeled_feedback("sw_build (compile) errors", check_feedback(state, "sw_build")),
-            labeled_feedback("sim (simulation) errors", check_feedback(state, "sim")),
+            sim_feedback(state),
             labeled_feedback(
                 "implementation_sw rejection", implementation_feedback(state, "implementation_sw")
             ),
@@ -1615,6 +2029,7 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
             intrinsics=render_cfu_intrinsics(isa_spec),
             targets=targets,
             feedback=feedback,
+            optimization=optimization_directive(state),
         ),
         deterministic_software_plan(state["task"], state.get("design_contract", "")),
     )
@@ -1624,6 +2039,9 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
         toolbox=toolbox,
     )
     errors.extend(outcome["errors"])
+    intent_error = tool_intent_error(result.text, str(getattr(result, "degraded_reason", "") or ""))
+    if intent_error and not outcome["applied"]:
+        errors.append(intent_error)
     if outcome["applied"]:
         uses_cfu, cfu_problem = _software_exercises_cfu(state, toolbox, targets)
         if not uses_cfu:
@@ -1632,12 +2050,18 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
     if intrinsics_path:
         summary += f"\n\nWrote {intrinsics_path} from the CFU ISA spec."
     _write_software_artifact(state, result.text, outcome, errors, feedback)
+    attempt = {
+        "response_hash": _attempt_digest(result.text),
+        "error_hash": _attempt_digest("\n".join(errors)),
+        "applied": bool(outcome["applied"]),
+    }
     return {
         "software_plan": result.text,
         "software_patch": outcome["patch"],
         "implementation_sw_summary": summary,
         "changed_sw_files": outcome["files"],
         "llm_raw_outputs": [raw_output],
+        "sw_attempts": [attempt],
         "stage_jobs": "validation",
         "errors": errors,
         "gates": {
@@ -1649,7 +2073,13 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
                 "files": outcome["files"],
                 "intrinsics_header": intrinsics_path,
                 "repair": bool(feedback),
+                # Digest of the contract this kernel was written against, so a
+                # later iteration can tell whether the ABI moved under it.
+                "isa_hash": _isa_digest(state),
+                "tools_degraded": str(getattr(result, "degraded_reason", "") or ""),
                 "repair_diagnosis": ("REPAIR_DIAGNOSIS" in result.text) if feedback else None,
+                "response_hash": attempt["response_hash"],
+                "error_hash": attempt["error_hash"],
                 "errors": errors,
             },
         },
@@ -1679,9 +2109,67 @@ def _software_targets(state: CfuDesignState, toolbox: RepoToolbox) -> list[tuple
     return []
 
 
-# Helpers that only enable/fence the CFU do not exercise the datapath, so a
-# kernel that calls them and then runs the scalar loop is not an acceleration.
-CFU_NON_DATAPATH_HELPERS = ("cfu_enable", "cfu_memory_fence")
+# Helpers that only enable/fence the CFU (or report cycles for the generated
+# benchmark harness) do not exercise the datapath, so a kernel that calls them
+# and then runs the scalar loop is not an acceleration. They are still accepted
+# when the ISA contract itself declares one of these names.
+CFU_NON_DATAPATH_HELPERS = (
+    "cfu_enable",
+    "cfu_memory_fence",
+    "cfu_agent_counter_read",
+    "cfu_agent_counter_elapsed",
+)
+
+# Cap on recorded intrinsic call sites (evidence, not a full call graph).
+MAX_CFU_CALL_SITES = 25
+
+
+def _cfu_call_sites(
+    state: CfuDesignState,
+    toolbox: RepoToolbox,
+    targets: list[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """CFU datapath intrinsic calls in the current bytes of ``targets``.
+
+    Comments are stripped first so a commented-out call cannot satisfy a check.
+    ``cfu_enable()``/``cfu_memory_fence()`` only enable/fence the CFU, and the
+    generated harness's ``cfu_agent_counter_*`` helpers only report cycles, so
+    none of them count as datapath evidence. A differently named
+    ``cfu_<something>()`` the model emitted still counts, which is what
+    ``_software_exercises_cfu`` has always accepted.
+    """
+    expected = set(intrinsic_symbols(state.get("isa_spec", {}) or {}))
+    sites: list[dict[str, Any]] = []
+    for path, _ in targets:
+        try:
+            text = toolbox.read_text(path, limit=2_000_000)
+        except PolicyError:
+            continue
+        if not text:
+            continue
+        stripped = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+        stripped = re.sub(r"//[^\n]*", " ", stripped)
+        for lineno, line in enumerate(stripped.splitlines(), start=1):
+            for match in re.finditer(r"\b(cfu_\w+)\s*\(", line):
+                name = match.group(1)
+                if name in CFU_NON_DATAPATH_HELPERS and name not in expected:
+                    continue
+                sites.append({"file": path, "line": lineno, "name": name, "text": line.strip()})
+                if len(sites) >= MAX_CFU_CALL_SITES:
+                    # Enough evidence for a boolean check and for the decision
+                    # artifact; unbounded call lists would only bloat the run.
+                    return sites
+    return sites
+
+
+def _cfu_missing_intrinsic_message(state: CfuDesignState) -> str:
+    expected = intrinsic_symbols(state.get("isa_spec", {}) or {})
+    wanted = ", ".join(expected) or "a generated cfu_<command>() intrinsic"
+    return (
+        f"the CFU build does not call any CFU datapath intrinsic (expected {wanted}); "
+        "an #ifdef USE_AGENT_CFU branch that only calls cfu_enable() and then runs the "
+        "scalar loop is not acceleration"
+    )
 
 
 def _software_exercises_cfu(
@@ -1695,36 +2183,122 @@ def _software_exercises_cfu(
     the ``#ifdef USE_AGENT_CFU`` branch, is not acceleration. The check runs on
     the applied workspace bytes so a Protocol A/B/C change is all covered.
     """
-    expected = intrinsic_symbols(state.get("isa_spec", {}) or {})
-    sources: list[tuple[str, str]] = []
-    for path, _ in targets:
-        try:
-            text = toolbox.read_text(path, limit=2_000_000)
-        except PolicyError:
-            continue
-        if text:
-            # Strip comments so a commented-out call cannot satisfy the check.
-            stripped = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-            stripped = re.sub(r"//[^\n]*", " ", stripped)
-            sources.append((path, stripped))
+    if _cfu_call_sites(state, toolbox, targets):
+        return True, ""
+    return False, _cfu_missing_intrinsic_message(state)
 
-    for _, text in sources:
-        for symbol in expected:
-            if re.search(rf"\b{re.escape(symbol)}\s*\(", text):
-                return True, ""
-    # Accept a differently named CFU intrinsic the model may have emitted, as
-    # long as it is not just the enable/fence helpers.
-    for _, text in sources:
-        for match in re.finditer(r"\b(cfu_\w+)\s*\(", text):
-            if match.group(1) not in CFU_NON_DATAPATH_HELPERS:
-                return True, ""
 
-    wanted = ", ".join(expected) or "a generated cfu_<command>() intrinsic"
-    return False, (
-        f"the CFU build does not call any CFU datapath intrinsic (expected {wanted}); "
-        "an #ifdef USE_AGENT_CFU branch that only calls cfu_enable() and then runs the "
-        "scalar loop is not acceleration"
+def _isa_digest(state: CfuDesignState) -> str:
+    """Stable digest of the CFU ISA contract, for software/hardware ABI checks."""
+    import yaml as _yaml
+
+    try:
+        text = _yaml.safe_dump(state.get("isa_spec", {}) or {}, sort_keys=True)
+    except Exception:  # pragma: no cover - a malformed spec is not comparable
+        text = str(state.get("isa_spec", ""))
+    return _attempt_digest(text)
+
+
+def _software_reuse_evidence(
+    state: CfuDesignState, toolbox: RepoToolbox
+) -> tuple[bool, str, list[str], list[dict[str, Any]]]:
+    """Whether the existing software already drives the CFU for this contract.
+
+    Returns ``(ok, evidence, files, calls)``. This is the honesty guard for
+    skipping the software rung: "no change is needed" is only accepted when the
+    current kernel bytes call a CFU datapath intrinsic *and* the ISA contract has
+    not changed since that kernel was written (a changed contract can add or
+    rename a command the kernel does not call yet).
+    """
+    targets = _software_targets(state, toolbox)
+    if not targets:
+        return False, "no software target exists for this workload", [], []
+    files = [path for path, _ in targets]
+    calls = _cfu_call_sites(state, toolbox, targets)
+    if not calls:
+        return False, _cfu_missing_intrinsic_message(state), files, []
+    gate = _rung_gate(state, "implementation_sw")
+    written_with = str(gate.get("isa_hash", "") or "")
+    current = _isa_digest(state)
+    if written_with and written_with != current:
+        return (
+            False,
+            "the ISA contract changed since the software was written, so the kernel must "
+            "be updated for the new intrinsics",
+            files,
+            calls,
+        )
+    names = ", ".join(sorted({str(call["name"]) for call in calls}))
+    return True, f"the current kernel already calls {names} with the current contract", files, calls
+
+
+def _choose_software_change(
+    state: CfuDesignState, toolbox: RepoToolbox
+) -> tuple[bool, dict[str, Any], str]:
+    """Decide whether the software rung must run after the hardware was built.
+
+    Returns ``(reuse, decision, raw_output_path)``. ``reuse`` means "go straight
+    to the software build with the kernel that is already in the workspace". The
+    deterministic guard runs first; only when it passes does the agent decide, and
+    any failure (no LLM, unusable answer, ``--software-change always``) falls back
+    to running the software rung, which is the pre-existing ladder.
+    """
+    ok, evidence, files, calls = _software_reuse_evidence(state, toolbox)
+    decision: dict[str, Any] = {
+        "software_change": "required",
+        "reason": evidence,
+        "source": "guard",
+        "evidence": evidence,
+        "files": files,
+        "calls": calls,
+    }
+    if str(state.get("software_change", "auto")) != "auto":
+        decision["source"] = "fixed"
+        decision["reason"] = "--software-change always: the software rung must run"
+        return False, decision, ""
+    if not ok:
+        # Nothing to ask: the kernel does not drive the CFU (or the contract
+        # moved), so a software change is required to accelerate anything.
+        return False, decision, ""
+    fallback = json.dumps(
+        {
+            "software_change": "required",
+            "reason": "keep the ladder's default: the software rung runs",
+        }
     )
+    try:
+        result, raw_output = _complete_llm(
+            state,
+            "route_software",
+            "software_route",
+            SYSTEM_PROMPT,
+            software_need_prompt(
+                state.get("task", ""),
+                state.get("workload_spec", {}),
+                state.get("isa_spec", {}) or {},
+                hardware_summary=str(state.get("implementation_hw_summary", "") or ""),
+                software_summary=str(state.get("implementation_sw_summary", "") or ""),
+                calls=calls,
+                evidence=evidence,
+            ),
+            fallback,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:  # noqa: BLE001 - routing must never break the ladder
+        decision["source"] = "fallback"
+        decision["reason"] = f"the software router failed: {exc}"
+        return False, decision, ""
+    parsed = parse_yaml_mapping(result.text) or {}
+    answer = str(parsed.get("software_change", "") or "").strip()
+    if result.used_llm and answer in ("required", "not_required"):
+        decision["software_change"] = answer
+        decision["source"] = "llm"
+        decision["reason"] = str(parsed.get("reason", "") or "")[:400]
+        return answer == "not_required", decision, raw_output
+    decision["source"] = "fallback"
+    decision["raw"] = result.text[:400]
+    decision["reason"] = "the software router did not return a usable software_change"
+    return False, decision, raw_output
 
 
 def _write_intrinsics_header(state: CfuDesignState, toolbox: RepoToolbox) -> str:
@@ -1931,7 +2505,9 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
         # nothing, so fail the rung here and let the ladder repair implement_hw.
         errors: list[str] = [
             "the hardware rung did not apply a design change; "
-            "refusing to generate the SoC from the scaffold"
+            "refusing to generate the SoC from the scaffold "
+            "(the implementation_hw answer must contain an "
+            "EDIT_BEGIN/FILE_BEGIN/PATCH_BEGIN deliverable)"
         ]
     else:
         errors = _missing_design_files(state)
@@ -1958,19 +2534,93 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
 
     ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
     _write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
+
+    # The hardware now exists, so the agent may decide that the software it
+    # already wrote still matches it and skip the software rung. The guard in
+    # _choose_software_change only lets that happen when the current kernel calls
+    # a CFU datapath intrinsic and the ISA contract has not moved.
+    software_decision: dict[str, Any] = {}
+    software_reused = False
+    route_raw = ""
+    reuse_summary = ""
+    reuse_gate: dict[str, Any] = {}
+    if ok:
+        impl_toolbox = _toolbox_for_stage(state, "implementation")
+        software_reused, software_decision, route_raw = _choose_software_change(
+            state, impl_toolbox
+        )
+        if software_decision:
+            _artifacts_for_stage(state, "implementation").write_yaml(
+                "implementation",
+                "09_implementation/software_decision.yaml",
+                software_decision,
+                status="produced",
+            )
+        if software_reused:
+            # The intrinsics header is a pure function of the ISA contract and the
+            # software rung normally writes it, so write it here too before the build.
+            header = _write_intrinsics_header(state, impl_toolbox)
+            note = str(software_decision.get("reason", "") or "").strip()
+            prior_summary = str(state.get("implementation_sw_summary", "") or "").strip()
+            reuse_summary = "\n\n".join(
+                part
+                for part in (prior_summary, f"Software reused unchanged: {note}" if note else "")
+                if part
+            )
+            reuse_gate = {
+                "ok": True,
+                "reused": True,
+                "skipped": False,
+                "applied": False,
+                "files": list(software_decision.get("files", []) or []),
+                "intrinsics_header": header,
+                "isa_hash": _isa_digest(state),
+                "reason": note,
+                "evidence": str(software_decision.get("evidence", "") or ""),
+                "calls": list(software_decision.get("calls", []) or []),
+            }
+
     extra, next_node = _ladder_transition(
-        state, rung, ok=ok, default="implement_sw", repair_target="implement_hw"
+        state,
+        rung,
+        ok=ok,
+        default="build_sw" if software_reused else "implement_sw",
+        repair_target="implement_hw",
     )
+    gates = {
+        **state.get("gates", {}),
+        rung: {
+            "ok": ok,
+            "skipped": False,
+            "commands": len(results),
+            "software_decision": software_decision,
+            "next": next_node,
+        },
+    }
+    if reuse_gate:
+        gates["implementation_sw"] = reuse_gate
+    # iteration_history is append-annotated: these are only this node's new lines.
+    history = ["Generated the SoC from the agent design."]
+    if software_reused:
+        history.append(
+            "Software reused unchanged: the existing kernel already drives this CFU, so the "
+            "software rung was skipped and the existing kernel is compiled instead."
+        )
+    if software_decision:
+        history.append(
+            f"Software change {software_decision.get('software_change')} "
+            f"({software_decision.get('source')}): {software_decision.get('reason')}"
+        )
+    extra["iteration_history"] = [*(extra.get("iteration_history") or []), *history]
     update = {
         "validation_results": results,
         "stage_jobs": "validation",
         "errors": errors,
-        "gates": {
-            **state.get("gates", {}),
-            rung: {"ok": ok, "skipped": False, "commands": len(results), "next": next_node},
-        },
-        "iteration_history": append_history(state, "Generated the SoC from the agent design."),
+        "llm_raw_outputs": [route_raw] if route_raw else [],
+        "gates": gates,
     }
+    if reuse_summary:
+        update["implementation_sw_summary"] = reuse_summary
     return _apply_transition(update, extra)
 
 
@@ -2023,6 +2673,7 @@ def build_sw(state: CfuDesignState) -> CfuDesignState:
         errors.append(f"software build produced no ELF at {elf}")
 
     ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
+    reused = bool(impl_gate.get("reused"))
     _write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
     extra, next_node = _ladder_transition(
         state, rung, ok=ok, default="simulate", repair_target="implement_sw"
@@ -2033,9 +2684,21 @@ def build_sw(state: CfuDesignState) -> CfuDesignState:
         "errors": errors,
         "gates": {
             **state.get("gates", {}),
-            rung: {"ok": ok, "skipped": False, "commands": len(results), "elf": elf, "next": next_node},
+            rung: {
+                "ok": ok,
+                "skipped": False,
+                "commands": len(results),
+                "elf": elf,
+                "software_reused": reused,
+                "next": next_node,
+            },
         },
-        "iteration_history": append_history(state, "Compiled the accelerated software."),
+        "iteration_history": append_history(
+            state,
+            "Compiled the reused software unchanged."
+            if reused
+            else "Compiled the accelerated software.",
+        ),
     }
     return _apply_transition(update, extra)
 
@@ -2048,6 +2711,73 @@ def _software_elf(state: CfuDesignState) -> str:
         name = str(project.get("benchmark", "") or spec.get("benchmark_name", ""))
         return embench_elf_path(run_root, name, "cfu") if name else ""
     return str(project.get("elf_path", "") or "")
+
+
+def sim_attribution(results: list[dict], sim_text: str) -> str:
+    """A short, actionable cause for a failed emulation run.
+
+    MiCoSocSim only reports that the CPU reached the pass/fail symbol, which is
+    true but useless for a repair. This maps the log (and the harness's verify
+    diagnostic) to a concrete cause.
+    """
+    lowered = sim_text.lower()
+    verify: dict = {}
+    for result in results:
+        candidate = (result.get("parsed") or {}).get("verify")
+        if isinstance(candidate, dict):
+            verify = candidate
+    if verify.get("status") == "fail":
+        benchmark = str(verify.get("benchmark", "the benchmark"))
+        code = verify.get("verify")
+        detail = f" (verify_benchmark returned {code})" if code is not None else ""
+        return (
+            f"Embench verify failed for {benchmark}{detail}: the accelerated (CFU) build "
+            "computed a different observable result from the scalar reference. This is a "
+            "wrong-result failure, not a build error, a crash, or a harness problem."
+        )
+    if "fail symbol" in lowered:
+        return (
+            "the software reached the fail symbol, i.e. main() returned non-zero because "
+            "verify_benchmark() rejected the result: the CFU build produced a wrong value "
+            "(correctness), not a build or harness failure."
+        )
+    if any(result.get("timed_out") for result in results):
+        return (
+            "the simulation timed out before reaching the pass/fail symbol: likely a hang "
+            "(unfinished TileLink transaction, a wait on a fence, or a non-terminating loop)."
+        )
+    if verify.get("status") == "pass":
+        # Correctness passed: any remaining failure is the rung's own gate (for
+        # example the speedup floor), which already reports itself.
+        return ""
+    if results and all(result.get("returncode") in (0, None) for result in results):
+        return ""
+    return (
+        "the simulation ended without reaching the pass or fail symbol; check the log for a "
+        "trap/exception or a simulator error."
+    )
+
+
+def sim_feedback(state: CfuDesignState) -> str:
+    """Simulation feedback for a repair prompt: attribution first, then the log."""
+    gate = (state.get("gates", {}) or {}).get("sim") or {}
+    attribution = str(gate.get("attribution", "") or "")
+    # When the router picked this rung, carry its diagnosis so the repair works on
+    # the named defect instead of re-deriving the failure from the log.
+    decision = gate.get("repair_decision") or {}
+    routing = ""
+    if isinstance(decision, dict) and decision.get("source") == "llm":
+        cause = str(decision.get("root_cause", "") or "").strip()
+        reason = str(decision.get("reason", "") or "").strip()
+        if cause or reason:
+            routing = (
+                f"Repair routing assigned this failure to {decision.get('target')}: "
+                f"{cause or reason}"
+            )
+    log = check_feedback(state, "sim")
+    return labeled_feedback(
+        "sim (simulation) errors", "\n\n".join(p for p in (attribution, routing, log) if p)
+    )
 
 
 def simulate(state: CfuDesignState) -> CfuDesignState:
@@ -2119,6 +2849,19 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
                 f"({cfu_cycles} vs {ref_cycles} cycles, {speedup_x100 / 100:.2f}x); "
                 "reverting to scalar inside the CFU build is not acceleration"
             )
+    elif not state.get("changed_design_files"):
+        # Without an applied design change the ELF exercises the scaffold, so
+        # there is nothing to validate.
+        errors.append("no design change was applied; the simulation runs the scaffold CFU")
+
+    ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
+    # Attribute the failure from the log (verify code, fail symbol, timeout) so a
+    # repair prompt is not limited to "reached the fail symbol".
+    attribution = "" if ok else sim_attribution(results, sim_text)
+    if attribution:
+        errors.append(attribution)
+
+    if is_embench:
         artifacts = _artifacts_for_stage(state, "validation")
         artifacts.write_yaml(
             "validation",
@@ -2130,21 +2873,42 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
                 "cfu_cycles": cfu_cycles,
                 "speedup_x100": speedup_x100,
                 "min_speedup_x100": MIN_EMBENCH_SPEEDUP_X100,
-                "status": "passed" if not errors else "failed",
+                "attribution": attribution,
+                "status": "passed" if ok else "failed",
             },
         )
-    elif not state.get("changed_design_files"):
-        # Without an applied design change the ELF exercises the scaffold, so
-        # there is nothing to validate.
-        errors.append("no design change was applied; the simulation runs the scaffold CFU")
 
-    ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
     _write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
+
+    # Which side repairs a failed simulation is the agent's decision (software
+    # vs hardware), with the deterministic escalation as the fallback.
+    repair_decision: dict[str, Any] = {}
+    route_raw = ""
+    repair_target = _sim_repair_target(state)
+    if not ok and _repairs_left(state):
+        repair_target, repair_decision, route_raw = _choose_repair_target(
+            state, attribution=attribution, sim_text=sim_text, results=results
+        )
+        if repair_decision:
+            _artifacts_for_stage(state, "validation").write_yaml(
+                "validation",
+                "10_validation/sim_repair_decision.yaml",
+                repair_decision,
+                status="produced",
+            )
+
     extra, next_node = _ladder_transition(
-        state, rung, ok=ok, default="estimate_cost", repair_target=_sim_repair_target
+        state, rung, ok=ok, default="estimate_cost", repair_target=repair_target
     )
+    if repair_decision:
+        extra["iteration_history"] = [
+            *(extra.get("iteration_history") or []),
+            f"Repair routing chose {repair_decision.get('target')} "
+            f"({repair_decision.get('source')}): {repair_decision.get('root_cause') or repair_decision.get('reason')}",
+        ]
     update = {
         "validation_results": results,
+        "llm_raw_outputs": [route_raw] if route_raw else [],
         "stage_jobs": "cost",
         "errors": errors,
         "gates": {
@@ -2152,9 +2916,15 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
             rung: {
                 "ok": ok,
                 "skipped": False,
+                # Which optimization round these numbers belong to, so the
+                # ledger can never attribute a stale measurement to a round
+                # that failed before simulating.
+                "round": int(state.get("optimization_round", 0) or 0),
                 "reference_cycles": ref_cycles,
                 "cfu_cycles": cfu_cycles,
                 "speedup_x100": speedup_x100,
+                "attribution": attribution,
+                "repair_decision": repair_decision,
                 "next": next_node,
             },
         },
@@ -2272,6 +3042,7 @@ def estimate_cost(state: CfuDesignState) -> CfuDesignState:
                 "skipped": not execute,
                 "reason": reason or ("" if execute else "execution-disabled"),
                 "rtl": rtl,
+                "round": int(state.get("optimization_round", 0) or 0),
                 "next": next_node,
             },
         },
@@ -2281,23 +3052,115 @@ def estimate_cost(state: CfuDesignState) -> CfuDesignState:
 
 
 def review_and_route(state: CfuDesignState) -> CfuDesignState:
-    """Terminal decision node.
+    """Terminal decision node, plus the optional optimization loop.
 
     Retry routing lives in the per-rung routers, so review only reports the
-    honest outcome of the ladder: complete, planned, failed, or blocked.
+    honest outcome of the ladder: complete, planned, failed, or blocked. With
+    ``--loop`` a complete run may instead spend its remaining iteration budget on
+    one more improvement round, chosen by the agent; every round is recorded in
+    the optimization ledger so a regression is visible.
     """
     decision, status = _review_decision(state)
-    _report_review_decision(state, decision, status)
+    rounds = [dict(item) for item in (state.get("optimization_rounds") or [])]
+    plan = state.get("optimization_plan") or {}
+    if not isinstance(plan, dict):
+        plan = {}
+    if plan or not rounds:
+        # Record the round that just finished; with no plan yet this is the
+        # baseline produced by the initial ladder.
+        entry = _score_snapshot(
+            state,
+            target=str(plan.get("target", "") or "baseline"),
+            reason=str(plan.get("reason", "") or "initial ladder"),
+            source=str(plan.get("source", "") or "baseline"),
+            round_index=len(rounds),
+        )
+        entry["improved"] = _round_improved(entry, _best_round(rounds))
+        rounds.append(entry)
+
+    target, optimization, raw_output = ("", {}, "")
+    if status == "complete":
+        target, optimization, raw_output = _choose_optimization(state, rounds)
+
     stopped = state.get("stopped_at", "")
     note = f"Reviewed the run: {status}."
     if stopped:
         note = f"Reviewed the run: {status} (stopped at {stopped})."
-    return {
+    update: dict[str, Any] = {
         "status": status,
         "stage_jobs": "final_report",
-        "gates": {**state.get("gates", {}), "review": {"decision": decision, "status": status}},
+        "optimization_rounds": rounds,
+        "optimization_plan": {},
+        "gates": {
+            **state.get("gates", {}),
+            "review": {
+                "decision": decision,
+                "status": status,
+                "next": target or "final_report",
+                "optimization": optimization,
+            },
+        },
+        "llm_raw_outputs": [raw_output] if raw_output else [],
         "iteration_history": append_history(state, note),
     }
+    if target:
+        focus = str(optimization.get("focus", "") or "performance")
+        attempts = dict(state.get("attempts", {}) or {})
+        attempts["optimize"] = int(attempts.get("optimize", 0) or 0) + 1
+        # An optimization round is budgeted like a repair: --max-iters remains the
+        # single bound on how long a run may take.
+        update.update(
+            {
+                "repairs_used": int(state.get("repairs_used", 0) or 0) + 1,
+                "iteration": int(state.get("iteration", 0) or 0) + 1,
+                "attempts": attempts,
+                "stage_jobs": target,
+                # Stamped on the sim/cost gates of this round's measurements.
+                "optimization_round": len(rounds),
+                "optimization_plan": {
+                    "round": len(rounds),
+                    "target": target,
+                    "focus": focus,
+                    "reason": str(optimization.get("reason", "") or ""),
+                    "source": str(optimization.get("source", "") or ""),
+                    "score": optimization_score(state),
+                },
+            }
+        )
+        update["gates"]["review"]["decision"] = f"optimize:{target}"
+        update["iteration_history"] = [
+            *update["iteration_history"],
+            f"Started optimization round {len(rounds)} on {target} (focus {focus}): "
+            f"{optimization.get('reason', '')}",
+        ]
+
+    artifacts = _artifacts_for_stage(state, "review")
+    if state.get("loop_optimize") or len(rounds) > 1:
+        best = _best_round(rounds)
+        artifacts.write_yaml(
+            "review",
+            "12_review/optimization_rounds.yaml",
+            {
+                "rounds": rounds,
+                "best_round": (best or {}).get("round"),
+                "final_round": rounds[-1]["round"] if rounds else None,
+                "status": status,
+            },
+            status="produced",
+        )
+    if optimization:
+        artifacts.write_yaml(
+            "review",
+            "12_review/optimization_decision.yaml",
+            {**optimization, "target": target, "round": len(rounds)},
+            status="produced",
+        )
+    _report_review_decision(state, update["gates"]["review"]["decision"], status)
+    return update
+
+
+def _route_after_review(state: CfuDesignState) -> str:
+    return _rung_next(state, "review", "final_report")
 
 
 def final_report(state: CfuDesignState) -> CfuDesignState:
@@ -2715,7 +3578,7 @@ def _route_after_cost(state: CfuDesignState) -> str:
 
 
 def _sim_repair_target(state: CfuDesignState) -> str:
-    """Simulation failures repair the software first, then the hardware.
+    """Fallback escalation: simulation failures repair software, then hardware.
 
     Escalation must key off *simulation* repairs only. Reading the global
     ``last_repair_target`` would let an earlier ``sw_build`` repair make the very
@@ -2724,6 +3587,367 @@ def _sim_repair_target(state: CfuDesignState) -> str:
     """
     sim_repairs = int((state.get("attempts", {}) or {}).get("sim", 0) or 0)
     return "implement_hw" if sim_repairs > 0 else "implement_sw"
+
+
+def _choose_repair_target(
+    state: CfuDesignState,
+    *,
+    attribution: str,
+    sim_text: str,
+    results: list[dict],
+) -> tuple[str, dict[str, Any], str]:
+    """Pick which side repairs a failed simulation.
+
+    Returns ``(target, decision, raw_output_path)``. The LLM decides from the
+    attribution, the design summaries and the measured numbers; on any failure
+    (no LLM, invalid answer, ``--repair-routing fixed``) the deterministic
+    software-then-hardware escalation is used instead.
+    """
+    heuristic = _sim_repair_target(state)
+    fallback = json.dumps(
+        {
+            "repair_target": heuristic,
+            "root_cause": "deterministic fallback",
+            "reason": "software first, then hardware",
+        }
+    )
+    if str(state.get("repair_routing", "auto")) != "auto":
+        return heuristic, {"target": heuristic, "reason": "fixed escalation policy", "source": "fixed"}, ""
+    try:
+        result, raw_output = _complete_llm(
+            state,
+            "route_repair",
+            "repair_route",
+            SYSTEM_PROMPT,
+            repair_routing_prompt(
+                state.get("task", ""),
+                attribution,
+                sim_text,
+                state.get("workload_spec", {}),
+                profile=state.get("embench_profiles"),
+                isa_spec=state.get("isa_spec", {}),
+                hardware_summary=state.get("implementation_hw_summary", ""),
+                software_summary=state.get("implementation_sw_summary", ""),
+                sim_repairs=int((state.get("attempts", {}) or {}).get("sim", 0) or 0),
+            ),
+            fallback,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:  # noqa: BLE001 - routing must never break the ladder
+        # The router is advisory by design: any transport/parse/artifact failure
+        # leaves the deterministic escalation in charge instead of crashing a
+        # simulation that already ran.
+        return heuristic, {
+            "target": heuristic,
+            "reason": f"the repair router failed: {exc}",
+            "source": "fallback",
+            "advisory": heuristic,
+        }, ""
+    parsed = parse_yaml_mapping(result.text) or {}
+    target = str(parsed.get("repair_target", "") or "").strip()
+    if target in ("implement_sw", "implement_hw") and result.used_llm:
+        decision = {
+            "target": target,
+            "root_cause": str(parsed.get("root_cause", "") or "")[:400],
+            "reason": str(parsed.get("reason", "") or "")[:400],
+            "source": "llm",
+            "advisory": heuristic,
+        }
+        return target, decision, raw_output
+    decision = {
+        "target": heuristic,
+        "reason": "the router did not return a usable repair_target",
+        "source": "fallback",
+        "advisory": heuristic,
+        "raw": result.text[:400],
+    }
+    return heuristic, decision, raw_output
+
+
+# --- Optimization rounds (--loop) ------------------------------------------
+#
+# With --loop, a run that already passes every gate may spend the remaining
+# iteration budget on a deliberate improvement round instead of stopping. The
+# ladder still validates each round, so an optimization can never bypass verify,
+# the speedup floor, or the build rungs; it can only be slower than the round
+# before, which the ledger records (see 12_review/optimization_rounds.yaml).
+
+OPTIMIZATION_TARGETS = ("implement_hw", "implement_sw")
+
+
+def _cost_metric(state: CfuDesignState) -> dict[str, int]:
+    """Area proxy from the last parsed Yosys cost line."""
+    for result in reversed(state.get("cost_results") or []):
+        parsed = result.get("parsed") or {}
+        cost = parsed.get("cost") if isinstance(parsed, dict) else None
+        if isinstance(cost, dict) and cost:
+            return {
+                "cells": int(cost.get("cells", 0) or 0),
+                "wire_bits": int(cost.get("wire_bits", 0) or 0),
+                "memories": int(cost.get("memories", 0) or 0),
+                "memory_bits": int(cost.get("memory_bits", 0) or 0),
+            }
+    return {}
+
+
+def optimization_score(state: CfuDesignState) -> str:
+    """One line describing the current measured result (cycles, speedup, area)."""
+    gate = _rung_gate(state, "sim")
+    speedup_x100 = int(gate.get("speedup_x100", 0) or 0)
+    reference = int(gate.get("reference_cycles", 0) or 0)
+    cfu = int(gate.get("cfu_cycles", 0) or 0)
+    parts = (
+        [f"{reference} -> {cfu} cycles ({speedup_x100 / 100:.2f}x)"]
+        if reference and cfu
+        else ["no cycle measurement"]
+    )
+    cost = _cost_metric(state)
+    if cost:
+        parts.append(
+            f"{cost['cells']} cells, {cost['wire_bits']} wire bits, "
+            f"{cost['memories']} memories ({cost['memory_bits']} bits)"
+        )
+    else:
+        parts.append("no Yosys cost measurement")
+    return "; ".join(parts)
+
+
+def _score_snapshot(
+    state: CfuDesignState, *, target: str, reason: str, source: str, round_index: int
+) -> dict[str, Any]:
+    """The measured result of one round, or an explicit "not measured".
+
+    ``simulate``/``estimate_cost`` stamp their gates with the round they ran in,
+    so a round that failed before measuring reports ``measured: false`` instead of
+    repeating the previous round's numbers as if they were its own.
+    """
+    sim = _rung_gate(state, "sim")
+    cost_gate = _rung_gate(state, "cost")
+    fresh_sim = int(sim.get("round", 0) or 0) == round_index
+    fresh_cost = int(cost_gate.get("round", 0) or 0) == round_index
+    reference = int(sim.get("reference_cycles", 0) or 0) if fresh_sim else 0
+    cfu = int(sim.get("cfu_cycles", 0) or 0) if fresh_sim else 0
+    return {
+        "round": round_index,
+        "target": target,
+        "source": source,
+        "reason": str(reason or "")[:400],
+        "measured": bool(reference or cfu),
+        "speedup_x100": int(sim.get("speedup_x100", 0) or 0) if fresh_sim else 0,
+        "reference_cycles": reference,
+        "cfu_cycles": cfu,
+        "cost": _cost_metric(state) if fresh_cost else {},
+    }
+
+
+def _round_metrics_text(entry: dict[str, Any]) -> str:
+    """``speedup=2.50x cells=1300`` for a measured round, else ``not measured``."""
+    if not entry.get("measured"):
+        return "not measured"
+    speedup = int(entry.get("speedup_x100", 0) or 0)
+    cells = int((entry.get("cost") or {}).get("cells", 0) or 0)
+    text = f"speedup={speedup / 100:.2f}x" if speedup else "speedup=n/a"
+    return text + (f" cells={cells}" if cells else " cells=n/a")
+
+
+def _metric_deltas(entry: dict[str, Any], previous: dict[str, Any] | None) -> str:
+    """`` (+0.50x, +100 cells)`` against the previous measured round."""
+    if not previous or not previous.get("measured") or not entry.get("measured"):
+        return ""
+    parts: list[str] = []
+    speedup = int(entry.get("speedup_x100", 0) or 0)
+    before = int(previous.get("speedup_x100", 0) or 0)
+    if speedup and before:
+        parts.append(f"{'+' if speedup >= before else ''}{(speedup - before) / 100:.2f}x")
+    cells = int((entry.get("cost") or {}).get("cells", 0) or 0)
+    before_cells = int((previous.get("cost") or {}).get("cells", 0) or 0)
+    if cells and before_cells:
+        parts.append(f"{'+' if cells >= before_cells else ''}{cells - before_cells} cells")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _previous_measured(
+    rounds: list[dict[str, Any]], index: int
+) -> dict[str, Any] | None:
+    for entry in reversed(rounds[:index]):
+        if entry.get("measured"):
+            return entry
+    return None
+
+
+def _round_improved(entry: dict[str, Any], best: dict[str, Any] | None) -> bool:
+    """True when a round is Pareto-better than the best round so far.
+
+    Not slower, not larger, and better on at least one of the two axes, so an
+    "optimization" that trades speed for nothing can never be recorded as one.
+    """
+    if not entry.get("measured", True):
+        # A round with no measurement of its own cannot be an improvement.
+        return False
+    if not best:
+        return True
+    speed = int(entry.get("speedup_x100", 0) or 0)
+    best_speed = int(best.get("speedup_x100", 0) or 0)
+    cells = int((entry.get("cost") or {}).get("cells", 0) or 0)
+    best_cells = int((best.get("cost") or {}).get("cells", 0) or 0)
+    if best_speed and speed < best_speed:
+        return False
+    if best_cells and cells and cells > best_cells:
+        return False
+    faster = bool(best_speed) and speed > best_speed
+    smaller = bool(best_cells and cells) and cells < best_cells
+    return faster or smaller
+
+
+def _best_round(rounds: list[dict[str, Any]]) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    for entry in rounds:
+        if entry.get("improved"):
+            best = entry
+    return best
+
+
+def _rounds_digest(rounds: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for entry in rounds:
+        cost = entry.get("cost") or {}
+        lines.append(
+            f"- round {entry.get('round')}: target={entry.get('target')} "
+            f"{_round_metrics_text(entry)} "
+            f"improved={bool(entry.get('improved'))} "
+            f"reason={entry.get('reason', '') or 'n/a'}"
+        )
+    return "\n".join(lines)
+
+
+def optimization_directive(state: CfuDesignState) -> str:
+    """The instructions a rung gets when it runs as an optimization round."""
+    plan = state.get("optimization_plan") or {}
+    if not isinstance(plan, dict) or not plan:
+        return ""
+    focus = str(plan.get("focus", "") or "performance")
+    goal = {
+        "cost": "reduce the synthesized CFU cost (area) without losing performance",
+        "performance": "raise the measured speedup without growing the hardware",
+    }.get(focus, "improve the measured result")
+    return (
+        f"Round {plan.get('round', '?')} focus: {goal}.\n"
+        f"Current validated result: {optimization_score(state)}\n"
+        f"Planner's reason: {plan.get('reason', '')}\n"
+        "Change one thing and keep everything the software already relies on: the ISA "
+        "contract is frozen for this run, so do not add, rename or reshape a command."
+    )
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _choose_optimization(
+    state: CfuDesignState, rounds: list[dict[str, Any]]
+) -> tuple[str, dict[str, Any], str]:
+    """Ask whether another optimization round is worth the budget.
+
+    Returns ``(target, decision, raw_output_path)``; an empty target means "stop".
+    Only a model answer that names a concrete change can spend budget, and the
+    remaining ``--max-iters`` budget is the hard bound.
+    """
+    if not bool(state.get("loop_optimize", False)):
+        return "", {}, ""
+    remaining = max_repairs(state) - int(state.get("repairs_used", 0) or 0)
+    if remaining <= 0:
+        return "", {
+            "continue": False,
+            "source": "budget",
+            "reason": "no iteration budget is left for another round",
+        }, ""
+    plan = state.get("optimization_plan") or {}
+    focus = str(plan.get("focus", "") or "performance")
+    fallback = json.dumps(
+        {
+            "continue": False,
+            "target": "implement_hw",
+            "focus": focus,
+            "reason": "stopping: no optimization plan was returned",
+        }
+    )
+    try:
+        result, raw_output = _complete_llm(
+            state,
+            "optimize",
+            "optimize",
+            SYSTEM_PROMPT,
+            optimization_prompt(
+                state.get("task", ""),
+                state.get("workload_spec", {}),
+                optimization_score(state),
+                _rounds_digest(rounds),
+                state.get("isa_spec", {}) or {},
+                hardware_summary=str(state.get("implementation_hw_summary", "") or ""),
+                software_summary=str(state.get("implementation_sw_summary", "") or ""),
+                budget_left=remaining,
+                focus=focus,
+            ),
+            fallback,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:  # noqa: BLE001 - the loop must never break the run
+        return "", {
+            "continue": False,
+            "source": "fallback",
+            "reason": f"the optimization router failed: {exc}",
+        }, ""
+    parsed = parse_yaml_mapping(result.text)
+    if not result.used_llm or not isinstance(parsed, dict):
+        # A fallback answer or unparseable text is not a model decision to spend
+        # the remaining budget, so the loop stops and says why.
+        return "", {
+            "continue": False,
+            "source": "fallback",
+            "reason": (
+                "the optimization router did not use the model"
+                if not result.used_llm
+                else "the optimization router did not return a usable decision"
+            ),
+        }, raw_output
+    target = str(parsed.get("target", "") or "").strip()
+    reason = str(parsed.get("reason", "") or "").strip()
+    focus = str(parsed.get("focus", "") or focus)
+    if _as_bool(parsed.get("continue")):
+        if target in OPTIMIZATION_TARGETS and reason:
+            return target, {
+                "continue": True,
+                "target": target,
+                "focus": focus,
+                "reason": reason[:400],
+                "source": "llm",
+            }, raw_output
+        if not reason:
+            return "", {
+                "continue": False,
+                "target": target,
+                "focus": focus,
+                "reason": "stopping: spending budget needs a concrete change, and none was given",
+                "source": "llm",
+            }, raw_output
+        return "", {
+            "continue": False,
+            "target": target,
+            "focus": focus,
+            "reason": "the optimization router returned an unusable target",
+            "source": "fallback",
+        }, raw_output
+    return "", {
+        "continue": False,
+        "target": target,
+        "focus": focus,
+        "reason": reason[:400] or "the optimizer chose to stop",
+        "source": "llm",
+    }, raw_output
 
 
 # Static edges of the pure-Python runner. Nodes whose successor depends on a
@@ -2754,6 +3978,7 @@ PY_ROUTERS: dict[str, Any] = {
     "build_sw": _route_after_sw_build,
     "simulate": _route_after_sim,
     "estimate_cost": _route_after_cost,
+    "review_and_route": _route_after_review,
 }
 
 
@@ -3137,6 +4362,40 @@ def render_report(state: CfuDesignState) -> str:
     lines.append("## Validation Ladder")
     lines.append(render_ladder(state))
     lines.append("")
+    rounds = state.get("optimization_rounds") or []
+    if rounds:
+        best = _best_round(rounds) or {}
+        best_index = best.get("round")
+        final_index = rounds[-1].get("round")
+        lines.append("## Optimization Rounds")
+        lines.append(
+            f"- mode: --loop, {len(rounds)} recorded result(s), best round "
+            f"{best_index}, final round {final_index}"
+        )
+        if (
+            best_index is not None
+            and final_index is not None
+            and best_index != final_index
+            and rounds[-1].get("measured")
+        ):
+            # Only a measured final round can be called a regression; a round with
+            # no measurement of its own shows up as "not measured" and the run's
+            # status already reports that it failed.
+            lines.append(
+                "- WARNING: the final round is not the best round; the delivered files "
+                "belong to the final round, so this run regressed against its own best result"
+            )
+        for index, entry in enumerate(rounds):
+            lines.append(
+                f"- round {entry.get('round')}: {entry.get('target')} "
+                + _round_metrics_text(entry)
+                + _metric_deltas(entry, _previous_measured(rounds, index))
+                # The baseline is the reference point, not an "improvement".
+                + (f" improved={bool(entry.get('improved'))}" if entry.get("round") else "")
+                + (" (best)" if entry.get("round") == best_index else "")
+                + (f" — {entry.get('reason')}" if entry.get("reason") else "")
+            )
+        lines.append("")
     lines.append("## Normalized WorkloadSpec")
     lines.append("```yaml")
     lines.append(state.get("spec_text", "").strip())

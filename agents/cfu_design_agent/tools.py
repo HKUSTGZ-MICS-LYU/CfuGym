@@ -57,6 +57,13 @@ DEFAULT_CONTEXT_FILES = (
 )
 
 PROFILE_RE = re.compile(r"(?P<name>[A-Z0-9_]+_PROFILE)\s+(?P<body>.*)")
+# Summary line printed by skills/cfu-designer/scripts/yosys_cost_report.py.
+COST_RE = re.compile(
+    r"cost top=(?P<top>\S+)\s+cells=(?P<cells>\d+)\s+wire_bits=(?P<wire_bits>\d+)"
+    r"\s+memories=(?P<memories>\d+)\s+memory_bits=(?P<memory_bits>\d+)"
+)
+# Verify diagnostic printed by the generated embench_main.c (see embench.py).
+VERIFY_RE = re.compile(r"EMBENCH_VERIFY_(?P<status>PASS|FAIL)\s+(?P<body>.*)")
 
 
 @dataclass
@@ -568,7 +575,7 @@ def _parse_edit_pairs(block_lines: list[str], *, target: str) -> list[tuple[str,
             mode = "search"
             search = []
             replace = []
-        elif mode == "search" and stripped == DIVIDER_MARKER:
+        elif mode == "search" and stripped.startswith(DIVIDER_MARKER):
             mode = "replace"
         elif mode == "replace" and stripped.startswith(REPLACE_MARKER):
             pairs.append((_trim_blank_edges(search), _trim_blank_edges(replace)))
@@ -580,6 +587,16 @@ def _parse_edit_pairs(block_lines: list[str], *, target: str) -> list[tuple[str,
     if mode is not None:
         raise ValueError(f"{target}: unterminated SEARCH/REPLACE block")
     return pairs
+
+
+def _is_edit_end(stripped: str) -> bool:
+    """True for a section terminator, tolerating trailing junk.
+
+    Samplers occasionally append a stray token to the terminator (observed:
+    ``EDIT_END સલ``). Requiring an exact match discarded an otherwise valid edit
+    and the rung reported only "no deliverable", so the model repeated it.
+    """
+    return bool(re.match(r"^EDIT_END\b", stripped))
 
 
 def extract_edit_blocks(text: str) -> list[tuple[str, list[tuple[str, str]]]]:
@@ -609,7 +626,7 @@ def extract_edit_blocks(text: str) -> list[tuple[str, list[tuple[str, str]]]]:
             current_path = stripped[len("EDIT_BEGIN"):].strip()
             current = []
             continue
-        if stripped == "EDIT_END":
+        if _is_edit_end(stripped):
             if current_path:
                 blocks.append((current_path, _parse_edit_pairs(current, target=current_path)))
             current_path = None
@@ -618,6 +635,18 @@ def extract_edit_blocks(text: str) -> list[tuple[str, list[tuple[str, str]]]]:
         if current_path is not None:
             current.append(line)
     return blocks
+
+
+def unterminated_edit_blocks(text: str) -> int:
+    """Number of EDIT_BEGIN sections that never reached a terminator.
+
+    Used to tell "the model sent no edit at all" apart from "the edit was
+    malformed", which need different repair feedback.
+    """
+    begins = sum(
+        1 for line in (text or "").splitlines() if line.strip().startswith("EDIT_BEGIN")
+    )
+    return max(0, begins - len(extract_edit_blocks(text or "")))
 
 
 def _match_window(content_lines: list[str], search_lines: list[str]) -> list[int]:
@@ -634,6 +663,65 @@ def _match_window(content_lines: list[str], search_lines: list[str]) -> list[int
     return hits
 
 
+def _locate_closest(
+    content_lines: list[str], search_lines: list[str]
+) -> tuple[int, int, str, str] | None:
+    """Closest existing region and its first differing line.
+
+    Returns ``(search_line_no, content_line_no, expected, actual)`` (1-based) or
+    None when the SEARCH anchor does not appear at all. Used to tell the model
+    exactly which line it mis-copied instead of only "not found".
+    """
+    stripped_search = [line.rstrip() for line in search_lines]
+    stripped_content = [line.rstrip() for line in content_lines]
+    anchor_index = next((i for i, line in enumerate(search_lines) if line.strip()), 0)
+    anchor = search_lines[anchor_index]
+    candidates = [i for i, line in enumerate(stripped_content) if line == anchor]
+    if not candidates and anchor.strip():
+        candidates = [
+            i for i, line in enumerate(stripped_content) if line.strip() == anchor.strip()
+        ]
+    if not candidates:
+        return None
+    best: tuple[int, int, str, str] | None = None
+    for start in candidates:
+        offset = start - anchor_index
+        for index, expected in enumerate(search_lines):
+            content_index = offset + index
+            if content_index < 0 or content_index >= len(content_lines):
+                actual = "<past end of file>"
+                difference = (index + 1, content_index + 1, expected, actual)
+                break
+            if stripped_content[content_index] != stripped_search[index]:
+                difference = (index + 1, content_index + 1, expected, content_lines[content_index])
+                break
+        else:
+            continue
+        # Prefer the region that matches the longest prefix of the SEARCH block.
+        if best is None or difference[0] > best[0]:
+            best = difference
+    return best
+
+
+def _describe_mismatch(content_lines: list[str], search_lines: list[str]) -> str:
+    """Actionable description of why a SEARCH block did not match."""
+    located = _locate_closest(content_lines, search_lines)
+    if located is None:
+        return (
+            "The first SEARCH line does not appear in the current file either; re-read the "
+            "target content shown in the prompt and rebuild the edit from it."
+        )
+    search_no, content_no, expected, actual = located
+    return (
+        f"First difference: SEARCH line {search_no} of {len(search_lines)} vs current file "
+        f"line {content_no}.\n"
+        f"  your SEARCH:  {expected!r}\n"
+        f"  current file: {actual!r}\n"
+        "Copy the current file text verbatim (comments included), or shrink the SEARCH to the "
+        "few unique code lines you actually change."
+    )
+
+
 def apply_edit_pairs(content: str, pairs: list[tuple[str, str]]) -> tuple[str, list[str]]:
     """Apply search/replace pairs to ``content``; return (new_content, errors).
 
@@ -644,6 +732,7 @@ def apply_edit_pairs(content: str, pairs: list[tuple[str, str]]) -> tuple[str, l
     """
     errors: list[str] = []
     total = len(pairs)
+    original_lines = content.split("\n")
     for index, (search, replace) in enumerate(pairs, start=1):
         if not search.strip():
             errors.append(f"edit {index}/{total}: SEARCH block is empty")
@@ -652,10 +741,17 @@ def apply_edit_pairs(content: str, pairs: list[tuple[str, str]]) -> tuple[str, l
         content_lines = content.split("\n")
         hits = _match_window(content_lines, search_lines)
         if not hits:
-            errors.append(
-                f"edit {index}/{total}: SEARCH block not found; copy the current lines "
-                "exactly (an earlier section or pair may already have changed this region)"
-            )
+            if _match_window(original_lines, search_lines):
+                errors.append(
+                    f"edit {index}/{total}: SEARCH block no longer matches because an earlier "
+                    "section or pair changed that region; pairs apply in order, so search for the "
+                    "text as it is now"
+                )
+            else:
+                errors.append(
+                    f"edit {index}/{total}: SEARCH block not found. "
+                    + _describe_mismatch(content_lines, search_lines)
+                )
             break
         if len(hits) > 1:
             errors.append(
@@ -773,6 +869,27 @@ def parse_command_output(text: str) -> dict[str, object]:
         profiles.append(entry)
     if profiles:
         parsed["profiles"] = profiles
+    cost = COST_RE.search(text)
+    if cost:
+        parsed["cost"] = {
+            "top": cost.group("top"),
+            "cells": int(cost.group("cells")),
+            "wire_bits": int(cost.group("wire_bits")),
+            "memories": int(cost.group("memories")),
+            "memory_bits": int(cost.group("memory_bits")),
+        }
+    verify = VERIFY_RE.search(text)
+    if verify:
+        entry: dict[str, object] = {"status": verify.group("status").lower()}
+        for item in verify.group("body").split():
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            try:
+                entry[key] = int(value)
+            except ValueError:
+                entry[key] = value
+        parsed["verify"] = entry
     if " PASS " in text or text.strip().endswith(" PASS"):
         parsed["pass"] = True
     if "FAILURE" in text or " FAIL" in text:
