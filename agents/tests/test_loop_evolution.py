@@ -238,6 +238,21 @@ class EvolutionLoopTest(unittest.TestCase):
         self.assertLessEqual(len(out), 2600)
         self.assertIn('[truncated]', out)
 
+    def test_isa_artifact_survives_a_rejected_candidate(self):
+        # The isa rung writes the markdown for a REJECTED candidate too, so a
+        # malformed field must not crash the run before the problems are reported.
+        malformed = {"spec_version": "1", "identity": {"name": "x"}, "commands": [],
+                     "assumptions": ["free-form"], "unknowns": ["u"]}
+        graph._write_isa_artifact(self.state, malformed, ["assumptions must be a mapping"])
+        path = self.root / "08_isa/cfu_isa.md"
+        self.assertTrue(path.exists(), path)
+        self.assertIn("- free-form", path.read_text())
+
+    def test_isa_artifact_survives_a_formatter_crash(self):
+        with mock.patch.object(graph, "render_isa_markdown", side_effect=RuntimeError("boom")):
+            graph._write_isa_artifact(self.state, {"commands": []}, ["bad"])
+        self.assertIn("Markdown rendering failed", (self.root / "08_isa/cfu_isa.md").read_text())
+
     def test_call_evidence_ignores_strings_and_inactive_cfu_branches(self):
         source = '''const char *s = "cfu_batch(a,b)";
 #if 0

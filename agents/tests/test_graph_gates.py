@@ -427,6 +427,7 @@ class ReviewDecisionTest(unittest.TestCase):
             "isa": {"ok": True},
             "implementation_hw": {"ok": True},
             "hw_build": {"ok": True},
+            "hw_conformance": {"ok": True},
             "implementation_sw": {"ok": True},
             "sw_build": {"ok": True},
             "sim": {"ok": True},
@@ -1178,7 +1179,12 @@ class SoftwareChangeRoutingTest(unittest.TestCase):
         update = self._generate(self._state(), (True, decision, "09_implementation/llm_raw/software_route_000.txt"))
         gate = update["gates"]["hw_build"]
         self.assertTrue(gate["ok"])
-        self.assertEqual(gate["next"], "build_sw")
+        # The conformance micro-test runs before the software rung; the reuse decision
+        # is preserved and applied once conformance passes.
+        self.assertEqual(gate["next"], "check_conformance")
+        self.assertEqual(
+            graph._route_after_hw_conformance({"gates": update["gates"]}), "build_sw"
+        )
         self.assertEqual(gate["software_decision"]["software_change"], "not_required")
         sw_gate = update["gates"]["implementation_sw"]
         self.assertTrue(sw_gate["ok"])
@@ -1202,7 +1208,7 @@ class SoftwareChangeRoutingTest(unittest.TestCase):
             "calls": [],
         }
         update = self._generate(self._state(), (False, decision, ""))
-        self.assertEqual(update["gates"]["hw_build"]["next"], "implement_sw")
+        self.assertEqual(update["gates"]["hw_build"]["next"], "check_conformance")
         self.assertNotIn("implementation_sw", update["gates"])
         self.assertNotIn("implementation_sw_summary", update)
 
@@ -1236,6 +1242,7 @@ class SoftwareChangeRoutingTest(unittest.TestCase):
                 "isa": {"ok": True},
                 "implementation_hw": {"ok": True},
                 "hw_build": {"ok": True},
+                "hw_conformance": {"ok": True},
                 "implementation_sw": {"ok": True, "reused": True},
                 "sw_build": {"ok": True, "software_reused": True},
                 "sim": {"ok": True},
@@ -1260,6 +1267,7 @@ class LoopOptimizationTest(unittest.TestCase):
             "isa": {"ok": True},
             "implementation_hw": {"ok": True},
             "hw_build": {"ok": True},
+            "hw_conformance": {"ok": True},
             "implementation_sw": {"ok": True},
             "sw_build": {"ok": True},
             "sim": {"ok": True, "speedup_x100": 200, "reference_cycles": 100, "cfu_cycles": 50},

@@ -227,6 +227,29 @@ stages:
       - "agents/generated/runs/**/workspace/*_project_profile/**"
       - "sw/tests/**"
     commands: [git_apply_check, git_apply]
+  # Hardware conformance: a harness-generated differential micro-test of the new
+  # instructions, run between the SoC build and the software rung. The C test is
+  # produced by the harness (never a model write target); only its oracle and the
+  # build products live in the run workspace.
+  conformance:
+    read:
+      - "agents/generated/runs/**/02_workload/**"
+      - "agents/generated/runs/**/08_isa/**"
+      - "agents/generated/runs/**/09_implementation/**"
+      - "agents/generated/runs/**/10_validation/**"
+      - "agents/generated/runs/**/workspace/**"
+      - "sw/MiCo-Lib/**"
+      - "src/main/scala/vexiiriscv/execute/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
+    write:
+      - "agents/generated/runs/**/09_implementation/**"
+      - "agents/generated/runs/**/run.yaml"
+      # The generated intrinsics header lives beside the workload software.
+      - "agents/generated/runs/**/workspace/embench_*/cfu/**"
+      - "agents/generated/runs/**/workspace/*_benchmark/**"
+      - "agents/generated/runs/**/workspace/*_project_profile/**"
+    commands: [conformance_build, soc_sim]
   validation:
     read:
       - "agents/generated/runs/**/02_workload/**"
@@ -278,6 +301,13 @@ commands:
     executable: make
     required_tokens: [TARGET=vexii_soc]
     required_substrings: ["EXTRA_SOURCES="]
+    priority: 10
+  # Hardware conformance micro-test build: the same make shape as a benchmark build,
+  # but it must name the harness-owned test so a benchmark build cannot stand in.
+  conformance_build:
+    executable: make
+    required_tokens: [TARGET=vexii_soc]
+    required_substrings: ["cfu_conformance"]
     priority: 10
   soc_generate:
     executable: sbt

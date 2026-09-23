@@ -176,6 +176,118 @@ class IsaValidationTest(unittest.TestCase):
         self.assertEqual(validate_isa_spec(spec), [])
 
 
+class IsaRendererRobustnessTest(unittest.TestCase):
+    """Renderers also run on candidates that FAILED validation.
+
+    The isa rung records every attempt and feeds the repair prompt, so a formatter
+    crash would abort the run instead of reporting the lint problems.
+    """
+
+    MALFORMED = {
+        # Regression: Assumptions was the one section that called .items() directly,
+        # so a model returning a list crashed the whole run.
+        "assumptions-list": {"assumptions": ["free-form"], "unknowns": []},
+        "identity-list": {"identity": ["x"]},
+        "commands-with-non-dict": {"commands": [None, 3, "s", {"function_id": 1, "name": "c"}]},
+        "commands-not-list": {"commands": {"a": 1}},
+        "unknowns-int": {"unknowns": 7},
+        "datapath-scalar": {"datapath": 3, "roofline": "text"},
+        "everything-wrong-type": {
+            "identity": 5, "commands": 5, "roofline": "x", "state": [1], "memory": None,
+            "datapath": 3, "software": [1], "integration": 2, "validation": "v",
+            "assumptions": 9, "unknowns": 9, "operations_contract": [1, 2],
+        },
+        "empty": {},
+    }
+
+    def test_markdown_renders_rejected_candidate_without_raising(self) -> None:
+        from agents.cfu_design_agent.isa import render_isa_markdown
+
+        for name, data in self.MALFORMED.items():
+            with self.subTest(case=name):
+                text = render_isa_markdown(data)
+                self.assertTrue(text.startswith("# CFU ISA Spec"), text[:80])
+                for section in ("## Commands", "## Assumptions", "## Unknowns"):
+                    self.assertIn(section, text)
+
+    def test_markdown_renders_list_valued_assumptions(self) -> None:
+        from agents.cfu_design_agent.isa import render_isa_markdown
+
+        text = render_isa_markdown({"assumptions": ["free-form note"], "unknowns": ["u"]})
+        self.assertIn("- free-form note", text)
+        self.assertIn("- u", text)
+
+    def test_markdown_escapes_table_separators(self) -> None:
+        from agents.cfu_design_agent.isa import render_isa_markdown
+
+        text = render_isa_markdown({"commands": [{"function_id": 1, "name": "a|b"}]})
+        self.assertIn("a\\|b", text)
+
+    def test_intrinsics_render_rejected_candidate_without_raising(self) -> None:
+        from agents.cfu_design_agent.isa import render_cfu_intrinsics
+
+        for name, data in self.MALFORMED.items():
+            with self.subTest(case=name):
+                self.assertIn("#ifndef CFU_INTRINSICS_H", render_cfu_intrinsics(data))
+
+
+class IsaEnvelopeToleranceTest(unittest.TestCase):
+    """A model may wrap the contract; accept the nested one instead of failing the run.
+
+    Observed with GLM: {"analysis": ..., "roofline": {...}, "isa_contract": "<yaml>"}.
+    Every top-level key then looked missing, so the rung burned its whole repair
+    budget re-emitting the same envelope.
+    """
+
+    def test_nested_contract_string_is_unwrapped(self) -> None:
+        import json
+
+        import yaml
+
+        response = json.dumps({
+            "analysis": "hot loop analysis",
+            "roofline": {"bottleneck": "memory-bound"},
+            "isa_contract": yaml.safe_dump(yaml.safe_load(VALID_ISA_YAML)),
+        })
+        spec, problems = validate_isa_text(response)
+        self.assertEqual(problems, [])
+        self.assertEqual(spec["identity"]["name"], "u8_wavg_agent")
+
+    def test_nested_contract_mapping_is_unwrapped(self) -> None:
+        import json
+
+        import yaml
+
+        response = json.dumps({
+            "analysis": "x",
+            "cfu_isa": yaml.safe_load(VALID_ISA_YAML),
+        })
+        spec, problems = validate_isa_text(response)
+        self.assertEqual(problems, [])
+        self.assertEqual(spec["identity"]["name"], "u8_wavg_agent")
+
+    def test_envelope_without_a_contract_is_still_rejected(self) -> None:
+        import json
+
+        response = json.dumps({"analysis": "x", "roofline": {"bottleneck": "unknown"}})
+        spec, problems = validate_isa_text(response)
+        self.assertTrue(problems)
+        # The parsed envelope survives to the artifact so the report shows what came back.
+        self.assertIn("analysis", spec)
+
+    def test_flat_contract_is_not_rewritten(self) -> None:
+        import json
+
+        import yaml
+
+        contract = yaml.safe_load(VALID_ISA_YAML)
+        contract["isa_contract"] = "decoy"
+        spec, problems = validate_isa_text(json.dumps(contract))
+        self.assertEqual(problems, [])
+        self.assertEqual(spec["isa_contract"], "decoy")
+        self.assertEqual(spec["identity"]["name"], "u8_wavg_agent")
+
+
 class WorkloadSpecValidationTest(unittest.TestCase):
     def test_formatted_spec_strips_unknown_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

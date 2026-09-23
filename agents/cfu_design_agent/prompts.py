@@ -483,7 +483,11 @@ Repo context:
 This is the ISA-CONTRACT stage only. The next node parses your response directly with a YAML parser.
 Return exactly one YAML mapping and nothing else. Do not return analysis, prose, Markdown fences,
 Scala, C, a patch, FILE_BEGIN/FILE_END blocks, or an implementation plan. Do not continue to
-hardware or software implementation. The YAML must contain these top-level keys:
+hardware or software implementation. The contract object must BE the top level of the response:
+do not wrap it in an envelope, do not nest it under isa_contract/contract/spec, do not return it
+as a string, and do not add thoughts/analysis/reasoning keys. This API may require JSON; if so,
+the JSON object must have exactly the top-level keys listed below.
+The YAML must contain these top-level keys:
 `spec_version`, `identity`, `commands`, `operations_contract`, `state`, `memory`, `datapath`,
 `software`, `integration`, `validation`, `assumptions`, `unknowns`, and `roofline`.
 Copy the Roofline conclusion into `roofline`, including the selected boundary, intensity,
@@ -528,6 +532,89 @@ HARDWARE_TARGETS = (
     "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala",
     "src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala",
 )
+
+
+def _conformance_command_table(isa: dict) -> str:
+    """Per-command summary of what the oracle must supply."""
+    from .conformance import cpu_value_roles, has_vector_resource, writes_cpu_rd
+
+    lines: list[str] = []
+    for command in isa.get("commands") or []:
+        if not isinstance(command, dict):
+            continue
+        name = command.get("name", "")
+        roles = cpu_value_roles(command)
+        needs = "reference (command writes CPU rd)" if writes_cpu_rd(command) else "verify (no CPU result)"
+        setup = "; setup required (uses the vector register file)" if has_vector_resource(command) else ""
+        arguments = ", ".join(f"{role}->{'ab'[i]}" for i, role in enumerate(roles)) or "no arguments"
+        lines.append(f"- {name}: {needs}{setup}; arguments: {arguments}")
+    return "\n".join(lines) if lines else "- (no encodable command)"
+
+
+def conformance_prompt(
+    task: str,
+    isa: dict,
+    spec: WorkloadSpec,
+    *,
+    feedback: str = "",
+) -> str:
+    """Prompt for the hw_conformance rung: the oracle, and nothing else."""
+    feedback_block = ""
+    if feedback.strip():
+        feedback_block = (
+            "\n=== ORACLE REPAIR MODE ===\n"
+            "The previous oracle was rejected by the conformance validator. The exact\n"
+            "problems are:\n"
+            "```text\n" + feedback.strip() + "\n```\n"
+            "Fix each listed problem. You cannot change the test: the harness generates\n"
+            "the C file from this oracle, so an unverifiable command is a hard failure.\n"
+        )
+    return f"""Task:
+{task}
+
+CFU ISA contract under test:
+{spec_digest(dict(isa))}
+
+Commands and what each one needs:
+{_conformance_command_table(isa)}
+{feedback_block}
+This is the HARDWARE CONFORMANCE rung only. The harness generates a minimal C
+program that calls each declared CFU instruction and compares it against YOUR
+oracle; you do not write the test file, and any file you emit would be ignored.
+
+Return exactly one YAML mapping and nothing else, with a single top-level key
+`commands` holding one entry per command above:
+
+commands:
+  - name: <exact command name>
+    helpers: |            # optional C definitions inserted at the top of the file
+      static uint32_t ref_<name>(uint32_t a, uint32_t b) {{ ... }}
+    setup: |              # required when the command uses the vector register file
+      // C statements that seed the vector slot(s) this command reads
+    reference: "ref_<name>(a, b)"   # required when the command writes CPU rd
+    verify: "..."                   # required instead when it has no CPU result
+    cases:
+      - args: [0, 1]      # one value per CPU-value argument, in rs1/rs2 order
+
+Rules:
+- `reference` must be an INDEPENDENT scalar implementation of the command's
+  documented semantics, transcribed from the workload's own scalar code. Never
+  copy a constant table or an expected value out of your hardware design, and never
+  make the reference call the CFU intrinsic: that would only re-state the hardware
+  and prove nothing.
+- `verify` is only for commands with no CPU result (a vector write or an
+  acknowledgement), which cannot be read back generically. It is a C expression
+  that must be non-zero after the call, evaluated over state your `setup`/`helpers`
+  established. It is weaker evidence than `reference`; use `reference` whenever the
+  command returns a CPU value.
+- `args` bind to `a` (rs1 value) and `b` (rs2 value) in the declared order; the
+  same names are available to `reference` and `verify`.
+- Give each command at least one case. One representative case per command is
+  enough; add more only if they are genuinely useful.
+- Do not measure or print anything: no cycles, counters, timers or throughput.
+  The harness owns all reporting.
+- `cases`, `reference`/`verify` and vector `setup` are mandatory for every command;
+  a missing one fails the rung instead of being skipped."""
 
 
 def hardware_prompt(

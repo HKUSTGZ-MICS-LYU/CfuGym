@@ -343,6 +343,35 @@ def _document_candidates(text: str) -> Iterable[str]:
         yield match.group("body")
 
 
+# A model can wrap the contract in an envelope instead of returning it directly.
+# Observed: GLM returning {"analysis": ..., "roofline": {...},
+# "isa_contract": "<yaml string>"}. Accept the nested contract when the top level
+# is clearly not one, so a formatting slip costs nothing instead of a whole run.
+CONTRACT_KEYS = ("identity", "commands")
+_WRAPPER_KEYS = ("isa_contract", "cfu_isa", "isa", "cfu_isa_spec", "contract", "spec")
+
+
+def unwrap_isa_contract(data: Any) -> dict[str, Any]:
+    """Return the nested CFU contract when a model wrapped it in an envelope.
+
+    The contract may be nested as a mapping or as a string holding YAML/JSON. The
+    top-level object is returned unchanged when it already looks like a contract, or
+    when no candidate wrapper holds one.
+    """
+    if not isinstance(data, dict) or any(key in data for key in CONTRACT_KEYS):
+        return data
+    for key in _WRAPPER_KEYS:
+        nested = data.get(key)
+        if isinstance(nested, str):
+            try:
+                nested = yaml.safe_load(nested)
+            except yaml.YAMLError:
+                continue
+        if isinstance(nested, dict) and any(candidate in nested for candidate in CONTRACT_KEYS):
+            return nested
+    return data
+
+
 def validate_isa_text(text: str) -> tuple[dict[str, Any], list[str]]:
     parse_error: Exception | None = None
     for candidate in _document_candidates(text):
@@ -356,14 +385,53 @@ def validate_isa_text(text: str) -> tuple[dict[str, Any], list[str]]:
                 parse_error = yaml_exc
                 continue
         if isinstance(data, dict):
+            data = unwrap_isa_contract(data)
             return data, validate_isa_spec(data)
     if parse_error is not None:
         raise IsaLintError(f"CFU ISA spec does not parse: {parse_error}") from parse_error
     raise IsaLintError("CFU ISA spec must be a mapping")
 
 
+def _cell(value: Any) -> str:
+    """One Markdown table cell: never breaks the row for any JSON-ish value."""
+    return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _render_mapping(value: Any) -> str:
+    """Bullet lines for a mapping, tolerating a rejected candidate's malformed value.
+
+    A candidate that failed validation can hold a list or a scalar where the schema
+    wants a mapping; rendering must degrade to bullets instead of raising.
+    """
+    if isinstance(value, dict):
+        return "\n".join(f"- {key}: {item}" for key, item in value.items())
+    if isinstance(value, (list, tuple)) and value:
+        return "\n".join(f"- {item}" for item in value)
+    if isinstance(value, str) and value:
+        return f"- {value}"
+    return ""
+
+
+def _render_sequence(value: Any) -> str:
+    """Bullet lines for a sequence, tolerating malformed values the same way."""
+    if isinstance(value, (list, tuple)):
+        return "\n".join(f"- {item}" for item in value)
+    return _render_mapping(value)
+
+
 def render_isa_markdown(data: dict[str, Any]) -> str:
-    identity = data.get("identity", {})
+    """Render a CFU ISA contract as Markdown.
+
+    This formatter also runs on candidates that FAILED validation, because the isa
+    rung records every attempt and feeds the repair prompt. It must therefore never
+    raise on malformed input: a crash here aborts the run instead of reporting the
+    lint problems that are supposed to drive the repair. Unknown or wrong-typed
+    fields render as empty cells or "n/a".
+    """
+    if not isinstance(data, dict):
+        data = {}
+    identity = data.get("identity") if isinstance(data.get("identity"), dict) else {}
+    commands = data.get("commands") if isinstance(data.get("commands"), list) else []
     lines: list[str] = [
         "# CFU ISA Spec",
         f"- Name: {identity.get('name', '')}",
@@ -376,21 +444,24 @@ def render_isa_markdown(data: dict[str, Any]) -> str:
         "| function_id | subfunction_id | Kind | Command | Operand | Result | Semantics | Response |",
         "| ---: | ---: | --- | --- | --- | --- | --- | --- |",
     ]
-    for command in data.get("commands", []):
+    for command in commands:
+        if not isinstance(command, dict):
+            lines.append(f"| | | | {_cell(command)} | | | | |")
+            continue
         lines.append(
             "| {flag} | {sub} | {kind} | {name} | {operand} | {result} | {semantics} | {response} |".format(
-                flag=command.get("function_id", ""),
-                sub=command.get("subfunction_id", 0),
-                kind=command_kind(command),
-                name=command.get("name", ""),
-                operand=command.get("operand", ""),
-                result=command.get("result", ""),
-                semantics=command.get("semantics", ""),
-                response=command.get("response", ""),
+                flag=_cell(command.get("function_id", "")),
+                sub=_cell(command.get("subfunction_id", 0)),
+                kind=_cell(command_kind(command)),
+                name=_cell(command.get("name", "")),
+                operand=_cell(command.get("operand", "")),
+                result=_cell(command.get("result", "")),
+                semantics=_cell(command.get("semantics", "")),
+                response=_cell(command.get("response", "")),
             )
         )
 
-    explicit = [c for c in data.get("commands", []) if isinstance(c, dict) and "resources" in c]
+    explicit = [c for c in commands if isinstance(c, dict) and "resources" in c]
     if explicit:
         lines += ["", "## CfuResource bindings", "| Command | Resources | CPU completion |", "| --- | --- | --- |"]
         for command in explicit:
@@ -398,7 +469,7 @@ def render_isa_markdown(data: dict[str, Any]) -> str:
             problems = validate_cfu_resources(resources, data.get("datapath"))
             bindings = "; ".join(_resource_description(r) for r in resources) if not problems else "INVALID: " + "; ".join(problems)
             cpu_rd = not problems and any(r["storage"] == "cpu" and r["access"] == "write" for r in resources)
-            lines.append(f"| {command.get('name', '')} | {bindings or 'none (ack only)'} | {'result to CPU RD' if cpu_rd else 'ack; CPU rd=x0'} |")
+            lines.append(f"| {_cell(command.get('name', ''))} | {bindings or 'none (ack only)'} | {'result to CPU RD' if cpu_rd else 'ack; CPU rd=x0'} |")
 
     works = data.get("operations_contract", "")
     if isinstance(works, dict):
@@ -430,18 +501,12 @@ def render_isa_markdown(data: dict[str, Any]) -> str:
         _render_mapping(data.get("validation")) or "n/a",
         "",
         "## Assumptions",
-        "\n".join(f"- {key}: {value}" for key, value in (data.get("assumptions") or {}).items()) or "n/a",
+        _render_mapping(data.get("assumptions")) or "n/a",
         "",
         "## Unknowns",
-        "\n".join(f"- {item}" for item in data.get("unknowns") or []) or "n/a",
+        _render_sequence(data.get("unknowns")) or "n/a",
     ]
     return "\n".join(lines) + "\n"
-
-
-def _render_mapping(value: Any) -> str:
-    if not isinstance(value, dict):
-        return ""
-    return "\n".join(f"- {key}: {item}" for key, item in value.items())
 
 
 CFU_OPCODE_CUSTOM0 = 0x0B
@@ -542,9 +607,14 @@ def render_cfu_intrinsics(data: dict[str, Any]) -> str:
     what a two-register intrinsic needs. custom1 (0x2B) decodes an immediate
     instead, so ``validate_isa_spec`` rejects it for generated intrinsics.
     """
+    if not isinstance(data, dict):
+        data = {}
     identity = data.get("identity", {}) if isinstance(data.get("identity"), dict) else {}
     name = str(identity.get("name", "agent_cfu") or "agent_cfu")
-    commands = [c for c in data.get("commands", []) if isinstance(c, dict)]
+    commands = [
+        c for c in (data.get("commands") if isinstance(data.get("commands"), list) else [])
+        if isinstance(c, dict)
+    ]
     lines = [
         "/* Generated from the CFU ISA spec. Do not edit by hand. */",
         "#ifndef CFU_INTRINSICS_H",

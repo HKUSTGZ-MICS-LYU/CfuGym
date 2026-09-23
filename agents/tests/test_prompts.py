@@ -115,6 +115,14 @@ class RooflinePromptTest(unittest.TestCase):
                 {"storage": "cpu", "access": "write", "role": "rd"},
             ])
 
+    def test_contract_prompt_forbids_wrapping_the_contract(self) -> None:
+        # GLM wrapped the contract in {"analysis", "roofline", "isa_contract": "<yaml>"}
+        # and the rung could not recover, so the prompt must forbid it explicitly.
+        prompt = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
+        for term in ("must BE the top level", "isa_contract", "as a string",
+                     "thoughts/analysis/reasoning"):
+            self.assertIn(term, prompt)
+
     def test_downstream_prompts_preserve_roofline_decision(self) -> None:
         prompts = (
             contract_prompt("accelerate it", self.spec, self.analysis, self.context),

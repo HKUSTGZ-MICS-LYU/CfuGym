@@ -30,6 +30,7 @@ from .benchmarks import (
     profile_result_from_commands,
 )
 from .embench import (
+    DEFAULT_MARCH,
     benchmark_source_files,
     build_command as embench_build_command,
     cfu_source_targets,
@@ -41,6 +42,11 @@ from .embench import (
     prepare_embench_benchmark,
     workspace_rel as embench_workspace,
 )
+from .conformance import (
+    parse_conformance,
+    render_conformance,
+    validate_oracle,
+)
 from .embench_instrument import instrument_sources
 from .isa import (
     IsaLintError,
@@ -49,6 +55,7 @@ from .isa import (
     intrinsic_symbols,
     render_cfu_intrinsics,
     render_isa_markdown,
+    unwrap_isa_contract,
     validate_isa_text,
     validate_isa_extension,
 )
@@ -69,6 +76,7 @@ from .policy import PolicyError, load_policy, normalize_repo_path
 from .progress import StageProgress, stage_label
 from .prompts import (
     SYSTEM_PROMPT,
+    conformance_prompt,
     contract_prompt,
     hardware_prompt,
     optimization_prompt,
@@ -246,6 +254,7 @@ def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: igno
     graph.add_node("extend_isa", _wrap_node(extend_isa))
     graph.add_node("implement_hw", _wrap_node(implement_hw))
     graph.add_node("generate_soc", _wrap_node(generate_soc))
+    graph.add_node("check_conformance", _wrap_node(check_conformance))
     graph.add_node("implement_sw", _wrap_node(implement_sw))
     graph.add_node("build_sw", _wrap_node(build_sw))
     graph.add_node("simulate", _wrap_node(simulate))
@@ -295,6 +304,13 @@ def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: igno
     graph.add_conditional_edges(
         "generate_soc",
         _route_after_hw_build,
+        _identity_map("check_conformance", "build_sw", "implement_hw", "review_and_route"),
+    )
+    # Hardware conformance: the harness-owned differential micro-test runs before any
+    # workload software exists, so a failure repairs the design instead of the kernel.
+    graph.add_conditional_edges(
+        "check_conformance",
+        _route_after_hw_conformance,
         _identity_map("implement_sw", "build_sw", "implement_hw", "review_and_route"),
     )
     graph.add_edge("implement_sw", "build_sw")
@@ -457,6 +473,7 @@ def python_nodes() -> dict[str, Any]:
         "extend_isa": extend_isa,
         "implement_hw": implement_hw,
         "generate_soc": generate_soc,
+        "check_conformance": check_conformance,
         "implement_sw": implement_sw,
         "build_sw": build_sw,
         "simulate": simulate,
@@ -605,6 +622,7 @@ def _record_llm_output(
         "design_contract": ("isa", "08_isa"),
         "extend_isa": ("isa", "08_isa"),
         "implement_hw": ("implementation", "09_implementation"),
+        "check_conformance": ("implementation", "09_implementation"),
         "implement_sw": ("implementation", "09_implementation"),
         "route_repair": ("validation", "10_validation"),
         "route_software": ("implementation", "09_implementation"),
@@ -1394,6 +1412,7 @@ def hardware_repair_feedback(state: CfuDesignState) -> str:
     """
     parts = [
         labeled_feedback("hw_build (SoC generation) errors", check_feedback(state, "hw_build")),
+        labeled_feedback("hw_conformance errors", conformance_feedback(state)),
         sim_feedback(state),
         labeled_feedback("cost (Yosys) errors", cost_feedback(state)),
         labeled_feedback(
@@ -1583,6 +1602,39 @@ def isa_repair_feedback(state: CfuDesignState) -> str:
     return "\n".join(f"- {problem}" for problem in problems)
 
 
+def _isa_enveloped(text: str) -> bool:
+    """True when the response wrapped its contract in an envelope.
+
+    Unwrapping is deliberately lenient, so record it in the run history rather than
+    accepting a malformed protocol silently.
+    """
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(data, dict) and unwrap_isa_contract(data) is not data
+
+
+def _isa_shape_note(isa_spec: dict) -> str:
+    """Report what the parser actually extracted from an ISA response.
+
+    A model that nests the contract (observed: GLM returning {"analysis": ...,
+    "roofline": {...}, "isa_contract": "<yaml>"}) otherwise only sees symptoms such
+    as "identity.name is required" and re-emits the identical envelope, because
+    nothing tells it that its contract WAS present but wrapped.
+    """
+    if not isinstance(isa_spec, dict):
+        return "note: the response did not parse as a mapping"
+    keys = ", ".join(str(key) for key in isa_spec.keys()) or "(none)"
+    return (
+        f"note: the parser read these top-level keys from the response: {keys}. "
+        "The contract must BE the top-level object with keys spec_version, identity, "
+        "commands, operations_contract, state, memory, datapath, software, integration, "
+        "validation, assumptions, unknowns and roofline. Do not nest it under another "
+        "key (such as isa_contract) and do not return it as a string."
+    )
+
+
 def design_contract(state: CfuDesignState) -> CfuDesignState:
     spec = state.get("workload_spec", {})
     fallback = _isa_from_template(state.get("isa_spec_text", ""), spec, state.get("workload_analysis", ""))
@@ -1608,6 +1660,9 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
         isa_spec, problems = fallback, _isa_problem_note(result.text, fallback)
     if not problems and not _has_isaable_commands(isa_spec):
         isa_spec, problems = fallback, ["no usable commands after ISA extraction"]
+    if problems:
+        # Show what the parser actually saw, not only the resulting symptoms.
+        problems = [*problems, _isa_shape_note(isa_spec)]
     _write_isa_artifact(state, isa_spec, problems)
     ok = not problems
     extra, next_node = _ladder_transition(
@@ -1617,6 +1672,9 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
         default="implement_hw",
         repair_target="design_contract",
     )
+    history = "Produced CFU ISA/integration contract."
+    if _isa_enveloped(result.text):
+        history += " (unwrapped from a model envelope)"
     update = {
         "isa_spec": isa_spec,
         "isa_revision": 0,
@@ -1629,7 +1687,7 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
             **state.get("gates", {}),
             "isa": {"ok": ok, "problems": problems, "next": next_node},
         },
-        "iteration_history": append_history(state, "Produced CFU ISA/integration contract."),
+        "iteration_history": append_history(state, history),
     }
     return _apply_transition(update, extra)
 
@@ -1665,6 +1723,8 @@ def extend_isa(state: CfuDesignState) -> CfuDesignState:
             problems = validate_isa_extension(previous, candidate)
     except (IsaLintError, TypeError, AttributeError) as exc:
         candidate, problems = previous, [f"ISA extension rejected: {exc}"]
+    if problems:
+        problems = [*problems, _isa_shape_note(candidate)]
     ok = not problems and bool(result.used_llm)
     if not result.used_llm:
         problems = [*problems, "ISA extension requires a model-authored candidate"]
@@ -2836,7 +2896,8 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
         state,
         rung,
         ok=ok,
-        default="build_sw" if software_reused else "implement_sw",
+        # The conformance micro-test runs before any software decision is final.
+        default="check_conformance",
         repair_target="implement_hw",
     )
     gates = {
@@ -2873,6 +2934,192 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
     }
     if reuse_summary:
         update["implementation_sw_summary"] = reuse_summary
+    return _apply_transition(update, extra)
+
+
+CONFORMANCE_SUBDIR = "09_implementation/conformance"
+CONFORMANCE_SOURCE = "cfu_conformance.c"
+CONFORMANCE_BIN = "cfu_conformance"
+
+
+def conformance_feedback(state: CfuDesignState) -> str:
+    """Failure lines from the conformance micro-test, for the hardware repair."""
+    gate = _rung_gate(state, "hw_conformance")
+    chunks = [str(item) for item in (gate.get("errors") or []) if str(item).strip()]
+    chunks.extend(str(item) for item in (gate.get("details") or []) if str(item).strip())
+    return "\n".join(chunks)
+
+
+def _conformance_workspace(state: CfuDesignState) -> str:
+    return f"{state.get('run_root', '')}/{CONFORMANCE_SUBDIR}"
+
+
+def _conformance_build_command(state: CfuDesignState, header_path: str) -> tuple[list[str], str]:
+    """make invocation that builds the harness-owned micro-test, plus its ELF.
+
+    Mirrors ``embench.build_command``: paths are relative to ``sw/`` because the
+    Makefile is invoked with ``-C sw``. The test is the ``MAIN`` translation unit,
+    so it must NOT also appear in ``EXTRA_SOURCES`` (the Makefile links
+    ``$(OBJS) $(MAIN).c``, and listing it twice is a duplicate ``main``).
+    ``vexii_soc.mk`` already links ``start.S``/``soc_stdio.c``, so the test needs
+    no board support sources.
+    """
+    cfg = _conformance_workspace(state)
+    rel = os.path.relpath(cfg, "sw")
+    header_dir = os.path.relpath(os.path.dirname(header_path) or ".", "sw")
+    elf = f"{cfg}/{CONFORMANCE_BIN}.elf"
+    return (
+        [
+            "make",
+            "-C",
+            "sw",
+            "TARGET=vexii_soc",
+            f"MARCH={DEFAULT_MARCH}",
+            f"MAIN={rel}/{CONFORMANCE_BIN}",
+            f"BUILD={rel}/build",
+            f"EXTRA_INCLUDES={header_dir}",
+            "compile",
+        ],
+        elf,
+    )
+
+
+def _oracle_from_text(text: str) -> tuple[dict, list[str]]:
+    data = parse_yaml_mapping(text)
+    if data is None:
+        return {}, ["the oracle must be exactly one YAML mapping with a commands list"]
+    return data, []
+
+
+def check_conformance(state: CfuDesignState) -> CfuDesignState:
+    """Rung 3: differential micro-test of the freshly built CFU.
+
+    The harness generates the C test and the model supplies only the oracle, so a
+    repair can never weaken the test. A failure here means the design does not
+    satisfy its own contract, so it repairs the hardware and the software rung never
+    builds on top of an unverified instruction.
+    """
+    rung = "hw_conformance"
+    reason = _validation_reason(state)
+    if reason:
+        result = _skipped_result("make cfu_conformance + MiCoSocSim", state, reason)
+        result["rung"] = rung
+        _write_ladder_artifact(state, rung, [result], "planned", reason)
+        return {
+            "validation_results": [result],
+            "stage_jobs": "validation",
+            "gates": {**state.get("gates", {}), rung: {"ok": False, "skipped": True, "reason": reason}},
+            "iteration_history": append_history(state, f"Skipped hardware conformance ({reason})."),
+        }
+
+    isa_spec = state.get("isa_spec", {}) or {}
+    artifacts = _artifacts_for_stage(state, "implementation")
+    toolbox = _toolbox_for_stage(state, "conformance")
+    errors: list[str] = []
+
+    header_path = _write_intrinsics_header(state, toolbox)
+    if not header_path:
+        errors.append(
+            "the generated CFU intrinsics header is unavailable, so the conformance "
+            "test cannot be built"
+        )
+
+    oracle: dict = {}
+    if not errors:
+        prompt = conformance_prompt(
+            state["task"], isa_spec, state.get("workload_spec", {}),
+            feedback=conformance_feedback(state),
+        )
+        result, raw = _complete_llm(
+            state, "check_conformance", "conformance", SYSTEM_PROMPT, prompt,
+            json.dumps({"commands": []}, indent=2),
+            response_format={"type": "json_object"},
+        )
+        oracle, problems = _oracle_from_text(result.text)
+        if not problems:
+            problems = validate_oracle(isa_spec, oracle)
+        errors.extend(problems)
+        artifacts.write_yaml(
+            "implementation", f"{CONFORMANCE_SUBDIR}/oracle.yaml",
+            {"oracle": oracle, "problems": problems, "raw": raw}, status="produced",
+        )
+
+    results: list[dict] = []
+    verdict: dict = {"status": "missing", "ok": False, "commands": 0, "total": 0,
+                     "cases": 0, "failed": [], "details": []}
+    if not errors:
+        toolbox.write_text(
+            f"{_conformance_workspace(state)}/{CONFORMANCE_SOURCE}",
+            render_conformance(isa_spec, oracle),
+        )
+        build_argv, elf = _conformance_build_command(state, header_path)
+        build = _run_check(
+            state, toolbox, build_argv, rung=rung,
+            command_id="conformance_build", mutate=True,
+        )
+        results.append(build)
+        if build.get("returncode") not in (0, None):
+            errors.append(f"conformance test build failed: {' '.join(build_argv)[:200]}")
+        else:
+            for argv in agent_cfu_sim_commands(state, isa_spec, elf=elf):
+                sim = _run_check(
+                    state, toolbox, argv, rung=rung,
+                    command_id="soc_sim", timeout=3600, mutate=True,
+                )
+                results.append(sim)
+                verdict = parse_conformance(
+                    "\n".join([str(sim.get("stdout_tail") or ""), str(sim.get("stderr_tail") or "")])
+                )
+                if sim.get("returncode") not in (0, None):
+                    errors.append("conformance simulation failed (the CPU reached the fail symbol)")
+                if not verdict["ok"]:
+                    detail = (
+                        f"commands={verdict['commands']}/{verdict['total']} "
+                        f"cases={verdict['cases']}"
+                    )
+                    if verdict["failed"]:
+                        detail += f" failed={','.join(verdict['failed'])}"
+                    errors.append(f"conformance verdict {verdict['status']}: {detail}")
+                if errors:
+                    break
+
+    ok = (
+        not errors
+        and bool(results)
+        and all(r.get("returncode") in (0, None) for r in results)
+        and bool(verdict["ok"])
+    )
+    artifacts.write_yaml(
+        "implementation", f"{CONFORMANCE_SUBDIR}/result.yaml",
+        {"ok": ok, "verdict": verdict, "errors": errors,
+         "commands": [r.get("command") for r in results]},
+        status="passed" if ok else "failed",
+    )
+    _write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
+    extra, next_node = _ladder_transition(
+        state, rung, ok=ok, default=_post_conformance_default(state),
+        repair_target="implement_hw",
+    )
+    update = {
+        "validation_results": results,
+        "stage_jobs": "validation" if ok else "implementation",
+        "errors": errors,
+        "conformance_verdict": verdict,
+        "gates": {
+            **state.get("gates", {}),
+            rung: {
+                "ok": ok, "next": next_node, "errors": errors,
+                "details": verdict.get("details") or [],
+                "verdict": verdict.get("status"), "cases": verdict.get("cases"),
+            },
+        },
+        "iteration_history": append_history(
+            state,
+            f"Hardware conformance {'passed' if ok else 'failed'} "
+            f"({verdict.get('commands')}/{verdict.get('total')} commands, "
+            f"{verdict.get('cases')} cases).",
+        ),
+    }
     return _apply_transition(update, extra)
 
 
@@ -3633,7 +3880,13 @@ def _write_analysis_artifact(state: CfuDesignState, analysis: dict) -> None:
 def _write_isa_artifact(state: CfuDesignState, isa_spec: dict, problems: list[str]) -> None:
     artifacts = _artifacts_for_stage(state, "isa")
     artifacts.write_yaml("isa", "08_isa/cfu_isa.yaml", dict(isa_spec), status="invalid" if problems else "produced")
-    artifacts.write_text("isa", "08_isa/cfu_isa.md", render_isa_markdown(isa_spec), kind="markdown")
+    # This renders candidates that FAILED validation too, so a formatter bug must not
+    # abort the run before the lint problems can drive a repair.
+    try:
+        markdown = render_isa_markdown(isa_spec)
+    except Exception as exc:  # pragma: no cover - defensive
+        markdown = f"# CFU ISA Spec\n\nMarkdown rendering failed: {exc!r}\n"
+    artifacts.write_text("isa", "08_isa/cfu_isa.md", markdown, kind="markdown")
     artifacts.write_yaml("isa", "08_isa/validation.yaml", {"status": "invalid" if problems else "valid", "problems": problems})
 
 
@@ -3773,7 +4026,7 @@ def is_agent_cfu_run(state: CfuDesignState) -> bool:
     return bool(state.get("agent_cfu", True))
 
 
-LADDER_RUNGS = ("hw_build", "sw_build", "sim", "cost")
+LADDER_RUNGS = ("hw_build", "hw_conformance", "sw_build", "sim", "cost")
 
 # A CFU design must show a measurable cycle improvement over the scalar
 # reference; 105 means at least 1.05x. Without a floor, a kernel that reverts to
@@ -3785,6 +4038,7 @@ REQUIRED_GATES = (
     "isa",
     "implementation_hw",
     "hw_build",
+    "hw_conformance",
     "implementation_sw",
     "sw_build",
     "sim",
@@ -3873,7 +4127,24 @@ def _route_after_isa(state: CfuDesignState) -> str:
 
 
 def _route_after_hw_build(state: CfuDesignState) -> str:
-    return _rung_next(state, "hw_build", "implement_sw")
+    return _rung_next(state, "hw_build", "check_conformance")
+
+
+def _route_after_hw_conformance(state: CfuDesignState) -> str:
+    return _rung_next(state, "hw_conformance", _post_conformance_default(state))
+
+
+def _post_conformance_default(state: CfuDesignState) -> str:
+    """Where a passing conformance rung goes.
+
+    ``generate_soc`` may already have decided that the software on disk still
+    matches the built design; that shortcut is preserved by reading its decision
+    instead of re-deriving it here.
+    """
+    decision = _rung_gate(state, "hw_build").get("software_decision") or {}
+    if isinstance(decision, dict) and str(decision.get("software_change") or "") == "not_required":
+        return "build_sw"
+    return "implement_sw"
 
 
 def _route_after_sw_build(state: CfuDesignState) -> str:
@@ -4350,6 +4621,7 @@ PY_ROUTERS: dict[str, Any] = {
     "design_contract": _route_after_isa,
     "extend_isa": _route_after_isa,
     "generate_soc": _route_after_hw_build,
+    "check_conformance": _route_after_hw_conformance,
     "build_sw": _route_after_sw_build,
     "simulate": _route_after_sim,
     "estimate_cost": _route_after_cost,
@@ -4680,7 +4952,8 @@ def render_ladder(state: CfuDesignState) -> str:
     gates = state.get("gates", {}) or {}
     attempts = state.get("attempts", {}) or {}
     lines: list[str] = []
-    rungs = ("isa", "implementation_hw", "hw_build", "implementation_sw", "sw_build", "sim", "cost")
+    rungs = ("isa", "implementation_hw", "hw_build", "hw_conformance",
+             "implementation_sw", "sw_build", "sim", "cost")
     for rung in rungs:
         gate = gates.get(rung)
         if not isinstance(gate, dict):

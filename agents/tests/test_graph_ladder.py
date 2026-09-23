@@ -71,9 +71,15 @@ class _FakeResult:
         self.used_llm = False
 
 
+CONFORMANCE_STDOUT = "CFU_CONFORMANCE PASS commands=1/1 cases=1 failed=none\n"
+
+
 def _soc_sim_stdout(args: list[str]) -> str:
     """Embench profile lines: reference is slower than profile/cfu."""
     joined = " ".join(args)
+    if "cfu_conformance" in joined:
+        # The harness-owned differential micro-test reports its own verdict line.
+        return "CFU_CONFORMANCE PASS commands=1/1 cases=1 failed=none\n"
     match = re.search(r"/workspace/embench_([^/]+)/(reference|profile|cfu)/", joined)
     if match:
         name, config = match.group(1), match.group(2)
@@ -86,9 +92,33 @@ def _soc_sim_stdout(args: list[str]) -> str:
     return "CFU_AGENT_PROFILE scalar_kernel=100\nCFU_AGENT_PASS\n"
 
 
+def _scripted_oracle(user: str) -> str:
+    """Oracle covering whatever commands the conformance prompt listed.
+
+    The prompt prints one table row per command, so the fake oracle follows the ISA
+    through extension rounds instead of hard-coding command names.
+    """
+    lines = ["commands:"]
+    section = user.split("Commands and what each one needs:", 1)[-1].split("\n\n", 1)[0]
+    for name, rest in re.findall(r"^- ([^\s:]+): (.*)$", section, re.MULTILINE):
+        arguments = re.search(r"arguments: (.*)$", rest)
+        count = (
+            0
+            if not arguments or arguments.group(1).strip() == "no arguments"
+            else len(arguments.group(1).split(","))
+        )
+        lines.append(f"  - name: {name}")
+        if "setup required" in rest:
+            lines.append("    setup: |")
+            lines.append("      /* the scripted micro-test does not seed vector slots */")
+        lines.append('    verify: "1"' if "no CPU result" in rest else '    reference: "0"')
+        lines.append("    cases:")
+        lines.append(f"      - args: [{', '.join(['0'] * count)}]")
+    return "\n".join(lines) + "\n"
+
+
 class _ScriptedLlm:
     """Deterministic responses; records every prompt for assertions."""
-
     available = False
 
     def __init__(self) -> None:
@@ -98,6 +128,8 @@ class _ScriptedLlm:
         self.prompts.append(user)
         if "Design the CFU contract" in user:
             return _FakeResult(VALID_ISA)
+        if "HARDWARE CONFORMANCE rung only" in user:
+            return _FakeResult(_scripted_oracle(user))
         if "This is the HARDWARE rung only" in user:
             if "HARDWARE REPAIR MODE" in user:
                 return _FakeResult("REPAIR_DIAGNOSIS\n- Observed errors: FAKE\n" + HARDWARE_BLOCKS)
@@ -227,6 +259,39 @@ class _EditHardwareLlm(_ScriptedLlm):
         return super().complete(system, user, fallback=fallback, response_format=response_format)
 
 
+class _EnvelopeIsaLlm(_ScriptedLlm):
+    """The ISA rung answers with the contract wrapped in a JSON envelope.
+
+    Observed with GLM: {"analysis": ..., "roofline": {...}, "isa_contract": "<yaml>"}.
+    """
+
+    def complete(self, system: str, user: str, *, fallback: str, response_format=None):
+        if "This is the ISA-CONTRACT stage only" in user:
+            import json
+
+            import yaml
+
+            self.prompts.append(user)
+            return _FakeResult(json.dumps({
+                "analysis": "hot loop analysis",
+                "roofline": {"bottleneck": "unknown"},
+                "isa_contract": yaml.safe_dump(yaml.safe_load(VALID_ISA)),
+            }))
+        return super().complete(system, user, fallback=fallback, response_format=response_format)
+
+
+class _EnvelopeWithoutContractLlm(_ScriptedLlm):
+    """The ISA rung wraps analysis but never returns a contract."""
+
+    def complete(self, system: str, user: str, *, fallback: str, response_format=None):
+        if "This is the ISA-CONTRACT stage only" in user:
+            import json
+
+            self.prompts.append(user)
+            return _FakeResult(json.dumps({"analysis": "x", "roofline": {"bottleneck": "u"}}))
+        return super().complete(system, user, fallback=fallback, response_format=response_format)
+
+
 class _ScriptedCommands:
     """Stand-in for ``RepoToolbox.run_command``.
 
@@ -250,6 +315,19 @@ class _ScriptedCommands:
         self.calls.append((toolbox.stage, command_id))
         if command_id.startswith("git_apply"):
             return _REAL_RUN_COMMAND(toolbox, args, **kwargs)
+        if command_id == "soc_sim" and any("cfu_conformance" in str(arg) for arg in args):
+            # The conformance micro-test is a separate program: it always passes and it
+            # must not consume the workload simulation's scripted return codes or its
+            # custom stdout, which models a different binary entirely.
+            stdout = CONFORMANCE_STDOUT
+            return {
+                "command": " ".join(args),
+                "cwd": str(toolbox.workdir),
+                "returncode": 0,
+                "stdout_tail": stdout,
+                "stderr_tail": "",
+                "parsed": parse_command_output(stdout),
+            }
         if toolbox.stage == "profile":
             # Profiling is setup, not a ladder rung: it always succeeds and does
             # not consume the scripted ladder plan. It still reports the profile
@@ -356,7 +434,8 @@ class LadderTest(unittest.TestCase):
         self.assertEqual(final["attempts"].get("hw_build"), 1)
         self.assertEqual(
             scripted.ladder,
-            ["soc_generate_agent", "soc_generate_agent", "make_profile", "soc_sim", "cfu_generate_agent", "yosys_cost"],
+            ["soc_generate_agent", "soc_generate_agent", "conformance_build", "soc_sim",
+             "make_profile", "soc_sim", "cfu_generate_agent", "yosys_cost"],
         )
         # The repair prompt must carry the exact tool error.
         repairs = llm.hardware_prompts()
@@ -404,6 +483,30 @@ class LadderTest(unittest.TestCase):
             final["errors"],
         )
 
+    def test_wrapped_isa_contract_is_unwrapped(self) -> None:
+        # GLM returned {"analysis", "roofline", "isa_contract": "<yaml>"}: the contract
+        # was complete but nested. The rung must use it instead of spending every
+        # repair attempt on the envelope's missing top-level keys.
+        final, scripted, llm = self._run(
+            {"soc_generate_agent": [0], "yosys_cost": [0]}, llm=_EnvelopeIsaLlm()
+        )
+        self.assertTrue(final["gates"]["isa"]["ok"], final["gates"]["isa"])
+        self.assertEqual(final["isa_spec"]["identity"]["name"], "u8_wavg_agent")
+        # Leniency must not be silent: the history records that it happened.
+        self.assertTrue(
+            any("unwrapped from a model envelope" in line for line in final["iteration_history"]),
+            final["iteration_history"][-3:],
+        )
+
+    def test_envelope_without_a_contract_reports_what_the_parser_saw(self) -> None:
+        final, scripted, llm = self._run({"soc_generate_agent": [0]}, llm=_EnvelopeWithoutContractLlm())
+        gate = final["gates"]["isa"]
+        self.assertFalse(gate["ok"], gate)
+        self.assertTrue(any("identity.name is required" in p for p in gate["problems"]), gate)
+        # The repair prompt must say what the parser actually extracted, otherwise the
+        # model only sees symptoms and re-emits the same envelope.
+        self.assertTrue(any(p.startswith("note: the parser read") for p in gate["problems"]), gate)
+
     def test_hardware_targeted_edit_is_applied(self) -> None:
         # Protocol A (preferred): a targeted SEARCH/REPLACE edit is cheaper than
         # a whole-file rewrite and must be applied to the seeded design file.
@@ -446,7 +549,8 @@ class LadderTest(unittest.TestCase):
         self.assertEqual(final["attempts"].get("sw_build"), 1)
         self.assertEqual(
             scripted.ladder,
-            ["soc_generate_agent", "make_profile", "make_profile", "soc_sim", "cfu_generate_agent", "yosys_cost"],
+            ["soc_generate_agent", "conformance_build", "soc_sim", "make_profile",
+             "make_profile", "soc_sim", "cfu_generate_agent", "yosys_cost"],
         )
         repairs = llm.software_prompts()
         self.assertEqual(len(repairs), 2)
@@ -464,11 +568,15 @@ class LadderTest(unittest.TestCase):
             scripted.ladder,
             [
                 "soc_generate_agent",
+                "conformance_build",
+                "soc_sim",
                 "make_profile",
                 "soc_sim",
                 "make_profile",
                 "soc_sim",
                 "soc_generate_agent",
+                "conformance_build",
+                "soc_sim",
                 "make_profile",
                 "soc_sim",
                 "cfu_generate_agent",
@@ -501,6 +609,8 @@ class LadderTest(unittest.TestCase):
             scripted.ladder,
             [
                 "soc_generate_agent",
+                "conformance_build",
+                "soc_sim",
                 "make_profile",
                 "make_profile",
                 "soc_sim",
@@ -517,7 +627,9 @@ class LadderTest(unittest.TestCase):
         )
         self.assertEqual(final["status"], "failed")
         self.assertEqual(final["stopped_at"], "sw_build")
-        self.assertNotIn("soc_sim", scripted.ladder)
+        # Only the conformance micro-test ran; the workload software never reached a
+        # simulator.
+        self.assertEqual(scripted.ladder.count("soc_sim"), 1)
         self.assertNotIn("sim", final["gates"])
 
     def test_timed_out_check_is_a_failed_rung_not_a_crash(self) -> None:
@@ -547,13 +659,17 @@ class LadderTest(unittest.TestCase):
         self.assertEqual(len(llm.software_prompts()), 1)
         self.assertTrue(final["gates"]["implementation_sw"]["reused"])
         self.assertTrue(final["gates"]["implementation_sw"]["ok"])
-        self.assertEqual(final["gates"]["hw_build"]["next"], "build_sw")
+        self.assertEqual(final["gates"]["hw_build"]["next"], "check_conformance")
+        self.assertEqual(
+            graph._post_conformance_default(final), "build_sw",
+            "the reuse decision must survive the conformance rung",
+        )
         self.assertEqual(final["gates"]["hw_build"]["software_decision"]["source"], "llm")
         self.assertTrue(final["gates"]["sw_build"]["software_reused"])
         self.assertTrue(final["gates"]["sw_build"]["ok"])
         # The reused kernel is still compiled and simulated twice: reuse skips the
-        # rewrite, never the validation.
-        self.assertEqual(scripted.ladder.count("soc_sim"), 2)
+        # rewrite, never the validation. Each round also runs one conformance sim.
+        self.assertEqual(scripted.ladder.count("soc_sim"), 4)
         self.assertIn("Software reused unchanged", "\n".join(final["iteration_history"]))
         decision_path = self.run_dir / "09_implementation/software_decision.yaml"
         self.assertTrue(decision_path.is_file())
@@ -614,7 +730,8 @@ class LadderTest(unittest.TestCase):
                 self.assertEqual(final["isa_revision"], 1)
                 self.assertEqual(len(final["isa_spec"]["commands"]), 2)
                 self.assertEqual(commands.ladder.count("soc_generate_agent"), 2)
-                self.assertEqual(commands.ladder.count("soc_sim"), 2)
+                # Each round runs one conformance sim and one workload sim.
+                self.assertEqual(commands.ladder.count("soc_sim"), 4)
                 self.assertEqual(len(llm.software_prompts()), 2)
                 self.assertFalse(final["gates"]["sw_build"]["software_reused"])
                 self.assertTrue(final["best_candidate"]["manifest"])
@@ -654,7 +771,8 @@ class LadderTest(unittest.TestCase):
         self.assertEqual(final["status"], "complete")
         # One initial ladder pass plus exactly one optimization round.
         self.assertEqual(scripted.ladder.count("soc_generate_agent"), 2)
-        self.assertEqual(scripted.ladder.count("soc_sim"), 2)
+        # Each round runs one conformance sim and one workload sim.
+        self.assertEqual(scripted.ladder.count("soc_sim"), 4)
         self.assertEqual(final["repairs_used"], 1)
         self.assertEqual(final["attempts"]["optimize"], 1)
         # An optimization round is not a repair and not a software rewrite.
@@ -728,7 +846,8 @@ class LadderTest(unittest.TestCase):
         self.assertEqual(final["status"], "complete")
         self.assertEqual(
             scripted.ladder,
-            ["soc_generate_agent", "embench_build", "soc_sim", "cfu_generate_agent", "yosys_cost"],
+            ["soc_generate_agent", "conformance_build", "soc_sim", "embench_build", "soc_sim",
+             "cfu_generate_agent", "yosys_cost"],
         )
         self.assertTrue(final["gates"]["sim"]["ok"])
         self.assertTrue(final["gates"]["sw_build"]["elf"].endswith("workspace/embench_crc32/cfu/embench_main.elf"))
@@ -816,7 +935,9 @@ class LadderTest(unittest.TestCase):
         )
         self.assertEqual(final["status"], "failed")
         self.assertEqual(final.get("stopped_at"), "sim")
-        self.assertNotIn("soc_sim", scripted.ladder)
+        # Only the conformance micro-test ran; the workload software never reached a
+        # simulator.
+        self.assertEqual(scripted.ladder.count("soc_sim"), 1)
         sim_gate = final["gates"]["sim"]
         self.assertFalse(sim_gate["ok"])
 
@@ -947,7 +1068,9 @@ class RouterTest(unittest.TestCase):
 
     def test_routers_default_to_the_next_rung_when_skipped(self) -> None:
         state = self._state(gates={"hw_build": {"ok": False, "skipped": True}})
-        self.assertEqual(graph._route_after_hw_build(state), "implement_sw")
+        self.assertEqual(graph._route_after_hw_build(state), "check_conformance")
+        state = self._state(gates={"hw_conformance": {"ok": False, "skipped": True}})
+        self.assertEqual(graph._route_after_hw_conformance(state), "implement_sw")
         state = self._state(gates={"sim": {"ok": False, "skipped": True}})
         self.assertEqual(graph._route_after_sim(state), "estimate_cost")
 
