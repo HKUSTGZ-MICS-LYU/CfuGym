@@ -219,8 +219,41 @@ class RunArtifacts:
         self.policy.check_write(stage, rel_path)
         path = self.workdir / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        text = yaml.safe_dump(self.manifest, sort_keys=False, allow_unicode=False).encode("utf-8")
+        text = yaml.safe_dump(
+            self._merged_manifest(path), sort_keys=False, allow_unicode=False
+        ).encode("utf-8")
         _atomic_write(path, text)
+
+    def _merged_manifest(self, path: Path) -> dict[str, Any]:
+        """This instance's view unioned with the on-disk artifact refs.
+
+        RunArtifacts instances are cheap and often short-lived, and each write
+        rewrites run.yaml wholesale. Without this merge, an instance created
+        before another instance's write silently dropped that write's ref: this
+        is how the hw_conformance answers vanished from run.yaml and every retry
+        re-used the same ``conformance_000.txt`` number (observed 2026-09-26).
+        Scalars stay last-writer-wins; artifact refs merge by path, newest
+        entry winning.
+        """
+        try:
+            loaded = yaml.safe_load(path.read_text(errors="replace"))
+        except (OSError, yaml.YAMLError):
+            loaded = None
+        if not isinstance(loaded, dict):
+            return self.manifest
+        manifest = {**loaded, **{k: v for k, v in self.manifest.items() if k != "artifacts"}}
+        merged: list[Any] = []
+        for ref in [
+            *(loaded.get("artifacts") or []),
+            *(self.manifest.get("artifacts") or []),
+        ]:
+            if not isinstance(ref, dict):
+                continue
+            key = str(ref.get("path", ""))
+            merged = [entry for entry in merged if str(entry.get("path", "")) != key]
+            merged.append(ref)
+        manifest["artifacts"] = merged
+        return manifest
 
 
 def new_run_id() -> str:

@@ -536,7 +536,7 @@ HARDWARE_TARGETS = (
 
 def _conformance_command_table(isa: dict) -> str:
     """Per-command summary of what the oracle must supply."""
-    from .conformance import cpu_value_roles, has_vector_resource, writes_cpu_rd
+    from .conformance import cpu_value_roles, has_vector_resource, intrinsic_name, writes_cpu_rd
 
     lines: list[str] = []
     for command in isa.get("commands") or []:
@@ -547,7 +547,10 @@ def _conformance_command_table(isa: dict) -> str:
         needs = "reference (command writes CPU rd)" if writes_cpu_rd(command) else "verify (no CPU result)"
         setup = "; setup required (uses the vector register file)" if has_vector_resource(command) else ""
         arguments = ", ".join(f"{role}->{'ab'[i]}" for i, role in enumerate(roles)) or "no arguments"
-        lines.append(f"- {name}: {needs}{setup}; arguments: {arguments}")
+        params = ", ".join(f"uint32_t {role}" for role in roles)
+        result_type = "uint32_t" if writes_cpu_rd(command) else "void"
+        intrinsic = f"{intrinsic_name(command)}({params}) -> {result_type}"
+        lines.append(f"- {name}: generated intrinsic `{intrinsic}`; {needs}{setup}; arguments: {arguments}")
     return "\n".join(lines) if lines else "- (no encodable command)"
 
 
@@ -566,8 +569,12 @@ def conformance_prompt(
             "The previous oracle was rejected by the conformance validator. The exact\n"
             "problems are:\n"
             "```text\n" + feedback.strip() + "\n```\n"
-            "Fix each listed problem. You cannot change the test: the harness generates\n"
-            "the C file from this oracle, so an unverifiable command is a hard failure.\n"
+            "Fix every listed problem at once. You cannot change the test: the harness\n"
+            "generates the C file from this oracle, so an unverifiable command is a hard\n"
+            "failure. Do not fix one field while reintroducing another violation; in\n"
+            "particular `cases[i].args` must be integer literals only (no casts,\n"
+            "addresses, identifiers or expressions) with exactly one per CPU-value role,\n"
+            "and any address/data preparation belongs in `setup`.\n"
         )
     return f"""Task:
 {task}
@@ -612,6 +619,18 @@ Rules:
   command returns a CPU value.
 - `args` bind to `a` (rs1 value) and `b` (rs2 value) in the declared order; the
   same names are available to `reference` and `verify`.
+- Every `args` entry must be an INTEGER LITERAL (decimal, or a C-style integer
+  string such as `0xFFFFFFFF`). Casts like `(uintptr_t)ptr`, addresses of your
+  `helpers` arrays, identifiers and expressions are rejected: the harness embeds
+  each arg as a compile-time constant into the generated intrinsic call. If a
+  command loads or stores data, put that address/data preparation in `setup` and
+  give the argument a literal value (e.g. `args: [0]`); if the command declares
+  no CPU-value role, use `args: []`.
+- The oracle's C (`helpers`/`setup`/`reference`/`verify`) may call ONLY the
+  generated intrinsics named in the command table above (exact spellings!) plus
+  `cfu_enable` and `cfu_memory_fence`. Never invent a plausible name like
+  `cfu_load`: an unknown name is an `undefined reference` at link time. Use the
+  exact generated name, e.g. `cfu_vector_load_i32(...)` rather than `cfu_load(...)`.
 - Give each command at least one case. One representative case per command is
   enough; add more only if they are genuinely useful.
 - Do not measure or print anything: no cycles, counters, timers or throughput.

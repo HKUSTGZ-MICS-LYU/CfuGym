@@ -105,6 +105,12 @@ RUNG_ORDER = (
     "cost",
 )
 
+# Build rung guards: hw_build/sw_build fail WITHOUT running any command when the
+# implementation rung that feeds them applied nothing. The guard is not the real
+# failure rung -- the implementation rejection is (observed 2026-09-26: a
+# missing-EDIT_END delivery failure was recorded as stopped_at=hw_build).
+GUARDED_BUILD_RUNGS = {"hw_build": "implementation_hw", "sw_build": "implementation_sw"}
+
 FAILURE_CLASSES = (
     "input_or_policy",
     "spec_invalid",
@@ -612,6 +618,24 @@ def classify_failure(record: dict) -> dict | None:
                 break
     else:
         failing_gate = gates.get(failing_rung) if isinstance(gates.get(failing_rung), dict) else {}
+
+    # Attribute a guarded build failure to the implementation rejection behind
+    # it: the build rung ran zero commands, so recording it as a build failure
+    # would misplace the failure stage in every experiment table.
+    guard_note = ""
+    impl_rung = GUARDED_BUILD_RUNGS.get(failing_rung)
+    if impl_rung and not (failing_gate.get("commands") or []):
+        impl_gate = gates.get(impl_rung)
+        if isinstance(impl_gate, dict) and (
+            impl_gate.get("ok") is False or impl_gate.get("applied") is False
+        ):
+            guard_note = (
+                f"[{failing_rung} never ran: it refuses to build with no applied "
+                f"{impl_rung} change]"
+            )
+            failing_rung = impl_rung
+            failing_gate = impl_gate
+
     errors = _gate_errors(failing_gate)
     sim_errors = _gate_errors(gates.get("sim") or {})
     attribution = str(record.get("sim_attribution") or "")
@@ -624,10 +648,11 @@ def classify_failure(record: dict) -> dict | None:
         budget_exhausted = repairs_used >= max_repairs
 
     failure_class, detail = _classify_rung(failing_rung, failing_gate, detail_text, record, status)
+    detail = " ".join(part for part in ((detail or errors or status), guard_note) if part)
     return {
         "failure_class": failure_class,
         "failure_rung": failing_rung or "unknown",
-        "failure_detail": detail or errors or status,
+        "failure_detail": detail,
         "budget_exhausted": budget_exhausted,
     }
 

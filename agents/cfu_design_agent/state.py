@@ -209,6 +209,12 @@ class CfuDesignState(TypedDict, total=False):
     # (response_hash, error_hash) per software attempt; two identical consecutive
     # entries mean the repair prompt produced the same answer again.
     sw_attempts: Annotated[list[dict], operator.add]
+    # The same ledger for the hardware rung: a byte-identical stuck retry must
+    # switch delivery strategy instead of burning the whole repair budget.
+    hw_attempts: Annotated[list[dict], operator.add]
+    # Rejected conformance-oracle attempts (problems_hash): a rejection that
+    # recurs means the repair is oscillating between two validation errors.
+    conformance_attempts: Annotated[list[dict], operator.add]
     progress_summary: dict[str, Any]
 
 

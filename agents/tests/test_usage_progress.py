@@ -6,8 +6,8 @@ import types
 import unittest
 
 from agents.cfu_design_agent import llm
-from agents.cfu_design_agent.graph import _node_ok
-from agents.cfu_design_agent.progress import NODE_TO_STEP, StageProgress
+from agents.cfu_design_agent.graph import _node_ok, _update_ok
+from agents.cfu_design_agent.progress import NODE_TO_STEP, STAGE_LABELS, StageProgress
 
 
 class UsageLedgerTest(unittest.TestCase):
@@ -60,19 +60,64 @@ class NodeOkTest(unittest.TestCase):
 
 
 class StageProgressTest(unittest.TestCase):
+    ORDER = [
+        "load_context", "ingest_input", "route_input", "prepare_benchmark",
+        "profile", "hotspot", "analysis", "isa", "implementation_hw",
+        "hw_build", "hw_conformance", "implementation_sw", "sw_build", "sim",
+        "cost", "review", "final_report",
+    ]
+
     def test_node_to_step_alignment(self) -> None:
-        order = [v for v in [
-            "load_context", "ingest_input", "route_input", "prepare_benchmark",
-            "profile", "hotspot", "analysis", "isa", "implementation",
-            "validation", "cost", "review", "final_report",
-        ]]
-        progress = StageProgress(order)
+        progress = StageProgress(self.ORDER)
         self.assertEqual(progress._index_of("load_context"), 0)
         self.assertEqual(progress._index_of("instrument_and_profile"), 4)
-        self.assertEqual(progress._index_of("review_and_route"), 11)
-        self.assertEqual(progress._index_of("final_report"), 12)
+        self.assertEqual(progress._index_of("check_conformance"), 10)
+        self.assertEqual(progress._index_of("review_and_route"), 15)
+        self.assertEqual(progress._index_of("final_report"), 16)
         # Unknown node falls back to the end of the list (count), not negative.
-        self.assertEqual(progress._index_of("bogus"), len(order))
+        self.assertEqual(progress._index_of("bogus"), len(self.ORDER))
+
+    def test_stage_order_is_the_single_slot_source(self) -> None:
+        from agents.cfu_design_agent.graph import STAGE_ORDER
+
+        self.assertEqual(list(STAGE_ORDER), self.ORDER)
+
+    def test_every_node_maps_to_a_valid_slot(self) -> None:
+        # Regression: check_conformance mapped to nothing and printed [14/13].
+        progress = StageProgress(self.ORDER)
+        for name in NODE_TO_STEP:
+            self.assertIn(NODE_TO_STEP[name], self.ORDER, name)
+            self.assertLess(progress._index_of(name), len(self.ORDER), name)
+
+    def test_every_node_has_a_label(self) -> None:
+        self.assertEqual(set(STAGE_LABELS), set(NODE_TO_STEP))
+        self.assertIn("check conformance", STAGE_LABELS.values())
+
+
+class UpdateOkTest(unittest.TestCase):
+    def test_conformance_failure_is_fail_even_with_prior_errors(self) -> None:
+        # Regression: added_errors subtracted the state's prior error total, so
+        # a failing rung printed OK whenever the run had already seen an error
+        # (a repaired hw_build before a failing hw_conformance) while the ladder
+        # routed back to a repair.
+        update = {
+            "errors": ["conformance test build failed"],
+            "gates": {"hw_conformance": {"ok": False}},
+        }
+        self.assertFalse(_update_ok(update, "check_conformance"))
+
+    def test_gate_only_failure_is_fail(self) -> None:
+        self.assertFalse(_update_ok({"gates": {"hw_conformance": {"ok": False}}}, "check_conformance"))
+
+    def test_clean_node_is_ok(self) -> None:
+        update = {"errors": [], "gates": {"hw_conformance": {"ok": True}}}
+        self.assertTrue(_update_ok(update, "check_conformance"))
+
+    def test_prepare_node_gate_is_found(self) -> None:
+        # Regression: the gate map keyed prepare nodes without the ``_node``
+        # suffix of the wrapped function, so their gates were never found.
+        update = {"errors": [], "gates": {"prepare_benchmark": {"ok": False}}}
+        self.assertFalse(_update_ok(update, "prepare_embench_benchmark_node"))
 
 
 if __name__ == "__main__":

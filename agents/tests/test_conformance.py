@@ -266,5 +266,83 @@ class ParseVerdictTest(unittest.TestCase):
         self.assertTrue(any("add[0]" in d for d in verdict["details"]), verdict)
 
 
+class ArgGuidanceTest(unittest.TestCase):
+    """Oracle-arg rejections must explain the fix, not just the format.
+
+    Regression (2026-09-26, matmult-int): the model oscillated three oracle
+    attempts between the arg-count and arg-literal errors because neither the
+    validator message nor the prompt said that args are compile-time constants
+    and addresses belong in `setup`.
+    """
+
+    def entry(self, **fields) -> dict:
+        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
+
+    def test_literal_error_names_value_and_setup_fix(self) -> None:
+        problems = validate_oracle(
+            isa(CPU_COMMAND),
+            {"commands": [self.entry(reference="a", cases=[{"args": ["(uintptr_t)probe", 2]}])]},
+        )
+        message = next(p for p in problems if "args[0]" in p)
+        self.assertIn("(uintptr_t)probe", message)  # the offending value
+        self.assertIn("setup", message)  # where the address belongs
+        self.assertIn("compile-time constant", message)
+
+    def test_count_error_says_one_literal_per_role(self) -> None:
+        problems = validate_oracle(
+            isa(CPU_COMMAND),
+            {"commands": [self.entry(reference="a", cases=[{"args": ["0x80000000", 0, 3]}])]},
+        )
+        message = next(p for p in problems if "value(s)" in p)
+        self.assertIn("one literal per role", message)
+        self.assertIn("setup", message)
+
+    def test_prompt_documents_literal_args_and_repair_discipline(self) -> None:
+        from agents.cfu_design_agent.prompts import conformance_prompt
+
+        prompt = conformance_prompt("task", isa(CPU_COMMAND), {}, feedback="compute: problems")
+        self.assertIn("INTEGER LITERAL", prompt)
+        self.assertIn("ORACLE REPAIR MODE", prompt)
+        self.assertIn("at once", prompt)
+        self.assertIn("setup", prompt)
+        # The prompt names the generated intrinsics so setup/verify cannot
+        # invent names like cfu_load (2026-09-26 link failure).
+        self.assertIn("cfu_compute(", prompt)
+        self.assertIn("undefined reference", prompt)
+
+
+class UnknownIntrinsicLintTest(unittest.TestCase):
+    """An invented cfu_* name must fail validation, not the linker."""
+
+    def test_invented_intrinsic_is_rejected_before_the_linker(self) -> None:
+        entry = {
+            "name": "compute", "cases": [{"args": [1, 2]}], "reference": "a + b",
+            "setup": "cfu_load((uintptr_t)buf, 0);",
+        }
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [entry]})
+        message = next(p for p in problems if "unknown intrinsic" in p)
+        self.assertIn("cfu_load", message)
+        self.assertIn("defines only", message)
+        self.assertIn("cfu_compute", message)
+
+    def test_suggests_the_generated_name(self) -> None:
+        command = dict(CPU_COMMAND, name="vector_load_i32")
+        entry = {
+            "name": "vector_load_i32", "cases": [{"args": [1, 2]}], "reference": "a + b",
+            "setup": "cfu_load(p, 0);",
+        }
+        problems = validate_oracle(isa(command), {"commands": [entry]})
+        message = next(p for p in problems if "unknown intrinsic" in p)
+        self.assertIn("did you mean cfu_vector_load_i32", message)
+
+    def test_generated_names_and_helpers_are_allowed(self) -> None:
+        entry = {
+            "name": "compute", "cases": [{"args": [1, 2]}], "reference": "a + b",
+            "setup": "cfu_enable(); cfu_memory_fence();",
+        }
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [entry]})
+        self.assertFalse(any("unknown intrinsic" in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()

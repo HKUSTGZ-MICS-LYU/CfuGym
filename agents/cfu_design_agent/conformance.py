@@ -77,6 +77,52 @@ def intrinsic_name(command: dict[str, Any]) -> str:
     return f"cfu_{command_symbol(command, int(command.get('function_id', 0)))}"
 
 
+# C helpers the generated header/test provide besides the command intrinsics.
+RESERVED_INTRINSIC_HELPERS = (
+    "cfu_enable",
+    "cfu_memory_fence",
+    "cfu_agent_counter_read",
+    "cfu_agent_counter_elapsed",
+)
+
+
+def allowed_intrinsics(isa: Any) -> set[str]:
+    """Every ``cfu_*`` callable from the oracle's C (generated + reserved)."""
+    names = set(RESERVED_INTRINSIC_HELPERS)
+    for command in _commands(isa):
+        if encodable(command):
+            names.add(intrinsic_name(command))
+    return names
+
+
+def unknown_intrinsic_calls(entry: dict[str, Any], isa: Any) -> list[str]:
+    """``cfu_*`` calls in the oracle C that the generated header cannot resolve.
+
+    Without this lint an invented name only surfaces as a linker error
+    (``undefined reference to `cfu_load'``), and when the repair feedback omits
+    the linker output the model repairs blind and repeats the same invented
+    name until the budget is gone (observed 2026-09-26).
+    """
+    import difflib
+
+    allowed = sorted(allowed_intrinsics(isa))
+    problems: list[str] = []
+    for field in ("helpers", "setup", "reference", "verify"):
+        text = str(entry.get(field) or "")
+        for call in sorted(set(re.findall(r"\b(cfu_[A-Za-z0-9_]+)\s*\(", text))):
+            if call in allowed:
+                continue
+            # Cutoff 0.5: an invented short name like `cfu_load` is only ~0.59
+            # similar to the real `cfu_vector_load_i32`, below difflib's 0.6.
+            suggestion = difflib.get_close_matches(call, allowed, n=1, cutoff=0.5)
+            hint = f" (did you mean {suggestion[0]}?)" if suggestion else ""
+            problems.append(
+                f"{field} calls unknown intrinsic {call}{hint}: the generated "
+                f"cfu_intrinsics.h defines only {', '.join(allowed)}"
+            )
+    return problems
+
+
 def cpu_value_roles(command: dict[str, Any]) -> list[str]:
     """CPU-value arguments of the generated intrinsic, in rs1/rs2 order.
 
@@ -188,13 +234,19 @@ def _coverage_problem(command: dict[str, Any], entry: dict[str, Any] | None) -> 
         if len(args) != len(roles):
             return (
                 f"cases[{index}].args has {len(args)} value(s) but the command takes "
-                f"{len(roles)} CPU value argument(s) ({', '.join(roles) or 'none'})"
+                f"{len(roles)} CPU value argument(s) ({', '.join(roles) or 'none'}): "
+                f"give exactly one literal per role, in rs1/rs2 order, and move any "
+                f"data/address preparation into `setup`"
             )
         for position, value in enumerate(args):
             if not _c_literal(value):
                 return (
-                    f"cases[{index}].args[{position}] must be an integer or a C-style "
-                    "integer string such as 0xFFFFFFFF"
+                    f"cases[{index}].args[{position}] = {value!r} must be an integer or "
+                    "a C-style integer string such as 0xFFFFFFFF; casts, addresses, "
+                    "identifiers and expressions are rejected because the harness embeds "
+                    "each arg as a compile-time constant into the generated intrinsic call "
+                    "(move the address/data preparation into `setup` and pass a literal "
+                    "value instead)"
                 )
     return ""
 
@@ -227,9 +279,12 @@ def validate_oracle(isa: Any, oracle: Any) -> list[str]:
             errors.append(f"oracle.commands[{index}] names unknown command {name!r}")
     for command in commands:
         name = str(command.get("name", ""))
-        problem = _coverage_problem(command, _oracle_entries(oracle).get(name))
+        entry = _oracle_entries(oracle).get(name)
+        problem = _coverage_problem(command, entry)
         if problem:
             errors.append(f"{name}: {problem}")
+        for issue in unknown_intrinsic_calls(entry or {}, isa):
+            errors.append(f"{name}: {issue}")
     return errors
 
 

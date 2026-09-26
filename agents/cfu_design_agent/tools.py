@@ -605,6 +605,26 @@ def strip_code_fences(text: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# A degenerate sampler occasionally restarts its answer template inside the same
+# completion, so the whole response appears twice with the second copy beginning
+# immediately after the terminator (``EDIT_ENDREPAIR_DIAGNOSIS ...``, observed
+# 2026-09-26). A terminator is only recognized on a line of its own, so the
+# glued copy made the parser report "missing EDIT_END" and drop an otherwise
+# correct edit. Split the glue before parsing; ``_`` continuations stay content
+# (``EDIT_END_foo`` reads like an identifier, not a terminator run-over).
+_GLUED_TERMINATOR = re.compile(r"(?m)^(EDIT_END|FILE_END)(?=[^\s_])")
+
+
+def normalize_delivery_terminators(text: str) -> str:
+    """Split a delivery terminator glued to the next token onto its own line.
+
+    Applied only where delivery blocks are parsed, so the audit copy of the
+    model's bytes stays untouched. ``PATCH_END`` needs no handling: the PATCH
+    parser matches its marker anywhere in the text.
+    """
+    return _GLUED_TERMINATOR.sub(r"\1\n", text or "")
+
+
 def extract_file_blocks(text: str) -> list[tuple[str, str]]:
     """Parse whole-file replacements from an LLM response.
 
@@ -616,12 +636,14 @@ def extract_file_blocks(text: str) -> list[tuple[str, str]]:
         ...content...
         FILE_END
 
-    Returns [(path, content)] in response order.
+    Returns [(path, content)] in response order. Byte-identical duplicates (a
+    restarted answer template emitted the same block twice) collapse to the
+    first copy, so the second copy cannot fail on already-changed content.
     """
     blocks: list[tuple[str, str]] = []
     current_path: str | None = None
     current: list[str] = []
-    for line in text.splitlines():
+    for line in normalize_delivery_terminators(text).splitlines():
         stripped = line.strip()
         if stripped.startswith("FILE_BEGIN"):
             header = stripped[len("FILE_BEGIN"):].strip()
@@ -630,7 +652,9 @@ def extract_file_blocks(text: str) -> list[tuple[str, str]]:
             continue
         if stripped == "FILE_END":
             if current_path:
-                blocks.append((current_path, strip_code_fences("\n".join(current))))
+                block = (current_path, strip_code_fences("\n".join(current)))
+                if block not in blocks:
+                    blocks.append(block)
             current_path = None
             current = []
             continue
@@ -710,11 +734,14 @@ def extract_edit_blocks(text: str) -> list[tuple[str, list[tuple[str, str]]]]:
 
     One section may hold several pairs, and a response may hold several
     sections. Returns [(path, [(search, replace), ...])] in response order.
+    Byte-identical duplicate sections (a restarted answer template emitted the
+    same edit twice) collapse to the first copy: after the first applies, the
+    duplicate's SEARCH no longer matches and would reject the whole response.
     """
     blocks: list[tuple[str, list[tuple[str, str]]]] = []
     current_path: str | None = None
     current: list[str] = []
-    for line in text.splitlines():
+    for line in normalize_delivery_terminators(text).splitlines():
         stripped = line.strip()
         if stripped.startswith("EDIT_BEGIN"):
             current_path = stripped[len("EDIT_BEGIN"):].strip()
@@ -722,7 +749,9 @@ def extract_edit_blocks(text: str) -> list[tuple[str, list[tuple[str, str]]]]:
             continue
         if _is_edit_end(stripped):
             if current_path:
-                blocks.append((current_path, _parse_edit_pairs(current, target=current_path)))
+                block = (current_path, _parse_edit_pairs(current, target=current_path))
+                if block not in blocks:
+                    blocks.append(block)
             current_path = None
             current = []
             continue
@@ -735,12 +764,15 @@ def unterminated_edit_blocks(text: str) -> int:
     """Number of EDIT_BEGIN sections that never reached a terminator.
 
     Used to tell "the model sent no edit at all" apart from "the edit was
-    malformed", which need different repair feedback.
+    malformed", which need different repair feedback. Counted from the markers
+    rather than the parsed blocks, so a legitimately duplicated section (which
+    extract_edit_blocks collapses) is not misreported as unterminated.
     """
-    begins = sum(
-        1 for line in (text or "").splitlines() if line.strip().startswith("EDIT_BEGIN")
-    )
-    return max(0, begins - len(extract_edit_blocks(text or "")))
+    text = normalize_delivery_terminators(text)
+    lines = [line.strip() for line in (text or "").splitlines()]
+    begins = sum(1 for line in lines if line.startswith("EDIT_BEGIN"))
+    ends = sum(1 for line in lines if _is_edit_end(line))
+    return max(0, begins - ends)
 
 
 def _match_window(content_lines: list[str], search_lines: list[str]) -> list[int]:

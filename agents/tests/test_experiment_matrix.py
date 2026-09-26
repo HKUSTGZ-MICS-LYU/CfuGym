@@ -320,6 +320,35 @@ class ClassifyTest(unittest.TestCase):
         record = {"status": "blocked", "stopped_at": "", "gates": {}}
         self.assertEqual(rm.classify_failure(record)["failure_class"], "spec_invalid")
 
+    def test_guarded_build_failure_points_at_implementation(self) -> None:
+        # hw_build refuses to run sbt when implementation_hw applied nothing
+        # (gate commands == 0): the failure stage is the implementation
+        # rejection, not the build. Regression for the matmult-int run where a
+        # missing-EDIT_END rejection was recorded as stopped_at=hw_build.
+        record = _failure_record(
+            "hw_build",
+            {"ok": False, "commands": [], "errors": ["the hardware rung did not apply a design change"]},
+        )
+        record["gates"]["implementation_hw"] = {
+            "ok": False,
+            "applied": False,
+            "errors": ["the response opened an EDIT_BEGIN section but the block was not closed (missing EDIT_END)"],
+        }
+        result = rm.classify_failure(record)
+        self.assertEqual(result["failure_class"], "no_deliverable")
+        self.assertEqual(result["failure_rung"], "implementation_hw")
+        self.assertIn("missing EDIT_END", result["failure_detail"])
+        self.assertIn("hw_build never ran", result["failure_detail"])
+
+        # A real build failure (sbt actually ran) stays a build failure.
+        record = _failure_record(
+            "hw_build", {"ok": False, "commands": [{"command": "sbt ..."}], "errors": ["scala boom"]}
+        )
+        record["gates"]["implementation_hw"] = {"ok": True, "applied": True}
+        result = rm.classify_failure(record)
+        self.assertEqual(result["failure_class"], "hw_build")
+        self.assertEqual(result["failure_rung"], "hw_build")
+
 
 class InfraTest(unittest.TestCase):
     def test_timeout_is_infra(self) -> None:

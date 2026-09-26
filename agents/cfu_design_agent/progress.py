@@ -20,6 +20,7 @@ STAGE_LABELS: dict[str, str] = {
     "extend_isa": "extend CFU ISA",
     "implement_hw": "implement HW",
     "generate_soc": "generate SoC",
+    "check_conformance": "check conformance",
     "implement_sw": "implement SW",
     "build_sw": "compile SW",
     "simulate": "simulate",
@@ -35,7 +36,10 @@ def stage_label(name: str) -> str:
 
 # Map a node/function name to its logical step slot (one of the stage order
 # names) so the printed index stays within 1..N even for node names that differ
-# from the human-facing stage slots.
+# from the human-facing stage slots. Every registered graph node maps to exactly
+# one slot, and each validation-ladder rung owns its slot, so a clean run prints
+# strictly increasing indices (a repair loop legitimately revisits an earlier
+# index).
 NODE_TO_STEP: dict[str, str] = {
     "load_context": "load_context",
     "ingest_input": "ingest_input",
@@ -49,11 +53,12 @@ NODE_TO_STEP: dict[str, str] = {
     "analyze_workload": "analysis",
     "design_contract": "isa",
     "extend_isa": "isa",
-    "implement_hw": "implementation",
-    "implement_sw": "implementation",
-    "generate_soc": "validation",
-    "build_sw": "validation",
-    "simulate": "validation",
+    "implement_hw": "implementation_hw",
+    "generate_soc": "hw_build",
+    "check_conformance": "hw_conformance",
+    "implement_sw": "implementation_sw",
+    "build_sw": "sw_build",
+    "simulate": "sim",
     "estimate_cost": "cost",
     "review_and_route": "review",
     "final_report": "final_report",
@@ -63,8 +68,8 @@ NODE_TO_STEP: dict[str, str] = {
 class StageProgress:
     """Prints one line when a stage starts and one when it finishes.
 
-    Line 1 (stage begins): ``[ 3/13] analyze workload ... running``
-    Line 2 (stage ends):   ``[ 3/13] analyze workload ... OK (321 tok, 2.4s)``
+    Line 1 (stage begins): ``[ 7/17] analyze workload ... running``
+    Line 2 (stage ends):   ``[ 7/17] analyze workload ... OK (321 tok, 2.4s)``
     """
 
     def __init__(self, stages: list[str]) -> None:

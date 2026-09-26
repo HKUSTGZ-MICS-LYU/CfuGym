@@ -140,21 +140,24 @@ def progress() -> StageProgress | None:
     return _PROGRESS
 
 
-# Map a node's return value to the gate key that reports its success. Nodes
-# whose gate is not present in the map are considered OK unless they add errors.
+# Map a node's return value to the gate key that reports its success. Keys are
+# the wrapped function names (fn.__name__). Nodes whose gate is not present in
+# the map are considered OK unless their own update added errors.
 _NODE_TO_GATE: dict[str, str] = {
     "load_context": "load_context",
     "ingest_input": "workload_spec",
-    "prepare_c_project_profile": "prepare_benchmark",
-    "create_benchmark_project": "prepare_benchmark",
-    "prepare_embench_benchmark": "prepare_benchmark",
+    "prepare_c_project_profile_node": "prepare_benchmark",
+    "create_benchmark_project_node": "prepare_benchmark",
+    "prepare_embench_benchmark_node": "prepare_benchmark",
     "instrument_and_profile": "profile",
     "profile_embench": "profile",
     "extract_hotspot": "hotspot",
+    "analyze_workload": "analysis",
     "design_contract": "isa",
     "extend_isa": "isa",
     "implement_hw": "implementation_hw",
     "generate_soc": "hw_build",
+    "check_conformance": "hw_conformance",
     "implement_sw": "implementation_sw",
     "build_sw": "sw_build",
     "simulate": "sim",
@@ -183,10 +186,25 @@ def _node_ok(update: Any, name: str) -> bool:
     effective = _node_update(update)
     if not isinstance(effective, dict):
         return True
-    gate = effective.get("gates", {}).get(_NODE_TO_GATE.get(name, name))
+    gate_key = _NODE_TO_GATE.get(name) or _NODE_TO_GATE.get(name.removesuffix("_node")) or name
+    gate = effective.get("gates", {}).get(gate_key)
     if isinstance(gate, dict) and "ok" in gate:
         return bool(gate.get("ok"))
     return True
+
+
+def _update_ok(update: Any, name: str) -> bool:
+    """Progress verdict for a finished node: its gate AND its own errors.
+
+    ``errors`` is an append-reducer, so the update carries only this node's
+    increment and its length IS the added count. (Subtracting the state's prior
+    error total here used to report FAILing rungs as OK whenever the run had
+    already seen an error -- for example a repaired hw_build before a failing
+    hw_conformance.)
+    """
+    effective = _node_update(update)
+    added = len(effective.get("errors") or []) if isinstance(effective, dict) else 0
+    return _node_ok(update, name) and added <= 0
 
 
 def _wrap_node(fn):
@@ -196,7 +214,6 @@ def _wrap_node(fn):
         set_stage(name)
         if _PROGRESS is None:
             return fn(state)
-        prior_errors = len((state.get("errors") or []))
         prior_total = _PROGRESS._running_total()
         start = time.monotonic()
         _PROGRESS.begin(name)
@@ -211,14 +228,10 @@ def _wrap_node(fn):
                 tokens=_PROGRESS._running_total() - prior_total,
             )
             raise
-        effective = _node_update(update)
-        added_errors = 0
-        if isinstance(effective, dict):
-            added_errors = len(effective.get("errors") or []) - prior_errors
         _LIVE_LINE.clear()
         _PROGRESS.end(
             name,
-            ok=_node_ok(update, name) and added_errors <= 0,
+            ok=_update_ok(update, name),
             elapsed=time.monotonic() - start,
             tokens=_PROGRESS._running_total() - prior_total,
         )
@@ -349,8 +362,11 @@ APPEND_STATE_KEYS = (
     "graph_events",
     "llm_raw_outputs",
     "tool_calls",
-    # (response_hash, error_hash) per software attempt, to detect a stuck retry.
+    # (response_hash, error_hash) per attempt, to detect a stuck retry.
     "sw_attempts",
+    "hw_attempts",
+    # Rejected conformance-oracle attempts (problems_hash), same idea.
+    "conformance_attempts",
 )
 
 
@@ -413,8 +429,12 @@ STAGE_ORDER = (
     "hotspot",
     "analysis",
     "isa",
-    "implementation",
-    "validation",
+    "implementation_hw",
+    "hw_build",
+    "hw_conformance",
+    "implementation_sw",
+    "sw_build",
+    "sim",
     "cost",
     "review",
     "final_report",
@@ -2131,7 +2151,14 @@ def _run_agent_step(
 def implement_hw(state: CfuDesignState) -> CfuDesignState:
     """Hardware rung: design AgentCfu.scala / AgentCfuFiber.scala only."""
     toolbox = _toolbox_for_stage(state, "implementation")
-    feedback = hardware_repair_feedback(state)
+    feedback = "\n\n".join(
+        part
+        for part in (
+            hardware_stuck_directive(state),
+            hardware_repair_feedback(state),
+        )
+        if part
+    )
     system = SYSTEM_PROMPT
     client = _llm(state)
     tools_enabled = _tools_enabled(state, client)
@@ -2175,6 +2202,11 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         outcome["errors"].append(intent_error)
         outcome["summary"] += "\n\n" + intent_error
     _write_hardware_artifact(state, result.text, outcome, feedback)
+    attempt = {
+        "response_hash": _attempt_digest(result.text),
+        "error_hash": _attempt_digest("\n".join(outcome["errors"])),
+        "applied": bool(outcome["applied"]),
+    }
     return {
         "hardware_plan": result.text,
         "hardware_patch": outcome["patch"],
@@ -2182,6 +2214,7 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         "changed_design_files": outcome["files"],
         "llm_raw_outputs": [raw_output],
         "tool_calls": [_tool_call_summary(call) for call in tool_calls],
+        "hw_attempts": [attempt],
         "stage_jobs": "validation",
         "errors": outcome["errors"],
         "gates": {
@@ -2195,6 +2228,8 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
                 "tool_calls": len(tool_calls),
                 "tools_degraded": str(getattr(result, "degraded_reason", "") or ""),
                 "repair_diagnosis": ("REPAIR_DIAGNOSIS" in result.text) if feedback else None,
+                "response_hash": attempt["response_hash"],
+                "error_hash": attempt["error_hash"],
                 "errors": outcome["errors"],
             },
         },
@@ -2226,17 +2261,17 @@ def tool_intent_error(text: str, degraded_reason: str = "") -> str:
     )
 
 
-def software_stuck_directive(state: CfuDesignState) -> str:
-    """A blunt instruction when the last two software attempts were identical.
+def _repeated_attempt_directive(attempts: Any) -> str:
+    """A blunt instruction when the last two rung attempts were identical.
 
     A rejected response leaves the workspace unchanged, so an unchanged prompt
     can make the model repeat the same answer until the repair budget is gone.
     Detecting that here forces a different delivery strategy on the next try.
     """
-    attempts = [item for item in (state.get("sw_attempts") or []) if isinstance(item, dict)]
-    if len(attempts) < 2:
+    entries = [item for item in (attempts or []) if isinstance(item, dict)]
+    if len(entries) < 2:
         return ""
-    last, previous = attempts[-1], attempts[-2]
+    last, previous = entries[-1], entries[-2]
     if (
         last.get("response_hash") != previous.get("response_hash")
         or last.get("error_hash") != previous.get("error_hash")
@@ -2252,6 +2287,21 @@ def software_stuck_directive(state: CfuDesignState) -> str:
         "target content above (no long comment blocks), or\n"
         "- if a SEARCH failed on a comment, use the exact current comment text from above."
     )
+
+
+def software_stuck_directive(state: CfuDesignState) -> str:
+    """Stuck-retry directive for the software rung (see _repeated_attempt_directive)."""
+    return _repeated_attempt_directive(state.get("sw_attempts"))
+
+
+def hardware_stuck_directive(state: CfuDesignState) -> str:
+    """Stuck-retry directive for the hardware rung (see _repeated_attempt_directive).
+
+    The hardware rung used to lack this guard while the software rung had it:
+    a model stuck on one byte-identical broken answer burned the whole repair
+    budget (observed 2026-09-26, three identical deliveries in a row).
+    """
+    return _repeated_attempt_directive(state.get("hw_attempts"))
 
 
 def implement_sw(state: CfuDesignState) -> CfuDesignState:
@@ -2969,6 +3019,86 @@ def conformance_feedback(state: CfuDesignState) -> str:
     return "\n".join(chunks)
 
 
+def conformance_oracle_directive(state: CfuDesignState) -> str:
+    """Flag an oracle rejection the model has already produced before.
+
+    An oracle repair that varies one field at a time oscillates between two
+    errors (fix the arg count, break the arg literals; fix the literals,
+    re-add the extra arg; keep inventing the same intrinsic name) and burns the
+    whole budget. A rejection recurring is the signal to satisfy every
+    constraint at once.
+    """
+    attempts = [
+        item for item in (state.get("conformance_attempts") or []) if isinstance(item, dict)
+    ]
+    if len(attempts) < 2:
+        return ""
+    earlier = {item.get("problems_hash") for item in attempts[:-1]}
+    if attempts[-1].get("problems_hash") not in earlier:
+        return ""
+    return (
+        "=== REPEATED ORACLE REJECTION DETECTED ===\n"
+        "This exact rejection (validator failure or generated-test build/link failure) has "
+        "already occurred in this run. Varying one field at a time only oscillates between "
+        "the errors; satisfy every constraint at once:\n"
+        "- `cases[i].args` holds EXACTLY one integer literal per declared CPU-value role "
+        "(rs1, then rs2). Casts, addresses, identifiers and expressions are rejected: the "
+        "harness embeds each arg as a compile-time constant into the generated intrinsic "
+        "call.\n"
+        "- Any address or data preparation belongs in `setup` (plain C statements); seed "
+        "the vectors there and give the argument a literal value, e.g. `args: [0]`.\n"
+        "- The oracle's C may call ONLY the generated intrinsics named in the command "
+        "table plus `cfu_enable`/`cfu_memory_fence`; an invented name such as `cfu_load` "
+        "is an `undefined reference` at link time.\n"
+        "- `reference`/`verify` and the vector `setup` requirements are unchanged."
+    )
+
+
+def _tool_diagnostics(*results: dict) -> str:
+    """Error-shaped lines from command output, for repair feedback.
+
+    The conformance build failure used to report only the make command line, so
+    the oracle repair could not see ``undefined reference to `cfu_load'`` and
+    repeated the same invented intrinsic until the budget was gone.
+    """
+    lines: list[str] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        text = f"{result.get('stdout_tail') or ''}\n{result.get('stderr_tail') or ''}"
+        for line in text.splitlines():
+            if re.search(r"error|undefined reference|multiple definition|ld returned|fatal", line, re.I):
+                cleaned = line.strip()
+                if cleaned and cleaned not in lines:
+                    lines.append(cleaned)
+    return "\n".join(lines[:40])
+
+
+def conformance_build_error(build: dict, build_argv: list[str]) -> str:
+    """The build-failure rejection message, with the compiler/linker output."""
+    message = f"conformance test build failed: {' '.join(build_argv)[:200]}"
+    diagnostics = _tool_diagnostics(build)
+    return message + (f"\nbuild diagnostics:\n{diagnostics}" if diagnostics else "")
+
+
+def _rejection_attempt(problems: list[str], result_text: str = "") -> dict | None:
+    """Ledger entry for a rejected oracle (validator problems or its build).
+
+    Hashes the diagnostic-shaped lines, so an identical failure recurs even if
+    incidental make chatter differs between attempts.
+    """
+    if not problems:
+        return None
+    key_lines = [
+        line for line in problems
+        if re.search(r"error|fail|undefined reference|rejected|must be|unknown", line, re.I)
+    ] or list(problems)
+    return {
+        "problems_hash": _attempt_digest("\n".join(key_lines)),
+        "response_hash": _attempt_digest(result_text),
+    }
+
+
 def _conformance_workspace(state: CfuDesignState) -> str:
     return f"{state.get('run_root', '')}/{CONFORMANCE_SUBDIR}"
 
@@ -3035,6 +3165,7 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
     artifacts = _artifacts_for_stage(state, "implementation")
     toolbox = _toolbox_for_stage(state, "conformance")
     errors: list[str] = []
+    oracle_attempts: list[dict] = []
 
     header_path = _write_intrinsics_header(state, toolbox)
     if not header_path:
@@ -3049,7 +3180,14 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
     if not errors:
         prompt = conformance_prompt(
             state["task"], isa_spec, state.get("workload_spec", {}),
-            feedback=conformance_feedback(state),
+            feedback="\n\n".join(
+                part
+                for part in (
+                    conformance_oracle_directive(state),
+                    conformance_feedback(state),
+                )
+                if part
+            ),
         )
         result, raw = _complete_llm(
             state, "check_conformance", "conformance", SYSTEM_PROMPT, prompt,
@@ -3077,6 +3215,9 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
             # A malformed oracle is an answer problem, not evidence about the design:
             # retry the oracle instead of spending a hardware repair on it.
             oracle_failure = oracle_failure or bool(problems)
+            attempt = _rejection_attempt(problems, result.text)
+            if attempt:
+                oracle_attempts.append(attempt)
         artifacts.write_yaml(
             "implementation", f"{CONFORMANCE_SUBDIR}/oracle.yaml",
             {"oracle": oracle, "problems": problems if result.used_llm else [model_failure],
@@ -3101,7 +3242,7 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
             # The generated test embeds the oracle's C (helpers/setup/reference/verify),
             # so a build failure is attributed to the oracle, not to the design.
             oracle_failure = True
-            errors.append(f"conformance test build failed: {' '.join(build_argv)[:200]}")
+            errors.append(conformance_build_error(build, build_argv))
         else:
             for argv in agent_cfu_sim_commands(state, isa_spec, elf=elf):
                 sim = _run_check(
@@ -3113,7 +3254,11 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
                     "\n".join([str(sim.get("stdout_tail") or ""), str(sim.get("stderr_tail") or "")])
                 )
                 if sim.get("returncode") not in (0, None):
-                    errors.append("conformance simulation failed (the CPU reached the fail symbol)")
+                    diagnostics = _tool_diagnostics(sim)
+                    errors.append(
+                        "conformance simulation failed (the CPU reached the fail symbol)"
+                        + (f"\nsimulation diagnostics:\n{diagnostics}" if diagnostics else "")
+                    )
                 if not verdict["ok"]:
                     detail = (
                         f"commands={verdict['commands']}/{verdict['total']} "
@@ -3132,6 +3277,12 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
         and all(r.get("returncode") in (0, None) for r in results)
         and bool(verdict["ok"])
     )
+    if oracle_failure and not oracle_attempts:
+        # A build/link failure is an oracle rejection too: record it so a
+        # recurring one trips the REPEATED ORACLE REJECTION directive.
+        attempt = _rejection_attempt(errors, "")
+        if attempt:
+            oracle_attempts.append(attempt)
     if model_failure:
         # Stop with the transport error instead of repairing a design that was never
         # tested: the model never answered, so the ladder learned nothing about it.
@@ -3147,6 +3298,7 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
             "stage_jobs": "review",
             "stopped_at": rung,
             "errors": errors,
+            "conformance_attempts": oracle_attempts,
             "gates": {
                 **state.get("gates", {}),
                 rung: {"ok": False, "next": "review_and_route", "errors": errors,
@@ -3176,6 +3328,7 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
         "stage_jobs": "validation" if ok else "implementation",
         "errors": errors,
         "conformance_verdict": verdict,
+        "conformance_attempts": oracle_attempts,
         "gates": {
             **state.get("gates", {}),
             rung: {
