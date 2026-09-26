@@ -174,6 +174,10 @@ class LlmResult:
     # (for example the gateway has no /responses route for the model). This
     # explains "no thinking captured" for such a call.
     fallback_reason: str = ""
+    # Set when the request itself failed (timeout, gateway error) and the graph
+    # degraded to the fallback. This is an environment failure, never a design
+    # defect, so a rung can report it without blaming the artifact.
+    transport_error: str = ""
 
 
 # --- Reasoning / thinking handling -----------------------------------------

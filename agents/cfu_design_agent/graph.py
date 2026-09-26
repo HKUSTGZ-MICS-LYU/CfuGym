@@ -311,7 +311,7 @@ def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: igno
     graph.add_conditional_edges(
         "check_conformance",
         _route_after_hw_conformance,
-        _identity_map("implement_sw", "build_sw", "implement_hw", "review_and_route"),
+        _identity_map("implement_sw", "build_sw", "check_conformance", "implement_hw", "review_and_route"),
     )
     graph.add_edge("implement_sw", "build_sw")
     graph.add_conditional_edges(
@@ -715,14 +715,33 @@ def _complete_llm(
     client=None,
 ) -> tuple[LlmResult, str]:
     client = client or _llm(state)
-    result = clean_llm_text(
-        client.complete(
-            system,
-            user,
-            fallback=fallback,
-            **({"response_format": response_format} if response_format is not None else {}),
+    if response_format and response_format.get("type") == "json_object":
+        # OpenAI-compatible gateways reject json_object mode with an opaque HTTP 400
+        # when the messages never contain the word "json". Enforce the protocol here
+        # so no individual prompt can reintroduce that failure.
+        if "json" not in f"{system}\n{user}".lower():
+            user = f"{user}\nRespond with a single JSON object and nothing else."
+    try:
+        result = clean_llm_text(
+            client.complete(
+                system,
+                user,
+                fallback=fallback,
+                **({"response_format": response_format} if response_format is not None else {}),
+            )
         )
-    )
+    except Exception as exc:
+        # An endpoint that never answers (client timeout, gateway error) must not kill
+        # the run: degrade to the fallback with ``used_llm=False`` and let the rung
+        # decide. Rungs that cannot work without a model answer check that flag and
+        # report an environment failure instead of blaming the design.
+        result = LlmResult(
+            fallback,
+            used_llm=False,
+            model=str(getattr(client, "model", "") or ""),
+            fallback_reason=f"llm call failed: {type(exc).__name__}: {exc}",
+            transport_error=f"{type(exc).__name__}: {exc}",
+        )
     return result, _record_llm_output(state, stage, label, result, client=client)
 
 
@@ -3025,6 +3044,8 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
         )
 
     oracle: dict = {}
+    model_failure = ""
+    oracle_failure = False
     if not errors:
         prompt = conformance_prompt(
             state["task"], isa_spec, state.get("workload_spec", {}),
@@ -3035,19 +3056,37 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
             json.dumps({"commands": []}, indent=2),
             response_format={"type": "json_object"},
         )
-        oracle, problems = _oracle_from_text(result.text)
-        if not problems:
-            problems = validate_oracle(isa_spec, oracle)
-        errors.extend(problems)
+        if not result.used_llm:
+            # The endpoint did not answer (timeout/gateway) or no model is configured.
+            # That is not a hardware defect, so it must not consume a hardware repair
+            # on a design that was never tested.
+            reason_detail = (
+                getattr(result, "transport_error", "")
+                or getattr(result, "fallback_reason", "")
+                or "no response"
+            )
+            model_failure = (
+                "the conformance oracle request got no model answer "
+                f"({reason_detail}); this is an endpoint failure, not a hardware defect"
+            )
+        else:
+            oracle, problems = _oracle_from_text(result.text)
+            if not problems:
+                problems = validate_oracle(isa_spec, oracle)
+            errors.extend(problems)
+            # A malformed oracle is an answer problem, not evidence about the design:
+            # retry the oracle instead of spending a hardware repair on it.
+            oracle_failure = oracle_failure or bool(problems)
         artifacts.write_yaml(
             "implementation", f"{CONFORMANCE_SUBDIR}/oracle.yaml",
-            {"oracle": oracle, "problems": problems, "raw": raw}, status="produced",
+            {"oracle": oracle, "problems": problems if result.used_llm else [model_failure],
+             "raw": raw}, status="produced",
         )
 
     results: list[dict] = []
     verdict: dict = {"status": "missing", "ok": False, "commands": 0, "total": 0,
                      "cases": 0, "failed": [], "details": []}
-    if not errors:
+    if not errors and not model_failure:
         toolbox.write_text(
             f"{_conformance_workspace(state)}/{CONFORMANCE_SOURCE}",
             render_conformance(isa_spec, oracle),
@@ -3059,6 +3098,9 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
         )
         results.append(build)
         if build.get("returncode") not in (0, None):
+            # The generated test embeds the oracle's C (helpers/setup/reference/verify),
+            # so a build failure is attributed to the oracle, not to the design.
+            oracle_failure = True
             errors.append(f"conformance test build failed: {' '.join(build_argv)[:200]}")
         else:
             for argv in agent_cfu_sim_commands(state, isa_spec, elf=elf):
@@ -3085,10 +3127,35 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
 
     ok = (
         not errors
+        and not model_failure
         and bool(results)
         and all(r.get("returncode") in (0, None) for r in results)
         and bool(verdict["ok"])
     )
+    if model_failure:
+        # Stop with the transport error instead of repairing a design that was never
+        # tested: the model never answered, so the ladder learned nothing about it.
+        errors.append(model_failure)
+        artifacts.write_yaml(
+            "implementation", f"{CONFORMANCE_SUBDIR}/result.yaml",
+            {"ok": False, "verdict": verdict, "errors": errors, "model_failure": True},
+            status="failed",
+        )
+        _write_ladder_artifact(state, rung, results, "failed", model_failure)
+        return {
+            "validation_results": results,
+            "stage_jobs": "review",
+            "stopped_at": rung,
+            "errors": errors,
+            "gates": {
+                **state.get("gates", {}),
+                rung: {"ok": False, "next": "review_and_route", "errors": errors,
+                       "model_failure": True, "verdict": verdict.get("status")},
+            },
+            "iteration_history": append_history(
+                state, f"Hardware conformance could not run: {model_failure}"
+            ),
+        }
     artifacts.write_yaml(
         "implementation", f"{CONFORMANCE_SUBDIR}/result.yaml",
         {"ok": ok, "verdict": verdict, "errors": errors,
@@ -3096,9 +3163,13 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
         status="passed" if ok else "failed",
     )
     _write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
+    # Only a test that actually ran and disagreed with its reference is evidence
+    # about the design. A malformed oracle or a test that will not compile repairs
+    # the oracle, so conformance strictness never burns a hardware repair.
+    repair_target = "check_conformance" if oracle_failure else "implement_hw"
     extra, next_node = _ladder_transition(
         state, rung, ok=ok, default=_post_conformance_default(state),
-        repair_target="implement_hw",
+        repair_target=repair_target,
     )
     update = {
         "validation_results": results,
@@ -3111,6 +3182,7 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
                 "ok": ok, "next": next_node, "errors": errors,
                 "details": verdict.get("details") or [],
                 "verdict": verdict.get("status"), "cases": verdict.get("cases"),
+                "repair_target": repair_target, "oracle_failure": oracle_failure,
             },
         },
         "iteration_history": append_history(

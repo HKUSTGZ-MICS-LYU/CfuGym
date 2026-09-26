@@ -129,7 +129,11 @@ class _ScriptedLlm:
         if "Design the CFU contract" in user:
             return _FakeResult(VALID_ISA)
         if "HARDWARE CONFORMANCE rung only" in user:
-            return _FakeResult(_scripted_oracle(user))
+            # The double stands in for a real model answer, so it must report one:
+            # the conformance rung refuses an oracle that no model authored.
+            result = _FakeResult(_scripted_oracle(user))
+            result.used_llm = True
+            return result
         if "This is the HARDWARE rung only" in user:
             if "HARDWARE REPAIR MODE" in user:
                 return _FakeResult("REPAIR_DIAGNOSIS\n- Observed errors: FAKE\n" + HARDWARE_BLOCKS)
@@ -292,6 +296,31 @@ class _EnvelopeWithoutContractLlm(_ScriptedLlm):
         return super().complete(system, user, fallback=fallback, response_format=response_format)
 
 
+class _DeadConformanceLlm(_ScriptedLlm):
+    """The conformance oracle request never gets an answer (endpoint timeout)."""
+
+    def complete(self, system: str, user: str, *, fallback: str, response_format=None):
+        if "HARDWARE CONFORMANCE rung" in user:
+            self.prompts.append(user)
+            raise TimeoutError("the endpoint did not answer")
+        return super().complete(system, user, fallback=fallback, response_format=response_format)
+
+
+class _BadOracleLlm(_ScriptedLlm):
+    """The conformance oracle omits the required reference."""
+
+    def complete(self, system: str, user: str, *, fallback: str, response_format=None):
+        if "HARDWARE CONFORMANCE rung only" in user:
+            self.prompts.append(user)
+            text = "\n".join(
+                line for line in _scripted_oracle(user).splitlines() if "reference:" not in line
+            ) + "\n"
+            result = _FakeResult(text)
+            result.used_llm = True
+            return result
+        return super().complete(system, user, fallback=fallback, response_format=response_format)
+
+
 class _ScriptedCommands:
     """Stand-in for ``RepoToolbox.run_command``.
 
@@ -300,10 +329,15 @@ class _ScriptedCommands:
     the patch path stays real.
     """
 
-    def __init__(self, plan: dict[str, list[int]] | None = None, sim_stdout=None) -> None:
+    def __init__(self, plan: dict[str, list[int]] | None = None, sim_stdout=None,
+                 conformance_stdout=None) -> None:
         self.plan = {key: list(value) for key, value in (plan or {}).items()}
         self.calls: list[tuple[str, str]] = []
         self.sim_stdout = sim_stdout or _soc_sim_stdout
+        # The conformance program is a separate binary from the workload, so its
+        # verdict is its own input rather than a constant: a test must be able to
+        # script a failing micro-test.
+        self.conformance_stdout = conformance_stdout or CONFORMANCE_STDOUT
 
     @property
     def ladder(self) -> list[str]:
@@ -319,7 +353,7 @@ class _ScriptedCommands:
             # The conformance micro-test is a separate program: it always passes and it
             # must not consume the workload simulation's scripted return codes or its
             # custom stdout, which models a different binary entirely.
-            stdout = CONFORMANCE_STDOUT
+            stdout = self.conformance_stdout
             return {
                 "command": " ".join(args),
                 "cwd": str(toolbox.workdir),
@@ -396,9 +430,11 @@ class LadderTest(unittest.TestCase):
         runner=None,
         llm=None,
         sim_stdout=None,
+        conformance_stdout=None,
         **overrides,
     ) -> tuple[dict, _ScriptedCommands, _ScriptedLlm]:
-        scripted = _ScriptedCommands(plan, sim_stdout=sim_stdout)
+        scripted = _ScriptedCommands(plan, sim_stdout=sim_stdout,
+                                     conformance_stdout=conformance_stdout)
         llm = llm or _ScriptedLlm()
         state = {
             "workdir": str(REPO_ROOT),
@@ -482,6 +518,101 @@ class LadderTest(unittest.TestCase):
             any("did not apply a design change" in err for err in final["errors"]),
             final["errors"],
         )
+
+    def test_llm_failure_degrades_instead_of_raising(self) -> None:
+        # An endpoint that never answers must not kill the run: the call degrades to
+        # the fallback with used_llm=False so the rung can report an environment
+        # failure instead of crashing with a traceback.
+        class Dead:
+            model = "dead"
+
+            def complete(self, *_args, **_kwargs):
+                raise TimeoutError("no answer")
+
+        state = {"workdir": str(REPO_ROOT), "run_id": self.run_id}
+        result, raw = graph._complete_llm(
+            state, "check_conformance", "conformance", "sys", "user", "fallback",
+            client=Dead(),
+        )
+        self.assertFalse(result.used_llm)
+        self.assertEqual(result.text, "fallback")
+        self.assertIn("TimeoutError", result.fallback_reason)
+        self.assertTrue(raw)
+
+    def test_bad_oracle_repairs_the_oracle_not_the_hardware(self) -> None:
+        # A malformed oracle is an answer problem: blaming the design for it burned
+        # real hardware repairs (observed in a live run).
+        final, scripted, llm = self._run(
+            {"soc_generate_agent": [0]}, max_iters=3, llm=_BadOracleLlm()
+        )
+        self.assertEqual(final.get("last_repair_target"), "check_conformance",
+                         final.get("errors"))
+        self.assertEqual(int(final.get("attempts", {}).get("implementation_hw", 0) or 0), 0)
+        gate = final["gates"]["hw_conformance"]
+        self.assertTrue(gate.get("oracle_failure"), gate)
+        self.assertEqual(gate.get("repair_target"), "check_conformance")
+        # The oracle is retried with its problems, and the bad one is never built.
+        prompts = [p for p in llm.prompts if "HARDWARE CONFORMANCE rung only" in p]
+        self.assertGreaterEqual(len(prompts), 2)
+        self.assertIn("ORACLE REPAIR MODE", prompts[1])
+        self.assertNotIn("conformance_build", scripted.ladder)
+
+    def test_conformance_verdict_failure_repairs_the_hardware(self) -> None:
+        # A test that ran and disagreed with its reference IS evidence about the design.
+        final, _scripted, _llm = self._run(
+            {"soc_generate_agent": [0]}, max_iters=3,
+            conformance_stdout="CFU_CONFORMANCE FAIL commands=0/1 cases=1 failed=compute\n",
+        )
+        gate = final["gates"]["hw_conformance"]
+        self.assertFalse(gate["ok"])
+        self.assertFalse(gate.get("oracle_failure"), gate)
+        self.assertEqual(gate.get("repair_target"), "implement_hw")
+
+    def test_json_mode_request_always_mentions_json(self) -> None:
+        # OpenAI-compatible gateways reject json_object mode with an opaque HTTP 400
+        # when the messages never contain the word "json", so the transport enforces
+        # it for every prompt instead of trusting each stage to remember.
+        seen: list[str] = []
+
+        class Recorder:
+            model = "rec"
+
+            def complete(self, system, user, *, fallback, response_format=None):
+                seen.append(user)
+
+                class R:
+                    text = "{}"
+                    used_llm = True
+
+                return R()
+
+        state = {"workdir": str(REPO_ROOT), "run_id": self.run_id}
+        graph._complete_llm(state, "check_conformance", "conformance", "sys",
+                            "no magic word here", "{}",
+                            response_format={"type": "json_object"}, client=Recorder())
+        self.assertIn("JSON", seen[0])
+        seen.clear()
+        graph._complete_llm(state, "check_conformance", "conformance", "sys",
+                            "return json please", "{}",
+                            response_format={"type": "json_object"}, client=Recorder())
+        self.assertEqual(seen[0], "return json please")
+        seen.clear()
+        graph._complete_llm(state, "check_conformance", "conformance", "sys", "plain", "{}",
+                            client=Recorder())
+        self.assertEqual(seen[0], "plain")
+
+    def test_conformance_without_a_model_answer_stops_instead_of_repairing(self) -> None:
+        # The model never answered, so the ladder learned nothing about the design:
+        # it must not spend a hardware repair, and it must not build or simulate an
+        # untested instruction either.
+        final, scripted, llm = self._run({"soc_generate_agent": [0]}, llm=_DeadConformanceLlm())
+        self.assertEqual(final.get("stopped_at"), "hw_conformance", final.get("errors"))
+        self.assertEqual(int(final.get("repairs_used", 0) or 0), 0, final.get("errors"))
+        self.assertNotIn("conformance_build", scripted.ladder)
+        gate = final["gates"]["hw_conformance"]
+        self.assertFalse(gate["ok"])
+        self.assertTrue(gate.get("model_failure"), gate)
+        self.assertTrue(any("endpoint failure" in e for e in gate["errors"]), gate["errors"])
 
     def test_wrapped_isa_contract_is_unwrapped(self) -> None:
         # GLM returned {"analysis", "roofline", "isa_contract": "<yaml>"}: the contract

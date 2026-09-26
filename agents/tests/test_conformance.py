@@ -240,6 +240,31 @@ class ParseVerdictTest(unittest.TestCase):
         self.assertNotIn("EXTRA_SOURCES=", joined)
         self.assertTrue(elf.endswith(f"{graph.CONFORMANCE_BIN}.elf"), elf)
 
+    def test_sbt_prefixed_verdict_is_parsed(self) -> None:
+        # Real MiCoSocSim output is sbt-framed ("[info] CFU_CONFORMANCE PASS ...").
+        # A mock that feeds bare lines passes while the real path reports "missing".
+        text = (
+            "[info] [Progress] Start MiCoSocSim test simulation with seed 42\n"
+            "[info] CFU_CONFORMANCE PASS commands=4/4 cases=7 failed=none\n"
+            "[info] [Done] Simulation done in 3718.700 ms\n"
+            "[success] Total time: 8 s\n"
+        )
+        verdict = parse_conformance(text)
+        self.assertTrue(verdict["ok"], verdict)
+        self.assertEqual(verdict["commands"], 4)
+        self.assertEqual(verdict["cases"], 7)
+
+    def test_sbt_prefixed_case_failure_is_parsed(self) -> None:
+        text = (
+            '[info] CFU_CONFORMANCE_CASE FAIL add[0] got=0x00000000 ref=0x00000003\n'
+            "[info] CFU_CONFORMANCE FAIL commands=0/1 cases=2 failed=add\n"
+            '[error] Exception in thread "main" spinal.sim.SimFailure: boom\n'
+        )
+        verdict = parse_conformance(text)
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(verdict["failed"], ["add"])
+        self.assertTrue(any("add[0]" in d for d in verdict["details"]), verdict)
+
 
 if __name__ == "__main__":
     unittest.main()

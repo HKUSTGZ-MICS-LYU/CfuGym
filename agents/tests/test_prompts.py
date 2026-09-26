@@ -123,6 +123,26 @@ class RooflinePromptTest(unittest.TestCase):
                      "thoughts/analysis/reasoning"):
             self.assertIn(term, prompt)
 
+    def test_conformance_prompt_mentions_json_for_json_mode(self) -> None:
+        # The conformance request sets json_object mode; a prompt without the word
+        # "json" makes OpenAI-compatible gateways answer HTTP 400.
+        from agents.cfu_design_agent.prompts import conformance_prompt
+
+        isa = {
+            "spec_version": "1",
+            "identity": {"name": "x", "opcode": "custom0", "function_id_width": 3},
+            "commands": [{
+                "function_id": 1, "subfunction_id": 1, "name": "add", "semantics": "rd = a + b",
+                "resources": [
+                    {"storage": "cpu", "access": "read", "role": "rs1"},
+                    {"storage": "cpu", "access": "write", "role": "rd"},
+                ],
+            }],
+        }
+        prompt = conformance_prompt("accelerate it", isa, {"name": "w"})
+        self.assertIn("json", prompt.lower())
+        self.assertIn("commands", prompt)
+
     def test_downstream_prompts_preserve_roofline_decision(self) -> None:
         prompts = (
             contract_prompt("accelerate it", self.spec, self.analysis, self.context),

@@ -582,8 +582,11 @@ This is the HARDWARE CONFORMANCE rung only. The harness generates a minimal C
 program that calls each declared CFU instruction and compares it against YOUR
 oracle; you do not write the test file, and any file you emit would be ignored.
 
-Return exactly one YAML mapping and nothing else, with a single top-level key
-`commands` holding one entry per command above:
+Return exactly one JSON object and nothing else, with a single top-level key
+`commands` holding one entry per command above (the parser also accepts the same
+structure as YAML). The word JSON matters: this request sets json_object mode, and
+OpenAI-compatible gateways reject a json_object request whose messages never say
+"json" — with an opaque HTTP 400 that has nothing to do with your answer.
 
 commands:
   - name: <exact command name>

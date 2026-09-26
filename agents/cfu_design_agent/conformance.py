@@ -32,6 +32,10 @@ from typing import Any
 from .isa import MAX_FUNCTION_ID, MAX_SUBFUNCTION_ID, command_symbol
 
 STATUS_SENTINEL = "CFU_CONFORMANCE"
+# sbt prefixes every line of the forked simulator's output ("[info] CFU_CONFORMANCE
+# PASS ..."), so the parser must tolerate the level marker. A mock that feeds bare
+# lines hides this, which is why the pattern allows the prefix explicitly.
+_SBT_PREFIX_RE = re.compile(r"^\s*\[(?:info|error|warn|success)\]\s?")
 STATUS_RE = re.compile(
     r"^CFU_CONFORMANCE\s+(?P<status>PASS|FAIL)\s+"
     r"commands=(?P<commands>\d+)/(?P<total>\d+)\s+"
@@ -353,7 +357,9 @@ def parse_conformance(text: str) -> dict[str, Any]:
     A missing line is reported as ``status="missing"`` and must be treated as a
     failure: silence is not evidence.
     """
-    body = str(text or "")
+    body = "\n".join(
+        _SBT_PREFIX_RE.sub("", line) for line in str(text or "").splitlines()
+    )
     matches = list(STATUS_RE.finditer(body))
     details = [line.strip() for line in DETAIL_RE.findall(body)]
     if not matches:
