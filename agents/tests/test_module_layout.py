@@ -48,6 +48,8 @@ class ModuleLayoutTest(unittest.TestCase):
         self.assertEqual(set(graph.PY_ROUTERS), set(wiring.ROUTER_NAMES))
         self.assertEqual(graph.PY_SUCCESSORS, wiring.SUCCESSORS)
         self.assertEqual(set(wiring.ROUTE_TARGETS), set(wiring.ROUTER_NAMES))
+        self.assertEqual(wiring.SUCCESSORS["extract_hotspot"], "collect_ir_evidence")
+        self.assertEqual(wiring.SUCCESSORS["collect_ir_evidence"], "analyze_workload")
         ascii_graph = graph.fallback_ascii_graph()
         for node in wiring.NODE_NAMES:
             self.assertIn(f"{node} -> ", ascii_graph)

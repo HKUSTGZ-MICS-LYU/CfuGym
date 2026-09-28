@@ -227,6 +227,109 @@ class EmbenchDiscoveryTest(unittest.TestCase):
         parsed = embench.parse_profile(text)
         self.assertEqual(parsed["crc32"]["cycles"], 15503563)
 
+    def test_profile_parsing_from_sbt_prefixed_simulator_output(self) -> None:
+        # A real MiCoSocSim log prefixes *every* guest stdout line with [info].
+        # It must retain both the whole-loop baseline and individual loop calls.
+        text = (
+            "[info] Start MiCoSocSim test simulation with seed 42\n"
+            "[info] CFU_AGENT_PROFILE crc32=16223945\n"
+            "[info] CFU_AGENT_PROFILE obs_loop_ffaeb24f_crc32pseudo_1=15488349 calls=170\n"
+            "[info] EMBENCH_VERIFY_PASS benchmark=crc32 verify=1 result=11433\n"
+        )
+        # The harness EMBENCH_VERIFY line folds verify/result into the
+        # whole-benchmark entry so the gate can compare the reference run's
+        # observable result with the cfu run's, independent of verify_benchmark.
+        self.assertEqual(embench.parse_profile(text), {
+            "crc32": {"cycles": 16223945, "verify": 1, "result": 11433},
+            "obs_loop_ffaeb24f_crc32pseudo_1": {"cycles": 15488349, "calls": 170},
+        })
+        self.assertEqual(embench.hotspot_from_profile(embench.parse_profile(text), exclude=("crc32",)),
+                         "obs_loop_ffaeb24f_crc32pseudo_1")
+        self.assertEqual(embench.parse_profile("[warn] CFU_AGENT_PROFILE crc32=12\n"), {})
+        self.assertEqual(embench.parse_profile("something CFU_AGENT_PROFILE crc32=12\n"), {})
+
+    def test_parse_verify_result(self) -> None:
+        text = (
+            "[info] EMBENCH_VERIFY_FAIL benchmark=md5sum verify=0 result=42\n"
+            "[info] EMBENCH_VERIFY_PASS benchmark=md5sum verify=1 result=12345\n"
+        )
+        # The LAST line wins: a run's final observed result is the comparison basis.
+        self.assertEqual(embench.parse_verify_result(text), {
+            "benchmark": "md5sum", "pass": True, "verify": 1, "result": 12345,
+        })
+        self.assertIsNone(embench.parse_verify_result("no verify line here"))
+        self.assertEqual(
+            embench.parse_verify_result("EMBENCH_VERIFY_FAIL benchmark=x verify=0 result=-7"),
+            {"benchmark": "x", "pass": False, "verify": 0, "result": -7},
+        )
+
+
+class EmbenchTamperTest(unittest.TestCase):
+    """The benchmark oracle must not be editable through the cfu copy."""
+
+    def _workspace(self, tmp: Path, name: str = "md5sum") -> tuple[Path, str]:
+        run_root = "agents/generated/runs/test-tamper"
+        for config in ("reference", "cfu"):
+            root = tmp / embench.config_workspace(run_root, name, config)
+            (root / "src").mkdir(parents=True, exist_ok=True)
+            (root / "board").mkdir(parents=True, exist_ok=True)
+            (root / "support").mkdir(parents=True, exist_ok=True)
+            (root / "embench_main.c").write_text("main")
+            for fname in ("boardsupport.c", "boardsupport.h", "embench_obs.h"):
+                (root / "board" / fname).write_text(fname)
+            for fname in ("main.c", "beebsc.c", "beebsc.h", "support.h"):
+                (root / "support" / fname).write_text(fname)
+        src = (
+            "int kernel(int r) { return r; }\n"
+            "int verify_benchmark(int r) { return r == RESULT; }\n"
+        )
+        (tmp / embench.config_workspace(run_root, name, "reference") / "src" / "md5.c").write_text(src)
+        (tmp / embench.config_workspace(run_root, name, "cfu") / "src" / "md5.c").write_text(src)
+        return tmp, run_root
+
+    def test_identical_copies_report_no_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp, run_root = self._workspace(Path(tmp_dir))
+            self.assertEqual(embench.workspace_tampering(tmp, run_root, "md5sum"), [])
+
+    def test_modified_verify_benchmark_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp, run_root = self._workspace(Path(tmp_dir))
+            cfu_src = tmp / embench.config_workspace(run_root, "md5sum", "cfu") / "src" / "md5.c"
+            cfu_src.write_text(
+                "int kernel(int r) { return r; }\n"
+                "int verify_benchmark(int r) { return 1; }\n"
+            )
+            problems = embench.workspace_tampering(tmp, run_root, "md5sum")
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("verify_benchmark()", problems[0])
+
+    def test_modified_kernel_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp, run_root = self._workspace(Path(tmp_dir))
+            cfu_src = tmp / embench.config_workspace(run_root, "md5sum", "cfu") / "src" / "md5.c"
+            cfu_src.write_text(
+                "int kernel(int r) { return r + 1; }\n"
+                "int verify_benchmark(int r) { return r == RESULT; }\n"
+            )
+            self.assertEqual(embench.workspace_tampering(tmp, run_root, "md5sum"), [])
+
+    def test_modified_boardsupport_and_main_are_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp, run_root = self._workspace(Path(tmp_dir))
+            cfu_root = tmp / embench.config_workspace(run_root, "md5sum", "cfu")
+            (cfu_root / "board" / "boardsupport.c").write_text("int cycles(void) { return 1; }")
+            (cfu_root / "embench_main.c").write_text("int main(void) { return 0; }")
+            problems = embench.workspace_tampering(tmp, run_root, "md5sum")
+            self.assertEqual(len(problems), 2, problems)
+            self.assertTrue(any("boardsupport.c" in p for p in problems))
+            self.assertTrue(any("embench_main.c" in p for p in problems))
+
+    def test_missing_reference_copy_skips_gracefully(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Fixture workspaces without a full config set must not error out.
+            self.assertEqual(embench.workspace_tampering(Path(tmp_dir), "r", "md5sum"), [])
+
 
 class EmbenchPolicyTest(unittest.TestCase):
     def setUp(self) -> None:

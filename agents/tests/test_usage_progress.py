@@ -4,10 +4,73 @@ from __future__ import annotations
 
 import types
 import unittest
+from pathlib import Path
 
 from agents.cfu_design_agent.runtime import llm
 from agents.cfu_design_agent.graph import _node_ok, _update_ok
 from agents.cfu_design_agent.runtime.progress import NODE_TO_STEP, STAGE_LABELS, StageProgress
+
+
+class UsageByStageTest(unittest.TestCase):
+    """Per-stage input tokens: the "which stage's input is big" view."""
+
+    def setUp(self) -> None:
+        llm.reset_usage_log()
+        llm.set_stage("")
+
+    def test_by_stage_aggregates_in_first_seen_order(self) -> None:
+        llm.record_usage("implement_hw", 100, 10, 110)
+        llm.record_usage("design_contract", 5, 1, 6)
+        llm.record_usage("implement_hw", 200, 20, 220)
+        by_stage = llm.usage_by_stage()
+        self.assertEqual(list(by_stage), ["implement_hw", "design_contract"])
+        self.assertEqual(
+            by_stage["implement_hw"], {"calls": 2, "input": 300, "output": 30, "total": 330}
+        )
+        self.assertEqual(by_stage["design_contract"]["input"], 5)
+
+    def test_empty_log_yields_no_stages(self) -> None:
+        self.assertEqual(llm.usage_by_stage(), {})
+
+    def test_stage_line_and_summary_split_input_output(self) -> None:
+        llm.set_stage("implement_hw")
+        llm.record_usage("implement_hw", 42, 7, 49)
+        progress = StageProgress(list(NODE_TO_STEP.values()))
+        progress.end("implement_hw", ok=True, elapsed=1.5, tokens=49)
+        self.assertEqual(progress.results["implement_hw"]["input_tokens"], 42)
+        self.assertEqual(progress.results["implement_hw"]["output_tokens"], 7)
+        stage = progress.summary()["stages"]["implement_hw"]
+        self.assertEqual(stage["input_tokens"], 42)
+        self.assertEqual(stage["output_tokens"], 7)
+
+
+class SpecPromptSinkTest(unittest.TestCase):
+    """Every LLM call must leave its prompt behind, including the spec call."""
+
+    def test_spec_call_reports_both_prompt_and_answer(self) -> None:
+        from agents.cfu_design_agent.spec import normalize_workload_spec
+
+        seen: dict[str, str] = {}
+        answers: list[tuple[str, str]] = []
+
+        class _Llm:
+            available = True
+
+            def complete(self, system, user, *, fallback):
+                return llm.LlmResult("name: t\nunknowns: []", used_llm=True)
+
+        normalize_workload_spec(
+            task="accelerate a dot product",
+            input_mode="natural_language",
+            context={"files": {}},
+            workdir=Path("."),
+            llm=_Llm(),
+            llm_result_sink=lambda label, result: answers.append((label, result.text)),
+            llm_prompt_sink=lambda system, user: seen.update(system=system, user=user),
+        )
+        self.assertTrue(answers, "the spec LLM call must reach the result sink")
+        self.assertTrue(seen.get("system"), "the spec LLM call must reach the prompt sink")
+        self.assertIn("WorkloadSpec", seen["system"] + seen["user"])
 
 
 class UsageLedgerTest(unittest.TestCase):
@@ -62,7 +125,7 @@ class NodeOkTest(unittest.TestCase):
 class StageProgressTest(unittest.TestCase):
     ORDER = [
         "load_context", "ingest_input", "route_input", "prepare_benchmark",
-        "profile", "hotspot", "analysis", "isa", "implementation_hw",
+        "profile", "hotspot", "ir", "analysis", "isa", "implementation_hw",
         "hw_build", "hw_conformance", "implementation_sw", "sw_build", "sim",
         "cost", "review", "final_report",
     ]
@@ -71,9 +134,9 @@ class StageProgressTest(unittest.TestCase):
         progress = StageProgress(self.ORDER)
         self.assertEqual(progress._index_of("load_context"), 0)
         self.assertEqual(progress._index_of("instrument_and_profile"), 4)
-        self.assertEqual(progress._index_of("check_conformance"), 10)
-        self.assertEqual(progress._index_of("review_and_route"), 15)
-        self.assertEqual(progress._index_of("final_report"), 16)
+        self.assertEqual(progress._index_of("check_conformance"), 11)
+        self.assertEqual(progress._index_of("review_and_route"), 16)
+        self.assertEqual(progress._index_of("final_report"), 17)
         # Unknown node falls back to the end of the list (count), not negative.
         self.assertEqual(progress._index_of("bogus"), len(self.ORDER))
 

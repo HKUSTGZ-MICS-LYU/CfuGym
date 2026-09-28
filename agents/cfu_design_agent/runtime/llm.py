@@ -310,6 +310,24 @@ def stage_usage(stage: str) -> dict[str, int]:
     }
 
 
+def usage_by_stage() -> dict[str, dict[str, int]]:
+    """Per-stage usage in first-seen stage order.
+
+    This is what makes a big-input stage visible: every request is attributed
+    to the node that made it (``set_stage``), so callers can report where the
+    input tokens actually went instead of only a run total.
+    """
+    stages: dict[str, dict[str, int]] = {}
+    for entry in _USAGE_LOG:
+        name = str(entry.get("stage") or "(unset)")
+        bucket = stages.setdefault(name, {"calls": 0, "input": 0, "output": 0, "total": 0})
+        bucket["calls"] += 1
+        bucket["input"] += int(entry.get("input") or 0)
+        bucket["output"] += int(entry.get("output") or 0)
+        bucket["total"] += int(entry.get("total") or 0)
+    return stages
+
+
 def _read(value, *keys):
     """Read ``value`` as a pydantic model or dict, trying ``keys`` in order."""
     if isinstance(value, dict):

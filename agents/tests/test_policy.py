@@ -251,6 +251,8 @@ class VisibilityPolicyTest(unittest.TestCase):
         self.assertFalse(policy.is_denied("agents/generated/runs/x/workspace/a.asm"))
         self.assertTrue(policy.is_denied("sw/build/foo.asm"))
         self.assertFalse(policy.can_read("analysis", "sw/build/foo.asm"))
+        self.assertTrue(policy.can_read("analysis", "agents/generated/runs/x/07_analysis/ir/kernel.ll"))
+        self.assertFalse(policy.can_read("load_context", "agents/generated/runs/x/07_analysis/ir/kernel.ll"))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -349,6 +350,12 @@ class RepoToolbox:
         through the same redirect and write policy as a whole-file replacement,
         and all sections are validated before any file is written, so one
         rejected section cannot leave the workspace half-edited.
+
+        On success the result carries a compact unified diff of every touched
+        file (capped at EDIT_DIFF_MAX_CHARS) so the model sees what changed
+        without re-reading. A response whose sections only re-apply already
+        present content succeeds with a note and touched_paths == [] instead of
+        erroring, so replayed deliveries do not churn the repair loop.
         """
         # Resolve targets first so diagnostics can report "section i/n".
         resolved_targets: list[str | None] = []
@@ -363,7 +370,9 @@ class RepoToolbox:
             section_totals[resolved] = section_totals.get(resolved, 0) + 1
 
         pending: dict[str, str] = {}
+        originals: dict[str, str] = {}
         section_seen: dict[str, int] = {}
+        notes: list[str] = []
         errors: list[str] = []
         for (target, pairs), resolved in zip(edits, resolved_targets):
             if resolved is None:
@@ -383,6 +392,7 @@ class RepoToolbox:
                 content = pending.get(resolved)
                 if content is None:
                     content = self.read_text(resolved, limit=2_000_000)
+                    originals[resolved] = content
             except PolicyError as exc:
                 errors.append(f"{target}: cannot read the current content ({exc})")
                 continue
@@ -396,7 +406,11 @@ class RepoToolbox:
                 errors.extend(f"{resolved}: {label}: {problem}" for problem in problems)
                 continue
             if updated == content:
-                errors.append(f"{resolved}: {label}: edits produced no change")
+                # A no-op pair (SEARCH == REPLACE, or an already-applied replay)
+                # is success-with-note, not an error: echo/replayed deliveries
+                # must not churn the repair loop. Unmatched SEARCH is still an
+                # error above: there the model clearly intended a change.
+                notes.append(f"{resolved}: {label}: edit was already applied (no content change)")
                 continue
             pending[resolved] = updated
 
@@ -409,6 +423,26 @@ class RepoToolbox:
                 stderr_tail="; ".join(errors)[:2000],
                 parsed={"touched_paths": []},
             )
+        if not edits:
+            return CommandResult(
+                command="edit",
+                cwd=str(self.workdir),
+                returncode=1,
+                stdout_tail="",
+                stderr_tail="no edit blocks were supplied",
+                parsed={"touched_paths": []},
+            )
+        if not pending:
+            # Every section was a no-op: report success with the note.
+            summary_note = "edit was already applied (no content change)"
+            return CommandResult(
+                command="edit",
+                cwd=str(self.workdir),
+                returncode=0,
+                stdout_tail="\n".join([summary_note, *notes]),
+                stderr_tail="",
+                parsed={"touched_paths": []},
+            )
 
         try:
             self._commit_files(pending)
@@ -416,12 +450,15 @@ class RepoToolbox:
             return CommandResult(command="edit", cwd=str(self.workdir), returncode=1,
                                  stdout_tail="", stderr_tail=str(exc), parsed={"touched_paths": []})
         applied = list(pending)
+        diff_text = cap_change_diffs("".join(
+            render_change_diff(originals.get(name, ""), pending[name], name) for name in applied
+        ))
         return CommandResult(
             command="edit",
             cwd=str(self.workdir),
-            returncode=0 if applied else 1,
-            stdout_tail="",
-            stderr_tail="" if applied else "no edit blocks were supplied",
+            returncode=0,
+            stdout_tail="\n".join(part for part in [*notes, diff_text] if part),
+            stderr_tail="",
             parsed={"touched_paths": applied},
         )
 
@@ -444,14 +481,26 @@ class RepoToolbox:
             raise
 
     def apply_file_blocks(self, blocks: list[tuple[str, str]]) -> CommandResult:
-        """Prevalidate every FILE target, then commit with in-process rollback."""
+        """Prevalidate every FILE target, then commit with in-process rollback.
+
+        Like apply_edit_blocks, the result echoes a compact unified diff of the
+        touched files so the model can see the replacement it delivered.
+        """
         pending: dict[str, str] = {}
+        originals: dict[str, str | None] = {}
         try:
             for target, content in blocks:
                 resolved = self.resolve_target(target)
                 self.policy.check_write(self.stage, resolved)
                 if resolved in pending:
                     raise ValueError(f"duplicate FILE target: {target}")
+                existing: str | None = ""
+                if (self.workdir / resolved).is_file():
+                    try:
+                        existing = self.read_text(resolved, limit=2_000_000)
+                    except PolicyError:
+                        existing = None  # unreadable: skip the diff, do not fake one
+                originals[resolved] = existing
                 pending[resolved] = content
             if not pending:
                 raise ValueError("no file blocks supplied")
@@ -459,8 +508,14 @@ class RepoToolbox:
         except (ValueError, PolicyError, OSError) as exc:
             return CommandResult(command="file", cwd=str(self.workdir), returncode=1,
                                  stdout_tail="", stderr_tail=str(exc), parsed={"touched_paths": []})
+        diff_text = cap_change_diffs("".join(
+            render_change_diff(before or "", pending[name], name)
+            for name, before in originals.items()
+            if before is not None
+        ))
         return CommandResult(command="file", cwd=str(self.workdir), returncode=0,
-                             stdout_tail="", stderr_tail="", parsed={"touched_paths": list(pending)})
+                             stdout_tail=diff_text, stderr_tail="",
+                             parsed={"touched_paths": list(pending)})
 
     def stage_bucket(self, stage: str) -> "RepoToolbox":
         return RepoToolbox(
@@ -667,6 +722,30 @@ SEARCH_MARKER = "<<<<<<< SEARCH"
 DIVIDER_MARKER = "======="
 REPLACE_MARKER = ">>>>>>> REPLACE"
 
+# A parse failure inside one EDIT_BEGIN section is carried as this sentinel pair
+# (message in the replace slot) instead of raising out of extract_edit_blocks:
+# graph.py calls the parser outside its try/except, so an escaping exception
+# would kill the run instead of becoming repairable feedback. apply_edit_pairs
+# turns the sentinel back into the stored error message.
+EDIT_PARSE_ERROR = "<<<<<<< PARSE_ERROR"
+
+# Delivery/conflict-marker shape: 5+ '<', '>' or '=' at line start. Real content
+# with these shapes (git conflict regions, comment dividers) collides with the
+# edit protocol: `=======` inside a SEARCH region silently flips the parser into
+# replace mode (verified 2026-09-28 audit). Such lines are rejected with an
+# actionable message; the model must edit around them.
+_MARKER_LINE = re.compile(r"^(?:<{5,}|>{5,}|={5,})")
+
+
+def _collision_message(stripped: str) -> str:
+    return (
+        f"conflict-marker-like line {stripped!r} inside a SEARCH/REPLACE block "
+        "collides with the edit protocol markers; lines starting with <<<<<<< / "
+        ">>>>>>> or made of ======= cannot be delivered as content. Shrink the "
+        "SEARCH/REPLACE block so the marker-like line is not part of it and edit "
+        "the lines around it instead"
+    )
+
 
 def _trim_blank_edges(lines: list[str]) -> str:
     """Join lines, dropping blank lines that only pad the block markers."""
@@ -680,28 +759,44 @@ def _trim_blank_edges(lines: list[str]) -> str:
 
 
 def _parse_edit_pairs(block_lines: list[str], *, target: str) -> list[tuple[str, str]]:
-    """Parse one EDIT_BEGIN body into [(search, replace)] pairs."""
+    """Parse one EDIT_BEGIN body into [(search, replace)] pairs.
+
+    Lines shaped like git conflict markers (``<<<<<<<``/``>>>>>>>`` heads or a
+    ``=======`` run) cannot appear as SEARCH/REPLACE content: they are either
+    protocol markers or would silently flip the parser into the wrong mode, so
+    they are rejected with an actionable message instead of mis-parsing.
+    """
     pairs: list[tuple[str, str]] = []
     mode: str | None = None
     search: list[str] = []
     replace: list[str] = []
     for line in block_lines:
         stripped = line.strip()
-        if stripped.startswith(SEARCH_MARKER):
-            if mode is not None:
-                raise ValueError(f"{target}: nested SEARCH marker")
-            mode = "search"
-            search = []
-            replace = []
-        elif mode == "search" and stripped.startswith(DIVIDER_MARKER):
-            mode = "replace"
-        elif mode == "replace" and stripped.startswith(REPLACE_MARKER):
-            pairs.append((_trim_blank_edges(search), _trim_blank_edges(replace)))
-            mode = None
+        marker_like = bool(_MARKER_LINE.match(stripped))
+        if stripped.startswith(SEARCH_MARKER) and mode is not None:
+            raise ValueError(f"{target}: nested SEARCH marker")
+        if mode is None:
+            if stripped.startswith(SEARCH_MARKER):
+                mode = "search"
+                search = []
+                replace = []
+            elif marker_like:
+                raise ValueError(f"{target}: {_collision_message(stripped)}")
         elif mode == "search":
-            search.append(line)
-        elif mode == "replace":
-            replace.append(line)
+            if stripped.startswith(DIVIDER_MARKER):
+                mode = "replace"
+            elif marker_like:
+                raise ValueError(f"{target}: {_collision_message(stripped)}")
+            else:
+                search.append(line)
+        else:
+            if stripped.startswith(REPLACE_MARKER):
+                pairs.append((_trim_blank_edges(search), _trim_blank_edges(replace)))
+                mode = None
+            elif marker_like:
+                raise ValueError(f"{target}: {_collision_message(stripped)}")
+            else:
+                replace.append(line)
     if mode is not None:
         raise ValueError(f"{target}: unterminated SEARCH/REPLACE block")
     return pairs
@@ -737,6 +832,10 @@ def extract_edit_blocks(text: str) -> list[tuple[str, list[tuple[str, str]]]]:
     Byte-identical duplicate sections (a restarted answer template emitted the
     same edit twice) collapse to the first copy: after the first applies, the
     duplicate's SEARCH no longer matches and would reject the whole response.
+    A malformed section (nested marker, conflict-marker content, unterminated
+    SEARCH/REPLACE) becomes one ``EDIT_PARSE_ERROR`` sentinel pair so the
+    parser never raises into the run: the apply step reports the stored message
+    as ordinary repairable feedback.
     """
     blocks: list[tuple[str, list[tuple[str, str]]]] = []
     current_path: str | None = None
@@ -749,7 +848,11 @@ def extract_edit_blocks(text: str) -> list[tuple[str, list[tuple[str, str]]]]:
             continue
         if _is_edit_end(stripped):
             if current_path:
-                block = (current_path, _parse_edit_pairs(current, target=current_path))
+                try:
+                    pairs = _parse_edit_pairs(current, target=current_path)
+                except ValueError as exc:
+                    pairs = [(EDIT_PARSE_ERROR, str(exc))]
+                block = (current_path, pairs)
                 if block not in blocks:
                     blocks.append(block)
             current_path = None
@@ -860,6 +963,11 @@ def apply_edit_pairs(content: str, pairs: list[tuple[str, str]]) -> tuple[str, l
     total = len(pairs)
     original_lines = content.split("\n")
     for index, (search, replace) in enumerate(pairs, start=1):
+        if search == EDIT_PARSE_ERROR:
+            # Carried parse failure from extract_edit_blocks: surface the stored
+            # message as ordinary repairable feedback instead of mis-applying.
+            errors.append(replace)
+            break
         if not search.strip():
             errors.append(f"edit {index}/{total}: SEARCH block is empty")
             break
@@ -886,7 +994,10 @@ def apply_edit_pairs(content: str, pairs: list[tuple[str, str]]) -> tuple[str, l
             )
             break
         start = hits[0]
-        content_lines[start:start + len(search_lines)] = replace.split("\n")
+        # An empty replacement deletes the matched lines; splitting "" would
+        # yield [""] and leave a stray blank line behind.
+        replacement = replace.split("\n") if replace else []
+        content_lines[start:start + len(search_lines)] = replacement
         content = "\n".join(content_lines)
     return content, errors
 
@@ -978,6 +1089,39 @@ def tail(text: str, *, max_chars: int = 6000) -> str:
     return text[-max_chars:]
 
 
+# The applied change is echoed back with every successful delivery so the model
+# sees what its edit actually did instead of re-reading the whole file (run
+# 2026-09-28: "Edit result: {'returncode': 0 ...}" forced a full re-read before
+# the next repair could trust its own earlier change).
+EDIT_DIFF_MAX_CHARS = 4000
+
+
+def render_change_diff(before: str, after: str, rel_path: str) -> str:
+    """Compact unified diff of one before -> after file change ("" when equal)."""
+    if before == after:
+        return ""
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{rel_path}",
+            tofile=f"b/{rel_path}",
+            n=2,
+        )
+    )
+
+
+def cap_change_diffs(diff_text: str, max_chars: int = EDIT_DIFF_MAX_CHARS) -> str:
+    """Cap the echoed diff, cutting at a line boundary and saying so."""
+    if len(diff_text) <= max_chars:
+        return diff_text
+    cut = diff_text[:max_chars]
+    newline = cut.rfind("\n")
+    if newline > max_chars // 2:
+        cut = cut[: newline + 1]
+    return cut + f"...[diff truncated at {max_chars} chars]"
+
+
 def parse_command_output(text: str) -> dict[str, object]:
     text = filter_output(text)
     parsed: dict[str, object] = {}
@@ -1024,13 +1168,27 @@ def parse_command_output(text: str) -> dict[str, object]:
 
 
 def validate_text_patch(text: str) -> list[str]:
-    """Accept only unambiguous regular-file unified diffs (no Git side effects)."""
+    """Accept only unambiguous regular-file unified diffs (no Git side effects).
+
+    Each hunk header's declared line counts are checked against the hunk body
+    (context+deleted = old count, context+added = new count) in the one
+    direction git itself rejects: a body SHORTER than the header declares dies
+    later inside ``git apply`` with "corrupt patch at line N" and wastes a whole
+    turn, so it is rejected here with a precise message. A body longer than the
+    header declares is accepted, matching git (verified empirically: ``git
+    apply --check`` returns 0 for such a patch).
+    """
     targets: list[str] = []
     git_pair = None
     old = None
     new = None
     has_hunk = False
     in_hunk = False
+    hunk_index = 0
+    declared_old = None
+    declared_new = None
+    seen_old = 0
+    seen_new = 0
 
     def path(value: str, prefix: str) -> str:
         if value == "/dev/null":
@@ -1042,7 +1200,27 @@ def validate_text_patch(text: str) -> list[str]:
             raise ValueError("unsafe patch path")
         return value
 
+    def close_hunk() -> None:
+        nonlocal declared_old, declared_new
+        if declared_old is None:
+            return
+        target = new if old == "/dev/null" else old
+        if seen_old < declared_old:
+            raise ValueError(
+                f"{target}: hunk {hunk_index}: header says {declared_old} old lines "
+                f"but the body has {seen_old} (context+deleted)"
+            )
+        if seen_new < declared_new:
+            raise ValueError(
+                f"{target}: hunk {hunk_index}: header says {declared_new} new lines "
+                f"but the body has {seen_new} (context+added)"
+            )
+        declared_old = declared_new = None
+
     def finish() -> None:
+        nonlocal hunk_index
+        close_hunk()
+        hunk_index = 0
         if old is None and new is None and git_pair is None:
             return
         if old is None or new is None or not has_hunk:
@@ -1078,11 +1256,28 @@ def validate_text_patch(text: str) -> list[str]:
                 raise ValueError("unpaired or duplicate patch header")
             new = path(line[4:], "b/")
         elif line.startswith("@@ "):
-            if old is None or new is None or not re.match(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", line):
+            match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if old is None or new is None or not match:
                 raise ValueError("invalid text hunk header")
+            close_hunk()
+            hunk_index += 1
+            declared_old = int(match.group(2)) if match.group(2) is not None else 1
+            declared_new = int(match.group(4)) if match.group(4) is not None else 1
+            seen_old = 0
+            seen_new = 0
             has_hunk = in_hunk = True
-        elif in_hunk and (line.startswith((" ", "+", "-")) or line == "\\ No newline at end of file"):
-            continue
+        elif in_hunk and (line.startswith((" ", "+", "-")) or line == "\\ No newline at end of file"
+                          or line == ""):
+            if line.startswith("-"):
+                seen_old += 1
+            elif line.startswith("+"):
+                seen_new += 1
+            else:
+                # Context line, "\ No newline ..." marker (no counts) and a bare
+                # blank line, which git reads as a context line.
+                if line != "\\ No newline at end of file":
+                    seen_old += 1
+                    seen_new += 1
         elif re.fullmatch(r"index [0-9a-fA-F]+\.\.[0-9a-fA-F]+(?: 100644)?", line) and git_pair and old is None:
             continue
         elif line:

@@ -146,6 +146,7 @@ stages:
     read:
       - "agents/generated/runs/**/02_workload/**"
       - "agents/generated/runs/**/06_hotspot/**"
+      - "agents/generated/runs/**/07_analysis/ir/**"
       # The profile build's disassembly, so the analysis can read the real
       # instructions of the hot loop instead of inferring them from C.
       - "agents/generated/runs/**/workspace/**/*.asm"

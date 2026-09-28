@@ -15,6 +15,7 @@ STAGE_LABELS: dict[str, str] = {
     "prepare_embench_benchmark_node": "prepare embench",
     "profile_embench": "profile embench",
     "extract_hotspot": "extract hotspot",
+    "collect_ir_evidence": "collect LLVM IR evidence",
     "analyze_workload": "analyze workload",
     "design_contract": "design CFU ISA",
     "extend_isa": "extend CFU ISA",
@@ -50,6 +51,7 @@ NODE_TO_STEP: dict[str, str] = {
     "prepare_embench_benchmark_node": "prepare_benchmark",
     "profile_embench": "profile",
     "extract_hotspot": "hotspot",
+    "collect_ir_evidence": "ir",
     "analyze_workload": "analysis",
     "design_contract": "isa",
     "extend_isa": "isa",
@@ -92,15 +94,22 @@ class StageProgress:
     def end(self, name: str, *, ok: bool, elapsed: float, tokens: int) -> None:
         idx = self._index_of(name)
         status = "OK" if ok else "FAIL"
+        # Input/output split straight from the usage ledger: the point of the
+        # line is to show which step's input is big at a glance.
+        from .llm import stage_usage
+
+        usage = stage_usage(name)
         print(
             f"[{idx + 1:>2}/{self.count:>2}] {stage_label(name)} ... "
-            f"{status} ({tokens} tok, {elapsed:.1f}s)",
+            f"{status} (in={usage['input']} out={usage['output']} tok, {elapsed:.1f}s)",
             flush=True,
         )
         self.results[name] = {
             "ok": ok,
             "elapsed": elapsed,
             "tokens": tokens,
+            "input_tokens": int(usage.get("input", 0)),
+            "output_tokens": int(usage.get("output", 0)),
         }
 
     @staticmethod
@@ -120,7 +129,13 @@ class StageProgress:
             "stages_failed": len(stages) - ok,
             "stage_tokens": tokens,
             "stages": {
-                s: {"ok": v["ok"], "tokens": v["tokens"], "elapsed": v["elapsed"]}
+                s: {
+                    "ok": v["ok"],
+                    "tokens": v["tokens"],
+                    "input_tokens": v.get("input_tokens", 0),
+                    "output_tokens": v.get("output_tokens", 0),
+                    "elapsed": v["elapsed"],
+                }
                 for s, v in self.results.items()
             },
         }

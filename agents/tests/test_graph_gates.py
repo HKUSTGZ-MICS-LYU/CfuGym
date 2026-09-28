@@ -440,6 +440,14 @@ class ReviewDecisionTest(unittest.TestCase):
         state = _base_state("review-complete", gates=self._gates())
         self.assertEqual(graph._review_decision(state), ("final_report", "complete"))
 
+    def test_ir_require_failure_is_separate_from_validation(self) -> None:
+        gates = self._gates(ir={"ok": False, "status": "unavailable", "required": True})
+        state = _base_state("review-ir-required", gates=gates, ir_features="require")
+        self.assertEqual(graph._review_decision(state), ("final_report", "failed"))
+        self.assertFalse(graph._is_complete(state))
+        optional = _base_state("review-ir-optional", gates=gates, ir_features="auto")
+        self.assertEqual(graph._review_decision(optional), ("final_report", "complete"))
+
     def test_skipped_rung_reports_planned(self) -> None:
         gates = self._gates(cost={"ok": False, "skipped": True, "reason": "execution-disabled"})
         state = _base_state("review-skip", gates=gates)
@@ -592,6 +600,35 @@ class AnalysisToolLoopTest(unittest.TestCase):
         self.run_dir = REPO_ROOT / f"agents/generated/runs/{self.run_id}"
         shutil.rmtree(self.run_dir, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.run_dir, True)
+
+    def test_analysis_offers_observation_tool_for_applied_profile_id(self) -> None:
+        ident = "obs_loop_517c0167_md5_3"
+        state = _base_state(
+            "gate-analysis-lookup-00000000",
+            benchmark_name="md5sum",
+            benchmark_project={"kind": "embench_benchmark", "benchmark": "md5sum"},
+            observation_report={"applied": [ident], "points": [{
+                "id": ident, "file": "md5.c", "function": "md5", "kind": "loop",
+                "line": 119, "ordinal": 3,
+            }]},
+            embench_profiles={"profile": {ident: {"cycles": 1200, "calls": 12}}},
+        )
+        class LookupLlm(_ToolUsingLlm):
+            def complete_with_tools(self, system, user, *, tools, tool_runner, **kwargs):
+                names = [item["function"]["name"] for item in tools]
+                self_tools = "inspect_observation" in names
+                assert self_tools, names
+                assert ident in user and "inspect_observation" in user
+                answer = tool_runner("inspect_observation", {"id": ident, "view": "summary"})
+                assert f"Observation {ident}" in answer, answer
+                return LlmResult(self.final_text, used_llm=True, tool_calls=({
+                    "round": 1, "name": "inspect_observation", "arguments": {"id": ident},
+                    "result": answer, "ok": True,
+                },), tool_rounds=1)
+        llm = LookupLlm(self.ANALYSIS_YAML, "unused")
+        with mock.patch.object(graph, "_llm", lambda state: llm):
+            result = graph.analyze_workload(state)
+        self.assertEqual(result["tool_calls"][0]["tool"], "inspect_observation")
 
     def test_analysis_records_tool_calls_and_parses_the_answer(self) -> None:
         state = _base_state(
@@ -884,6 +921,37 @@ class RepairRoutingTest(unittest.TestCase):
         self.assertEqual(target, "implement_sw")
         self.assertEqual(decision["source"], "fixed")
         self.assertEqual(raw, "")
+
+    def test_prefixed_profile_passes_sim_gate_with_measured_speedup(self) -> None:
+        from agents.cfu_design_agent.runtime.tools import parse_command_output
+
+        log = (
+            "[info] CFU_AGENT_PROFILE depthconv=900\n"
+            "[info] EMBENCH_VERIFY_PASS benchmark=depthconv verify=1 result=0\n"
+        )
+        state = self._state(
+            run_commands=True,
+            dry_run=False,
+            max_iters=1,
+            benchmark_project={"benchmark": "depthconv", "kind": "embench_benchmark", "verification": "bench_verify"},
+            embench_profiles={"reference": {"depthconv": {"cycles": 1000}}},
+            changed_design_files=["src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"],
+            gates={},
+        )
+        passed = {
+            "command": "fake-sim", "returncode": 0,
+            "parsed": parse_command_output(log), "stdout_tail": log, "stderr_tail": "",
+        }
+        with mock.patch.object(graph, "_toolbox_for_stage", lambda s, stage: object()), \
+                mock.patch.object(graph, "_software_sim_commands", lambda s, tb: [["fake-sim"]]), \
+                mock.patch.object(graph, "_run_check", lambda *a, **k: passed):
+            update = graph.simulate(state)
+        gate = update["gates"]["sim"]
+        self.assertTrue(gate["ok"])
+        self.assertEqual(gate["reference_cycles"], 1000)
+        self.assertEqual(gate["cfu_cycles"], 900)
+        self.assertEqual(gate["speedup_x100"], 111)
+        self.assertEqual(gate["next"], "estimate_cost")
 
     def test_simulate_records_and_follows_the_agent_decision(self) -> None:
         from agents.cfu_design_agent.runtime.tools import parse_command_output
@@ -1519,6 +1587,108 @@ class LoopOptimizationTest(unittest.TestCase):
 
     def test_the_report_has_no_section_without_rounds(self) -> None:
         self.assertNotIn("## Optimization Rounds", graph.render_report(self._state()))
+
+
+class RepairBudgetSplitTest(unittest.TestCase):
+    """Answer-only repairs draw from their own pool (2026-09-28 audit fix).
+
+    A malformed conformance oracle or ISA contract must never exhaust the
+    design-repair budget the run needs for real hardware/software fixes.
+    """
+
+    def _transition(self, state, rung, target):
+        return graph._ladder_transition(
+            state, rung, ok=False, default="implement_sw", repair_target=target
+        )
+
+    def test_answer_repair_spends_only_the_answer_pool(self) -> None:
+        state = _base_state("budget-split-00000000", max_iters=2, repairs_used=1)
+        update, target = self._transition(state, "hw_conformance", "check_conformance")
+        self.assertEqual(target, "check_conformance")
+        self.assertEqual(update.get("answer_repairs_used"), 1)
+        self.assertNotIn("repairs_used", update)
+
+    def test_answer_repair_works_with_an_exhausted_design_pool(self) -> None:
+        state = _base_state("budget-split-00000001", max_iters=1, repairs_used=0)
+        update, target = self._transition(state, "hw_conformance", "check_conformance")
+        self.assertEqual(target, "check_conformance")
+
+    def test_answer_pool_exhaustion_stops_with_a_named_budget(self) -> None:
+        state = _base_state(
+            "budget-split-00000002", max_iters=5, repairs_used=0,
+            max_answer_repairs=1, answer_repairs_used=1,
+        )
+        update, target = self._transition(state, "hw_conformance", "check_conformance")
+        self.assertEqual(target, "review_and_route")
+        self.assertEqual(update.get("stopped_at"), "hw_conformance")
+        self.assertIn("answer-repair budget", update["errors"][0])
+
+    def test_design_repair_still_spends_only_the_design_pool(self) -> None:
+        # max_iters=3 gives the design pool 2 rounds; one is already spent.
+        state = _base_state("budget-split-00000003", max_iters=3, repairs_used=1)
+        update, target = self._transition(state, "sim", "implement_hw")
+        self.assertEqual(target, "implement_hw")
+        self.assertEqual(update.get("repairs_used"), 2)
+        self.assertNotIn("answer_repairs_used", update)
+
+
+class RepairDiagnosisEnforcementTest(unittest.TestCase):
+    """A repair answer without REPAIR_DIAGNOSIS is rejected, not just logged."""
+
+    TEXT = (
+        "EDIT_BEGIN a.scala\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\nEDIT_END"
+    )
+
+    def test_repair_without_diagnosis_is_rejected(self) -> None:
+        outcome = graph._apply_agent_output(
+            {}, self.TEXT, toolbox=object(), require_diagnosis=True
+        )
+        self.assertFalse(outcome["applied"])
+        self.assertFalse(outcome["gate_ok"])
+        self.assertIn("REPAIR_DIAGNOSIS", outcome["errors"][0])
+
+    def test_repair_with_diagnosis_passes_the_contract(self) -> None:
+        text = "REPAIR_DIAGNOSIS\nObserved errors: x\n" + self.TEXT
+        outcome = graph._apply_agent_output(
+            {"dry_run": True}, text, toolbox=object(), require_diagnosis=True
+        )
+        self.assertTrue(outcome["gate_ok"])
+        self.assertTrue(outcome["proposed"])
+
+    def test_first_attempt_needs_no_diagnosis(self) -> None:
+        outcome = graph._apply_agent_output(
+            {"dry_run": True}, self.TEXT, toolbox=object(), require_diagnosis=False
+        )
+        self.assertTrue(outcome["gate_ok"])
+
+
+class AttemptMemoryTest(unittest.TestCase):
+    """Repair prompts must see what was already tried; repeats must be caught."""
+
+    A = {"response_hash": "aaa", "error_hash": "e1", "applied": False, "error_text": "SEARCH not found"}
+    B = {"response_hash": "bbb", "error_hash": "e2", "applied": False, "error_text": "no deliverable"}
+
+    def test_a_b_a_oscillation_is_detected(self) -> None:
+        directive = graph._repeated_attempt_directive([self.A, self.B, dict(self.A)])
+        self.assertIn("REPEATED IDENTICAL ATTEMPT", directive)
+
+    def test_distinct_attempts_produce_no_directive(self) -> None:
+        self.assertEqual(graph._repeated_attempt_directive([self.A, self.B]), "")
+
+    def test_ledger_lists_every_try_with_its_rejection(self) -> None:
+        ledger = graph.attempt_ledger_block([self.A, self.B])
+        self.assertIn("aaa", ledger)
+        self.assertIn("SEARCH not found", ledger)
+        self.assertIn("rejected", ledger)
+        self.assertEqual(graph.attempt_ledger_block([]), "")
+
+    def test_prior_attempts_alone_never_make_a_repair_prompt(self) -> None:
+        # Regression: the attempt ledger must be repair-context only. Appending
+        # it to a clean feedback string turned every re-run (e.g. an --loop
+        # optimization round) into "REPAIR MODE" demanding a REPAIR_DIAGNOSIS.
+        state = {"hw_attempts": [{"response_hash": "aaa", "error_hash": "e", "applied": True}]}
+        self.assertEqual(graph.hardware_repair_feedback(state), "")
+        self.assertEqual(graph._repeated_attempt_directive(state["hw_attempts"]), "")
 
 
 class _FakeTty(io.StringIO):

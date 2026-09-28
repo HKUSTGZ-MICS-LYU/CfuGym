@@ -378,6 +378,144 @@ class EditBlockTest(unittest.TestCase):
         finally:
             shutil.rmtree(run_dir, ignore_errors=True)
 
+    def test_edit_result_carries_the_applied_diff(self) -> None:
+        # The model must see what its edit did without re-reading the file.
+        run_root = "agents/generated/runs/tools-edit-diff-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(target, "int main(void) {\n  return 1;\n}\n")
+            result = toolbox.apply_edit_blocks([(target, [("  return 1;", "  return 0;")])])
+            self.assertEqual(result["returncode"], 0, result)
+            diff = result["stdout_tail"]
+            self.assertIn(f"--- a/{target}", diff)
+            self.assertIn(f"+++ b/{target}", diff)
+            self.assertIn("-  return 1;", diff)
+            self.assertIn("+  return 0;", diff)
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_edit_diff_is_capped_with_a_truncation_marker(self) -> None:
+        run_root = "agents/generated/runs/tools-edit-diffcap-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            original = "".join(f"line {i}\n" for i in range(300))
+            toolbox.write_text(target, original)
+            replaced = "".join(f"LINE {i}\n" for i in range(300))
+            result = toolbox.apply_edit_blocks([(target, [(original.rstrip("\n"), replaced.rstrip("\n"))])])
+            self.assertEqual(result["returncode"], 0, result)
+            self.assertIn("[diff truncated at 4000 chars]", result["stdout_tail"])
+            self.assertLessEqual(len(result["stdout_tail"]), 4000 + 200)
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_noop_edit_is_success_with_note(self) -> None:
+        # A replayed/echo delivery (SEARCH == REPLACE, or an already-applied
+        # edit) must not churn the repair loop with "edits produced no change".
+        run_root = "agents/generated/runs/tools-edit-noop-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(target, "int main(void) {\n  return 1;\n}\n")
+            result = toolbox.apply_edit_blocks([(target, [("  return 1;", "  return 1;")])])
+            self.assertEqual(result["returncode"], 0, result)
+            self.assertIn("edit was already applied (no content change)", result["stdout_tail"])
+            self.assertEqual(result["parsed"]["touched_paths"], [])
+            self.assertIn("return 1;", toolbox.read_text(target))
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_noop_pair_beside_a_real_change_still_applies(self) -> None:
+        run_root = "agents/generated/runs/tools-edit-noopmix-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(target, "int main(void) {\n  return 1;\n}\n")
+            edits = [(target, [("  return 1;", "  return 0;"), ("}", "}")])]
+            result = toolbox.apply_edit_blocks(edits)
+            self.assertEqual(result["returncode"], 0, result)
+            self.assertEqual(result["parsed"]["touched_paths"], [target])
+            self.assertIn("return 0;", toolbox.read_text(target))
+            self.assertIn("+  return 0;", result["stdout_tail"])
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_unmatched_search_stays_an_error(self) -> None:
+        # The success-with-note path must not swallow genuine mismatches.
+        run_root = "agents/generated/runs/tools-edit-mismatch-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(target, "int main(void) {\n  return 1;\n}\n")
+            result = toolbox.apply_edit_blocks([(target, [("  return 9;", "  return 0;")])])
+            self.assertEqual(result["returncode"], 1)
+            self.assertIn("SEARCH block not found", result["stderr_tail"])
+            self.assertEqual(result["parsed"]["touched_paths"], [])
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def test_replace_with_empty_deletes_without_a_blank_line(self) -> None:
+        from agents.cfu_design_agent.runtime.tools import apply_edit_pairs
+
+        updated, errors = apply_edit_pairs("a\nb\nc\n", [("b", "")])
+        self.assertEqual(errors, [])
+        self.assertEqual(updated, "a\nc\n")
+
+    def test_conflict_marker_content_rejects_the_whole_response(self) -> None:
+        # A git-conflict region inside SEARCH used to silently mis-parse (the
+        # `=======` line flipped the parser into replace mode).
+        run_root = "agents/generated/runs/tools-edit-conflict-00000000"
+        run_dir = REPO_ROOT / run_root
+        shutil.rmtree(run_dir, ignore_errors=True)
+        try:
+            toolbox = RepoToolbox(
+                REPO_ROOT, dry_run=False, stage="implementation", run_root=run_root
+            )
+            target = f"{run_root}/workspace/cfu_benchmark/main.c"
+            toolbox.write_text(target, "int main(void) {\n  return 1;\n}\n")
+            text = (
+                f"EDIT_BEGIN {target}\n"
+                "<<<<<<< SEARCH\n"
+                "<<<<<<< HEAD\n"
+                "  return 1;\n"
+                "=======\n"
+                "  return 2;\n"
+                ">>>>>>> branch\n"
+                "=======\n"
+                "  return 0;\n"
+                ">>>>>>> REPLACE\n"
+                "EDIT_END\n"
+            )
+            from agents.cfu_design_agent.runtime.tools import extract_edit_blocks
+
+            result = toolbox.apply_edit_blocks(extract_edit_blocks(text))
+            self.assertEqual(result["returncode"], 1, result)
+            self.assertIn("conflict-marker-like line", result["stderr_tail"])
+            self.assertIn("return 1;", toolbox.read_text(target))
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,7 @@ from typing import Any
 CACHE_SUBDIR = "agents/generated/cache/embench_profile"
 SCHEMA_VERSION = "1"
 # Bump when the key composition changes so old entries cannot be reused.
-KEY_VERSION = "4"
+KEY_VERSION = "5"  # [info]-prefixed simulator profile lines now produce measurements
 # Placeholder substituted for the run root before hashing, so the same
 # benchmark measured in two different runs shares one cache entry.
 RUN_PLACEHOLDER = "<run>"

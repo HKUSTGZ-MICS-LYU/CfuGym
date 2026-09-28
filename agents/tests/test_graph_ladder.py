@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from agents.cfu_design_agent import graph
+from agents.cfu_design_agent.conformance import ROLE_NAMES
 from agents.cfu_design_agent.runtime.tools import RepoToolbox, parse_command_output
 from agents.tests.common import REPO_ROOT
 
@@ -96,24 +97,45 @@ def _scripted_oracle(user: str) -> str:
     """Oracle covering whatever commands the conformance prompt listed.
 
     The prompt prints one table row per command, so the fake oracle follows the ISA
-    through extension rounds instead of hard-coding command names.
+    through extension rounds instead of hard-coding command names. The expressions
+    are real, identifier-bearing ones (an rd command compares its operands, a
+    no-result command verifies a relationship over them) because the conformance
+    validator rejects lazy oracles: ``reference: "0"``, ``verify: "1"`` and
+    self-referential calls all fail validation. A command with no CPU-value
+    arguments cannot reference ``a``/``b``, so it observes helper/setup state via
+    the shared ``conf_probe`` helper instead (defined exactly once, as the
+    validator requires).
     """
     lines = ["commands:"]
     section = user.split("Commands and what each one needs:", 1)[-1].split("\n\n", 1)[0]
+    first = True
     for name, rest in re.findall(r"^- ([^\s:]+): (.*)$", section, re.MULTILINE):
         arguments = re.search(r"arguments: (.*)$", rest)
-        count = (
-            0
+        roles = (
+            []
             if not arguments or arguments.group(1).strip() == "no arguments"
-            else len(arguments.group(1).split(","))
+            else [arg.split("->")[0].strip() for arg in arguments.group(1).split(",")]
         )
+        # Map role names through ROLE_NAMES, not the prompt's positional suffix.
+        operands = [ROLE_NAMES[role] for role in roles if role in ROLE_NAMES]
         lines.append(f"  - name: {name}")
+        if first:
+            lines.append("    helpers: |")
+            lines.append(
+                "      static uint32_t conf_probe(uint32_t a, uint32_t b) { return (a ^ b) + 1u; }"
+            )
+            first = False
+        lines.append("    setup: |")
         if "setup required" in rest:
-            lines.append("    setup: |")
             lines.append("      /* the scripted micro-test does not seed vector slots */")
-        lines.append('    verify: "1"' if "no CPU result" in rest else '    reference: "0"')
+        lines.append("      uint32_t conf_state = 3u;")
+        observed = " + ".join(operands) if operands else "conf_probe(conf_state, 7u)"
+        if "no CPU result" in rest:
+            lines.append(f'    verify: "({observed}) != 0"')
+        else:
+            lines.append(f'    reference: "{observed}"')
         lines.append("    cases:")
-        lines.append(f"      - args: [{', '.join(['0'] * count)}]")
+        lines.append(f"      - args: [{', '.join(['0'] * len(roles))}]")
     return "\n".join(lines) + "\n"
 
 

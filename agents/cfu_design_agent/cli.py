@@ -65,7 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="Total repair budget for the validation ladder: N-1 repair rounds. "
-        "1 disables repair, so the first failing rung stops the run.",
+        "1 disables repair, so the first failing rung stops the run. This is the "
+        "design-repair pool; answer-only repairs have their own smaller budget.",
+    )
+    parser.add_argument(
+        "--max-answer-repairs",
+        type=int,
+        default=2,
+        help="Separate repair budget for answer-only defects (a malformed conformance "
+        "oracle or ISA contract), so they cannot exhaust --max-iters (default: 2).",
     )
     parser.add_argument("--dry-run", action="store_true", help="Force read-only: never mutate source or run external commands.")
     parser.add_argument("--apply-patch", action="store_true", help="Allow an LLM patch to be applied to CFU/software allowlisted paths.")
@@ -104,6 +112,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("CFU_AGENT_PROFILE_CACHE", "on"),
         help="Reuse the cross-run reference/profile measurement when its inputs "
         "match: on (default), off, or refresh to recompute and overwrite.",
+    )
+    parser.add_argument(
+        "--ir-features",
+        choices=("off", "auto", "require", "approx"),
+        default="off",
+        help="Optional P0 LLVM IR export from uninstrumented Embench reference sources: "
+        "off (default), auto (strict best-effort), require (strict mandatory), or "
+        "approx (explicit rv32imc target fallback; NOT equivalent to GCC ISA). "
+        "IR never replaces measured cycles or selects loops.",
     )
     parser.add_argument(
         "--repair-routing",
@@ -194,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         "max_tool_rounds": args.max_tool_rounds,
         "max_tool_calls": args.max_tool_calls,
         "profile_cache": args.profile_cache,
+        "ir_features": args.ir_features,
         "loop_optimize": args.loop_optimize,
         "loop_policy": args.loop_policy,
         "loop_patience": max(1, args.loop_patience),
@@ -207,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         "skip_sim": args.skip_sim,
         "skip_yosys": args.skip_yosys,
         "max_iters": args.max_iters,
+        "max_answer_repairs": args.max_answer_repairs,
         "iteration": 0,
         "thread_id": args.thread_id,
         "run_id": args.run_id,
@@ -267,6 +286,33 @@ def _cost_summary(final_state: CfuDesignState) -> dict:
     return {}
 
 
+def _print_token_usage(final_state: CfuDesignState) -> None:
+    """Per-stage LLM tokens in the run summary, largest input first.
+
+    The breakdown answers "which stage's input is big" directly in the CLI
+    output: every request is attributed to the node that made it, so a stage
+    with an oversized prompt (context digest, re-read design surface) shows up
+    here without opening run.yaml.
+    """
+    by_stage = final_state.get("token_usage_by_stage") or {}
+    if not by_stage:
+        return
+    print("  llm_tokens:")
+    for name, bucket in sorted(
+        by_stage.items(), key=lambda item: (-int(item[1].get("input", 0)), item[0])
+    ):
+        print(
+            f"    {name:<24} in={int(bucket.get('input', 0)):>8} "
+            f"out={int(bucket.get('output', 0)):>7} calls={int(bucket.get('calls', 0))}"
+        )
+    total = final_state.get("token_usage") or {}
+    if total:
+        print(
+            f"    {'TOTAL':<24} in={int(total.get('input', 0)):>8} "
+            f"out={int(total.get('output', 0)):>7} calls={int(total.get('calls', 0))}"
+        )
+
+
 def _print_run_summary(final_state: CfuDesignState) -> None:
     """Headline results: reference/CFU cycles, speedup, and Yosys cost."""
     sim = _sim_gate(final_state)
@@ -299,6 +345,7 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
         key = str(cache.get("key", ""))[:12]
         suffix = f" (key {key})" if key else ""
         print(f"  profile_cache = {cache['status']}{suffix}")
+    _print_token_usage(final_state)
     rounds = final_state.get("optimization_rounds") or []
     if len(rounds) > 1 or final_state.get("loop_optimize"):
         graph = _graph_module()

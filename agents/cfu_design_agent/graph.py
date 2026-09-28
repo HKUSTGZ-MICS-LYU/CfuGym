@@ -26,6 +26,8 @@ from .flow.wiring import (
     SUCCESSORS as FLOW_SUCCESSORS, ROUTER_NAMES,
 )
 from .flow.state_updates import append_state_keys, merge_update
+from .ir import export_embench_ir
+from .ir.observation import build_observation_index
 from .runtime.agent_tools import ReadOnlyToolset
 from .runtime.artifacts import RunArtifacts
 from .benchmark.generic import (
@@ -44,8 +46,10 @@ from .benchmark.embench import (
     elf_path as embench_elf_path,
     hotspot_from_profile,
     parse_profile as parse_embench_profile,
+    parse_verify_result,
     prepare_embench_benchmark,
     workspace_rel as embench_workspace,
+    workspace_tampering as embench_workspace_tampering,
 )
 from .conformance import (
     parse_conformance,
@@ -74,6 +78,7 @@ from .runtime.llm import (
     reset_usage_log,
     set_stage,
     set_stream_callback,
+    usage_by_stage,
     usage_totals,
 )
 from .runtime.llm_config import effective_config, LlmConfigError
@@ -126,6 +131,19 @@ else:
 # programmatic callers leave it disabled to avoid noisy stdout.
 _PROGRESS: StageProgress | None = None
 
+# Rendered-prompt size above which the recorded metadata flags the call as
+# oversized (chars, ~4 chars/token). There is no hard budget yet; the flag is
+# what makes prompt growth visible in run.yaml.
+_PROMPT_WARN_CHARS = 120_000
+
+# Answer-only repairs (a malformed conformance oracle or ISA contract) get
+# their own small budget pool so they cannot exhaust the design-repair budget
+# the run needs for actual hardware/software fixes (observed 2026-09-28: an
+# oracle build failure consumed repair 4/4 and the real sim failure went
+# unrepairable). ``--max-answer-repairs`` overrides the default.
+DEFAULT_MAX_ANSWER_REPAIRS = 2
+ANSWER_REPAIR_TARGETS = {"check_conformance", "design_contract", "extend_isa"}
+
 
 def enable_progress(stages: list[str] | None = None) -> None:
     global _PROGRESS
@@ -157,6 +175,7 @@ _NODE_TO_GATE: dict[str, str] = {
     "instrument_and_profile": "profile",
     "profile_embench": "profile",
     "extract_hotspot": "hotspot",
+    "collect_ir_evidence": "ir",
     "analyze_workload": "analysis",
     "design_contract": "isa",
     "extend_isa": "isa",
@@ -274,6 +293,9 @@ def _merge_state_update(state: CfuDesignState, update: Any) -> None:
 def _finalize(state: CfuDesignState) -> CfuDesignState:
     """Attach run-wide token usage and (when enabled) the progress summary."""
     state["token_usage"] = usage_totals()
+    # Per-stage breakdown (input/output/calls): this is what the CLI and the
+    # report use to show WHICH stage consumed the input tokens.
+    state["token_usage_by_stage"] = usage_by_stage()
     if _PROGRESS is not None:
         state["progress_summary"] = _PROGRESS.summary()
     return state
@@ -317,6 +339,7 @@ STAGE_ORDER = (
     "prepare_benchmark",
     "profile",
     "hotspot",
+    "ir",
     "analysis",
     "isa",
     "implementation_hw",
@@ -484,8 +507,16 @@ def _record_llm_output(
     result: LlmResult,
     *,
     client=None,
+    system: str = "",
+    user: str = "",
 ) -> str:
-    """Persist the exact returned text without exposing the prompt/context."""
+    """Persist the exact returned text and the prompt that produced it.
+
+    Both halves of the exchange are kept in the run's own audit trail so a run
+    can be replayed after the prompt code changes: the answer as
+    ``llm_raw/NNN.txt`` and the rendered system/user prompt as
+    ``llm_raw/NNN.prompt.txt`` with a ``prompt_sha256`` in the metadata.
+    """
     stage_info = {
         "ingest_input": ("ingest_input", "02_workload"),
         "analyze_workload": ("analysis", "07_analysis"),
@@ -534,6 +565,15 @@ def _record_llm_output(
         "fallback_reason": str(getattr(result, "fallback_reason", "") or ""),
         "tool_rounds": int(getattr(result, "tool_rounds", 0) or 0),
     }
+    prompt_text = ""
+    if system or user:
+        prompt_text = f"### SYSTEM\n{system}\n\n### USER\n{user}\n"
+        metadata["prompt_sha256"] = _attempt_digest(prompt_text)
+        metadata["prompt_chars"] = len(prompt_text)
+        if len(prompt_text) > _PROMPT_WARN_CHARS:
+            # No hard budget exists yet; surface oversized prompts instead of
+            # letting them grow silently until the provider rejects the call.
+            metadata["prompt_oversize"] = True
     info_client = client
     if info_client is None:
         try:
@@ -550,6 +590,16 @@ def _record_llm_output(
         kind="llm_raw_output",
         metadata=metadata,
     )
+    if prompt_text:
+        # Run-local audit copy: what the model actually saw, so a replay does
+        # not depend on the current prompt code being unchanged.
+        artifacts.write_text(
+            artifact_stage,
+            f"{prefix}{index:03d}.prompt.txt",
+            prompt_text,
+            kind="llm_prompt",
+            metadata={**metadata, "kind": "prompt"},
+        )
     if reasoning:
         # Thinking is kept for audit but never parsed as the answer.
         artifacts.write_text(
@@ -567,7 +617,8 @@ def _record_llm_output(
         elif metadata["degraded_reason"]:
             note = " (tools degraded)"
         print(
-            f"    [llm] {label} -> {metadata['output_tokens']} output tok"
+            f"    [llm] {label} -> in={metadata['input_tokens']} "
+            f"out={metadata['output_tokens']} tok"
             f" ({metadata['api_mode_used']}, {metadata['finish_reason'] or 'n/a'}){note}",
             flush=True,
         )
@@ -612,7 +663,9 @@ def _complete_llm(
             fallback_reason=f"llm call failed: {type(exc).__name__}: {exc}",
             transport_error=f"{type(exc).__name__}: {exc}",
         )
-    return result, _record_llm_output(state, stage, label, result, client=client)
+    return result, _record_llm_output(
+        state, stage, label, result, client=client, system=system, user=user
+    )
 
 
 def load_context(state: CfuDesignState) -> CfuDesignState:
@@ -722,8 +775,21 @@ def ingest_input(state: CfuDesignState) -> CfuDesignState:
     artifacts = _artifacts(state, policy)
     llm_raw_outputs: list[str] = []
 
+    # The spec call builds its prompt internally; the sink captures it so the
+    # call leaves its prompt behind like every other LLM call in the run.
+    prompt_box = {"system": "", "user": ""}
+
+    def record_spec_prompt(system: str, user: str) -> None:
+        prompt_box["system"] = system
+        prompt_box["user"] = user
+
     def record_spec_output(_label: str, result: LlmResult) -> None:
-        llm_raw_outputs.append(_record_llm_output(state, "ingest_input", "spec", result))
+        llm_raw_outputs.append(
+            _record_llm_output(
+                state, "ingest_input", "spec", result,
+                system=prompt_box["system"], user=prompt_box["user"],
+            )
+        )
 
     spec, spec_text = normalize_workload_spec(
         task=state.get("task", ""),
@@ -740,6 +806,7 @@ def ingest_input(state: CfuDesignState) -> CfuDesignState:
         benchmark_name=state.get("benchmark_name", ""),
         llm=_llm(state),
         llm_result_sink=record_spec_output,
+        llm_prompt_sink=record_spec_prompt,
     )
     problems = validate_workload_spec(spec)
     artifacts.write_yaml("ingest_input", "02_workload/workload_spec.yaml", dict(spec), status="produced")
@@ -1480,9 +1547,61 @@ def extract_hotspot(state: CfuDesignState) -> CfuDesignState:
         "workload_spec": spec,
         "spec_text": spec_text,
         "hot_spot": hot,
-        "stage_jobs": "analysis",
+        "stage_jobs": "ir",
         "gates": {**state.get("gates", {}), "hotspot": {"ok": bool(hot), "source": source}},
         "iteration_history": append_history(state, f"Selected hot spot `{hot}` for CFU analysis."),
+    }
+
+
+def collect_ir_evidence(state: CfuDesignState) -> CfuDesignState:
+    """Optional P0 export; no IR-derived loop ranking or cycle estimates."""
+    mode = str(state.get("ir_features", "off") or "off")
+    project = state.get("benchmark_project", {}) or {}
+    name = str(project.get("benchmark", "") or "")
+    result: dict[str, Any] = {"schema_version": "1", "status": "off", "reason": "disabled"}
+    files: dict[str, str] = {}
+    if mode not in {"off", "auto", "require", "approx"}:
+        result = {"schema_version": "1", "status": "failed", "reason": f"invalid IR mode: {mode}"}
+    elif mode != "off" and state.get("dry_run", False):
+        result = {"schema_version": "1", "status": "unavailable", "reason": "dry-run: IR commands not executed"}
+    elif mode != "off" and not state.get("run_commands", False):
+        result = {"schema_version": "1", "status": "unavailable", "reason": "execution-disabled: IR commands not executed"}
+    elif mode != "off" and project.get("kind") != "embench_benchmark":
+        result = {"schema_version": "1", "status": "unavailable", "reason": "P0 supports Embench C sources only"}
+    elif mode != "off":
+        try:
+            result, files = export_embench_ir(
+                Path(state.get("workdir", ".")).resolve(),
+                str(state.get("run_root", "")), name, mode=mode,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            result = {"schema_version": "1", "status": "failed", "reason": f"IR export: {exc}"}
+    result = {**result, "mode": mode}
+    if mode == "off":
+        return {"stage_jobs": "analysis"}
+    # IR is analysis-only, independent of profile and cost caches. Preserve the
+    # entire auditable result even when the opt-in toolchain cannot compile.
+    try:
+        artifacts = _artifacts_for_stage(state, "analysis")
+        recorded: list[str] = []
+        for relative, text in sorted(files.items()):
+            ref = artifacts.write_text("analysis", relative, text, kind="llvm_ir")
+            recorded.append(ref["path"])
+        result["ir_files"] = recorded
+        artifacts.write_yaml("analysis", "07_analysis/ir_features.yaml", result)
+    except (OSError, ValueError, PolicyError) as exc:
+        result = {**result, "status": "failed", "reason": f"IR artifact unavailable: {exc}"}
+    # Explicit require is the only mode that blocks the analysis/ISA outcome;
+    # auto must preserve the original dynamic profiling and validation path.
+    required_failure = mode == "require" and result.get("status") != "ok"
+    return {
+        "ir_result": result,
+        "stage_jobs": "analysis",
+        "gates": {**state.get("gates", {}), "ir": {
+            "ok": not required_failure, "status": result.get("status"),
+            "reason": result.get("reason", ""), "required": mode == "require",
+        }},
+        "iteration_history": append_history(state, f"LLVM IR evidence: {result.get('status')} ({result.get('reason', '')})."),
     }
 
 
@@ -1499,6 +1618,20 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
     toolbox = _toolbox_for_stage(state, "analysis")
     client = _llm(state)
     tools_enabled = _tools_enabled(state, client)
+    observation_index = None
+    if (state.get("benchmark_project") or {}).get("kind") == "embench_benchmark":
+        try:
+            observation_index = build_observation_index(
+                run_root=str(state.get("run_root", "")),
+                benchmark=str((state.get("benchmark_project") or {}).get("benchmark", "")),
+                observation=state.get("observation_report") or {},
+                profiles=state.get("embench_profiles") or {},
+                ir_result=state.get("ir_result") or {},
+            )
+        except ValueError:
+            # Evidence lookup is advisory; malformed/unavailable profile data
+            # must not turn workload analysis into a new mandatory failure.
+            observation_index = None
     user = workload_prompt(
         task,
         state.get("workload_spec", {}),
@@ -1506,6 +1639,8 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
         profile=state.get("embench_profiles"),
         agent_tools=tools_enabled,
         tool_rounds=int(state.get("max_tool_rounds", 6) or 6),
+        ir_evidence=state.get("ir_result"),
+        observation_index=observation_index,
     )
     result, raw_output, tool_calls = _run_agent_step(
         state,
@@ -1519,8 +1654,20 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
         fallback=_yaml_str(fallback),
         client=client,
         deliverable_hint="the final YAML analysis mapping with the required Roofline fields",
+        observation_index=observation_index,
     )
     analysis = parse_yaml_mapping(result.text) or fallback
+    ir = state.get("ir_result") or {}
+    if ir.get("mode") in {"auto", "require", "approx"}:
+        # Preserve evidence provenance even if the LLM omits it; P0 does not
+        # synthesize static loop features or treat IR as measured cycles.
+        analysis["ir_evidence"] = {
+            "status": ir.get("status", "unavailable"),
+            "reason": ir.get("reason", ""),
+            "target_match": ir.get("toolchain", {}).get("target_match", False),
+            "ir_files": ir.get("ir_files", []),
+            "provenance": "07_analysis/ir_features.yaml",
+        }
     note = "Analyzed workload with LLM." if result.used_llm else "Analyzed workload with deterministic fallback."
     _write_analysis_artifact(state, analysis)
     return {
@@ -1695,6 +1842,7 @@ def _apply_agent_output(
     text: str,
     *,
     toolbox: RepoToolbox,
+    require_diagnosis: bool = False,
 ) -> dict[str, Any]:
     """Apply an LLM response's edits, FILE_BEGIN blocks, or patch.
 
@@ -1706,7 +1854,20 @@ def _apply_agent_output(
     The prompt shows, and the protocol edits, the *live run-workspace* content:
     repairs therefore compose on top of earlier attempts instead of being reset
     against the tracked original (which the prompt does not show).
+
+    ``require_diagnosis`` enforces the repair contract: a repair answer that
+    skips the REPAIR_DIAGNOSIS section is rejected before anything is applied,
+    so root-cause reasoning can never be silently skipped.
     """
+    if require_diagnosis and "REPAIR_DIAGNOSIS" not in (text or ""):
+        reason = (
+            "the repair response omitted the required REPAIR_DIAGNOSIS section (Observed "
+            "errors / Root cause / Repair mapping / Regression risks) before the delivery "
+            "block; nothing was applied. Re-send the repair with that section first."
+        )
+        return {"patch": "", "summary": (text or "") + "\n\nRejected: " + reason,
+                "errors": [reason], "applied": False, "files": [], "apply_result": None,
+                "gate_ok": False, "proposed": False}
     edit_blocks = extract_edit_blocks(text)
     file_blocks = extract_file_blocks(text)
     patch_text = extract_patch(text)
@@ -1959,6 +2120,7 @@ def _run_agent_step(
     response_format: dict[str, Any] | None = None,
     deliverable_hint: str = "",
     require_delivery: bool = False,
+    observation_index: dict[str, Any] | None = None,
 ) -> tuple[LlmResult, str, list[dict]]:
     """Run one LLM step, optionally inside the bounded read-only tool loop.
 
@@ -1981,7 +2143,7 @@ def _run_agent_step(
             client=client,
         )
         return result, raw_output, []
-    toolset = ReadOnlyToolset(toolbox)
+    toolset = ReadOnlyToolset(toolbox, observation_index=observation_index)
     try:
         result = clean_llm_text(
             client.complete_with_tools(
@@ -2025,7 +2187,9 @@ def _run_agent_step(
             ],
         )
         return clean_llm_text(result), raw_output, []
-    raw_output = _record_llm_output(state, stage, label, result, client=client)
+    raw_output = _record_llm_output(
+        state, stage, label, result, client=client, system=system, user=user
+    )
     tool_calls = list(getattr(result, "tool_calls", ()) or ())
     degraded = str(getattr(result, "degraded_reason", "") or "")
     if degraded:
@@ -2056,6 +2220,12 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         )
         if part
     )
+    if feedback:
+        # The ledger is repair-context only: appending it to a clean prompt
+        # would turn every re-run (e.g. an optimization round) into a "repair".
+        ledger = attempt_ledger_block(state.get("hw_attempts"))
+        if ledger:
+            feedback = f"{feedback}\n\n{ledger}"
     system = SYSTEM_PROMPT
     client = _llm(state)
     tools_enabled = _tools_enabled(state, client)
@@ -2093,6 +2263,9 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         state,
         result.text,
         toolbox=toolbox,
+        # The repair contract is enforced, not just prompted: a repair answer
+        # without a REPAIR_DIAGNOSIS is rejected before anything is applied.
+        require_diagnosis=bool(feedback) and bool(getattr(result, "used_llm", False)),
     )
     intent_error = tool_intent_error(result.text, str(getattr(result, "degraded_reason", "") or ""))
     if intent_error and not outcome["applied"]:
@@ -2103,6 +2276,8 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         "response_hash": _attempt_digest(result.text),
         "error_hash": _attempt_digest("\n".join(outcome["errors"])),
         "applied": bool(outcome["applied"]),
+        # Human-readable excerpt for the prior-attempt ledger in repair prompts.
+        "error_text": "; ".join(outcome["errors"])[:300],
     }
     return {
         "hardware_plan": result.text,
@@ -2159,31 +2334,55 @@ def tool_intent_error(text: str, degraded_reason: str = "") -> str:
 
 
 def _repeated_attempt_directive(attempts: Any) -> str:
-    """A blunt instruction when the last two rung attempts were identical.
+    """A blunt instruction when this exact answer already failed this run.
 
     A rejected response leaves the workspace unchanged, so an unchanged prompt
     can make the model repeat the same answer until the repair budget is gone.
-    Detecting that here forces a different delivery strategy on the next try.
+    The last response is compared against EVERY earlier attempt (not just the
+    immediately previous one), so an A-B-A oscillation is caught too. Detecting
+    it here forces a different delivery strategy on the next try.
     """
     entries = [item for item in (attempts or []) if isinstance(item, dict)]
     if len(entries) < 2:
         return ""
-    last, previous = entries[-1], entries[-2]
-    if (
-        last.get("response_hash") != previous.get("response_hash")
-        or last.get("error_hash") != previous.get("error_hash")
-    ):
+    last = entries[-1]
+    repeated = any(
+        last.get("response_hash") == earlier.get("response_hash")
+        and last.get("error_hash") == earlier.get("error_hash")
+        for earlier in entries[:-1]
+    )
+    if not repeated:
         return ""
     return (
         "=== REPEATED IDENTICAL ATTEMPT DETECTED ===\n"
-        "Your previous two responses were byte-identical and failed with the identical "
-        "rejection. Sending the same edit again wastes the remaining repair budget. Change "
+        "You already sent this exact response earlier in this run and it failed with the "
+        "identical rejection. Sending it again wastes the remaining repair budget. Change "
         "strategy now:\n"
         "- Prefer Protocol B (FILE_BEGIN) with the complete new file content, or\n"
         "- shrink every SEARCH block to a few unique code lines copied verbatim from the "
         "target content above (no long comment blocks), or\n"
         "- if a SEARCH failed on a comment, use the exact current comment text from above."
     )
+
+
+def attempt_ledger_block(attempts: Any) -> str:
+    """Compact record of earlier attempts for the repair prompt.
+
+    Without it the model sees only the newest failure and can silently repeat a
+    strategy that already failed; with it every repair prompt carries what was
+    tried and why it was rejected.
+    """
+    entries = [item for item in (attempts or []) if isinstance(item, dict)]
+    if not entries:
+        return ""
+    lines = ["=== PRIOR ATTEMPTS (do not repeat a rejected approach) ==="]
+    for index, item in enumerate(entries, start=1):
+        outcome = "applied" if item.get("applied") else "rejected"
+        error = str(item.get("error_text") or "").strip() or "(no error detail recorded)"
+        lines.append(
+            f"{index}. response={item.get('response_hash', '?')} {outcome}: {error[:200]}"
+        )
+    return "\n".join(lines)
 
 
 def software_stuck_directive(state: CfuDesignState) -> str:
@@ -2247,6 +2446,12 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
         )
         if part
     )
+    if feedback:
+        # The ledger is repair-context only: appending it to a clean prompt
+        # would turn every re-run (e.g. an optimization round) into a "repair".
+        ledger = attempt_ledger_block(state.get("sw_attempts"))
+        if ledger:
+            feedback = f"{feedback}\n\n{ledger}"
     result, raw_output = _complete_llm(
         state,
         "implement_sw",
@@ -2270,6 +2475,7 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
         state,
         result.text,
         toolbox=toolbox,
+        require_diagnosis=bool(feedback) and bool(getattr(result, "used_llm", False)),
     )
     errors.extend(outcome["errors"])
     intent_error = tool_intent_error(result.text, str(getattr(result, "degraded_reason", "") or ""))
@@ -2292,6 +2498,8 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
         "response_hash": _attempt_digest(result.text),
         "error_hash": _attempt_digest("\n".join(errors)),
         "applied": bool(outcome["applied"]),
+        # Human-readable excerpt for the prior-attempt ledger in repair prompts.
+        "error_text": "; ".join(errors)[:300],
     }
     return {
         "software_plan": result.text,
@@ -3449,6 +3657,14 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
     verification = str(project.get("verification", "none"))
 
     if is_embench:
+        # The correctness oracle and the cycle measurement live in the model's
+        # writable workspace copy: refuse results whose harness files differ
+        # from the untouched reference copy (hard-coded expected results or a
+        # faked rdcycle must never pass the gate). Test doubles without a real
+        # workdir simply skip the check (no reference copy exists there).
+        tamper_workdir = getattr(toolbox, "workdir", None) or Path(state.get("workdir", "."))
+        for problem in embench_workspace_tampering(tamper_workdir, run_root, name):
+            errors.append(problem)
         cfu_profile = parse_embench_profile(sim_text)
         cfu_cycles = int(cfu_profile.get(name, {}).get("cycles", 0) or 0)
         speedup_x100 = (ref_cycles * 100 // cfu_cycles) if cfu_cycles else 0
@@ -3456,6 +3672,17 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
             errors.append("simulation produced no CFU profile; the accelerated kernel did not run")
         if verification != "bench_verify":
             errors.append("benchmark provides no verification oracle; correctness cannot be claimed")
+        # Harness-side independent check: the reference run and the cfu run must
+        # compute the same observable result value (parsed from the injected
+        # EMBENCH_VERIFY line, not from the model-writable verify_benchmark).
+        ref_result = (reference.get(name, {}) or {}).get("result")
+        cfu_result = (cfu_profile.get(name, {}) or {}).get("result")
+        if ref_result is not None and cfu_result is not None and int(ref_result) != int(cfu_result):
+            errors.append(
+                f"the CFU build computed result={cfu_result} but the reference run computed "
+                f"result={ref_result}: the accelerated kernel changes the benchmark's observable "
+                "result"
+            )
         if not state.get("changed_design_files"):
             # The cfu build is then identical to the reference configuration, so
             # any speedup would come from the compiler, not the new CFU.
@@ -4152,13 +4379,24 @@ def max_repairs(state: CfuDesignState) -> int:
     """Repair rounds the global ``--max-iters`` budget still allows.
 
     ``--max-iters 1`` (the "iteration not allowed" case) yields zero repairs, so
-    the first failing rung stops the run.
+    the first failing rung stops the run. This is the DESIGN pool; answer-only
+    repairs (a malformed oracle or ISA contract) draw from a separate small pool
+    so they can never exhaust it.
     """
     return max(0, int(state.get("max_iters", 2) or 2) - 1)
 
 
+def answer_repairs_max(state: CfuDesignState) -> int:
+    """Repair rounds the answer-only pool (oracle/spec re-asks) still allows."""
+    return max(0, int(state.get("max_answer_repairs", DEFAULT_MAX_ANSWER_REPAIRS) or 0))
+
+
 def _repairs_left(state: CfuDesignState) -> bool:
     return int(state.get("repairs_used", 0) or 0) < max_repairs(state)
+
+
+def _answer_repairs_left(state: CfuDesignState) -> bool:
+    return int(state.get("answer_repairs_used", 0) or 0) < answer_repairs_max(state)
 
 
 def _ladder_transition(
@@ -4174,20 +4412,29 @@ def _ladder_transition(
 
     Conditional edges cannot update state, so the failing node records its own
     repair/stop decision (``gates.<rung>.next``) and the router only reads it.
+
+    Repair budgets are split by target class: a repair of an answer artifact
+    (``check_conformance`` oracle, ``design_contract``/``extend_isa`` spec) draws
+    from ``answer_repairs_used``/``--max-answer-repairs``; a repair of the actual
+    design draws from ``repairs_used``/``--max-iters``.
     """
     if ok or skipped:
         return {}, default
     target = repair_target(state) if callable(repair_target) else repair_target
-    if _repairs_left(state):
+    answer_repair = target in ANSWER_REPAIR_TARGETS
+    budget_left = _answer_repairs_left(state) if answer_repair else _repairs_left(state)
+    if budget_left:
+        consumed = int(state.get("answer_repairs_used" if answer_repair else "repairs_used", 0) or 0)
+        cap = answer_repairs_max(state) if answer_repair else max_repairs(state)
         note = (
             f"{rung} failed; repairing {target} "
-            f"(repair {int(state.get('repairs_used', 0) or 0) + 1}/{max_repairs(state)})."
+            f"(repair {consumed + 1}/{cap})."
         )
         attempts = dict(state.get("attempts", {}) or {})
         attempts[rung] = int(attempts.get(rung, 0)) + 1
         return {
             "attempts": attempts,
-            "repairs_used": int(state.get("repairs_used", 0) or 0) + 1,
+            ("answer_repairs_used" if answer_repair else "repairs_used"): consumed + 1,
             "iteration": int(state.get("iteration", 0) or 0) + 1,
             "last_repair_target": target,
             "stage_jobs": target,
@@ -4197,6 +4444,11 @@ def _ladder_transition(
     note = (
         f"{rung} failed and no repair budget remains "
         f"(--max-iters {state.get('max_iters', 2)}); stopping the run."
+        if not answer_repair
+        else (
+            f"{rung} failed and the answer-repair budget is exhausted "
+            f"(--max-answer-repairs {answer_repairs_max(state)}); stopping the run."
+        )
     )
     return {
         "stopped_at": rung,
@@ -4718,6 +4970,10 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
         return "final_report", "blocked"
     if not gates.get("isa", {}).get("ok", False):
         return "final_report", "blocked"
+    if (state.get("ir_features", "off") == "require"
+            and not gates.get("ir", {}).get("ok", False)):
+        # Explicit IR experiments have their own failure, never an HW/LLM one.
+        return "final_report", "failed"
     present = [rung for rung in LADDER_RUNGS if isinstance(gates.get(rung), dict)]
     executed = [rung for rung in present if not gates[rung].get("skipped")]
     skipped = [rung for rung in present if gates[rung].get("skipped")]
@@ -4736,7 +4992,9 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
 
 def _is_complete(state: CfuDesignState) -> bool:
     gates = state.get("gates", {})
-    return all(gates.get(key, {}).get("ok", False) for key in REQUIRED_GATES)
+    return (all(gates.get(key, {}).get("ok", False) for key in REQUIRED_GATES)
+            and (state.get("ir_features", "off") != "require"
+                 or gates.get("ir", {}).get("ok", False)))
 
 
 def _yaml_str(value: Any) -> str:
@@ -5147,6 +5405,14 @@ def render_report(state: CfuDesignState) -> str:
     lines.append("")
     lines.append("## Workload Analysis")
     lines.append(str(state.get("workload_analysis", "")))
+    if state.get("ir_features", "off") != "off":
+        ir = state.get("ir_result") or {}
+        lines.append("\n### LLVM IR evidence (static, optional)")
+        lines.append(f"- status: {ir.get('status', 'unavailable')}")
+        lines.append(f"- reason: {ir.get('reason', '')}")
+        lines.append(f"- target_match: {ir.get('toolchain', {}).get('target_match', False)}")
+        lines.append("- metadata: 07_analysis/ir_features.yaml")
+        lines.extend(f"- IR: {path}" for path in ir.get("ir_files", []))
     lines.append("")
     lines.append("## CFU ISA Spec")
     if state.get("isa_spec"):
@@ -5203,6 +5469,28 @@ def render_report(state: CfuDesignState) -> str:
     lines.append(f"- input tokens: {usage['input']}")
     lines.append(f"- output tokens: {usage['output']}")
     lines.append(f"- total tokens: {usage['total']}")
+    lines.append("")
+    by_stage = state.get("token_usage_by_stage") or usage_by_stage()
+    if by_stage:
+        lines.append("Per stage (sorted by input tokens, largest first):")
+        lines.append("")
+        lines.append("| stage | calls | input | output | total |")
+        lines.append("| --- | ---: | ---: | ---: | ---: |")
+        for name, bucket in sorted(
+            by_stage.items(), key=lambda item: (-int(item[1].get("input", 0)), item[0])
+        ):
+            lines.append(
+                f"| {name} | {bucket.get('calls', 0)} | {bucket.get('input', 0)} "
+                f"| {bucket.get('output', 0)} | {bucket.get('total', 0)} |"
+            )
+        lines.append("")
+    lines.append("## LLM Prompts")
+    run_root = Path(str(state.get("run_root", "") or ""))
+    prompt_files = sorted(run_root.glob("**/llm_raw/*.prompt.txt")) if str(run_root) else []
+    if prompt_files:
+        lines.extend(f"- `{path.relative_to(run_root)}`" for path in prompt_files)
+    else:
+        lines.append("No prompts were recorded for this run.")
     lines.append("")
     lines.append("## Iteration History")
     lines.append("\n".join(f"- {line}" for line in state.get("iteration_history", [])))

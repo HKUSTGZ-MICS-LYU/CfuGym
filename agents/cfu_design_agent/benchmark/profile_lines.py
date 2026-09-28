@@ -12,7 +12,12 @@ from collections.abc import Iterator
 from ..runtime.tools import filter_output
 
 
-_PROFILE_LINE_RE = re.compile(r"^CFU_AGENT_PROFILE[ \t]+(?P<body>[^\n]*)", re.MULTILINE)
+# sbt prefixes guest stdout with "[info] "; bare lines are also emitted by
+# direct runners. Match only these line starts, not incidental text in a log.
+_PROFILE_LINE_RE = re.compile(
+    r"^[ \t]*(?:\[info\][ \t]+)?CFU_AGENT_PROFILE[ \t]+(?P<body>[^\n]*)",
+    re.MULTILINE,
+)
 
 
 def profile_lines(text: str) -> Iterator[dict[str, int]]:

@@ -376,6 +376,14 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         self.toolset = ReadOnlyToolset(toolbox)
         self.target = f"{self.run_root}/workspace/cfu_benchmark/main.c"
 
+    def test_observation_tool_is_not_exposed_outside_analysis(self) -> None:
+        index = {"observations": {"obs_loop_x": {"id": "obs_loop_x"}}}
+        tools = ReadOnlyToolset(self.toolset.toolbox, observation_index=index)
+        self.assertNotIn("inspect_observation", [
+            schema["function"]["name"] for schema in tools.schemas()
+        ])
+        self.assertIn("unknown tool", tools.run("inspect_observation", {"id": "obs_loop_x"}))
+
     def test_read_file_numbers_lines_and_slices(self) -> None:
         whole = self.toolset.run("read_file", {"path": self.target})
         self.assertIn("int main(void)", whole)

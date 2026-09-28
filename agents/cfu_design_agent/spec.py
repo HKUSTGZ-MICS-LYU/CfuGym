@@ -41,6 +41,7 @@ def normalize_workload_spec(
     benchmark_name: str = "",
     llm: OpenAiTextClient | None = None,
     llm_result_sink: Callable[[str, LlmResult], None] | None = None,
+    llm_prompt_sink: Callable[[str, str], None] | None = None,
 ) -> tuple[WorkloadSpec, str]:
     if input_mode == "embench" or benchmark_name:
         spec = infer_embench_spec(task, benchmark_name or infer_benchmark_name(task, workdir))
@@ -65,7 +66,10 @@ def normalize_workload_spec(
             run_cmd=run_cmd,
             test_cmd=test_cmd,
         )
-        spec = llm_extract_or_fallback(task, context, fallback, llm, llm_result_sink=llm_result_sink)
+        spec = llm_extract_or_fallback(
+            task, context, fallback, llm,
+            llm_result_sink=llm_result_sink, llm_prompt_sink=llm_prompt_sink,
+        )
         spec.update(
             {
                 "source_kind": "c_project",
@@ -81,7 +85,12 @@ def normalize_workload_spec(
         return sanitize_spec(spec), yaml.safe_dump(dict(spec), sort_keys=False)
 
     fallback = infer_spec_from_text(task, source_kind="natural_language")
-    spec = llm_extract_or_fallback(task, context, fallback, llm)
+    # Both sinks are threaded here too: every LLM call in the run must leave its
+    # answer AND its rendered prompt behind, whatever the input mode.
+    spec = llm_extract_or_fallback(
+        task, context, fallback, llm,
+        llm_result_sink=llm_result_sink, llm_prompt_sink=llm_prompt_sink,
+    )
     spec.setdefault("source_kind", "natural_language")
     return sanitize_spec(spec), yaml.safe_dump(dict(spec), sort_keys=False)
 
@@ -147,6 +156,7 @@ def llm_extract_or_fallback(
     llm: OpenAiTextClient | None,
     *,
     llm_result_sink: Callable[[str, LlmResult], None] | None = None,
+    llm_prompt_sink: Callable[[str, str], None] | None = None,
 ) -> WorkloadSpec:
     if llm is None or not llm.available:
         return fallback
@@ -161,6 +171,8 @@ Fallback heuristic spec:
 {yaml.safe_dump(dict(fallback), sort_keys=False)}
 
 Return the normalized YAML WorkloadSpec."""
+    if llm_prompt_sink is not None:
+        llm_prompt_sink(SPEC_SYSTEM_PROMPT, prompt)
     result = clean_llm_text(
         llm.complete(SPEC_SYSTEM_PROMPT, prompt, fallback=yaml.safe_dump(dict(fallback), sort_keys=False))
     )

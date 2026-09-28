@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 
 from agents.cfu_design_agent.conformance import (
+    _c_literal,
+    _extra_cases,
     cpu_value_roles,
     parse_conformance,
     render_conformance,
@@ -41,6 +43,33 @@ VECTOR_COMMAND = {
     ],
 }
 LEGACY_COMMAND = {"function_id": 2, "subfunction_id": 0, "name": "config", "kind": "control"}
+ONE_ARG_COMMAND = {
+    "function_id": 4,
+    "subfunction_id": 0,
+    "name": "onesel",
+    "kind": "compute",
+    "semantics": "rd = f(rs1)",
+    "resources": [
+        {"storage": "cpu", "access": "read", "role": "rs1"},
+        {"storage": "cpu", "access": "write", "role": "rd"},
+    ],
+}
+CONST_INDEX_COMMAND = {
+    "function_id": 5,
+    "subfunction_id": 0,
+    "name": "vslot0",
+    "kind": "control",
+    "semantics": "vd[0] = rs1",
+    "resources": [
+        {"storage": "cpu", "access": "read", "role": "rs1"},
+        {
+            "storage": "vector",
+            "access": "write",
+            "role": "vd",
+            "index": {"source": "constant", "value": 0},
+        },
+    ],
+}
 
 
 def isa(*commands: dict) -> dict:
@@ -342,6 +371,218 @@ class UnknownIntrinsicLintTest(unittest.TestCase):
         }
         problems = validate_oracle(isa(CPU_COMMAND), {"commands": [entry]})
         self.assertFalse(any("unknown intrinsic" in p for p in problems), problems)
+
+
+class LazyOracleRejectionTest(unittest.TestCase):
+    """A lazy oracle must fail validation, never pass silently.
+
+    Regression class (2026-09-28, run 20260928-103622-049268-95608f2c): the
+    design passed hw_conformance 2/2 and then failed the Embench verify at
+    0.75x, because a one-case oracle with a weak expression cannot distinguish
+    a wrong design. ``verify: "1"``, ``reference: "0"`` and a self-referential
+    ``reference: "cfu_compute(a, b)"`` all validated clean before this lint.
+    """
+
+    def entry(self, **fields) -> dict:
+        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
+
+    def test_constant_reference_rejected(self) -> None:
+        for constant in ("1", "0", "0x1234u", "(uint32_t)0", "(unsigned long)0"):
+            with self.subTest(constant=constant):
+                problems = validate_oracle(
+                    isa(CPU_COMMAND), {"commands": [self.entry(reference=constant)]}
+                )
+                message = next((p for p in problems if "not a constant" in p), None)
+                self.assertIsNotNone(message, problems)
+                self.assertIn("must actually observe the command's effect", message)
+                self.assertIn("state set by setup", message)
+
+    def test_tautology_verify_rejected(self) -> None:
+        # Non-rd command: verify is the operative expression.
+        entry = {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();", "verify": "1"}
+        problems = validate_oracle(isa(VECTOR_COMMAND), {"commands": [entry]})
+        message = next((p for p in problems if "verify" in p and "not a constant" in p), None)
+        self.assertIsNotNone(message, problems)
+
+    def test_self_referential_reference_rejected(self) -> None:
+        problems = validate_oracle(
+            isa(CPU_COMMAND), {"commands": [self.entry(reference="cfu_compute(a, b)")]}
+        )
+        message = next((p for p in problems if "must not call cfu_*" in p), None)
+        self.assertIsNotNone(message, problems)
+        self.assertIn("cfu_compute", message)
+        self.assertIn("independent scalar C expression", message)
+
+    def test_self_referential_verify_rejected(self) -> None:
+        entry = {
+            "name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+            "verify": "cfu_vset(a, b)",
+        }
+        problems = validate_oracle(isa(VECTOR_COMMAND), {"commands": [entry]})
+        self.assertTrue(any("must not call cfu_*" in p for p in problems), problems)
+
+    def test_identifier_bearing_expression_passes_the_constant_check(self) -> None:
+        # Conservative on purpose: any identifier passes; no full C parsing.
+        for expression in ("a + b", "ref_rol32(a, b)", "a * 0 + b", "a ? 1 : 2"):
+            with self.subTest(expression=expression):
+                self.assertEqual(
+                    validate_oracle(
+                        isa(CPU_COMMAND), {"commands": [self.entry(reference=expression)]}
+                    ),
+                    [],
+                )
+
+
+class UndeclaredArgumentLintTest(unittest.TestCase):
+    """The generated case scope only binds declared roles' arguments.
+
+    Regression (run 20260928-105332-728135-7f9a4132, report.md:920): a verify
+    expression referencing ``b`` for a command that never declared rs2 died at
+    build time with ``'b' undeclared (first use in this function)``. The lint
+    names the identifier and the fix at validation time instead.
+    """
+
+    def test_verify_referencing_undeclared_role_rejected(self) -> None:
+        entry = {
+            "name": "vslot0", "cases": [{"args": [7]}], "setup": "seed();",
+            "verify": "slot_at(b) == 0",
+        }
+        problems = validate_oracle(isa(CONST_INDEX_COMMAND), {"commands": [entry]})
+        message = next((p for p in problems if "undeclared identifier" in p), None)
+        self.assertIsNotNone(message, problems)
+        self.assertIn("'b'", message)
+        self.assertIn("resources", message)
+        self.assertIn("rs1->a, rs2->b", message)
+
+    def test_reference_referencing_undeclared_role_rejected(self) -> None:
+        entry = {"name": "onesel", "cases": [{"args": [3]}], "reference": "a + b"}
+        problems = validate_oracle(isa(ONE_ARG_COMMAND), {"commands": [entry]})
+        self.assertTrue(
+            any("'b'" in p and "undeclared identifier" in p for p in problems), problems
+        )
+
+    def test_declared_roles_may_be_referenced(self) -> None:
+        entry = {"name": "onesel", "cases": [{"args": [3]}], "reference": "a * 2u + 1u"}
+        self.assertEqual(validate_oracle(isa(ONE_ARG_COMMAND), {"commands": [entry]}), [])
+
+
+class HelperCollisionTest(unittest.TestCase):
+    """Helper symbols must be defined exactly once across oracle entries.
+
+    Regression (run 20260928-103622-049268-95608f2c, report.md:998): two
+    entries each defined ``ref_rol32`` and the generated test failed with
+    ``redefinition of 'ref_rol32'`` at build time.
+    """
+
+    HELPER = "static uint32_t ref_rol32(uint32_t a, uint32_t b) { return a + (b << 1); }"
+
+    def oracle(self, second_helper: str) -> dict:
+        return {
+            "commands": [
+                {
+                    "name": "compute", "cases": [{"args": [1, 2]}],
+                    "reference": "ref_rol32(a, b)", "helpers": self.HELPER,
+                },
+                {
+                    "name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                    "verify": "ref_rol32(a, b)", "helpers": second_helper,
+                },
+            ]
+        }
+
+    def test_duplicate_helpers_rejected_redefinition_class(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND, VECTOR_COMMAND), self.oracle(self.HELPER))
+        message = next((p for p in problems if "helpers symbol" in p), None)
+        self.assertIsNotNone(message, problems)
+        self.assertIn("ref_rol32", message)
+        self.assertIn("defined by more than one command", message)
+        self.assertIn("rename it or share it once", message)
+
+    def test_identical_helpers_emitted_once(self) -> None:
+        text = render_conformance(isa(CPU_COMMAND, VECTOR_COMMAND), self.oracle(self.HELPER))
+        self.assertEqual(text.count("static uint32_t ref_rol32"), 1)
+
+    def test_colliding_distinct_helpers_first_definition_wins(self) -> None:
+        # The render stays compilable even without validation: the colliding
+        # block is dropped whole, so two definitions can never be emitted.
+        distinct = self.HELPER + "\nstatic uint32_t other_h(uint32_t a) { return a; }"
+        text = render_conformance(isa(CPU_COMMAND, VECTOR_COMMAND), self.oracle(distinct))
+        self.assertEqual(text.count("static uint32_t ref_rol32"), 1)
+        self.assertNotIn("other_h", text)
+
+    def test_distinct_helper_symbols_are_all_emitted(self) -> None:
+        distinct = "static uint32_t other_h(uint32_t a) { return a; }"
+        text = render_conformance(isa(CPU_COMMAND, VECTOR_COMMAND), self.oracle(distinct))
+        self.assertIn("ref_rol32", text)
+        self.assertIn("other_h", text)
+
+
+class HarnessExtraCasesTest(unittest.TestCase):
+    """Harness-side deterministic extra differential cases.
+
+    The model picks its own oracle cases and wrote the hardware, so the harness
+    appends fixed edge + seeded pseudo-random inputs for rd-writing commands.
+    Trade-off (accepted): ``reference`` must model these arbitrary inputs; an
+    address-taking or stateful command opts out with ``edge_cases: false``,
+    keeping the model's cases only — weaker coverage instead of wrong
+    comparisons.
+    """
+
+    def entry(self, **fields) -> dict:
+        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
+
+    def test_edge_case_extras_rendered_and_counted(self) -> None:
+        entry = self.entry(reference="a + b")
+        extras = _extra_cases(CPU_COMMAND, entry)
+        self.assertEqual(len(extras), 5)  # bounded at MAX_EXTRA_CASES
+        text = render_conformance(isa(CPU_COMMAND), {"commands": [entry]})
+        # Model case + extras all count into g_cases.
+        self.assertEqual(text.count("g_cases++;"), 1 + len(extras))
+        for case_args in extras:
+            for value in case_args:
+                self.assertIn(_c_literal(value), text)
+        # The deterministic edge sweep renders the fixed edge values verbatim.
+        self.assertIn("(uint32_t)0u", text)
+        self.assertIn("(uint32_t)1u", text)
+        self.assertIn("(uint32_t)2147483648u", text)
+        self.assertIn("(uint32_t)4294967295u", text)
+
+    def test_edge_cases_opt_out_renders_no_extras(self) -> None:
+        entry = self.entry(reference="a + b", edge_cases=False)
+        self.assertEqual(validate_oracle(isa(CPU_COMMAND), {"commands": [entry]}), [])
+        self.assertEqual(_extra_cases(CPU_COMMAND, entry), [])
+        text = render_conformance(isa(CPU_COMMAND), {"commands": [entry]})
+        self.assertEqual(text.count("g_cases++;"), 1)
+
+    def test_edge_cases_must_be_boolean(self) -> None:
+        problems = validate_oracle(
+            isa(CPU_COMMAND), {"commands": [self.entry(reference="a + b", edge_cases="no")]}
+        )
+        self.assertTrue(any("edge_cases must be a boolean" in p for p in problems), problems)
+
+    def test_extras_are_deterministic_per_command_name(self) -> None:
+        entry = self.entry(reference="a + b")
+        self.assertEqual(_extra_cases(CPU_COMMAND, entry), _extra_cases(CPU_COMMAND, entry))
+        other = _extra_cases(dict(CPU_COMMAND, name="compute2"), entry)
+        # The seeded pseudo-random tail differs between command names.
+        self.assertNotEqual(_extra_cases(CPU_COMMAND, entry)[2:], other[2:])
+
+    def test_extras_skipped_for_non_rd_commands(self) -> None:
+        entry = {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();", "verify": "slot_is(1)"}
+        self.assertEqual(_extra_cases(VECTOR_COMMAND, entry), [])
+        text = render_conformance(isa(VECTOR_COMMAND), {"commands": [entry]})
+        self.assertEqual(text.count("g_cases++;"), 1)
+
+    def test_case_scope_binds_a_and_b_unconditionally(self) -> None:
+        # Render backstop for stale oracles: undeclared identifiers must never
+        # fail the C build; the validator lint rejects them first with a fix.
+        entry = {"name": "onesel", "cases": [{"args": [3]}], "reference": "a"}
+        text = render_conformance(isa(ONE_ARG_COMMAND), {"commands": [entry]})
+        self.assertIn("uint32_t a = 0;", text)
+        self.assertIn("uint32_t b = 0;", text)
+        self.assertIn("(void)a; (void)b;", text)
+        self.assertIn("a = (uint32_t)3u;", text)
+        self.assertNotIn("b = (uint32_t)", text)  # undeclared role stays 0
 
 
 if __name__ == "__main__":

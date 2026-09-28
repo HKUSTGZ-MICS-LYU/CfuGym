@@ -13,10 +13,11 @@ import os
 import fnmatch
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .policy import PolicyError
 from .tools import RepoToolbox, redirect_target
+from ..ir.observation import inspect_observation
 
 
 READ_FILE_SCHEMA: dict[str, Any] = {
@@ -25,7 +26,8 @@ READ_FILE_SCHEMA: dict[str, Any] = {
         "name": "read_file",
         "description": (
             "Read a text file this stage is allowed to read. Returns numbered "
-            "lines. Use start_line/end_line to read a slice of a large file."
+            "lines. Use start_line/end_line to read a slice of a large file. "
+            "Missing, empty and not-visible files produce distinct messages."
         ),
         "parameters": {
             "type": "object",
@@ -60,14 +62,19 @@ SEARCH_TEXT_SCHEMA: dict[str, Any] = {
     "function": {
         "name": "search_text",
         "description": (
-            "Search visible files for a regular expression; returns path:line matches."
+            "Search visible files for a regular expression; returns path:line "
+            "matches. 'path' may be a directory (walked per glob) or a single "
+            "file (searched alone). If hits are truncated, page with 'skip'; "
+            "if a file/entry budget error appears, narrow 'path' to a "
+            "subdirectory or tighten 'glob' exactly as the message suggests."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Python regular expression."},
-                "path": {"type": "string", "description": "Repo-relative root (default '.')."},
+                "path": {"type": "string", "description": "Repo-relative root directory or a single file (default '.')."},
                 "glob": {"type": "string", "description": "File glob under root (default '**/*')."},
+                "skip": {"type": "integer", "description": "Skip the first N hits before applying the hit limit (paging, default 0)."},
             },
             "required": ["pattern"],
         },
@@ -108,7 +115,37 @@ def _validate_search_pattern(pattern: str) -> None:
     walk(_parser.parse(pattern, 0))
 
 
+OBSERVATION_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "inspect_observation",
+        "description": (
+            "Inspect a measured Embench observation ID: bounded source-level "
+            "LLVM IR candidates or reference-build function-level ASM candidates. "
+            "Returns confidence/ambiguity and never estimates cycles from static code."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Exact obs_loop_... or obs_fn_... ID from the measured profile."},
+                "view": {"type": "string", "enum": ["summary", "asm", "ir"], "description": "Evidence to inspect."},
+                "max_lines": {"type": "integer", "description": "Maximum excerpt lines, 8–100."},
+            },
+            "required": ["id"],
+        },
+    },
+}
+
 READ_ONLY_TOOL_SCHEMAS = (READ_FILE_SCHEMA, LIST_DIR_SCHEMA, SEARCH_TEXT_SCHEMA)
+
+
+class ToolUsageError(ValueError):
+    """A fixable tool-argument problem (bad path kind, bad paging, budget hit).
+
+    Rendered as a plain "usage error:" so it is never confused with a real
+    access-policy denial ("denied by access policy:"), which the model cannot
+    fix by rephrasing the call.
+    """
 
 
 @dataclass
@@ -116,6 +153,7 @@ class ReadOnlyToolset:
     """Harness-side executor for the read-only tools."""
 
     toolbox: RepoToolbox
+    observation_index: dict[str, Any] | None = None
     max_read_chars: int = 20000
     max_hits: int = 40
     max_files: int = 300
@@ -124,12 +162,15 @@ class ReadOnlyToolset:
 
     def schemas(self) -> list[dict[str, Any]]:
         # Deep-ish copy so callers cannot mutate the module-level schemas.
+        offered = list(READ_ONLY_TOOL_SCHEMAS)
+        if self.toolbox.stage == "analysis" and (self.observation_index or {}).get("observations"):
+            offered.append(OBSERVATION_SCHEMA)
         return [
             {**schema, "function": {**schema["function"], "parameters": {
                 **schema["function"]["parameters"],
                 "properties": dict(schema["function"]["parameters"].get("properties", {})),
             }}}
-            for schema in READ_ONLY_TOOL_SCHEMAS
+            for schema in offered
         ]
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
@@ -137,6 +178,7 @@ class ReadOnlyToolset:
             "read_file": self._read_file,
             "list_dir": self._list_dir,
             "search_text": self._search_text,
+            **({"inspect_observation": self._inspect_observation} if self.toolbox.stage == "analysis" and (self.observation_index or {}).get("observations") else {}),
         }
         handler = handlers.get(name)
         if handler is None:
@@ -145,8 +187,19 @@ class ReadOnlyToolset:
             return handler(arguments or {})
         except PolicyError as exc:
             return f"denied by access policy: {exc}"
+        except ToolUsageError as exc:
+            return f"usage error: {exc}"
         except (OSError, ValueError) as exc:
             return f"error: {type(exc).__name__}: {exc}"
+
+    def _inspect_observation(self, args: dict[str, Any]) -> str:
+        if not (self.observation_index or {}).get("observations") or self.toolbox.stage != "analysis":
+            raise PolicyError("observation inspection is available only in analysis")
+        return inspect_observation(
+            self.observation_index, self.toolbox,
+            str(args.get("id", "") or ""), str(args.get("view", "summary") or "summary"),
+            args.get("max_lines", 60),
+        )
 
     # --- internals ---------------------------------------------------------
     def _root(self, raw: str) -> Path:
@@ -154,9 +207,51 @@ class ReadOnlyToolset:
         root = self.toolbox.workdir if raw in {".", "./"} else self.toolbox.resolve(raw)
         if not self.toolbox.is_current_run_path(self._rel(root)):
             raise PolicyError(f"directory belongs to another run: {raw}")
-        if not root.exists() or not root.is_dir():
-            raise PolicyError(f"not a visible directory: {raw}")
+        # Missing/file paths are usage problems, not policy denials: reporting
+        # them as "denied by access policy" made the model retry the same call
+        # against a policy it cannot change (observed 2026-09-28 run).
+        if not root.exists():
+            raise ToolUsageError(f"no such directory: {raw}")
+        if not root.is_dir():
+            raise ToolUsageError(f"not a directory: {raw}")
         return root
+
+    def _search_base(self, raw: str) -> tuple[Path, bool]:
+        """Resolve a search path to (file, True) or (directory, False).
+
+        A file path searches just that file: forcing the model to express a
+        file-scoped search as a directory+glob walk is what produced five
+        wasted "not a visible directory" retries on a single file (observed
+        2026-09-28 run).
+        """
+        raw = (raw or ".").strip() or "."
+        root = self.toolbox.workdir if raw in {".", "./"} else self.toolbox.resolve(raw)
+        if not self.toolbox.is_current_run_path(self._rel(root)):
+            raise PolicyError(f"path belongs to another run: {raw}")
+        if not root.exists():
+            raise ToolUsageError(f"no such path: {raw}")
+        if root.is_file():
+            if not self.toolbox.is_read_allowed(self._rel(root)):
+                raise PolicyError(f"path is not visible to this stage: {raw}")
+            return root, True
+        if not root.is_dir():
+            raise ToolUsageError(f"not a regular file or directory: {raw}")
+        return root, False
+
+    @staticmethod
+    def _skip_count(value: Any) -> int:
+        """Validate the search paging argument."""
+        if value is None or value == "":
+            return 0
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            skip = int(value)
+        except (TypeError, ValueError):
+            raise ToolUsageError("skip must be a non-negative integer")
+        if skip < 0:
+            raise ToolUsageError("skip must be a non-negative integer")
+        return skip
 
     def _rel(self, path: Path) -> str:
         return path.relative_to(self.toolbox.workdir).as_posix()
@@ -201,6 +296,10 @@ class ReadOnlyToolset:
 
     def _visible(self, root: Path, glob: str) -> Iterator[Path]:
         seen = visited = 0
+        root_rel = self._rel(root)
+        # First subdirectory seen under root: a concrete narrowing suggestion
+        # for the budget errors ("narrow path (e.g. path=...)").
+        hint = root_rel
         stack = [root]
         recursive = "/" in glob
         while stack:
@@ -209,7 +308,11 @@ class ReadOnlyToolset:
                 for entry in entries:
                     visited += 1
                     if visited > self.max_files * 20:
-                        raise ValueError("directory enumeration budget exceeded; narrow path/glob")
+                        raise ToolUsageError(
+                            f"directory enumeration budget exceeded: {visited}+ entries visited "
+                            f"(limit {self.max_files * 20}) under '{root_rel}'; narrow path "
+                            f"(e.g. path={hint}) or tighten glob"
+                        )
                     if entry.is_symlink():
                         continue
                     path = Path(entry.path)
@@ -219,6 +322,8 @@ class ReadOnlyToolset:
                     if self.toolbox.policy.is_denied(rel) or self.toolbox.policy.is_denied(rel + "/"):
                         continue
                     if recursive and entry.is_dir(follow_symlinks=False):
+                        if hint == root_rel:
+                            hint = rel
                         stack.append(path)
                     local = path.relative_to(root).as_posix()
                     matches = fnmatch.fnmatchcase(local, glob) or (
@@ -226,17 +331,31 @@ class ReadOnlyToolset:
                     if not matches or not self.toolbox.is_read_allowed(rel):
                         continue
                     if seen >= self.max_files:
-                        raise ValueError("visible file budget exceeded; narrow path/glob")
+                        raise ToolUsageError(
+                            f"visible file budget exceeded: {self.max_files}+ files matched "
+                            f"(limit {self.max_files}) under '{root_rel}'; narrow path "
+                            f"(e.g. path={hint}) or tighten glob"
+                        )
                     seen += 1
                     yield path
 
     def _read_file(self, args: dict[str, Any]) -> str:
         path = str(args.get("path", "") or "").strip()
         if not path:
-            return "error: path is required"
-        text = self.toolbox.read_text(self._live_path(path), limit=self.max_file_bytes)
+            raise ToolUsageError("path is required")
+        rel = self._live_path(path)
+        text = self.toolbox.read_text(rel, limit=self.max_file_bytes)
         if not text:
-            return "(empty file, missing file, or not visible to this stage)"
+            # Missing, empty and not-visible are three different situations for
+            # the model; a single conflated message cost needless retries.
+            # Not-visible already raised PolicyError above ("denied by access
+            # policy: ..."); distinguish the other two here.
+            full = self.toolbox.workdir / self.toolbox.normalize(rel)
+            if full.is_dir():
+                raise ToolUsageError(f"{path} is a directory (use list_dir or search_text)")
+            if not full.is_file():
+                raise ToolUsageError(f"no such file: {path}")
+            return "(empty file)"
         lines = text.split("\n")
         offset = 1
         start = args.get("start_line")
@@ -266,16 +385,19 @@ class ReadOnlyToolset:
     def _search_text(self, args: dict[str, Any]) -> str:
         pattern = str(args.get("pattern", "") or "")
         if not pattern:
-            return "error: pattern is required"
+            raise ToolUsageError("pattern is required")
         try:
             _validate_search_pattern(pattern)
             regex = re.compile(pattern)
         except (re.error, ValueError) as exc:
             return f"error: invalid regex: {exc}"
-        root = self._root(str(args.get("path", ".") or "."))
+        root, single_file = self._search_base(str(args.get("path", ".") or "."))
         glob = self._check_glob(str(args.get("glob", "**/*") or "**/*"))
+        skip = self._skip_count(args.get("skip"))
         hits: list[str] = []
-        for path in self._visible(root, glob):
+        matched = 0
+        paths: Iterable[Path] = [root] if single_file else self._visible(root, glob)
+        for path in paths:
             if not path.is_file():
                 continue
             rel = self._rel(path)
@@ -287,10 +409,20 @@ class ReadOnlyToolset:
                 continue
             for lineno, line in enumerate(text.split("\n"), start=1):
                 if len(line) > 20000:
-                    raise ValueError("search line budget exceeded; use a narrower file/range")
+                    raise ToolUsageError("search line budget exceeded; use a narrower file/range")
                 if regex.search(line):
+                    matched += 1
+                    if matched <= skip:
+                        continue
                     hits.append(f"{rel}:{lineno}: {line.strip()[:200]}")
                     if len(hits) >= self.max_hits:
-                        hits.append("...[truncated]")
+                        hits.append(
+                            f"...[truncated at {self.max_hits} hits; "
+                            f"use skip={skip + self.max_hits} to see more]"
+                        )
                         return "\n".join(hits)
-        return "\n".join(hits) or "(no matches)"
+        if not hits:
+            if matched:
+                return f"(no matches after skip={skip}; {matched} earlier hit(s) were skipped)"
+            return "(no matches)"
+        return "\n".join(hits)

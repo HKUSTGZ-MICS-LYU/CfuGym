@@ -128,6 +128,27 @@ class RunSummaryTest(unittest.TestCase):
         self.assertIn("speedup       = n/a (--skip-sim)", text)
         self.assertIn("yosys_cost    = n/a", text)
 
+    def test_reports_per_stage_llm_input_tokens(self) -> None:
+        text = self._capture(
+            {
+                "token_usage": {"calls": 3, "input": 900, "output": 60, "total": 960},
+                "token_usage_by_stage": {
+                    "implement_hw": {"calls": 2, "input": 800, "output": 50, "total": 850},
+                    "design_contract": {"calls": 1, "input": 100, "output": 10, "total": 110},
+                },
+            }
+        )
+        self.assertIn("llm_tokens:", text)
+        self.assertIn("TOTAL", text)
+        self.assertIn("calls=3", text)
+        # Sorted by input tokens, largest first: the input-heavy stage is on top
+        # and the TOTAL line comes last.
+        self.assertLess(text.index("implement_hw"), text.index("design_contract"))
+        self.assertLess(text.index("design_contract"), text.index("TOTAL"))
+
+    def test_token_block_is_absent_without_usage(self) -> None:
+        self.assertNotIn("llm_tokens:", self._capture({}))
+
     def test_reports_every_optimization_round_with_its_deltas(self) -> None:
         text = self._capture(
             {
@@ -202,6 +223,28 @@ class StreamFlagTest(unittest.TestCase):
             self.assertIs(cli.build_parser().parse_args(["--task", "x"]).stream_llm, False)
         with mock.patch.dict(os.environ, {"CFU_AGENT_STREAM_LLM": "on"}):
             self.assertIs(cli.build_parser().parse_args(["--task", "x"]).stream_llm, True)
+
+
+class IrFeaturesFlagTest(unittest.TestCase):
+    def test_ir_evidence_is_opt_in_and_passed_to_state(self) -> None:
+        from unittest import mock
+
+        parser = cli.build_parser()
+        self.assertEqual(parser.parse_args(["--task", "x"]).ir_features, "off")
+        self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "auto"]).ir_features, "auto")
+        self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "require"]).ir_features, "require")
+        self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "approx"]).ir_features, "approx")
+        captured: dict = {}
+
+        def _fake_run(state, **kwargs):
+            captured.update(state)
+            return {"status": "planned"}
+
+        with mock.patch.object(cli, "run_agent", _fake_run), \
+                mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
+                mock.patch.object(cli, "enable_progress", lambda: None):
+            cli.main(["--task", "x", "--ir-features", "auto"])
+        self.assertEqual(captured.get("ir_features"), "auto")
 
 
 class RepairRoutingFlagTest(unittest.TestCase):

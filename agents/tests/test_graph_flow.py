@@ -37,6 +37,26 @@ class GraphFlowTest(unittest.TestCase):
         self.assertTrue((REPO_ROOT / final["final_report_path"]).exists())
         self.assertTrue((self.run_dir / "run.yaml").exists())
 
+    def test_ir_auto_dry_run_does_not_execute_and_does_not_block(self) -> None:
+        state = {
+            "workdir": str(REPO_ROOT),
+            "task": "Accelerate a uint8 weighted average kernel with a TileLink CFU.",
+            "input_mode": "natural_language",
+            "dry_run": True,
+            "run_commands": False,
+            "apply_patch": False,
+            "skip_sim": True,
+            "skip_yosys": True,
+            "ir_features": "auto",
+            "max_iters": 1,
+            "run_id": self.run_id,
+        }
+        final = run_agent_python(state)
+        self.assertEqual(final["status"], "planned")
+        self.assertEqual(final["ir_result"]["status"], "unavailable")
+        self.assertTrue(final["gates"]["ir"]["ok"])
+        self.assertTrue((self.run_dir / "07_analysis/ir_features.yaml").exists())
+
     def test_context_digest_omits_sensitive_and_other_runs(self) -> None:
         context = {
             "files": {

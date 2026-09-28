@@ -68,6 +68,31 @@ def instrument_embench_main(text: str) -> str:
     return VERIFY_PREAMBLE + injected
 
 
+# The machine-readable verify line the harness injects into every config's
+# main(). Parsing it gives the harness an oracle independent of the model's
+# writable cfu copy: the reference run and the cfu run must compute the same
+# ``result`` value.
+VERIFY_LINE_RE = re.compile(
+    r"EMBENCH_VERIFY_(?P<status>PASS|FAIL)\s+"
+    r"benchmark=(?P<benchmark>\S+)\s+"
+    r"verify=(?P<verify>-?\d+)\s+result=(?P<result>-?\d+)"
+)
+
+
+def parse_verify_result(text: str) -> dict | None:
+    """Last EMBENCH_VERIFY line as {benchmark, pass, verify, result}, or None."""
+    matches = list(VERIFY_LINE_RE.finditer(text or ""))
+    if not matches:
+        return None
+    last = matches[-1]
+    return {
+        "benchmark": last.group("benchmark"),
+        "pass": last.group("status") == "PASS",
+        "verify": int(last.group("verify")),
+        "result": int(last.group("result")),
+    }
+
+
 
 def benchmark_dir(name: str) -> str:
     return f"{EMBENCH_ROOT}/src/{name}"
@@ -262,7 +287,12 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
 
 
 def parse_profile(text: str) -> dict[str, dict[str, int]]:
-    """Collect CFU_AGENT_PROFILE lines into {id: {cycles, calls}}."""
+    """Collect CFU_AGENT_PROFILE lines into {id: {cycles, calls}}.
+
+    The harness EMBENCH_VERIFY line is folded in as ``verify``/``result`` on the
+    whole-benchmark entry so a run can compare the value the reference computed
+    with the value the cfu build computed, independent of verify_benchmark().
+    """
     result: dict[str, dict[str, int]] = {}
     for fields in profile_lines(text):
         calls = fields.get("calls")
@@ -270,6 +300,11 @@ def parse_profile(text: str) -> dict[str, dict[str, int]]:
             if name == "calls":
                 continue
             result[name] = {"cycles": cycles, **({"calls": calls} if calls is not None else {})}
+    verify = parse_verify_result(text)
+    if verify:
+        entry = result.setdefault(str(verify["benchmark"]), {})
+        entry["verify"] = int(verify["verify"])
+        entry["result"] = int(verify["result"])
     return result
 
 
@@ -283,3 +318,71 @@ def hotspot_from_profile(profile: dict[str, dict[str, int]], *, exclude: tuple[s
     if not candidates:
         return ""
     return max(candidates, key=lambda key: candidates[key])
+
+
+def function_region(text: str, name: str) -> str:
+    """The balanced-brace definition of ``name``, or "" when absent.
+
+    Used to compare one function across two workspace copies without parsing C:
+    the definition through its matching close brace is stable under renaming of
+    surrounding code.
+    """
+    brace = find_definition_brace(text or "", name)
+    if brace < 0:
+        return ""
+    depth = 0
+    i = brace
+    while i < len(text):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    return text[brace : i + 1]
+
+
+def workspace_tampering(workdir, run_root: str, name: str) -> list[str]:
+    """Benchmark-oracle tampering between the harness reference and cfu copies.
+
+    The model may edit the cfu kernel sources, but the correctness oracle
+    (verify_benchmark), the cycle measurement (board/*), the Embench support
+    code and the instrumented main must stay byte-identical to the
+    harness-owned reference copy; otherwise a hard-coded expected result or a
+    faked rdcycle passes every gate. Files absent from either copy are skipped
+    so fixture workspaces without a full config set still validate.
+    """
+    ref_root = Path(workdir) / config_workspace(run_root, name, "reference")
+    cfu_root = Path(workdir) / config_workspace(run_root, name, "cfu")
+    if not ref_root.is_dir() or not cfu_root.is_dir():
+        return []
+    problems: list[str] = []
+    protected = (
+        [f"board/{fname}" for fname in BOARD_FILES]
+        + [f"support/{fname}" for fname in SUPPORT_FILES]
+        + ["embench_main.c"]
+    )
+    for rel in protected:
+        ref, cfu = ref_root / rel, cfu_root / rel
+        if ref.is_file() and cfu.is_file() and ref.read_bytes() != cfu.read_bytes():
+            problems.append(
+                f"benchmark harness file '{rel}' was modified in the cfu workspace: the "
+                "correctness oracle and the cycle measurement must stay byte-identical to "
+                "the harness-owned reference copy"
+            )
+    ref_src_root, cfu_src_root = ref_root / "src", cfu_root / "src"
+    if ref_src_root.is_dir() and cfu_src_root.is_dir():
+        for ref_src in sorted(ref_src_root.glob("*.c")):
+            cfu_src = cfu_src_root / ref_src.name
+            if not cfu_src.is_file():
+                continue
+            ref_fn = function_region(ref_src.read_text(errors="replace"), "verify_benchmark")
+            cfu_fn = function_region(cfu_src.read_text(errors="replace"), "verify_benchmark")
+            if ref_fn and cfu_fn and ref_fn != cfu_fn:
+                problems.append(
+                    f"verify_benchmark() in 'src/{ref_src.name}' was modified in the cfu "
+                    "workspace: the benchmark's correctness oracle must stay byte-identical "
+                    "to the harness copy"
+                )
+    return problems

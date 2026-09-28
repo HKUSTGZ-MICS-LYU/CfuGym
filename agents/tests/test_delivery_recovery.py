@@ -95,6 +95,106 @@ class GluedTerminatorTest(unittest.TestCase):
         self.assertIn("content", blocks[0][1])
 
 
+class ConflictMarkerContentTest(unittest.TestCase):
+    """A git-conflict region inside a SEARCH/REPLACE block used to silently
+    mis-parse: the content `=======` line flipped the parser into replace mode
+    and the wrong pair was produced (2026-09-28 audit, verified by experiment).
+    The parser now rejects marker-shaped content with an actionable message,
+    routed through apply_edit_pairs as feedback instead of raising into the run.
+    """
+
+    @staticmethod
+    def _single_pair(text: str) -> tuple[str, list[tuple[str, str]]]:
+        blocks = tools.extract_edit_blocks(text)
+        assert len(blocks) == 1, blocks
+        return blocks[0]
+
+    def test_conflict_region_in_search_is_rejected(self) -> None:
+        text = (
+            "EDIT_BEGIN design/AgentCfu.scala\n"
+            "<<<<<<< SEARCH\n"
+            "<<<<<<< HEAD\n"
+            "old line\n"
+            "=======\n"
+            "new line\n"
+            ">>>>>>> branch\n"
+            "=======\n"
+            "replacement\n"
+            ">>>>>>> REPLACE\n"
+            "EDIT_END\n"
+        )
+        path, pairs = self._single_pair(text)
+        self.assertEqual(path, "design/AgentCfu.scala")
+        self.assertEqual(pairs[0][0], tools.EDIT_PARSE_ERROR)
+        _updated, errors = tools.apply_edit_pairs("anything\n", pairs)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("conflict-marker-like line", errors[0])
+        self.assertIn("'<<<<<<< HEAD'", errors[0])
+        self.assertIn("edit the lines around it instead", errors[0])
+
+    def test_conflict_marker_in_replace_is_rejected(self) -> None:
+        text = (
+            "EDIT_BEGIN design/AgentCfu.scala\n"
+            "<<<<<<< SEARCH\n"
+            "old line\n"
+            "=======\n"
+            "new line\n"
+            ">>>>>>> branch\n"
+            ">>>>>>> REPLACE\n"
+            "EDIT_END\n"
+        )
+        _path, pairs = self._single_pair(text)
+        self.assertEqual(pairs[0][0], tools.EDIT_PARSE_ERROR)
+        _updated, errors = tools.apply_edit_pairs("x\n", pairs)
+        self.assertIn("conflict-marker-like line", errors[0])
+        self.assertIn("'>>>>>>> branch'", errors[0])
+
+    def test_divider_like_line_in_replace_content_is_rejected(self) -> None:
+        text = (
+            "EDIT_BEGIN design/AgentCfu.scala\n"
+            "<<<<<<< SEARCH\n"
+            "old line\n"
+            "=======\n"
+            "new line\n"
+            "=======\n"
+            ">>>>>>> REPLACE\n"
+            "EDIT_END\n"
+        )
+        _path, pairs = self._single_pair(text)
+        self.assertEqual(pairs[0][0], tools.EDIT_PARSE_ERROR)
+
+    def test_parse_errors_never_raise_out_of_extract(self) -> None:
+        # An unterminated pair inside a closed EDIT block used to raise
+        # ValueError from the parser; it now becomes a sentinel pair whose
+        # message reaches the model as ordinary repair feedback.
+        text = "EDIT_BEGIN p\n<<<<<<< SEARCH\na\nEDIT_END\n"
+        path, pairs = self._single_pair(text)
+        self.assertEqual(path, "p")
+        self.assertEqual(pairs[0][0], tools.EDIT_PARSE_ERROR)
+        _updated, errors = tools.apply_edit_pairs("a\n", pairs)
+        self.assertIn("unterminated SEARCH/REPLACE block", errors[0])
+
+    def test_nested_search_marker_routed_through_the_error_channel(self) -> None:
+        text = (
+            "EDIT_BEGIN p\n"
+            "<<<<<<< SEARCH\na\n<<<<<<< SEARCH\n=======\nb\n>>>>>>> REPLACE\n"
+            "EDIT_END\n"
+        )
+        _path, pairs = self._single_pair(text)
+        self.assertEqual(pairs[0][0], tools.EDIT_PARSE_ERROR)
+        _updated, errors = tools.apply_edit_pairs("a\n", pairs)
+        self.assertIn("nested SEARCH marker", errors[0])
+
+    def test_normal_content_still_parses(self) -> None:
+        text = (
+            "EDIT_BEGIN p\n"
+            "<<<<<<< SEARCH\nval x = 1\n=======\nval x = 2\n>>>>>>> REPLACE\n"
+            "EDIT_END\n"
+        )
+        _path, pairs = self._single_pair(text)
+        self.assertEqual(pairs, [("val x = 1", "val x = 2")])
+
+
 class StuckAttemptDirectiveTest(unittest.TestCase):
     @staticmethod
     def _attempt(tag: str) -> dict:

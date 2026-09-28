@@ -61,6 +61,41 @@ class RooflinePromptTest(unittest.TestCase):
         self.assertIn("regDepth: 0", contract)
         self.assertIn("achieved", prompt)
 
+    def test_opt_in_approximate_ir_prompt_is_bounded_and_not_measured(self) -> None:
+        evidence = {
+            "mode": "approx", "status": "approximate", "reason": "reduced ISA",
+            "toolchain": {"target_match": False},
+            "ir_files": ["agents/generated/runs/r1/07_analysis/ir/kernel.ll"],
+            "units": [{"large_ir": "@" * 100_000}],
+        }
+        prompt = workload_prompt("accelerate it", self.spec, self.context, ir_evidence=evidence)
+        self.assertIn("target_match: False", prompt)
+        self.assertIn("do not infer loop counts, cycles", prompt)
+        self.assertIn("kernel.ll", prompt)
+        self.assertNotIn("large_ir", prompt)
+        self.assertNotIn("@" * 100, prompt)
+        default = workload_prompt("accelerate it", self.spec, self.context)
+        self.assertNotIn("LLVM IR export", default)
+
+    def test_observation_tool_prompt_names_only_measured_hotspots(self) -> None:
+        index = {"observations": {
+            "obs_loop_cold": {"cycles": 12, "calls": 1, "kind": "loop"},
+            "obs_loop_hot": {"cycles": 1200, "calls": 6, "kind": "loop"},
+            "obs_fn_context": {"cycles": 1500, "calls": 1, "kind": "function"},
+            "obs_loop_unmeasured": {"cycles": None, "calls": None, "kind": "loop"},
+        }}
+        prompt = workload_prompt("accelerate", self.spec, self.context,
+                                 agent_tools=True, observation_index=index)
+        self.assertIn("Call inspect_observation", prompt)
+        self.assertIn("top measured loop", prompt)
+        self.assertLess(prompt.index("obs_loop_hot"), prompt.index("obs_loop_cold"))
+        self.assertNotIn("obs_loop_unmeasured", prompt)
+        self.assertNotIn("obs_fn_context", prompt)
+        self.assertNotIn("inspect_observation", workload_prompt(
+            "accelerate", self.spec, self.context,
+            agent_tools=False, observation_index=index,
+        ))
+
     def test_fallback_keeps_roofline_values_conservative(self) -> None:
         roofline = deterministic_roofline_analysis({"operation": "dot_product"})
         self.assertEqual(roofline["arithmetic_intensity"]["value"], "unknown")
@@ -347,6 +382,47 @@ class RouterPromptTest(unittest.TestCase):
         self.assertIn('"software_change": "required" or "not_required"', text)
         self.assertIn("a.c:3", text)
         self.assertIn("only risk breaking working software", text)
+
+
+class CacheFriendlyOrderingTest(unittest.TestCase):
+    """Dynamic repair/optimization blocks must sit AFTER the static prompt body.
+
+    The ordering keeps the prompt prefix byte-stable across repair rounds (so a
+    provider can cache it) and puts the repair instructions where the model
+    reads them last.
+    """
+
+    def setUp(self) -> None:
+        self.spec = {"name": "t", "operation": "op", "pattern": "vector_to_scalar", "unknowns": []}
+        self.context = {"files": {"a.scala": "// a"}, "visibility": "standard"}
+
+    def test_hardware_feedback_block_comes_after_delivery_protocol(self) -> None:
+        prompt = hardware_prompt(
+            "task", self.spec, "analysis", "contract", self.context,
+            feedback="EXACT ERROR LOG BODY",
+        )
+        self.assertGreater(
+            prompt.index("=== HARDWARE REPAIR MODE ==="),
+            prompt.index("Protocol A (preferred): targeted edits"),
+        )
+        self.assertGreater(
+            prompt.index("=== HARDWARE REPAIR MODE ==="),
+            prompt.index("Allowed target paths"),
+        )
+        # The dynamic block is last: nothing static follows it.
+        self.assertTrue(prompt.rstrip().endswith("before the next build."))
+
+    def test_software_feedback_block_comes_after_delivery_protocol(self) -> None:
+        prompt = software_prompt(
+            "task", self.spec, "analysis", "contract", self.context,
+            targets=[("run/main.c", "int main(void){return 0;}")],
+            feedback="EXACT ERROR LOG BODY",
+        )
+        self.assertGreater(
+            prompt.index("=== SOFTWARE REPAIR MODE ==="),
+            prompt.index("Protocol A (preferred): targeted edits"),
+        )
+        self.assertTrue(prompt.rstrip().endswith("and keep the scalar fallback."))
 
 
 if __name__ == "__main__":

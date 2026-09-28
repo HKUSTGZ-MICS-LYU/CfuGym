@@ -129,6 +129,9 @@ class CfuDesignState(TypedDict, total=False):
     max_tool_calls: int
     # Reference/profile measurement cache: on | off | refresh.
     profile_cache: str
+    # Optional LLVM IR evidence: off | auto | require | approx (Embench P0).
+    ir_features: str
+    ir_result: dict[str, Any]
     # Stream provider output tokens (live progress + per-chunk read timeout).
     stream_llm: bool
     # Failed-simulation repair routing: auto (LLM decides sw/hw) | fixed.
@@ -191,10 +194,13 @@ class CfuDesignState(TypedDict, total=False):
     iteration_history: Annotated[list[str], operator.add]
     # Validation-ladder bookkeeping. ``attempts`` counts repairs per rung (the
     # simulation escalation reads ``attempts["sim"]``), ``repairs_used`` is the
-    # global repair budget consumed, and ``last_repair_target`` records the most
-    # recent repair for reporting.
+    # design-repair budget consumed, ``answer_repairs_used`` is the separate
+    # budget for answer-only repairs (malformed conformance oracle / ISA
+    # contract) so they cannot exhaust the design budget, and
+    # ``last_repair_target`` records the most recent repair for reporting.
     attempts: dict[str, int]
     repairs_used: int
+    answer_repairs_used: int
     last_repair_target: str
     stopped_at: str
     final_report_path: str

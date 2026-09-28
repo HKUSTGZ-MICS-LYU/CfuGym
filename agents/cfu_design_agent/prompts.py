@@ -421,10 +421,45 @@ def workload_prompt(
     profile: dict | None = None,
     agent_tools: bool = False,
     tool_rounds: int = 0,
+    ir_evidence: dict | None = None,
+    observation_index: dict | None = None,
 ) -> str:
     tools_block = agent_tools_block(
         agent_tools, tool_rounds, "the final YAML analysis mapping"
     )
+    evidence_note = ""
+    points = (observation_index or {}).get("observations", {})
+    if agent_tools and points:
+        measured = [
+            (ident, point) for ident, point in points.items()
+            if isinstance(point, dict) and type(point.get("cycles")) is int
+            and point["cycles"] >= 0 and type(point.get("calls")) is int
+            and point["calls"] > 0
+        ]
+        measured.sort(key=lambda item: (-item[1]["cycles"], item[0]))
+        hot_loops = [(ident, point) for ident, point in measured if point.get("kind") == "loop"]
+        ids = ", ".join(ident for ident, _ in (hot_loops or measured)[:5])
+        if ids:
+            evidence_note = (
+                "\nMeasured observation IDs (descending inclusive profile cycles): " + ids + ".\n"
+                "Call inspect_observation with an ID above and view='asm' or 'ir' "
+                "for the top measured loop before proposing the CFU shape; use view='summary' "
+                "for provenance. If the returned evidence is unavailable, continue from the "
+                "measured profile and source without guessing. "
+                "ASM is at most a reference-build function candidate, not a proven loop-address match; "
+                "LLVM IR is static Clang evidence, possibly approximate, and never measured cycles. "
+                "Unavailable or ambiguous evidence must remain unknown.\n"
+            )
+    ir_note = ""
+    if ir_evidence and ir_evidence.get("mode") != "off":
+        ir_note = (
+            "\nLLVM IR export (static analysis only; do not infer loop counts, cycles, "
+            "memory bytes, or source-loop matches from this P0 artifact):\n"
+            f"status: {str(ir_evidence.get('status', 'unknown'))[:32]}\n"
+            f"target_match: {ir_evidence.get('toolchain', {}).get('target_match', False)}\n"
+            f"reason: {str(ir_evidence.get('reason', ''))[:300]}\n"
+            f"artifacts: {', '.join(str(path) for path in ir_evidence.get('ir_files', [])[:4])}\n"
+        )
     return f"""Task:
 {task}
 
@@ -433,10 +468,10 @@ Normalized WorkloadSpec:
 
 Measured profile:
 {profile_digest(profile)}
-
+{ir_note}
 Repo context:
 {context_digest(context)}
-{tools_block}
+{tools_block}{evidence_note}
 {embench_instructions(spec)}
 {ROOFLINE_GUIDANCE}
 Analyze the workload. Classify the acceleration pattern, identify hardware/software state, data movement, expected bottlenecks, and the minimum validation needed.
@@ -538,7 +573,13 @@ HARDWARE_TARGETS = (
 
 def _conformance_command_table(isa: dict) -> str:
     """Per-command summary of what the oracle must supply."""
-    from .conformance import cpu_value_roles, has_vector_resource, intrinsic_name, writes_cpu_rd
+    from .conformance import (
+        ROLE_NAMES,
+        cpu_value_roles,
+        has_vector_resource,
+        intrinsic_name,
+        writes_cpu_rd,
+    )
 
     lines: list[str] = []
     for command in isa.get("commands") or []:
@@ -548,7 +589,10 @@ def _conformance_command_table(isa: dict) -> str:
         roles = cpu_value_roles(command)
         needs = "reference (command writes CPU rd)" if writes_cpu_rd(command) else "verify (no CPU result)"
         setup = "; setup required (uses the vector register file)" if has_vector_resource(command) else ""
-        arguments = ", ".join(f"{role}->{'ab'[i]}" for i, role in enumerate(roles)) or "no arguments"
+        # Label by ROLE, not by position: an rs2-only command binds case
+        # variable `b`, and a positional 'ab'[i] label would send the model
+        # looking for `a`.
+        arguments = ", ".join(f"{role}->{ROLE_NAMES[role]}" for role in roles) or "no arguments"
         params = ", ".join(f"uint32_t {role}" for role in roles)
         result_type = "uint32_t" if writes_cpu_rd(command) else "void"
         intrinsic = f"{intrinsic_name(command)}({params}) -> {result_type}"
@@ -724,7 +768,6 @@ Contract:
 
 Repo context:
 {context_digest(context, skip=HARDWARE_TARGETS)}
-{optimization_block}{feedback_block}
 {embench_instructions(spec)}{tools_block}
 This is the HARDWARE rung only. Design the SpinalHDL CFU datapath; the
 accelerated software is written in a later step and must not appear here.
@@ -791,7 +834,8 @@ automatically):
 
 Do not edit MiCoSoc.scala, MiCoSocParam.scala, CfuPlugin, or any other
 repository source. Only fall back to a plan if a required target file is
-genuinely absent."""
+genuinely absent.
+{optimization_block}{feedback_block}"""
 
 
 def optimization_prompt(
@@ -962,7 +1006,6 @@ Contract:
 Repo context:
 {context_digest(context, skip=target_paths)}
 {intrinsics_block}
-{optimization_block}{feedback_block}
 {embench_instructions(spec)}
 This is the SOFTWARE rung only. The hardware design is already fixed and
 already passed SoC generation; do not propose hardware changes here.
@@ -994,4 +1037,5 @@ Exact current contents of the software targets (base your change on these):
 Allowed target paths (use these paths verbatim):
 {target_list}
 
-Only fall back to a plan if a required target file is genuinely absent."""
+Only fall back to a plan if a required target file is genuinely absent.
+{optimization_block}{feedback_block}"""
