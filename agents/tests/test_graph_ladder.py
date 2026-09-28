@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from agents.cfu_design_agent import graph
-from agents.cfu_design_agent.tools import RepoToolbox, parse_command_output
+from agents.cfu_design_agent.runtime.tools import RepoToolbox, parse_command_output
 from agents.tests.common import REPO_ROOT
 
 VALID_ISA = """spec_version: "1"
@@ -174,7 +174,7 @@ class _ReuseSoftwareLlm(_ScriptedLlm):
 
     def complete(self, system: str, user: str, *, fallback: str, response_format=None):
         if "Decide whether the software rung must run again" in user:
-            from agents.cfu_design_agent.llm import LlmResult
+            from agents.cfu_design_agent.runtime.llm import LlmResult
 
             self.prompts.append(user)
             return LlmResult(
@@ -194,7 +194,7 @@ class _LoopingLlm(_ScriptedLlm):
         self.software_need_prompts: list[str] = []
 
     def complete(self, system: str, user: str, *, fallback: str, response_format=None):
-        from agents.cfu_design_agent.llm import LlmResult
+        from agents.cfu_design_agent.runtime.llm import LlmResult
 
         if "Decide whether another round is worth spending budget on" in user:
             self.optimize_prompts.append(user)
@@ -829,7 +829,7 @@ class LadderTest(unittest.TestCase):
     def test_loop_extends_isa_and_revalidates_both_implementations(self) -> None:
         import json
         import yaml
-        from agents.cfu_design_agent.llm import LlmResult
+        from agents.cfu_design_agent.runtime.llm import LlmResult
 
         class ExtendingLlm(_LoopingLlm):
             def complete(self, system, user, *, fallback, response_format=None):

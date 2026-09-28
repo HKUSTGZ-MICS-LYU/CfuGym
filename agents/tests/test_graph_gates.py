@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from agents.cfu_design_agent import graph
-from agents.cfu_design_agent.llm import LlmResult
+from agents.cfu_design_agent.runtime.llm import LlmResult
 from agents.tests.common import REPO_ROOT
 
 try:
@@ -189,7 +189,7 @@ class ImplementationGateTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.run_dir, True)
 
     def _seed(self) -> None:
-        from agents.cfu_design_agent.tools import RepoToolbox
+        from agents.cfu_design_agent.runtime.tools import RepoToolbox
 
         RepoToolbox(
             REPO_ROOT,
@@ -257,7 +257,7 @@ class ImplementationGateTest(unittest.TestCase):
         )
 
     def test_tool_intent_detection_matches_the_observed_failure(self) -> None:
-        from agents.cfu_design_agent.llm import looks_like_tool_intent
+        from agents.cfu_design_agent.runtime.llm import looks_like_tool_intent
 
         narration = (
             "I'll analyze the depthconv workload and design the CFU hardware. Let me "
@@ -723,7 +723,7 @@ class SimAttributionTest(unittest.TestCase):
     """A failed simulation must say why, not just "reached the fail symbol"."""
 
     def test_verify_failure_is_attributed(self) -> None:
-        from agents.cfu_design_agent.tools import parse_command_output
+        from agents.cfu_design_agent.runtime.tools import parse_command_output
 
         log = (
             "CFU_AGENT_PROFILE depthconv=120 calls=1\n"
@@ -751,7 +751,7 @@ class SimAttributionTest(unittest.TestCase):
         # Regression: verify PASS + rc 0 means correctness held; the remaining
         # failure is the speedup gate, which already reports itself. The old code
         # claimed "ended without reaching the pass or fail symbol".
-        from agents.cfu_design_agent.tools import parse_command_output
+        from agents.cfu_design_agent.runtime.tools import parse_command_output
 
         log = (
             "[info] CFU_AGENT_PROFILE depthconv=28912051\n"
@@ -886,7 +886,7 @@ class RepairRoutingTest(unittest.TestCase):
         self.assertEqual(raw, "")
 
     def test_simulate_records_and_follows_the_agent_decision(self) -> None:
-        from agents.cfu_design_agent.tools import parse_command_output
+        from agents.cfu_design_agent.runtime.tools import parse_command_output
 
         log = (
             "EMBENCH_VERIFY_FAIL benchmark=depthconv verify=0 result=0\n"
@@ -928,7 +928,7 @@ class RepairRoutingTest(unittest.TestCase):
         )
 
     def test_simulate_stays_deterministic_in_fixed_mode(self) -> None:
-        from agents.cfu_design_agent.tools import parse_command_output
+        from agents.cfu_design_agent.runtime.tools import parse_command_output
 
         log = "EMBENCH_VERIFY_FAIL benchmark=depthconv verify=0 result=0\n"
         state = self._state(

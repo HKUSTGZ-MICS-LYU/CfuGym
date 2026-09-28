@@ -58,7 +58,7 @@ class OverlayCommandTest(unittest.TestCase):
 
     def test_overlay_command_swaps_scaffolds_and_scopes_output(self) -> None:
         from agents.cfu_design_agent.graph import agent_cfu_overlay_commands
-        from agents.cfu_design_agent.policy import load_policy
+        from agents.cfu_design_agent.runtime.policy import load_policy
 
         run_root = "agents/generated/runs/overlay-test"
         state = {"run_root": run_root, "workdir": str(REPO_ROOT)}

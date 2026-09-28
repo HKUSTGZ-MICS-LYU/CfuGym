@@ -7,11 +7,9 @@ import re
 import shlex
 from pathlib import Path
 
-from .state import BenchmarkProject, CommandResult, ProfileRegion, ProfileResult, WorkloadSpec
-from .tools import RepoToolbox, parse_command_output
-
-
-PROFILE_LINE_RE = re.compile(r"CFU_AGENT_PROFILE\s+(?P<body>.*)")
+from ..state import BenchmarkProject, CommandResult, ProfileRegion, ProfileResult, WorkloadSpec
+from ..runtime.tools import RepoToolbox, parse_command_output
+from .profile_lines import profile_lines
 
 
 def slugify(text: str, *, default: str = "cfu_workload") -> str:
@@ -251,26 +249,19 @@ def profile_result_from_commands(results: list[CommandResult], *, dry_run: bool,
 
 def parse_profile_regions(text: str) -> list[ProfileRegion]:
     regions: list[ProfileRegion] = []
-    for match in PROFILE_LINE_RE.finditer(text):
-        for item in match.group("body").split():
-            if "=" not in item:
-                continue
-            name, value = item.split("=", 1)
-            if name in {"repeat", "bytes", "speedup_x100", "speedup_fused_x100", "speedup_twopass_x100"}:
-                continue
-            try:
-                cycles = int(value)
-            except ValueError:
-                continue
-            regions.append({"name": name, "cycles": cycles, "source": "CFU_AGENT_PROFILE"})
+    metadata = {"calls", "repeat", "bytes", "speedup_x100", "speedup_fused_x100", "speedup_twopass_x100"}
+    for fields in profile_lines(text):
+        for name, cycles in fields.items():
+            if name not in metadata:
+                regions.append({"name": name, "cycles": cycles, "source": "CFU_AGENT_PROFILE"})
+    # Other *_PROFILE diagnostics still use the generic command-output parser,
+    # but CFU_AGENT_PROFILE has already been consumed above. Never count it twice.
     parsed = parse_command_output(text)
     for profile in parsed.get("profiles", []):
-        if isinstance(profile, dict):
-            for name, value in profile.items():
-                if name == "name" or not isinstance(value, int):
-                    continue
-                if name in {"repeat", "bytes", "speedup_x100", "speedup_fused_x100", "speedup_twopass_x100"}:
-                    continue
+        if not isinstance(profile, dict) or profile.get("name") == "CFU_AGENT_PROFILE":
+            continue
+        for name, value in profile.items():
+            if name != "name" and name not in metadata and isinstance(value, int):
                 regions.append({"name": name, "cycles": value, "source": str(profile.get("name", "PROFILE"))})
     return regions
 

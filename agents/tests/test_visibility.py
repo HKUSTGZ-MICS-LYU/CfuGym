@@ -10,11 +10,11 @@ import unittest
 from unittest import mock
 
 from agents.cfu_design_agent import cli, graph
-from agents.cfu_design_agent.agent_tools import ReadOnlyToolset
+from agents.cfu_design_agent.runtime.agent_tools import ReadOnlyToolset
 from agents.cfu_design_agent.cli import build_parser
-from agents.cfu_design_agent.policy import load_policy
+from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.prompts import context_digest, hardware_prompt
-from agents.cfu_design_agent.tools import RepoToolbox
+from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
 
 SKILL = "skills/cfu-designer/SKILL.md"

@@ -112,6 +112,8 @@ RUNG_ORDER = (
 GUARDED_BUILD_RUNGS = {"hw_build": "implementation_hw", "sw_build": "implementation_sw"}
 
 FAILURE_CLASSES = (
+    "infra_timeout",
+    "infra_error",
     "input_or_policy",
     "spec_invalid",
     "isa_contract",
@@ -139,7 +141,10 @@ INFRA_PATTERNS = (
     re.compile(r"Connection (error|refused|reset|aborted)", re.I),
     re.compile(r"Max retries exceeded"),
     re.compile(r"SSLError", re.I),
+    re.compile(r"\b(?:HTTP(?: Error| status)?\s*[:=]?\s*500|upstream\b.{0,60}\b500)\b", re.I),
     re.compile(r"\b(?:502|503|504)\b.{0,40}(?:Bad Gateway|Service Unavailable|Gateway Time-out)", re.I),
+    re.compile(r"conformance oracle request got no model answer", re.I),
+    re.compile(r"\b(?:LLM|API|endpoint|gateway)\b.{0,80}\b(?:timed? out|timeout)\b", re.I),
     re.compile(r"No such file or directory: '?(?:sbt|make|yosys|conda)", re.I),
     # A misfiring lock shim is a harness problem, never a model failure.
     re.compile(r"sbt lock shim:"),
@@ -648,6 +653,11 @@ def classify_failure(record: dict) -> dict | None:
         budget_exhausted = repairs_used >= max_repairs
 
     failure_class, detail = _classify_rung(failing_rung, failing_gate, detail_text, record, status)
+    infra = record.get("infra") or {}
+    if infra.get("infra"):
+        failure_class = infra.get("infra_kind") or "infra_error"
+        detail = infra.get("infra_reason") or detail
+        budget_exhausted = None  # An endpoint incident did not exhaust a model repair budget.
     detail = " ".join(part for part in ((detail or errors or status), guard_note) if part)
     return {
         "failure_class": failure_class,
@@ -695,10 +705,25 @@ def _classify_rung(rung: str, gate: dict, detail_text: str, record: dict, status
     return "unknown", _gate_errors(gate) or f"no failing rung identified (status={status})"
 
 
-def detect_infra(stdout: str, stderr: str, timed_out: bool, exit_code: int | None) -> dict:
-    """Separate harness/infrastructure incidents from model failures."""
+def detect_infra(
+    stdout: str, stderr: str, timed_out: bool, exit_code: int | None,
+    gates: dict | None = None,
+) -> dict:
+    """Separate harness/endpoint incidents from model failures, including report gates."""
     if timed_out:
         return {"infra": True, "infra_kind": "infra_timeout", "infra_reason": "harness wall-clock timeout"}
+    conformance = (gates or {}).get("hw_conformance") or {}
+    if isinstance(conformance, dict) and conformance.get("ok") is False:
+        detail = _gate_errors(conformance)
+        endpoint_error = re.search(
+            r"conformance oracle request got no model answer|"
+            r"\b(?:LLM|API|endpoint|gateway|upstream)\b.{0,80}\b(?:timed? out|timeout|(?:HTTP\s*)?500)\b|"
+            r"\bHTTP Error 500\b", detail, re.I,
+        )
+        if conformance.get("model_failure") is True or endpoint_error:
+            kind = "infra_timeout" if re.search(r"timed? out|timeout", detail, re.I) else "infra_error"
+            return {"infra": True, "infra_kind": kind,
+                    "infra_reason": f"conformance oracle endpoint: {detail or 'no model answer'}"}
     text = f"{stdout}\n{stderr}"
     for pattern in INFRA_PATTERNS:
         m = pattern.search(text)
@@ -878,11 +903,14 @@ def collect_record(
         },
     }
 
-    record["failure"] = classify_failure(record)
-    record["episodes"] = reconstruct_episodes(record, framework_run_dir)
     record["infra"] = meta.get("infra") or detect_infra(
-        stdout, stderr, bool(meta.get("timed_out")), meta.get("exit_code")
+        stdout, stderr, bool(meta.get("timed_out")), meta.get("exit_code"), gates
     )
+    record["failure"] = classify_failure(record)
+    if record["failure"]:
+        for field in ("failure_class", "failure_rung", "failure_detail"):
+            record[field] = record["failure"][field]
+    record["episodes"] = reconstruct_episodes(record, framework_run_dir)
     record["parse_warnings"] = "; ".join(warnings)
     record["pass_at_1"] = _pass_flag(record, 1)
     record["pass_at_3"] = _pass_flag(record, 3)
@@ -990,6 +1018,8 @@ def _mean(values: list) -> float | None:
 
 
 def cell_metrics(records: list[dict], bootstrap_iters: int = 10000) -> dict:
+    # Retries are audit records, not independent model samples or model failures.
+    records = [r for r in records if not (r.get("infra") or {}).get("infra")]
     n = len(records)
     complete = [r for r in records if r.get("status") == "complete"]
     failure_tally: dict[str, int] = {}

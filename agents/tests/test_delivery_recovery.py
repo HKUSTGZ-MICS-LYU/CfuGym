@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import unittest
 
-from agents.cfu_design_agent import graph, tools
+from agents.cfu_design_agent import graph
+from agents.cfu_design_agent.runtime import tools
 
 
 # One completion containing the same edit twice, second copy glued to the first

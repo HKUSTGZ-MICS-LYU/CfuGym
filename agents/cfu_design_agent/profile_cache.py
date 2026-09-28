@@ -26,7 +26,7 @@ from typing import Any
 CACHE_SUBDIR = "agents/generated/cache/embench_profile"
 SCHEMA_VERSION = "1"
 # Bump when the key composition changes so old entries cannot be reused.
-KEY_VERSION = "2"
+KEY_VERSION = "4"
 # Placeholder substituted for the run root before hashing, so the same
 # benchmark measured in two different runs shares one cache entry.
 RUN_PLACEHOLDER = "<run>"
@@ -166,7 +166,17 @@ def build_key(
         # CPU/SoC knobs: the profile sim uses these even when the datapath flags
         # are still empty because the ISA contract has not been drafted yet.
         "cpu_flags": list(cpu_flags),
-        "observation_plan": observation_plan if observation_plan else "default",
+        "observation_plan": _normalize_run_root(observation_plan, run_root) if observation_plan else "default",
+        "instrumentation_hash": {
+            name: tree_hash(workdir / name) for name in (
+                "agents/cfu_design_agent/benchmark/generic.py",
+                "agents/cfu_design_agent/benchmark/embench.py",
+                "agents/cfu_design_agent/benchmark/embench_instrument.py",
+                "agents/cfu_design_agent/benchmark/embench_loops.py",
+                "sw/embench/boardsupport.c",
+                "sw/embench/embench_obs.h",
+            )
+        },
         "sources_hash": tree_hash(
             workdir / run_root / "workspace" / f"embench_{benchmark}" / "reference"
         ),

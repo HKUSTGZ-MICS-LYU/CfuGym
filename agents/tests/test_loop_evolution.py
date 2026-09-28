@@ -9,10 +9,10 @@ from unittest import mock
 import yaml
 
 from agents.cfu_design_agent import graph
-from agents.cfu_design_agent.artifacts import RunArtifacts
+from agents.cfu_design_agent.runtime.artifacts import RunArtifacts
 from agents.cfu_design_agent.cli import build_parser
-from agents.cfu_design_agent.llm import LlmResult
-from agents.cfu_design_agent.policy import load_policy
+from agents.cfu_design_agent.runtime.llm import LlmResult
+from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.tests.common import REPO_ROOT
 from agents.tests.test_graph_ladder import VALID_ISA
 

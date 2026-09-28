@@ -6,6 +6,7 @@ aggregation and command construction against synthetic run artifacts.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import os
@@ -16,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agents.cfu_design_agent.artifacts import _safe_run_id
+from agents.cfu_design_agent.runtime.artifacts import _safe_run_id
 from agents.experiments import run_matrix as rm
 
 
@@ -369,6 +370,40 @@ class InfraTest(unittest.TestCase):
         result = rm.detect_infra("status=failed\nstopped_at=hw_build\n", "scala boom", False, 1)
         self.assertFalse(result["infra"])
 
+    def test_conformance_endpoint_failure_from_structured_gate(self) -> None:
+        for error, expected in (
+            ("the conformance oracle request got no model answer (TimeoutError: timed out)", "infra_timeout"),
+            ("the conformance oracle request got no model answer (upstream HTTP 500)", "infra_error"),
+        ):
+            with self.subTest(error=error):
+                gate = {"ok": False, "model_failure": True, "errors": [error]}
+                result = rm.detect_infra("status=failed\n", "", False, 1,
+                                         {"hw_conformance": gate})
+                self.assertTrue(result["infra"])
+                self.assertEqual(result["infra_kind"], expected)
+                self.assertIn(error, result["infra_reason"])
+
+    def test_conformance_endpoint_error_without_model_failure_flag(self) -> None:
+        gate = {"ok": False, "errors": ["oracle endpoint upstream HTTP 500"]}
+        self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1,
+                                         {"hw_conformance": gate})["infra_kind"], "infra_error")
+        gate = {"ok": False, "errors": ["conformance oracle request got no model answer (timeout)"]}
+        self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1,
+                                         {"hw_conformance": gate})["infra_kind"], "infra_timeout")
+        gate = {"ok": False, "oracle_failure": True, "errors": ["oracle C compile failed"]}
+        self.assertFalse(rm.detect_infra("status=failed\n", "", False, 1,
+                                         {"hw_conformance": gate})["infra"])
+
+    def test_endpoint_log_fallback_without_parseable_gate(self) -> None:
+        for log in ("HTTP Error 500: Internal Server Error", "upstream 500 Internal Server Error",
+                    "conformance oracle request got no model answer (TimeoutError)"):
+            with self.subTest(log=log):
+                self.assertTrue(rm.detect_infra("status=failed\n" + log, "", False, 1)["infra"])
+        self.assertFalse(rm.detect_infra(
+            "status=failed\n", "conformance verdict fail commands=0/1 cases=1", False, 1,
+            {"hw_conformance": {"ok": False, "oracle_failure": False, "errors": ["verdict fail"]}},
+        )["infra"])
+
 
 class CollectTest(unittest.TestCase):
     def _fixture(self, tmp: Path, stdout: str, report: str, run_yaml: str, embench: str):
@@ -426,6 +461,71 @@ class CollectTest(unittest.TestCase):
             payload = json.loads(path.read_text())
             self.assertEqual(payload["terminal"]["failure_class"], "sim_correctness")
             self.assertEqual(payload["terminal"]["stopped_at"], "sim")
+
+
+class EndpointRetryTest(unittest.TestCase):
+    def test_endpoint_failure_is_collected_classified_and_retried(self) -> None:
+        error = "the conformance oracle request got no model answer (TimeoutError: timed out)"
+        failed_report = REPORT_PASS.replace("Status: complete", "Status: failed").replace(
+            "- sim: {'ok': True,", f"- hw_conformance: {{'ok': False, 'model_failure': True, 'errors': [{error!r}]}}\n- sim: {{'ok': True,"
+        ).replace("repairs used: 2/4 (iteration=2)", "repairs used: 0/4 (iteration=0)")
+        with tempfile.TemporaryDirectory() as tmp_str:
+            root = Path(tmp_str)
+            opts = argparse.Namespace(
+                exp_id="pk5-test", max_iters=5, workdir=root, python="python3", conda_env="",
+                visibility="standard", repair_routing="auto", software_change="auto",
+                profile_cache="on", timeout=1, force=False, infra_retries=1,
+            )
+            job = {"model": "glm-5.2", "benchmark": "crc32", "repeat": 1}
+            exp_dir = root / "experiment"
+            calls = []
+            original_run_logged = rm.run_logged
+
+            def fake_run_logged(argv, out_path, err_path, cwd, env, timeout):
+                calls.append(out_path.parent.name)
+                fw = root / "agents" / "generated" / "runs" / calls[-1]
+                if len(calls) == 1:
+                    _write(out_path, "status=failed\nstopped_at=hw_conformance\n")
+                    _write(fw / "report.md", failed_report)
+                    _write(fw / "run.yaml", RUN_YAML_PASS.replace("complete", "failed"))
+                    code = 1
+                else:
+                    _write(out_path, STDOUT_PASS)
+                    _write(fw / "report.md", REPORT_PASS)
+                    _write(fw / "run.yaml", RUN_YAML_PASS)
+                    code = 0
+                _write(err_path, "")
+                return {"exit_code": code, "wall_seconds": 1}
+
+            try:
+                rm.run_logged = fake_run_logged
+                records = rm.execute_one(job, opts, exp_dir, {"glm-5.2": {"config": "test"}}, None, {})
+            finally:
+                rm.run_logged = original_run_logged
+            self.assertEqual(len(records), 2)
+            self.assertTrue(calls[1].endswith("-infra1"), calls)
+            first = records[0]
+            self.assertEqual(first["infra"]["infra_kind"], "infra_timeout")
+            self.assertEqual(first["failure"]["failure_class"], "infra_timeout")
+            self.assertEqual(first["failure"]["failure_rung"], "hw_conformance")
+            self.assertIsNone(first["failure"]["budget_exhausted"])
+            self.assertEqual(json.loads((exp_dir / "runs" / calls[0] / "failure.json").read_text())
+                             ["terminal"]["failure_class"], "infra_timeout")
+            self.assertFalse(records[1]["infra"]["infra"])
+            self.assertEqual(rm.cell_metrics(records, bootstrap_iters=100)["runs"], 1)
+            self.assertEqual(rm.cell_metrics(records, bootstrap_iters=100)["pass_at_5_budget"], 1)
+            rm.aggregate(exp_dir, {"exp_id": "pk5-test"}, bootstrap_iters=100)
+            with (exp_dir / "results" / "runs.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 2)  # retain incident and retry for auditing
+            self.assertEqual(rows[0]["failure_class"], "infra_timeout")
+            with (exp_dir / "results" / "failures.csv").open() as handle:
+                failures = list(csv.DictReader(handle))
+            self.assertEqual(failures[0]["failure_class"], "infra_timeout")
+            with (exp_dir / "results" / "pass_at_k.csv").open() as handle:
+                metrics = list(csv.DictReader(handle))[0]
+            self.assertEqual(metrics["runs"], "1")
+            self.assertEqual(metrics["failure_classes"], "")
 
 
 class MetricsTest(unittest.TestCase):

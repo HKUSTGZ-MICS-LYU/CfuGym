@@ -7,8 +7,8 @@ import shutil
 import unittest
 from pathlib import Path
 
-from agents.cfu_design_agent.policy import PolicyError, load_policy
-from agents.cfu_design_agent.tools import (
+from agents.cfu_design_agent.runtime.policy import PolicyError, load_policy
+from agents.cfu_design_agent.runtime.tools import (
     DESIGN_SOURCE_FILES,
     RepoToolbox,
     design_scaffold_name,

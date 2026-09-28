@@ -222,8 +222,10 @@ def embench_instructions(spec: WorkloadSpec) -> str:
     name = spec.get("benchmark_name", "")
     return (
         f"Embench workload: {name}\n\n"
-        "The measured profile above lists cycle counts per observation point. Use the\n"
-        "hottest entry (excluding the whole-benchmark entry) as your target.\n\n"
+        "The measured profile includes whole-benchmark, function and (when available)\n"
+        "whole-loop inclusive cycles. Prioritize the hottest measured loop, using\n"
+        "its source function and line from WorkloadSpec.hot_loop as the edit target.\n"
+        "Nested loop cycles overlap; do not sum them.\n\n"
         "Deliverable: a unified git patch that rewrites that hot function so it uses the\n"
         "CFU intrinsics, keeping the scalar path for the reference build:\n\n"
         "- Guard every CFU use with #ifdef USE_AGENT_CFU / #else / #endif so the\n"
@@ -438,7 +440,7 @@ Repo context:
 {embench_instructions(spec)}
 {ROOFLINE_GUIDANCE}
 Analyze the workload. Classify the acceleration pattern, identify hardware/software state, data movement, expected bottlenecks, and the minimum validation needed.
-Name the exact function and loop that should become the CFU kernel.
+When WorkloadSpec.hot_loop is present, use its measured loop id, source function and line to identify the kernel; nested region cycles are inclusive and must not be summed. Name the exact function and loop that should become the CFU kernel.
 Return exactly one YAML mapping. {ROOFLINE_ANALYSIS_FIELDS}"""
 
 

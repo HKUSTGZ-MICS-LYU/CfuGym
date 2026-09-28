@@ -8,7 +8,7 @@ import io
 import unittest
 
 from agents.cfu_design_agent import cli
-from agents.cfu_design_agent.llm import LlmResult
+from agents.cfu_design_agent.runtime.llm import LlmResult
 from agents.tests.common import REPO_ROOT
 
 

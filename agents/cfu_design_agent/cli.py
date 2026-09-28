@@ -7,8 +7,8 @@ import os
 from pathlib import Path
 
 from .graph import enable_progress, export_graph_visualization, run_agent
-from .llm import OpenAiTextClient
-from .llm_config import LlmConfigError, effective_config, list_configs
+from .runtime.llm import OpenAiTextClient
+from .runtime.llm_config import LlmConfigError, effective_config, list_configs
 from .state import CfuDesignState
 
 

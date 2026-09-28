@@ -5,9 +5,9 @@ from __future__ import annotations
 import types
 import unittest
 
-from agents.cfu_design_agent import llm
+from agents.cfu_design_agent.runtime import llm
 from agents.cfu_design_agent.graph import _node_ok, _update_ok
-from agents.cfu_design_agent.progress import NODE_TO_STEP, STAGE_LABELS, StageProgress
+from agents.cfu_design_agent.runtime.progress import NODE_TO_STEP, STAGE_LABELS, StageProgress
 
 
 class UsageLedgerTest(unittest.TestCase):

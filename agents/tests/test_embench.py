@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
-from agents.cfu_design_agent import embench, embench_instrument
+from agents.cfu_design_agent.benchmark.embench_loops import discover_loops
+
+from agents.cfu_design_agent.benchmark import embench, embench_instrument
 from agents.cfu_design_agent.isa import render_cfu_intrinsics
-from agents.cfu_design_agent.policy import PolicyError, load_policy
+from agents.cfu_design_agent.runtime.policy import PolicyError, load_policy
 from agents.cfu_design_agent.spec import normalize_workload_spec, validate_workload_spec
-from agents.cfu_design_agent.tools import RepoToolbox, infer_command_id
+from agents.cfu_design_agent.runtime.tools import RepoToolbox, infer_command_id
 from agents.tests.common import REPO_ROOT
 
 
@@ -63,18 +68,20 @@ class InstrumenterTest(unittest.TestCase):
         twice, applied, skipped = embench_instrument.instrument_text(
             once, [{"function": "helper", "id": "helper"}], rel_path="benchmark.c"
         )
-        self.assertEqual(applied, [])
+        self.assertEqual(applied, ["helper"])
         self.assertEqual(twice.count("EMBENCH_OBS_ENTER(helper)"), 1)
-        self.assertTrue(any("already" in item["reason"] for item in skipped))
+        self.assertEqual(skipped, [])
 
-    def test_loop_points_degrade_with_reason(self) -> None:
-        _, applied, skipped = embench_instrument.instrument_text(
+    def test_loop_points_wrap_full_loop_once(self) -> None:
+        text, applied, skipped = embench_instrument.instrument_text(
             FIXTURE,
-            [{"function": "benchmark_body", "id": "loop1", "kind": "loop"}],
+            [{"function": "benchmark_body", "id": "loop1", "kind": "loop", "ordinal": 1}],
             rel_path="benchmark.c",
         )
-        self.assertEqual(applied, [])
-        self.assertTrue(any("loop-level" in item["reason"] for item in skipped))
+        self.assertEqual(applied, ["loop1"])
+        self.assertEqual(skipped, [])
+        self.assertIn("{ EMBENCH_OBS_ENTER(loop1);\nfor (i = 0; i < n; ++i)", text)
+        self.assertIn("  }\n}\n  return n;", text)
 
     def test_missing_definition_reported(self) -> None:
         _, applied, skipped = embench_instrument.instrument_text(
@@ -86,6 +93,95 @@ class InstrumenterTest(unittest.TestCase):
     def test_default_plan_finds_loops(self) -> None:
         points = embench_instrument.default_plan({"benchmark.c": FIXTURE})
         self.assertIn("benchmark_body", [p["function"] for p in points])
+        self.assertEqual([p["kind"] for p in points], ["function", "loop"])
+        self.assertEqual(points[1]["line"], 9)
+
+    def test_default_plan_has_stable_cross_run_ids(self) -> None:
+        paths = [f"agents/generated/runs/{run}/workspace/embench_x/profile/src/benchmark.c"
+                 for run in ("one", "two")]
+        first, second = (embench_instrument.default_plan({path: FIXTURE}) for path in paths)
+        self.assertEqual(first, second)
+        self.assertEqual(first[1]["file"], "benchmark.c")
+        self.assertTrue(first[0]["id"].startswith("obs_fn_"))
+
+    def test_nested_unbraced_do_and_preprocessor_text(self) -> None:
+        source = '''#include <stdint.h>
+#define HIDDEN for (int z=0;z<5;z++)
+int work(int n) {
+  // while (0) { not a loop }
+  const char *message = "for (;;)";
+  for (int i=0;i<n;i++)
+    for (int j=0;j<2;j++)
+      if (j) continue;
+  do { n--; } while(n>0);
+  return n;
+}
+'''
+        loops = discover_loops(source, ["work"])
+        self.assertEqual([loop.kind for loop in loops], ["for", "for", "do"])
+        self.assertEqual([loop.ordinal for loop in loops], [1, 2, 3])
+        points = embench_instrument.default_plan({"benchmark.c": source})
+        result, report = embench_instrument.instrument_sources({"benchmark.c": source}, {"points": points})
+        self.assertEqual(len(report.applied), 4)
+        self.assertEqual(report.skipped, [])
+        self.assertEqual(result["benchmark.c"].count("EMBENCH_OBS_ENTER("), 4)
+
+    def test_loop_scope_runtime_counts_early_exits(self) -> None:
+        compiler = shutil.which("gcc")
+        if not compiler:
+            self.skipTest("host GCC not installed")
+        source = '''#include <stdio.h>
+int work(int n) {
+  int total = 0;
+  for (int i=0; i<n; ++i) {
+    if (i == 1) continue;
+    if (i == 4) break;
+    total += i;
+  }
+  do { if (n < 0) return -1; --n; } while(n > 0);
+  return total;
+}
+int main(void) { printf("%d %d\\n", work(5), work(-1)); return 0; }
+'''
+        points = [{"file": "work.c", "function": "work", "kind": "loop", "id": "obs_for", "ordinal": 1},
+                  {"file": "work.c", "function": "work", "kind": "loop", "id": "obs_do", "ordinal": 2}]
+        text, report = embench_instrument.instrument_sources({"work.c": source}, {"points": points})
+        self.assertEqual(report.applied, ["obs_for", "obs_do"])
+        with tempfile.TemporaryDirectory() as workdir:
+            path = Path(workdir)
+            (path / "work.c").write_text(text["work.c"])
+            (path / "obs.c").write_text('''#include <stdint.h>
+#include <stdio.h>
+static int entries = 0, exits = 0;
+uint32_t embench_obs_enter_scope(const char *name) { (void)name; ++entries; return 0; }
+void embench_obs_exit_scope(const char *name, uint32_t start) { (void)name; (void)start; ++exits; }
+int main_dummy(void) { return 0; }
+__attribute__((destructor)) static void check(void) { printf("%d %d\\n", entries, exits); }
+''')
+            binary = path / "work"
+            built = subprocess.run([compiler, "-DEMBENCH_OBS", "-I" + str(REPO_ROOT / "sw/embench"),
+                                    str(path / "work.c"), str(path / "obs.c"), "-o", str(binary)],
+                                   capture_output=True, text=True, check=False)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            output = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
+            self.assertEqual(output.stdout.splitlines(), ["5 -1", "4 4"])
+
+    def test_instrumented_matmult_compiles_for_riscv(self) -> None:
+        compiler = shutil.which("riscv64-unknown-elf-gcc")
+        if not compiler:
+            self.skipTest("RISC-V GCC not installed")
+        path = REPO_ROOT / "benchmarks/embench-iot/src/matmult-int/matmult-int.c"
+        source = path.read_text()
+        instrumented, report = embench_instrument.instrument_sources({str(path): source})
+        self.assertGreaterEqual(len([p for p in report.points if p["kind"] == "loop"]), 7)
+        with tempfile.TemporaryDirectory() as workdir:
+            test_file = Path(workdir) / "matmult-int.c"
+            test_file.write_text(instrumented[str(path)])
+            command = [compiler, "-fsyntax-only", "-march=rv32imc_zicsr_zifencei", "-mabi=ilp32",
+                       "-DEMBENCH_OBS", "-DGLOBAL_SCALE_FACTOR=1", "-I" + str(REPO_ROOT / "sw/embench"),
+                       "-I" + str(REPO_ROOT / "benchmarks/embench-iot/support"), str(test_file)]
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class EmbenchDiscoveryTest(unittest.TestCase):
@@ -264,6 +360,23 @@ class PrepareWorkspaceTest(unittest.TestCase):
             embench.prepare_embench_benchmark(toolbox, {"benchmark_name": "does-not-exist"})
 
 class EmbenchHotspotTest(unittest.TestCase):
+    def test_selected_loop_keeps_source_function(self) -> None:
+        from unittest import mock
+        from agents.cfu_design_agent import graph
+
+        source = {"workload_spec": {"name": "matmult-int", "kernel_function": "main"},
+                  "profile_result": {"hot_spot": "obs_loop_x_Multiply_3", "regions": [],
+                                     "hot_spot_point": {"kind": "loop", "id": "obs_loop_x_Multiply_3",
+                                                        "function": "Multiply", "file": "matmult-int.c",
+                                                        "line": 153, "ordinal": 3, "loop_kind": "for"}},
+                  "benchmark_project": {"candidate_hotspots": ["Multiply"]}, "gates": {}}
+        with mock.patch.object(graph, "_write_hotspot_artifact"):
+            updated = graph.extract_hotspot(source)
+        self.assertEqual(updated["workload_spec"]["kernel_function"], "Multiply")
+        self.assertEqual(updated["workload_spec"]["hot_loop"]["line"], 153)
+        self.assertEqual(updated["workload_spec"]["hot_spot"], "obs_loop_x_Multiply_3")
+        self.assertIn("hot_loop:", updated["spec_text"])
+
     def test_instrumented_config_is_preferred(self) -> None:
         from agents.cfu_design_agent import graph
 
@@ -287,7 +400,7 @@ class EmbenchHotspotTest(unittest.TestCase):
 
 class EmbenchPatchRedirectTest(unittest.TestCase):
     def test_benchmark_source_patch_redirects_to_cfu_tree(self) -> None:
-        from agents.cfu_design_agent.tools import repair_patch_paths
+        from agents.cfu_design_agent.runtime.tools import repair_patch_paths
 
         patch = (
             "--- a/benchmarks/embench-iot/src/crc32/crc_32.c\n"
@@ -303,7 +416,7 @@ class EmbenchPatchRedirectTest(unittest.TestCase):
         self.assertIn("+++ b/" + expected, rewritten)
 
     def test_other_benchmark_source_is_rejected(self) -> None:
-        from agents.cfu_design_agent.tools import repair_patch_paths
+        from agents.cfu_design_agent.runtime.tools import repair_patch_paths
 
         patch = (
             "--- a/benchmarks/embench-iot/src/md5sum/md5.c\n"
@@ -324,7 +437,7 @@ class EmbenchPatchRedirectTest(unittest.TestCase):
         )
 
     def test_apply_patch_targets_cfu_copy(self) -> None:
-        from agents.cfu_design_agent.tools import RepoToolbox
+        from agents.cfu_design_agent.runtime.tools import RepoToolbox
 
         run_id = "embench-cfu-patch-0001"
         run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
@@ -371,7 +484,7 @@ class EmbenchPatchRedirectTest(unittest.TestCase):
 
 class FileBlockProtocolTest(unittest.TestCase):
     def test_extract_file_blocks(self) -> None:
-        from agents.cfu_design_agent.tools import extract_file_blocks
+        from agents.cfu_design_agent.runtime.tools import extract_file_blocks
 
         text = "chat\nFILE_BEGIN benchmarks/embench-iot/src/crc32/crc_32.c\nint x;\nFILE_END\ntail"
         blocks = extract_file_blocks(text)
@@ -380,7 +493,7 @@ class FileBlockProtocolTest(unittest.TestCase):
         self.assertEqual(blocks[0][1], "int x;\n")
 
     def test_file_block_redirect_and_write(self) -> None:
-        from agents.cfu_design_agent.tools import RepoToolbox
+        from agents.cfu_design_agent.runtime.tools import RepoToolbox
 
         run_id = "embench-fileblock-0001"
         run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"

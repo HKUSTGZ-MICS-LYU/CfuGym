@@ -5,8 +5,8 @@ from __future__ import annotations
 import shutil
 import unittest
 
-from agents.cfu_design_agent.artifacts import RunArtifacts
-from agents.cfu_design_agent.policy import PolicyError, load_policy
+from agents.cfu_design_agent.runtime.artifacts import RunArtifacts
+from agents.cfu_design_agent.runtime.policy import PolicyError, load_policy
 from agents.tests.common import REPO_ROOT, repo_files
 
 

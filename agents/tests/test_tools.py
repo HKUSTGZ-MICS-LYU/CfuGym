@@ -5,8 +5,8 @@ from __future__ import annotations
 import shutil
 import unittest
 
-from agents.cfu_design_agent.policy import PolicyError
-from agents.cfu_design_agent.tools import RepoToolbox
+from agents.cfu_design_agent.runtime.policy import PolicyError
+from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
 
 
@@ -71,19 +71,19 @@ class ToolsTest(unittest.TestCase):
         )
 
     def test_filter_output_removes_terminal_formatting_and_controls(self) -> None:
-        from agents.cfu_design_agent.tools import filter_output
+        from agents.cfu_design_agent.runtime.tools import filter_output
 
         text = "\x1b[31mERROR\x1b[0m\rprogress\b!\x1b]8;;https://example.test\x07link\x1b]8;;\x07\n"
         self.assertEqual(filter_output(text), "ERROR\nprogress!link\n")
 
     def test_parse_command_output_filters_ansi_before_parsing(self) -> None:
-        from agents.cfu_design_agent.tools import parse_command_output
+        from agents.cfu_design_agent.runtime.tools import parse_command_output
 
         parsed = parse_command_output("\x1b[32mCFU_AGENT_PROFILE crc32=42\x1b[0m\n")
         self.assertEqual(parsed["profiles"][0]["crc32"], 42)
 
     def test_parse_command_output_extracts_the_yosys_cost_line(self) -> None:
-        from agents.cfu_design_agent.tools import parse_command_output
+        from agents.cfu_design_agent.runtime.tools import parse_command_output
 
         parsed = parse_command_output(
             "Wrote out/summary.md\ncost top=AgentCfu cells=3845 wire_bits=4402 "
@@ -102,7 +102,7 @@ class ToolsTest(unittest.TestCase):
         self.assertNotIn("cost", parse_command_output("no cost summary here\n"))
 
     def test_parse_command_output_extracts_the_verify_diagnostic(self) -> None:
-        from agents.cfu_design_agent.tools import parse_command_output
+        from agents.cfu_design_agent.runtime.tools import parse_command_output
 
         # Embench: verify_benchmark() != 0 means correct; 0 means a mismatch.
         parsed = parse_command_output(
@@ -117,7 +117,7 @@ class ToolsTest(unittest.TestCase):
         self.assertNotIn("verify", parse_command_output("no verify line here\n"))
 
     def test_edit_end_tolerates_trailing_sampler_junk(self) -> None:
-        from agents.cfu_design_agent.tools import (
+        from agents.cfu_design_agent.runtime.tools import (
             extract_edit_blocks,
             unterminated_edit_blocks,
         )
@@ -141,7 +141,7 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(unterminated_edit_blocks(text), 0)
 
     def test_unterminated_edit_block_is_counted(self) -> None:
-        from agents.cfu_design_agent.tools import (
+        from agents.cfu_design_agent.runtime.tools import (
             extract_edit_blocks,
             unterminated_edit_blocks,
         )
@@ -177,7 +177,7 @@ class ToolsTest(unittest.TestCase):
 
 class CodeFenceTest(unittest.TestCase):
     def test_strips_markdown_fences_around_a_file_body(self) -> None:
-        from agents.cfu_design_agent.tools import extract_file_blocks, strip_code_fences
+        from agents.cfu_design_agent.runtime.tools import extract_file_blocks, strip_code_fences
 
         self.assertEqual(strip_code_fences("```scala\nobject A\n```"), "object A\n")
         self.assertEqual(strip_code_fences("object A\n"), "object A\n")
@@ -189,7 +189,7 @@ class CodeFenceTest(unittest.TestCase):
         self.assertEqual(blocks, [("path/A.scala", "object A\n")])
 
     def test_extract_patch_strips_fences(self) -> None:
-        from agents.cfu_design_agent.tools import extract_patch
+        from agents.cfu_design_agent.runtime.tools import extract_patch
 
         text = "PATCH_BEGIN\n```diff\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n```\nPATCH_END"
         patch = extract_patch(text)
@@ -201,7 +201,7 @@ class EditBlockTest(unittest.TestCase):
     """Targeted SEARCH/REPLACE edits: parsing, matching, and policy reuse."""
 
     def test_extract_edit_blocks_parses_multiple_pairs(self) -> None:
-        from agents.cfu_design_agent.tools import extract_edit_blocks
+        from agents.cfu_design_agent.runtime.tools import extract_edit_blocks
 
         text = (
             "prose\n"
@@ -216,7 +216,7 @@ class EditBlockTest(unittest.TestCase):
         self.assertEqual(blocks[0][1], [("old one", "new one"), ("old two", "new two")])
 
     def test_apply_edit_pairs_requires_a_unique_match(self) -> None:
-        from agents.cfu_design_agent.tools import apply_edit_pairs
+        from agents.cfu_design_agent.runtime.tools import apply_edit_pairs
 
         updated, errors = apply_edit_pairs("a\nb\n", [("b", "c")])
         self.assertEqual(errors, [])
@@ -229,14 +229,14 @@ class EditBlockTest(unittest.TestCase):
         self.assertTrue(any("not found" in problem for problem in errors))
 
     def test_apply_edit_pairs_tolerates_trailing_whitespace_only(self) -> None:
-        from agents.cfu_design_agent.tools import apply_edit_pairs
+        from agents.cfu_design_agent.runtime.tools import apply_edit_pairs
 
         updated, errors = apply_edit_pairs("  keep me   \nnext\n", [("  keep me", "  changed")])
         self.assertEqual(errors, [])
         self.assertEqual(updated, "  changed\nnext\n")
 
     def test_mismatch_names_the_first_differing_line(self) -> None:
-        from agents.cfu_design_agent.tools import apply_edit_pairs
+        from agents.cfu_design_agent.runtime.tools import apply_edit_pairs
 
         # A paraphrased comment (the depthconv failure mode) must be localized.
         content = "a\n// is a int8_t\nc\n"
@@ -248,7 +248,7 @@ class EditBlockTest(unittest.TestCase):
         self.assertIn("is a int8_t", errors[0])  # the current file line
 
     def test_mismatch_reports_when_an_earlier_pair_changed_the_region(self) -> None:
-        from agents.cfu_design_agent.tools import apply_edit_pairs
+        from agents.cfu_design_agent.runtime.tools import apply_edit_pairs
 
         _updated, errors = apply_edit_pairs(
             "alpha\nbeta\n", [("alpha", "ALPHA"), ("alpha", "omega")]
@@ -256,7 +256,7 @@ class EditBlockTest(unittest.TestCase):
         self.assertIn("an earlier section or pair changed that region", errors[0])
 
     def test_mismatch_without_an_anchor_says_to_rebuild_from_the_prompt(self) -> None:
-        from agents.cfu_design_agent.tools import apply_edit_pairs
+        from agents.cfu_design_agent.runtime.tools import apply_edit_pairs
 
         _updated, errors = apply_edit_pairs("a\nb\n", [("totally absent\ntext", "x")])
         self.assertIn("does not appear in the current file", errors[0])

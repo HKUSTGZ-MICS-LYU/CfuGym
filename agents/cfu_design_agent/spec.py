@@ -9,8 +9,8 @@ from typing import Any, Callable
 
 import yaml
 
-from .embench import list_benchmarks
-from .llm import LlmResult, OpenAiTextClient, clean_llm_text
+from .benchmark.embench import list_benchmarks
+from .runtime.llm import LlmResult, OpenAiTextClient, clean_llm_text
 from .state import RepoContext, WorkloadSpec
 
 
@@ -136,7 +136,7 @@ def load_formatted_spec(path: Path) -> WorkloadSpec:
 def strip_unknown_config_keys(data: dict[str, Any]) -> dict[str, Any]:
     """Drop config keys that are not part of the known WorkloadSpec schema."""
     allowed = set(WorkloadSpec.__annotations__)
-    allowed.update({"spec_version", "hot_spot"})
+    allowed.update({"spec_version", "hot_spot", "hot_loop"})
     return {key: value for key, value in data.items() if key in allowed}
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from agents.cfu_design_agent.policy import (
+from agents.cfu_design_agent.runtime.policy import (
     PolicyError,
     load_policy,
     normalize_repo_path,
@@ -105,7 +105,7 @@ class PolicyTest(unittest.TestCase):
             self.policy.check_command("validation", "soc_generate_agent", without_flag, REPO_ROOT)
 
     def test_agent_generation_id_is_selected_over_the_loose_one(self) -> None:
-        from agents.cfu_design_agent.tools import infer_command_id
+        from agents.cfu_design_agent.runtime.tools import infer_command_id
 
         overlay = [
             "sbt",

@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
-from agents.cfu_design_agent.llm import OpenAiTextClient
-from agents.cfu_design_agent.llm_config import (
+from agents.cfu_design_agent.runtime.llm import OpenAiTextClient
+from agents.cfu_design_agent.runtime.llm_config import (
     LlmConfigError,
     effective_config,
     load_config,
@@ -19,7 +19,7 @@ class LlmConfigTest(unittest.TestCase):
         import json
         import tempfile
 
-        from agents.cfu_design_agent.llm_config import list_configs
+        from agents.cfu_design_agent.runtime.llm_config import list_configs
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "agents" / "llm_configs"
@@ -39,7 +39,7 @@ class LlmConfigTest(unittest.TestCase):
         self.assertEqual(config["name"], "default")
 
     def test_invalid_mode_rejected(self) -> None:
-        from agents.cfu_design_agent.llm_config import resolve_config
+        from agents.cfu_design_agent.runtime.llm_config import resolve_config
 
         with self.assertRaises(LlmConfigError):
             resolve_config("bad", {"name": "bad", "api_mode": "nope"})
@@ -51,7 +51,7 @@ class LlmConfigTest(unittest.TestCase):
     def test_effective_config_default_missing_uses_env(self) -> None:
         import tempfile
 
-        from agents.cfu_design_agent.llm_config import effective_config
+        from agents.cfu_design_agent.runtime.llm_config import effective_config
 
         with tempfile.TemporaryDirectory() as directory:
             cfg = effective_config(Path(directory), "default")
@@ -112,14 +112,14 @@ class LlmConfigTest(unittest.TestCase):
 
 class ThinkingConfigTest(unittest.TestCase):
     def test_thinking_defaults_off(self) -> None:
-        from agents.cfu_design_agent.llm_config import resolve_config
+        from agents.cfu_design_agent.runtime.llm_config import resolve_config
 
         cfg = resolve_config("default", {})
         self.assertFalse(cfg["thinking"])
         self.assertIsNone(cfg["reasoning_effort"])
 
     def test_thinking_and_effort_resolution(self) -> None:
-        from agents.cfu_design_agent.llm_config import resolve_config
+        from agents.cfu_design_agent.runtime.llm_config import resolve_config
 
         cases = [
             ({"thinking": True}, True, "medium"),
@@ -135,13 +135,13 @@ class ThinkingConfigTest(unittest.TestCase):
             self.assertEqual(cfg["reasoning_effort"], expected_effort, data)
 
     def test_invalid_reasoning_effort_rejected(self) -> None:
-        from agents.cfu_design_agent.llm_config import resolve_config
+        from agents.cfu_design_agent.runtime.llm_config import resolve_config
 
         with self.assertRaises(LlmConfigError):
             resolve_config("c", {"thinking": True, "reasoning_effort": "bogus"})
 
     def test_thinking_body_must_be_an_object(self) -> None:
-        from agents.cfu_design_agent.llm_config import resolve_config
+        from agents.cfu_design_agent.runtime.llm_config import resolve_config
 
         with self.assertRaises(LlmConfigError):
             resolve_config("c", {"thinking": True, "thinking_body": "nope"})
@@ -195,7 +195,7 @@ class ThinkingConfigTest(unittest.TestCase):
         import os
         from unittest import mock
 
-        from agents.cfu_design_agent.llm_config import env_only_config
+        from agents.cfu_design_agent.runtime.llm_config import env_only_config
 
         with mock.patch.dict(
             os.environ,
@@ -337,7 +337,7 @@ class ThinkingConfigTest(unittest.TestCase):
             content="ANSWER",
             model_extra={"provider_specific_fields": {"reasoning": "provider thought"}},
         )
-        from agents.cfu_design_agent.llm import _extract_chat_reasoning
+        from agents.cfu_design_agent.runtime.llm import _extract_chat_reasoning
 
         text, source = _extract_chat_reasoning(message)
         self.assertEqual(text, "provider thought")
@@ -346,7 +346,7 @@ class ThinkingConfigTest(unittest.TestCase):
     def test_chat_ignores_a_null_provider_reasoning(self) -> None:
         from types import SimpleNamespace
 
-        from agents.cfu_design_agent.llm import _extract_chat_reasoning
+        from agents.cfu_design_agent.runtime.llm import _extract_chat_reasoning
 
         # DeepSeek on this gateway reports provider_specific_fields.reasoning: None.
         message = SimpleNamespace(
@@ -411,7 +411,7 @@ class ThinkingConfigTest(unittest.TestCase):
 
 class ReasoningSplitTest(unittest.TestCase):
     def test_split_reasoning_handles_common_formats(self) -> None:
-        from agents.cfu_design_agent.llm import split_reasoning
+        from agents.cfu_design_agent.runtime.llm import split_reasoning
 
         lt, gt = chr(60), chr(62)
         cases = [
@@ -427,7 +427,7 @@ class ReasoningSplitTest(unittest.TestCase):
             self.assertEqual(reason, expected_reason)
 
     def test_unclosed_thinking_tag_is_treated_as_reasoning(self) -> None:
-        from agents.cfu_design_agent.llm import split_reasoning
+        from agents.cfu_design_agent.runtime.llm import split_reasoning
 
         lt, gt = chr(60), chr(62)
         text, reason = split_reasoning(f"ANSWER?\n{lt}thinking{gt}cut off mid-thought")
@@ -437,7 +437,7 @@ class ReasoningSplitTest(unittest.TestCase):
     def test_chat_reasoning_field_is_split_from_the_answer(self) -> None:
         from types import SimpleNamespace
 
-        from agents.cfu_design_agent.llm import OpenAiTextClient
+        from agents.cfu_design_agent.runtime.llm import OpenAiTextClient
 
         lt, gt = chr(60), chr(62)
         seen: dict = {}
@@ -489,7 +489,7 @@ class StreamingTest(unittest.TestCase):
         from types import SimpleNamespace
         from unittest import mock
 
-        from agents.cfu_design_agent import llm
+        from agents.cfu_design_agent.runtime import llm
 
         chunks = [
             self._chunk(reasoning="think-"),

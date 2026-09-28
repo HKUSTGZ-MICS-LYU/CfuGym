@@ -2,6 +2,32 @@
 
 This folder contains local agent frameworks for CfuGym workflows.
 
+## Code layout
+
+`cfu_design_agent/` separates three responsibilities:
+
+- `benchmark/`: workload adapters. `generic.py` prepares generated/C-project
+  benchmarks; `embench.py`, `embench_instrument.py`, and `embench_loops.py`
+  handle Embench workspace, observation points, and source loop discovery.
+  New benchmark suites should add adapters here rather than extend the flow
+  runner with benchmark-specific workspace mechanics.
+- `flow/`: the shared node/edge specification and traversal for LangGraph and
+  the pure-Python runner (`wiring.py`). `graph.py` currently retains node
+  implementations and public `build_graph`/`run_agent` entry points, because
+  existing callers patch module-level node dependencies there. Move node
+  implementations incrementally only with explicit dependency injection.
+- `runtime/`: low-level execution services—policy, repository tools, artifacts,
+  read-only agent tools, LLM transport/config, and progress tracking. These
+  enforce access and run isolation independently of benchmark selection.
+
+The short-lived old-path alias scripts were removed; import adapters via
+`cfu_design_agent.benchmark.*` and execution services via
+`cfu_design_agent.runtime.*`. Imports such as `cfu_design_agent.embench` or
+`cfu_design_agent.tools` are no longer supported. The CLI entry point
+`agents/run_cfu_agent.py` is unchanged. The Embench reference/profile cache
+remains in `cfu_design_agent/profile_cache.py` and hashes the relocated
+benchmark implementation.
+
 ## Hardware design boundary
 
 `src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala` with `AgentCfuFiber.scala` is the
@@ -566,14 +592,21 @@ three configurations, each with its own source tree:
 | config | defines | evidence |
 | --- | --- | --- |
 | reference | board only | Embench verify passes + baseline cycles |
-| profile | `-DEMBENCH_OBS` | per-function `CFU_AGENT_PROFILE <id>=<cycles>` table |
+| profile | `-DEMBENCH_OBS` | per-loop inclusive cycles/calls plus containing-function context |
 | cfu | `-DUSE_AGENT_CFU` | verify still passes + speedup vs reference |
 
-Observation points are inserted by `embench_instrument.py` at function definitions
-(never prototypes) with a single `EMBENCH_OBS_ENTER(id)`; scope exit is handled by
-GCC cleanup attributes, so early returns are counted correctly. An LLM-supplied
-`observation_plan` selects the points; loop-level points are reported as skipped
-rather than silently ignored. Without a plan, functions containing loops are used.
+By default `embench_instrument.py` instruments complete `for`/`while`/`do` loop
+statements (not each iteration) and their containing functions, up to 24 total
+points per workload. Stable loop IDs map to source filename, function, ordinal,
+line and loop kind in `05_profile/embench.yaml`; `WorkloadSpec.hot_loop` preserves
+the selected loop and `kernel_function` remains the actual C function. An explicit
+`observation_plan` may select function or loop points (`kind: loop` requires a
+unique `ordinal` or `line`). Ambiguous/unsupported loops are skipped rather than
+instrumented at a guessed position. GCC cleanup attributes count early exits;
+nested loop/function cycles are inclusive and must not be summed. This default
+currently applies to the Embench path; arbitrary C-project builds retain their
+existing profiler. Only the profile copy is instrumented: reference and CFU
+correctness/speedup builds remain clean.
 
 Correctness comes from Embench itself: `support/main.c` returns `!correct` and the
 repo `start.S` maps that to the `pass`/`fail` symbols MiCoSocSim watches. Artifacts:
@@ -608,8 +641,10 @@ re-simulating both configurations (`--profile-cache on`, the default; `off` disa
 benchmark sources, both build commands (including their defines, with the run's own
 workspace path normalized to a placeholder so the key is **stable across runs**), the
 CPU/SoC flags, the seeded `workspace/design` overlay, the fixed
-`soc/mico`+`soc/cfu`+`execute/cfu` sources, the toolchain versions (`gcc`, `verilator`)
-and the git revision/submodules, so a toolchain or scaffold change invalidates it.
+`soc/mico`+`soc/cfu`+`execute/cfu` sources, the toolchain versions (`gcc`, `verilator`),
+the git revision/submodules, the normalized loop observation plan and the
+instrumenter/board-counter source hashes, so changed instrumentation, toolchain
+or scaffold invalidates it.
 Entries live in the git-ignored `agents/generated/cache/embench_profile/<key>.json` and
 are written only after a passing measurement. A hit runs no `make`/`sbt`, and the run
 records `profile_cache: {status: hit|miss|refresh|disabled, key, saved}` in
@@ -617,8 +652,9 @@ records `profile_cache: {status: hit|miss|refresh|disabled, key, saved}` in
 never mistaken for a fresh one.
 
 **Closed loop (LLM):** the analysis, contract and software prompts receive the
-benchmark source, the measured per-function profile, and the generated `cfu_intrinsics.h`.
-The LLM is asked to name the hottest function and to emit a patch for
+benchmark source, the measured loop/function profile (including the loop's source
+location), and the generated `cfu_intrinsics.h`. The LLM is asked to identify the
+hottest loop and its containing function and to emit a patch for
 `benchmarks/embench-iot/src/<bench>/<file>.c` guarded by `#ifdef USE_AGENT_CFU`; the
 harness redirects that path into the run's `cfu` configuration tree, so the reference
 build stays scalar and Embench's own `verify_benchmark()` still decides correctness.

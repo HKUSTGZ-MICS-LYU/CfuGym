@@ -62,6 +62,7 @@ class WorkloadSpec(TypedDict, total=False):
     alignment_bytes: int
     cfu_style: str
     hot_spot: str
+    hot_loop: dict[str, Any]
     validation: dict[str, Any]
     unknowns: list[str]
 
@@ -97,6 +98,7 @@ class ProfileResult(TypedDict, total=False):
     command_results: list[CommandResult]
     regions: list[ProfileRegion]
     hot_spot: str
+    hot_spot_point: dict[str, Any]
     summary: str
 
 

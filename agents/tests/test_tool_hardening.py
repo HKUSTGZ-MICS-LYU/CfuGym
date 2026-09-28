@@ -5,9 +5,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agents.cfu_design_agent.tools import RepoToolbox, validate_text_patch
-from agents.cfu_design_agent.policy import load_policy, PolicyError
-from agents.cfu_design_agent.agent_tools import ReadOnlyToolset
+from agents.cfu_design_agent.runtime.tools import RepoToolbox, validate_text_patch
+from agents.cfu_design_agent.runtime.policy import load_policy, PolicyError
+from agents.cfu_design_agent.runtime.agent_tools import ReadOnlyToolset
 from agents.tests.common import REPO_ROOT
 
 
@@ -99,7 +99,7 @@ class HardeningTest(unittest.TestCase):
         def run(args, **kwargs):
             calls.append(args)
             return real(args, **kwargs)
-        with mock.patch('agents.cfu_design_agent.tools.subprocess.run', side_effect=run):
+        with mock.patch('agents.cfu_design_agent.runtime.tools.subprocess.run', side_effect=run):
             result = self.box.apply_patch_text(self.patch())
         self.assertEqual(result['returncode'], 0, result)
         self.assertEqual((self.root / self.target).read_text(), 'new\n')
@@ -172,7 +172,7 @@ class HardeningTest(unittest.TestCase):
 
     def test_error_observation_is_not_success(self):
         from agents.tests.test_agent_tools import _FakeChatClient, _tool_call_response, _final_response
-        from agents.cfu_design_agent.llm import OpenAiTextClient
+        from agents.cfu_design_agent.runtime.llm import OpenAiTextClient
         fake = _FakeChatClient([_tool_call_response('read_file', '{}'), _final_response('done')])
         client = OpenAiTextClient(config={'model': 'm', 'api_key': 'synthetic', 'api_mode': 'chat'})
         with mock.patch('openai.OpenAI', return_value=fake):

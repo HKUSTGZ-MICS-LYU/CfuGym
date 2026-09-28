@@ -21,7 +21,8 @@ import re
 from pathlib import Path
 
 from .embench_instrument import find_definition_brace
-from .tools import RepoToolbox, embench_cfu_rel, filter_output
+from .profile_lines import profile_lines
+from ..runtime.tools import RepoToolbox, embench_cfu_rel
 
 
 EMBENCH_ROOT = "benchmarks/embench-iot"
@@ -262,26 +263,13 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
 
 def parse_profile(text: str) -> dict[str, dict[str, int]]:
     """Collect CFU_AGENT_PROFILE lines into {id: {cycles, calls}}."""
-    text = filter_output(text)
     result: dict[str, dict[str, int]] = {}
-    for match in re.finditer(r"CFU_AGENT_PROFILE\s+(?P<body>.*)", text):
-        fields: dict[str, int] = {}
-        name = ""
-        for item in match.group("body").split():
-            if "=" not in item:
+    for fields in profile_lines(text):
+        calls = fields.get("calls")
+        for name, cycles in fields.items():
+            if name == "calls":
                 continue
-            key, value = item.split("=", 1)
-            try:
-                number = int(value)
-            except ValueError:
-                continue
-            if key == "calls":
-                fields["calls"] = number
-            else:
-                name = key
-                fields["cycles"] = number
-        if name:
-            result[name] = fields
+            result[name] = {"cycles": cycles, **({"calls": calls} if calls is not None else {})}
     return result
 
 

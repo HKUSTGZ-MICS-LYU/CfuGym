@@ -7,9 +7,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from agents.cfu_design_agent.agent_tools import ReadOnlyToolset
-from agents.cfu_design_agent.llm import LlmResult, OpenAiTextClient
-from agents.cfu_design_agent.tools import RepoToolbox, design_workspace_paths
+from agents.cfu_design_agent.runtime.agent_tools import ReadOnlyToolset
+from agents.cfu_design_agent.runtime.llm import LlmResult, OpenAiTextClient
+from agents.cfu_design_agent.runtime.tools import RepoToolbox, design_workspace_paths
 from agents.tests.common import REPO_ROOT
 
 

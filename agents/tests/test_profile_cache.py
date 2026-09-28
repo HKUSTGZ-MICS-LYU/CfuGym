@@ -8,7 +8,8 @@ import unittest
 from unittest import mock
 
 from agents.cfu_design_agent import graph, profile_cache
-from agents.cfu_design_agent.tools import RepoToolbox
+from agents.cfu_design_agent.benchmark.embench_loops import loop_id
+from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
 
 
@@ -36,6 +37,9 @@ class _ScriptedProfile:
         command_id = str(kwargs.get("command_id") or "")
         self.calls.append(command_id)
         stdout = _sim_stdout(args) if command_id == "soc_sim" else ""
+        if command_id == "soc_sim" and "/profile/" in " ".join(args):
+            ident = loop_id("depthconv.c", "hot", 1)
+            stdout += f"CFU_AGENT_PROFILE {ident}=710 calls=1\n"
         return {
             "command": " ".join(args),
             "cwd": str(toolbox.workdir),
@@ -89,7 +93,9 @@ class ProfileCacheTest(unittest.TestCase):
         root = REPO_ROOT / run_root / "workspace" / "embench_depthconv"
         for config in ("reference", "profile"):
             (root / config / "src").mkdir(parents=True, exist_ok=True)
-            (root / config / "src" / "depthconv.c").write_text("int hot(int x){return x+1;}\n")
+            (root / config / "src" / "depthconv.c").write_text(
+                "int hot(int x){for(int i=0;i<x;i++){x++;break;} return x+1;}\n"
+            )
         design = REPO_ROOT / run_root / "workspace" / "design"
         design.mkdir(parents=True, exist_ok=True)
         (design / "AgentCfu.scala").write_text("// scaffold\n")

@@ -21,15 +21,20 @@ import time
 from typing import Any, Callable
 
 from . import profile_cache
-from .agent_tools import ReadOnlyToolset
-from .artifacts import RunArtifacts
-from .benchmarks import (
+from .flow.wiring import (
+    NODE_NAMES, ROUTE_TARGETS, register_langgraph, walk_python,
+    SUCCESSORS as FLOW_SUCCESSORS, ROUTER_NAMES,
+)
+from .flow.state_updates import append_state_keys, merge_update
+from .runtime.agent_tools import ReadOnlyToolset
+from .runtime.artifacts import RunArtifacts
+from .benchmark.generic import (
     prepare_c_project_profile as prepare_c_project_profile_workspace,
     prepare_generated_benchmark,
     profile_commands,
     profile_result_from_commands,
 )
-from .embench import (
+from .benchmark.embench import (
     DEFAULT_MARCH,
     benchmark_source_files,
     build_command as embench_build_command,
@@ -47,7 +52,7 @@ from .conformance import (
     render_conformance,
     validate_oracle,
 )
-from .embench_instrument import instrument_sources
+from .benchmark.embench_instrument import default_plan as embench_default_plan, instrument_sources
 from .isa import (
     IsaLintError,
     command_kind,
@@ -59,7 +64,7 @@ from .isa import (
     validate_isa_text,
     validate_isa_extension,
 )
-from .llm import (
+from .runtime.llm import (
     DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     LlmResult,
@@ -71,9 +76,9 @@ from .llm import (
     set_stream_callback,
     usage_totals,
 )
-from .llm_config import effective_config, LlmConfigError
-from .policy import PolicyError, load_policy, normalize_repo_path
-from .progress import StageProgress, stage_label
+from .runtime.llm_config import effective_config, LlmConfigError
+from .runtime.policy import PolicyError, load_policy, normalize_repo_path
+from .runtime.progress import StageProgress, stage_label
 from .prompts import (
     SYSTEM_PROMPT,
     conformance_prompt,
@@ -87,7 +92,7 @@ from .prompts import (
 )
 from .spec import normalize_workload_spec, validate_workload_spec
 from .state import CfuDesignState, append_history
-from .tools import (
+from .runtime.tools import (
     DEFAULT_CONTEXT_FILES,
     DESIGN_SOURCE_FILES,
     DESIGN_WORKSPACE_SUBDIR,
@@ -244,141 +249,26 @@ def _wrapped(fn):
     return _wrap_node(fn) if _PROGRESS is not None else fn
 
 
-def _identity_map(*names: str) -> dict[str, str]:
-    """Conditional-edge path map whose router returns node names directly."""
-    return {name: name for name in names}
-
-
 def build_graph(*, checkpointer: Any = None, debug: bool = False):  # type: ignore[misc]
     if not _LANGRAPH_AVAILABLE:
         raise RuntimeError("langgraph is not installed; use run_agent_python()")
     graph = StateGraph(CfuDesignState)
-    graph.add_node("load_context", _wrap_node(load_context), retry_policy=RetryPolicy(max_attempts=2))
-    graph.add_node("ingest_input", _wrap_node(ingest_input))
-    graph.add_node("route_input", _wrap_node(route_input))
-    graph.add_node("prepare_c_project_profile", _wrap_node(prepare_c_project_profile_node))
-    graph.add_node("create_benchmark_project", _wrap_node(create_benchmark_project_node))
-    graph.add_node("prepare_embench_benchmark", _wrap_node(prepare_embench_benchmark_node))
-    graph.add_node("profile_embench", _wrap_node(profile_embench))
-    graph.add_node("instrument_and_profile", _wrap_node(instrument_and_profile))
-    graph.add_node("extract_hotspot", _wrap_node(extract_hotspot))
-    graph.add_node("analyze_workload", _wrap_node(analyze_workload))
-    graph.add_node("design_contract", _wrap_node(design_contract))
-    graph.add_node("extend_isa", _wrap_node(extend_isa))
-    graph.add_node("implement_hw", _wrap_node(implement_hw))
-    graph.add_node("generate_soc", _wrap_node(generate_soc))
-    graph.add_node("check_conformance", _wrap_node(check_conformance))
-    graph.add_node("implement_sw", _wrap_node(implement_sw))
-    graph.add_node("build_sw", _wrap_node(build_sw))
-    graph.add_node("simulate", _wrap_node(simulate))
-    graph.add_node("estimate_cost", _wrap_node(estimate_cost))
-    graph.add_node("review_and_route", _wrap_node(review_and_route))
-    graph.add_node("final_report", _wrap_node(final_report))
-
-    graph.add_edge(START, "load_context")
-    graph.add_edge("load_context", "ingest_input")
-    graph.add_edge("ingest_input", "route_input")
-    graph.add_conditional_edges(
-        "route_input",
-        _route_input_target,
-        _identity_map("prepare_c_project_profile", "create_benchmark_project", "prepare_embench_benchmark"),
+    register_langgraph(
+        graph, python_nodes(), {name: globals()[symbol] for name, symbol in ROUTER_NAMES.items()},
+        wrap=_wrap_node, start=START, end=END, retry_policy=RetryPolicy(max_attempts=2),
     )
-    graph.add_conditional_edges(
-        "prepare_c_project_profile",
-        _route_after_prepare,
-        _identity_map("instrument_and_profile", "review_and_route"),
-    )
-    graph.add_conditional_edges(
-        "create_benchmark_project",
-        _route_after_prepare,
-        _identity_map("instrument_and_profile", "review_and_route"),
-    )
-    graph.add_conditional_edges(
-        "prepare_embench_benchmark",
-        _route_after_prepare,
-        _identity_map("profile_embench", "review_and_route"),
-    )
-    graph.add_edge("profile_embench", "extract_hotspot")
-    graph.add_edge("instrument_and_profile", "extract_hotspot")
-    graph.add_edge("extract_hotspot", "analyze_workload")
-    graph.add_edge("analyze_workload", "design_contract")
-    # Validation ladder: each artifact is checked by the tool that owns it and
-    # either repairs its own rung or stops the run immediately.
-    graph.add_conditional_edges(
-        "design_contract",
-        _route_after_isa,
-        _identity_map("design_contract", "implement_hw", "review_and_route"),
-    )
-    graph.add_conditional_edges(
-        "extend_isa", _route_after_isa,
-        _identity_map("extend_isa", "implement_hw", "review_and_route"),
-    )
-    graph.add_edge("implement_hw", "generate_soc")
-    graph.add_conditional_edges(
-        "generate_soc",
-        _route_after_hw_build,
-        _identity_map("check_conformance", "build_sw", "implement_hw", "review_and_route"),
-    )
-    # Hardware conformance: the harness-owned differential micro-test runs before any
-    # workload software exists, so a failure repairs the design instead of the kernel.
-    graph.add_conditional_edges(
-        "check_conformance",
-        _route_after_hw_conformance,
-        _identity_map("implement_sw", "build_sw", "check_conformance", "implement_hw", "review_and_route"),
-    )
-    graph.add_edge("implement_sw", "build_sw")
-    graph.add_conditional_edges(
-        "build_sw",
-        _route_after_sw_build,
-        _identity_map("simulate", "implement_sw", "review_and_route"),
-    )
-    graph.add_conditional_edges(
-        "simulate",
-        _route_after_sim,
-        _identity_map("estimate_cost", "implement_sw", "implement_hw", "review_and_route"),
-    )
-    graph.add_conditional_edges(
-        "estimate_cost",
-        _route_after_cost,
-        _identity_map("review_and_route", "implement_hw"),
-    )
-    graph.add_conditional_edges(
-        "review_and_route",
-        _route_after_review,
-        _identity_map("final_report", "implement_hw", "implement_sw", "extend_isa"),
-    )
-    graph.add_edge("final_report", END)
     return graph.compile(checkpointer=checkpointer, debug=debug, name="cfu_design_agent")
 
 
-# State keys annotated with operator.add in CfuDesignState. Nodes return only
-# their own increment for these keys; LangGraph appends automatically, and the
-# pure-Python runner merges them the same way in _merge_state_update.
-APPEND_STATE_KEYS = (
-    "errors",
-    "iteration_history",
-    "validation_results",
-    "cost_results",
-    "graph_events",
-    "llm_raw_outputs",
-    "tool_calls",
-    # (response_hash, error_hash) per attempt, to detect a stuck retry.
-    "sw_attempts",
-    "hw_attempts",
-    # Rejected conformance-oracle attempts (problems_hash), same idea.
-    "conformance_attempts",
-)
+
+# Reducer keys are derived from CfuDesignState in flow/state_updates.py,
+# rather than maintained separately from LangGraph's Annotated fields.
+APPEND_STATE_KEYS = append_state_keys(CfuDesignState)
 
 
 def _merge_state_update(state: CfuDesignState, update: Any) -> None:
     """Apply a node's partial update with the same semantics as LangGraph."""
-    if not isinstance(update, dict):
-        return
-    for key, value in update.items():
-        if key in APPEND_STATE_KEYS and isinstance(value, list):
-            state[key] = [*(state.get(key) or []), *value]
-        else:
-            state[key] = value
+    merge_update(state, update, APPEND_STATE_KEYS)
 
 
 def _finalize(state: CfuDesignState) -> CfuDesignState:
@@ -459,17 +349,12 @@ def run_agent_python(initial_state: CfuDesignState) -> CfuDesignState:
     # Node returns are partial updates; merge them like LangGraph state does,
     # including operator.add semantics for the append-annotated keys. The walk
     # follows the same static edges and conditional routers as build_graph().
-    nodes = python_nodes()
-    node: str | None = "load_context"
-    guard = 0
-    while node is not None:
-        guard += 1
-        if guard > recursion_limit(int(state.get("max_iters", 2))):  # both runners share the bound
-            raise RuntimeError(f"python runner did not terminate at node {node!r}")
-        fn = nodes[node]
-        _merge_state_update(state, _wrapped(fn)(state))
-        router = PY_ROUTERS.get(node)
-        node = router(state) if router is not None else PY_SUCCESSORS.get(node)
+    walk_python(
+        state, python_nodes(), PY_ROUTERS,
+        invoke=lambda fn, current: _wrapped(fn)(current),
+        merge=_merge_state_update,
+        limit=recursion_limit(int(state.get("max_iters", 2))),
+    )
 
     state["run_id"] = artifacts.run_id
     state["run_root"] = artifacts.root_rel
@@ -477,30 +362,13 @@ def run_agent_python(initial_state: CfuDesignState) -> CfuDesignState:
 
 
 def python_nodes() -> dict[str, Any]:
-    """Node name -> callable, mirroring the LangGraph node table."""
-    return {
-        "load_context": load_context,
-        "ingest_input": ingest_input,
-        "route_input": route_input,
-        "prepare_c_project_profile": prepare_c_project_profile_node,
-        "create_benchmark_project": create_benchmark_project_node,
-        "prepare_embench_benchmark": prepare_embench_benchmark_node,
-        "profile_embench": profile_embench,
-        "instrument_and_profile": instrument_and_profile,
-        "extract_hotspot": extract_hotspot,
-        "analyze_workload": analyze_workload,
-        "design_contract": design_contract,
-        "extend_isa": extend_isa,
-        "implement_hw": implement_hw,
-        "generate_soc": generate_soc,
-        "check_conformance": check_conformance,
-        "implement_sw": implement_sw,
-        "build_sw": build_sw,
-        "simulate": simulate,
-        "estimate_cost": estimate_cost,
-        "review_and_route": review_and_route,
-        "final_report": final_report,
+    """Resolve shared flow node names against this module's patchable globals."""
+    aliases = {
+        "prepare_c_project_profile": "prepare_c_project_profile_node",
+        "create_benchmark_project": "create_benchmark_project_node",
+        "prepare_embench_benchmark": "prepare_embench_benchmark_node",
     }
+    return {name: globals()[aliases.get(name, name)] for name in NODE_NAMES}
 
 
 def export_graph_visualization(out_dir: str | Path) -> dict[str, str]:
@@ -532,32 +400,14 @@ def export_graph_visualization(out_dir: str | Path) -> dict[str, str]:
 
 
 def fallback_ascii_graph() -> str:
-    return "\n".join(
-        [
-            "START",
-            "  -> load_context",
-            "  -> ingest_input",
-            "  -> route_input",
-            "       | goto prepare_c_project_profile/create_benchmark_project/prepare_embench_benchmark",
-            "  -> instrument_and_profile",
-            "  -> extract_hotspot",
-            "  -> analyze_workload",
-            "  -> design_contract (ISA spec)",
-            "  -> implement_hw (AgentCfu.scala/Fiber)",
-            "  -> generate_soc (HW gate)",
-            "       | fail -> implement_hw / stop",
-            "  -> implement_sw (kernel + intrinsics)",
-            "  -> build_sw (compile gate)",
-            "       | fail -> implement_sw / stop",
-            "  -> simulate (sim gate)",
-            "       | fail -> implement_sw, then implement_hw / stop",
-            "  -> estimate_cost (yosys)",
-            "  -> review_and_route",
-            "  -> final_report",
-            "  -> END",
-            "",
-        ]
-    )
+    """Render the shared wiring without maintaining a second hand-drawn graph."""
+    lines = ["START -> load_context"]
+    for name in NODE_NAMES:
+        if name in ROUTE_TARGETS:
+            lines.append(f"{name} -> {' | '.join(ROUTE_TARGETS[name])}")
+        else:
+            lines.append(f"{name} -> {FLOW_SUCCESSORS[name] or 'END'}")
+    return "\n".join(lines) + "\n"
 
 
 def recursion_limit(max_iters: int = 2) -> int:
@@ -1092,7 +942,7 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
 
     if not execute:
         planned = [
-            toolbox_skipped(embench_build_command(run_root, name, config), state, reason)
+            _skipped_result(embench_build_command(run_root, name, config), state, reason)
             for config in configs
         ]
         profile = profile_result_from_commands(planned, dry_run=True, planned_reason=reason)
@@ -1113,6 +963,19 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
     # measurement is design-independent and deterministic. Reuse it when every
     # input that shapes the ELF or the SoC matches.
     cache_mode = str(state.get("profile_cache", "on") or "on")
+    profile_sources = {
+        rel: toolbox.read_text(rel, limit=2_000_000)
+        for rel in config_sources(toolbox.workdir, run_root, name, "profile")
+    }
+    planned_observation = state.get("observation_plan")
+    if not planned_observation:
+        # Compute the default plan from clean sources, even on a second profile
+        # invocation in the same run (whose profile copy may already be edited).
+        reference_sources = {
+            rel: toolbox.read_text(rel, limit=2_000_000)
+            for rel in config_sources(toolbox.workdir, run_root, name, "reference")
+        }
+        planned_observation = {"points": embench_default_plan(reference_sources)}
     cache_info = profile_cache.build_key(
         toolbox.workdir,
         run_root=run_root,
@@ -1122,7 +985,7 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
             config: embench_build_command(run_root, name, config) for config in configs
         },
         cpu_flags=agent_cfu_gen_flags(state.get("isa_spec", {}) or {}),
-        observation_plan=state.get("observation_plan"),
+        observation_plan=planned_observation,
     )
     cache_key = str(cache_info["key"])
     cache_rel = profile_cache.cache_relpath(cache_key)
@@ -1144,11 +1007,7 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
 
     if cached is None:
         if "profile" in configs:
-            sources = {
-                rel: toolbox.read_text(rel, limit=2_000_000)
-                for rel in config_sources(toolbox.workdir, run_root, name, "profile")
-            }
-            instrumented, report = instrument_sources(sources, state.get("observation_plan"))
+            instrumented, report = instrument_sources(profile_sources, planned_observation)
             observation = report.to_dict()
             for rel, text in instrumented.items():
                 toolbox.write_text(rel, text)
@@ -1181,9 +1040,31 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
 
     reference = profiles.get("reference", {})
     instrumented = embench_instrumented_profile(profiles)
-    hot = hotspot_from_profile(instrumented, exclude=(name,)) or name
-    candidates = [region for region in instrumented if region != name]
-    ok = bool(reference) and not errors
+    applied_ids = set(observation.get("applied", []))
+    observed_points = {
+        str(point.get("id")): point for point in observation.get("points", [])
+        if isinstance(point, dict) and point.get("id") in applied_ids
+    }
+    loop_profiles = {
+        ident: data for ident, data in instrumented.items()
+        if ident in observed_points and observed_points[ident].get("kind") == "loop"
+        and isinstance(data, dict) and data.get("calls", 0) > 0
+    }
+    function_profiles = {
+        ident: data for ident, data in instrumented.items()
+        if ident in observed_points and observed_points[ident].get("kind") == "function"
+        and isinstance(data, dict) and data.get("calls", 0) > 0
+    }
+    hot = (hotspot_from_profile(loop_profiles) or hotspot_from_profile(function_profiles)
+           or hotspot_from_profile(instrumented, exclude=(name, "obs_overflow")) or name)
+    candidates = [region for region in instrumented if region != name and region != "obs_overflow"]
+    expected_loops = [point for point in observation.get("points", [])
+                      if isinstance(point, dict) and point.get("kind") == "loop"
+                      and point.get("id") in applied_ids]
+    ok = bool(reference) and bool(instrumented) and not errors
+    if expected_loops and not loop_profiles:
+        errors.append("no requested loop observation produced cycle/call evidence")
+        ok = False
 
     saved = False
     if ok and cache_mode in ("on", "refresh"):
@@ -1228,6 +1109,7 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
             for region, data in instrumented.items()
         ],
         "hot_spot": hot,
+        "hot_spot_point": observed_points.get(hot, {}),
         "summary": summarize_embench_profiles(profiles, name),
         "configs": sorted(profiles),
         "profile_cache": cache_report,
@@ -1522,7 +1404,7 @@ def instrument_and_profile(state: CfuDesignState) -> CfuDesignState:
         if not commands:
             commands = [["make", "TARGET=vexii_soc", "MARCH=rv32imc_zicsr_zifencei", "compile"]]
         results = [
-            toolbox_skipped(command, state, reason)
+            _skipped_result(command, state, reason)
             for command in commands
         ]
         profile = profile_result_from_commands(results, dry_run=True, planned_reason=reason)
@@ -1570,14 +1452,29 @@ def extract_hotspot(state: CfuDesignState) -> CfuDesignState:
         or (candidates[0] if candidates else "")
         or spec.get("operation", "scalar_kernel")
     )
+    point = profile.get("hot_spot_point", {}) or {}
     source = "profile" if profile.get("hot_spot") else "static"
     if profile.get("regions"):
         candidates = [region.get("name", "") for region in profile["regions"]] or candidates
-    if not spec.get("hot_spot"):
+    if point.get("kind") == "loop":
+        # Preserve the real source function as the software edit target; a loop
+        # observation id is not a function symbol.
+        spec["kernel_function"] = point["function"]
+        spec["hot_loop"] = {key: point[key] for key in ("id", "file", "function", "line", "ordinal", "loop_kind") if key in point}
+    if point.get("kind") == "loop" or not spec.get("hot_spot"):
         spec["hot_spot"] = hot
     spec_text = state.get("spec_text", "")
-    if "hot_spot:" not in spec_text:
+    if point.get("kind") == "loop" and "hot_spot:" in spec_text:
+        spec_text = re.sub(r"(?m)^hot_spot:.*$", f"hot_spot: {hot}", spec_text)
+    elif "hot_spot:" not in spec_text:
         spec_text = spec_text.rstrip() + f"\nhot_spot: {hot}\n"
+    if point.get("kind") == "loop":
+        if "hot_loop:" not in spec_text:
+            spec_text = spec_text.rstrip() + "\nhot_loop: " + json.dumps(spec["hot_loop"]) + "\n"
+        if "kernel_function:" in spec_text:
+            spec_text = re.sub(r"(?m)^kernel_function:.*$", f"kernel_function: {point['function']}", spec_text)
+        else:
+            spec_text = spec_text.rstrip() + f"\nkernel_function: {point['function']}\n"
     _write_hotspot_artifact(state, hot, source, candidates)
     return {
         "workload_spec": spec,
@@ -2863,7 +2760,7 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
     any software is written.
     """
     rung = "hw_build"
-    reason = _validation_reason(state)
+    reason = _profile_reason(state)
     if reason:
         result = _skipped_result("sbt MiCoSocGen (agent overlay)", state, reason)
         result["rung"] = rung
@@ -3149,7 +3046,7 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
     builds on top of an unverified instruction.
     """
     rung = "hw_conformance"
-    reason = _validation_reason(state)
+    reason = _profile_reason(state)
     if reason:
         result = _skipped_result("make cfu_conformance + MiCoSocSim", state, reason)
         result["rung"] = rung
@@ -3351,7 +3248,7 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
 def build_sw(state: CfuDesignState) -> CfuDesignState:
     """Rung 4: compile the accelerated software against the new intrinsics."""
     rung = "sw_build"
-    reason = _validation_reason(state)
+    reason = _profile_reason(state)
     if reason:
         result = _skipped_result("make (accelerated software compile)", state, reason)
         result["rung"] = rung
@@ -3507,7 +3404,7 @@ def sim_feedback(state: CfuDesignState) -> str:
 def simulate(state: CfuDesignState) -> CfuDesignState:
     """Rung 5: run the ELF on the generated SoC and check the result."""
     rung = "sim"
-    reason = _validation_reason(state)
+    reason = _profile_reason(state)
     if reason:
         result = _skipped_result("sbt MiCoSocSim", state, reason)
         result["rung"] = rung
@@ -3988,7 +3885,7 @@ def deterministic_roofline_analysis(spec: dict) -> dict[str, Any]:
     )
     return {
         "hot_function": spec.get("kernel_function") or spec.get("hot_spot") or "unknown",
-        "hot_loop": "unknown",
+        "hot_loop": spec.get("hot_loop", {}).get("id", "unknown"),
         "trip_count": "unknown",
         "memory_boundary": "unknown",
         "operations": "unknown",
@@ -4212,29 +4109,9 @@ def _profile_reason(state: CfuDesignState) -> str:
     return ""
 
 
-def _validation_reason(state: CfuDesignState) -> str:
-    if state.get("dry_run", False):
-        return "dry-run"
-    if state.get("skip_sim", False):
-        return "--skip-sim"
-    if not state.get("run_commands", False):
-        return "execution-disabled"
-    return ""
-
-
-def _skipped_result(command: str, state: CfuDesignState, reason: str) -> dict:
+def _skipped_result(command: str | list[str], state: CfuDesignState, reason: str) -> dict:
     return {
-        "command": command,
-        "cwd": state.get("workdir", "."),
-        "returncode": None,
-        "skipped": True,
-        "reason": reason,
-    }
-
-
-def toolbox_skipped(command: list[str], state: CfuDesignState, reason: str) -> dict:
-    return {
-        "command": " ".join(command),
+        "command": " ".join(command) if isinstance(command, list) else command,
         "cwd": state.get("workdir", "."),
         "returncode": None,
         "skipped": True,
@@ -4820,37 +4697,11 @@ def _choose_optimization(
     }, raw_output
 
 
-# Static edges of the pure-Python runner. Nodes whose successor depends on a
-# gate are listed in PY_ROUTERS instead; ``None`` ends the walk.
-PY_SUCCESSORS: dict[str, str | None] = {
-    "load_context": "ingest_input",
-    "ingest_input": "route_input",
-    "prepare_c_project_profile": "instrument_and_profile",
-    "create_benchmark_project": "instrument_and_profile",
-    "prepare_embench_benchmark": "profile_embench",
-    "profile_embench": "extract_hotspot",
-    "instrument_and_profile": "extract_hotspot",
-    "extract_hotspot": "analyze_workload",
-    "analyze_workload": "design_contract",
-    "implement_hw": "generate_soc",
-    "implement_sw": "build_sw",
-    "review_and_route": "final_report",
-    "final_report": None,
-}
+# Compatibility introspection: both runners use the shared flow wiring.
+PY_SUCCESSORS: dict[str, str | None] = dict(FLOW_SUCCESSORS)
 
 PY_ROUTERS: dict[str, Any] = {
-    "route_input": _route_input_target,
-    "prepare_c_project_profile": _route_after_prepare,
-    "create_benchmark_project": _route_after_prepare,
-    "prepare_embench_benchmark": _route_after_prepare,
-    "design_contract": _route_after_isa,
-    "extend_isa": _route_after_isa,
-    "generate_soc": _route_after_hw_build,
-    "check_conformance": _route_after_hw_conformance,
-    "build_sw": _route_after_sw_build,
-    "simulate": _route_after_sim,
-    "estimate_cost": _route_after_cost,
-    "review_and_route": _route_after_review,
+    name: globals()[symbol] for name, symbol in ROUTER_NAMES.items()
 }
 
 

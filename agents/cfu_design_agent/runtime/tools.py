@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .policy import AccessPolicy, PolicyError, load_policy, normalize_repo_path
-from .state import CommandResult, RepoContext
+from ..state import CommandResult, RepoContext
 
 
 MAX_FILE_CHARS = 20000
