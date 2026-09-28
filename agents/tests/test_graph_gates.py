@@ -1774,5 +1774,66 @@ class StreamLogTest(unittest.TestCase):
         self.assertIn("implement HW", printed)
 
 
+class AgentCfuCostParityTest(unittest.TestCase):
+    """The cost rung must elaborate the SAME AgentCfu configuration as SoC/sim.
+
+    Regression (2026-09-28): estimate_cost passed the WORKLOAD spec into the
+    cost flag builder, which emitted no --agent-cfu-* flags at all; GenAgentCfu
+    fell back to vlen=256 and a design that had passed generate_soc and
+    simulation died on its own designRequire(vlen == 512).
+    """
+
+    ISA = {
+        "datapath": {"vlen": 512, "xlen": 32, "regDepth": 2},
+        "memory": {"load": True, "store": False},
+    }
+
+    def _state(self, **overrides) -> dict:
+        state = _base_state(
+            "cost-parity-00000000",
+            isa_spec=self.ISA,
+            context={"design_workspace": "agents/generated/runs/cost-parity-00000000/workspace/design"},
+        )
+        state.update(overrides)
+        return state
+
+    def test_cost_carries_the_same_agent_cfu_flags_as_the_soc_path(self) -> None:
+        cost = " ".join(graph.agent_cfu_cost_commands(self._state())[0])
+        for flag in graph.agent_cfu_datapath_flags(self.ISA):
+            self.assertIn(flag, cost, f"cost command is missing {flag}")
+
+    def test_cost_flags_come_from_the_isa_spec_not_a_workload_spec(self) -> None:
+        # The exact bug: a workload spec (no datapath section) reached the flag
+        # builder. The helper now always derives from state["isa_spec"].
+        workload = {"benchmark_name": "md5sum", "operation": "md5"}
+        cost = " ".join(graph.agent_cfu_cost_commands(self._state(workload_spec=workload))[0])
+        self.assertIn("--agent-cfu-vlen 512", cost)
+        self.assertIn("--agent-cfu-no-store", cost)
+
+    def test_memory_options_are_forwarded(self) -> None:
+        flags = graph.agent_cfu_datapath_flags(
+            {"datapath": {"vlen": 128, "xlen": 32, "regDepth": 2},
+             "memory": {"load": False, "store": False}}
+        )
+        self.assertIn("--agent-cfu-no-load", flags)
+        self.assertIn("--agent-cfu-no-store", flags)
+        self.assertIn("--agent-cfu-no-tilelink", flags)
+        # A contract with load but no store must not lose the bus.
+        flags = graph.agent_cfu_datapath_flags(
+            {"datapath": {"vlen": 128, "xlen": 32, "regDepth": 2},
+             "memory": {"load": True, "store": False}}
+        )
+        self.assertIn("--agent-cfu-no-store", flags)
+        self.assertNotIn("--agent-cfu-no-tilelink", flags)
+
+    def test_soc_and_cost_stay_in_lockstep_for_a_plain_contract(self) -> None:
+        isa = {"datapath": {"vlen": 256, "xlen": 32, "regDepth": 2}}
+        cost = " ".join(graph.agent_cfu_cost_commands(self._state(isa_spec=isa))[0])
+        gen = " ".join(graph.agent_cfu_gen_flags(isa))
+        shared = [t for t in gen.split() if t.startswith("--agent-cfu-") or t.isdigit()]
+        for token in shared:
+            self.assertIn(token, cost, f"cost/SoC flag divergence on {token}")
+
+
 if __name__ == "__main__":
     unittest.main()

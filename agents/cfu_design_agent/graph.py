@@ -3821,7 +3821,10 @@ def estimate_cost(state: CfuDesignState) -> CfuDesignState:
     run_root = state.get("run_root", "")
     if run_root:
         out_dir = f"{run_root}/11_cost/yosys/{case}"
-        generator_commands = agent_cfu_cost_commands(state, spec) if agent_cfu else []
+        # NOTE: the cost rung derives its AgentCfu flags from the ISA spec
+        # internally -- never pass the workload spec here (that mismatch made
+        # cost re-elaborate the CFU with default parameters).
+        generator_commands = agent_cfu_cost_commands(state) if agent_cfu else []
         rtl = (
             f"{run_root}/11_cost/cfu_rtl"
             if generator_commands
@@ -5141,11 +5144,19 @@ def agent_cfu_overlay_settings(state: CfuDesignState) -> list[str]:
     return [add_overlay, swap_sources]
 
 
-def agent_cfu_cost_commands(state: CfuDesignState, spec: dict) -> list[list[str]]:
+def agent_cfu_cost_commands(state: CfuDesignState) -> list[list[str]]:
     """sbt command that elaborates the standalone CFU Verilog for the cost rung.
 
     Unlike the SoC build this does not need the CPU: GenAgentCfu elaborates only
     the overlaid AgentCfu class, so Yosys can synthesize the CFU in isolation.
+
+    The AgentCfu configuration comes from the state's ISA spec -- the SAME
+    source ``agent_cfu_gen_flags`` uses for the SoC build and the simulation.
+    The cost rung must elaborate the exact configuration that was built and
+    simulated, or a design's parameter checks fail here after passing everywhere
+    else (observed 2026-09-28: this function took the WORKLOAD spec, emitted no
+    datapath flags at all, and GenAgentCfu fell back to vlen=256 against a
+    design that required 512).
     """
     run_root = state.get("run_root", "")
     if not run_root or not is_agent_cfu_run(state):
@@ -5153,8 +5164,9 @@ def agent_cfu_cost_commands(state: CfuDesignState, spec: dict) -> list[list[str]
     settings = agent_cfu_overlay_settings(state)
     if not settings:
         return []
+    isa_spec = state.get("isa_spec", {}) or {}
     out_dir = f"{run_root}/11_cost/cfu_rtl"
-    flags = agent_cfu_datapath_flags(spec)
+    flags = agent_cfu_datapath_flags(isa_spec)
     run_main = " ".join(
         ["runMain vexiiriscv.soc.mico.GenAgentCfu", "--out-dir", out_dir, *flags]
     )
@@ -5190,8 +5202,15 @@ def agent_cfu_sim_commands(
 
 
 def agent_cfu_datapath_flags(spec: dict) -> list[str]:
-    """CFU datapath flags (vlen/bus width/reg depth) from the ISA spec."""
+    """AgentCfu generation flags (datapath + memory options) from the ISA spec.
+
+    SINGLE SOURCE OF TRUTH for the AgentCfu configuration: the SoC build, the
+    simulation and the cost rung's standalone GenAgentCfu all derive their
+    flags here, so the CFU that Yosys measures is bit-identical in
+    configuration to the CFU that was built and simulated.
+    """
     datapath = spec.get("datapath", {}) if isinstance(spec.get("datapath"), dict) else {}
+    memory = spec.get("memory", {}) if isinstance(spec.get("memory"), dict) else {}
     flags: list[str] = []
     vlen = datapath.get("vlen")
     xlen = datapath.get("xlen")
@@ -5202,6 +5221,17 @@ def agent_cfu_datapath_flags(spec: dict) -> list[str]:
         flags += ["--agent-cfu-bus-width", str(xlen)]
     if isinstance(reg_depth, int) and reg_depth > 0:
         flags += ["--agent-cfu-reg-depth", str(reg_depth)]
+    # Memory options map 1:1 onto AgentCfuParameter's withLoad/withStore/withTilelink.
+    # Forwarding them keeps every rung on the same configuration; dropping them
+    # silently rebuilt a CFU with load/store hardware the contract had disabled.
+    load = memory.get("load")
+    store = memory.get("store")
+    if load is False:
+        flags += ["--agent-cfu-no-load"]
+    if store is False:
+        flags += ["--agent-cfu-no-store"]
+    if load is False and store is False:
+        flags += ["--agent-cfu-no-tilelink"]
     return flags
 
 
