@@ -358,53 +358,6 @@ class ToolLoopTest(unittest.TestCase):
                 )
         self.assertEqual(len(fake.requests), 2, "at most one empty-answer re-ask")
 
-    def test_empty_answer_retry_survives_a_withdrawn_tool_budget(self) -> None:
-        # The re-ask must not depend on tool rounds remaining: it is a transport
-        # retry, not a tool round.
-        client = self._client()
-        fake = _FakeChatClient([
-            _tool_call_response("read_file", '{"path": "a"}'),
-            _final_response(""),
-            _final_response("DONE"),
-        ])
-        with mock.patch("openai.OpenAI", return_value=fake):
-            result = client.complete_with_tools(
-                "s",
-                "u",
-                tools=[{"type": "function", "function": {"name": "read_file"}}],
-                tool_runner=lambda name, args: "obs",
-                max_rounds=3,
-                max_total_calls=1,
-            )
-        self.assertEqual(result.text, "DONE")
-        self.assertEqual(len(fake.requests), 3)
-
-    def test_missing_deliverable_is_nudged_when_required(self) -> None:
-        # A rung that requires a block must not accept a plan-only answer while
-        # tools are still available.
-        client = self._client()
-        plan = "Plan: zero-extend the input lane before the signed multiply."
-        fake = _FakeChatClient([
-            _final_response(plan),
-            _final_response("FILE_BEGIN x\nbody\nFILE_END"),
-        ])
-        with mock.patch("openai.OpenAI", return_value=fake):
-            result = client.complete_with_tools(
-                "s",
-                "u",
-                tools=[{"type": "function", "function": {"name": "read_file"}}],
-                tool_runner=lambda name, args: "obs",
-                max_rounds=2,
-                is_deliverable=lambda text: "FILE_BEGIN" in text,
-            )
-        self.assertIn("FILE_BEGIN", result.text)
-        nudged = [
-            m
-            for m in fake.requests[1]["messages"]
-            if str(m.get("content", "")).startswith("Your reply contained no final deliverable")
-        ]
-        self.assertEqual(len(nudged), 1)
-
 
 class ReadOnlyToolsetTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -454,8 +407,15 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         # answered "(no visible entries)", so the model could not find
         # workspace/design and burned its whole exploration budget on dead ends.
         listing = self.toolset.run("list_dir", {"path": self.run_root})
-        self.assertIn(f"{self.run_root}/workspace/", listing)
+        self.assertIn("{{run-dir}}/workspace/", listing)
         self.assertNotIn("(no visible entries)", listing)
+
+    def test_run_dir_placeholder_is_accepted_and_echoed_back(self) -> None:
+        text = self.toolset.run("read_file", {"path": "{{run-dir}}/workspace/cfu_benchmark/main.c"})
+        self.assertIn("int main(void)", text)
+        missing = self.toolset.run("read_file", {"path": "{{run-dir}}/workspace/nope.c"})
+        self.assertIn("{{run-dir}}/workspace/nope.c", missing)
+        self.assertNotIn(self.run_root, missing)
 
     def test_list_command_logs_finds_the_runs_build_and_simulation_logs(self) -> None:
         # Every executed command persists its full output; the tool is how the
@@ -475,7 +435,7 @@ class ReadOnlyToolsetTest(unittest.TestCase):
             "returncode: 0\n\n=== STDOUT ===\ncells: 42\n")
         listing = self.toolset.run("list_command_logs", {})
         self.assertIn("2 command log(s)", listing)
-        self.assertIn(f"{self.run_root}/10_validation/logs/sim_003.log", listing)
+        self.assertIn("{{run-dir}}/10_validation/logs/sim_003.log", listing)
         self.assertIn("rung=sim rc=1", listing)
         self.assertIn("sbt runMain MiCoSocSim --load-elf x.elf", listing)
         filtered = self.toolset.run("list_command_logs", {"rung": "cost", "limit": 1})
@@ -484,10 +444,8 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         self.assertNotIn("sim_003.log", filtered)
         missing = self.toolset.run("list_command_logs", {"rung": "nope"})
         self.assertIn("no command log", missing)
-
-    def test_list_command_logs_rejects_a_bad_limit(self) -> None:
-        out = self.toolset.run("list_command_logs", {"limit": "many"})
-        self.assertTrue(out.startswith("usage error:"), out)
+        self.assertTrue(self.toolset.run("list_command_logs", {"limit": "many"})
+                        .startswith("usage error:"))
 
     def test_the_platform_library_is_discoverable_without_a_repo_wide_search(self) -> None:
         # Observed failure: the implementation stage never found

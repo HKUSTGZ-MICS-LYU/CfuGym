@@ -70,7 +70,6 @@ def load_context(state: CfuDesignState) -> CfuDesignState:
         "visible_files": sorted(files),
         "withheld_files": withheld,
         "denied_files": denied,
-        "git_status": toolbox.git_status(),
         "design_workspace": {
             "root": f"{artifacts.root_rel}/{DESIGN_WORKSPACE_SUBDIR}",
             "files": design_files,
@@ -96,7 +95,6 @@ def load_context(state: CfuDesignState) -> CfuDesignState:
     return {
         "context": {
             "files": files,
-            "git_status": manifest["git_status"],
             "visibility": policy.visibility,
             "withheld": withheld,
             # Prompts report where the agent works; run_root lets every

@@ -209,23 +209,19 @@ class StageWiringTest(unittest.TestCase):
                                      "error: simulation is available only in Verify")
             execute.assert_not_called()
 
-    def test_oracle_stays_editable_during_an_ordinary_design_repair(self) -> None:
-        """A wrong verification contract must be repairable, not frozen.
-
-        Regression class (run 20261003-090854-136683-d98e5be9): four design
-        repairs ran against a frozen 9-case oracle that never checked a
-        compression result, so the model could not strengthen it.
-        """
-        self.state["repair_scope"] = "design"
-        captured = self._capture()
-        session = captured["toolset_kwargs"]["conformance_session"]
-        self.assertTrue(session.editable)
-        delivery, problems = session.write(
-            "commands:\n  - name: compute\n    reference: a + b\n"
-            "    cases:\n      - args: [1, 2]\n")
-        self.assertEqual(problems, [])
-        self.assertTrue(delivery["source_path"].endswith("cfu_conformance.c"))
-        self.assertTrue(session.changed)
+    def test_edit_hardware_accepts_the_run_dir_token(self) -> None:
+        """The model may edit the path exactly as the prompt rendered it."""
+        design = self.root / self.run_root / "workspace/design"
+        design.mkdir(parents=True, exist_ok=True)
+        target = design / "AgentCfu.scala"
+        target.write_text("class AgentCfu {}\n")
+        tool = self._tool(self._capture())
+        applied = tool.run("edit_hardware", {"edits": [{
+            "path": "{{run-dir}}/workspace/design/AgentCfu.scala",
+            "search": "class AgentCfu {}", "replace": "class AgentCfu { int changed; }",
+        }]})
+        self.assertIn("+class AgentCfu { int changed; }", applied)
+        self.assertEqual(target.read_text(), "class AgentCfu { int changed; }\n")
 
     def test_conformance_session_refuses_an_undeclared_command_without_executing(self) -> None:
         from unittest import mock

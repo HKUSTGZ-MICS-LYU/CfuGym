@@ -61,6 +61,9 @@ class CodingSession:
             normalized = normalize(path)
         except Exception:
             return None
+        if normalized in self.allowed_targets:
+            # Already the run overlay: `{{run-dir}}/...` expands to exactly this.
+            return normalized
         redirected = redirect_target(
             normalized, run_root, str(getattr(self.toolbox, "embench_benchmark", "") or "")
         )

@@ -18,7 +18,36 @@ from agents.cfu_design_agent.runtime.llm import (
 from agents.cfu_design_agent.runtime.stage_executor import (
     StageExecutionRequest,
     StageExecutor,
+    _RunDirView,
 )
+
+
+class RunDirViewTest(unittest.TestCase):
+    """Every tool result the model sees renders this run's root as {{run-dir}}."""
+
+    def test_tool_output_is_virtualized_and_attributes_delegate(self) -> None:
+        class Fake:
+            rolled_back = False
+
+            def schemas(self):
+                return [{"type": "function", "function": {"name": "read_file"}}]
+
+            def run(self, name, arguments):
+                return "see agents/generated/runs/r-1/08_isa/cfu_isa.yaml"
+
+            def rollback(self):
+                self.rolled_back = True
+                return "rolled back"
+
+        inner = Fake()
+        view = _RunDirView(inner, "agents/generated/runs/r-1/")
+        self.assertEqual(view.schemas(), inner.schemas())
+        self.assertEqual(view.run("read_file", {}), "see {{run-dir}}/08_isa/cfu_isa.yaml")
+        self.assertEqual(view.rollback(), "rolled back")
+        self.assertTrue(inner.rolled_back)
+        # Without a run root there is nothing to hide.
+        self.assertEqual(_RunDirView(inner, "").run("read_file", {}),
+                         "see agents/generated/runs/r-1/08_isa/cfu_isa.yaml")
 
 
 class _Session:

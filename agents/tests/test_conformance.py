@@ -468,21 +468,18 @@ class InformativeOracleTest(unittest.TestCase):
         self.assert_message(self.problems(isa(VECTOR_COMMAND), entry),
                             "verify only references the case arguments")
 
-    def test_verify_comparing_its_own_setup_constant_is_rejected(self) -> None:
-        entry = {
-            "name": "vset", "cases": [{"args": [1, 2]}],
-            "setup": "static volatile uint32_t marker = 1u; seed(); marker = 1u;",
-            "verify": "marker == 1u",
-        }
-        self.assert_message(self.problems(isa(VECTOR_COMMAND), entry),
-                            "assigned a literal to")
-
-    def test_reference_comparing_its_own_helper_constant_is_rejected(self) -> None:
-        entry = {"name": "compute", "cases": [{"args": [1, 2]}],
-                 "helpers": "static uint32_t expected;\nstatic void set_expected(void) { expected = 4u; }",
-                 "setup": "set_expected();", "reference": "expected"}
-        self.assert_message(self.problems(isa(CPU_COMMAND), entry),
-                            "assigned a literal to")
+    def test_expression_comparing_its_own_value_is_rejected(self) -> None:
+        """A value the oracle wrote next to the check cannot verify anything."""
+        marker = {"name": "vset", "cases": [{"args": [1, 2]}],
+                  "setup": "static volatile uint32_t marker = 1u; seed(); marker = 1u;",
+                  "verify": "marker == 1u"}
+        helper = {"name": "compute", "cases": [{"args": [1, 2]}],
+                  "helpers": "static uint32_t expected;\n"
+                             "static void set_expected(void) { expected = 4u; }",
+                  "setup": "set_expected();", "reference": "expected"}
+        for entry, contract in ((marker, isa(VECTOR_COMMAND)), (helper, isa(CPU_COMMAND))):
+            with self.subTest(expression=entry.get("verify") or entry["reference"]):
+                self.assert_message(self.problems(contract, entry), "assigned a literal to")
 
     def test_all_zero_case_arguments_are_rejected(self) -> None:
         entry = {"name": "compute", "cases": [{"args": [0, 0]}], "reference": "a + b"}
@@ -493,44 +490,35 @@ class InformativeOracleTest(unittest.TestCase):
                  "reference": "a + b"}
         self.assertEqual(self.problems(isa(CPU_COMMAND), entry), [])
 
-    def test_zero_argument_commands_are_unaffected(self) -> None:
-        control = {"function_id": 3, "subfunction_id": 0, "name": "ctl", "kind": "control",
-                   "resources": []}
-        entry = {"name": "ctl", "cases": [{"args": []}],
-                 "helpers": "static void seed_memory(void) { volatile uint32_t *p = "
-                            "(volatile uint32_t *)0x80000000u; p[0] = 4u; }\n"
-                            "static uint32_t ctl_seen(void) { volatile uint32_t *p = "
-                            "(volatile uint32_t *)0x80000000u; return p[0] == 4u; }",
-                 "setup": "seed_memory();",
-                 "verify": "ctl_seen()"}
-        self.assertEqual(self.problems(isa(control), entry), [])
-
-    def test_real_observations_still_validate(self) -> None:
-        # Memory state seeded in setup and a helper that reads memory back are
-        # genuine observations and must keep validating.
+    def test_genuine_observations_still_validate(self) -> None:
+        """No false positives: seed it in setup, read it back, and it is evidence."""
+        control = {"function_id": 3, "subfunction_id": 0, "name": "ctl",
+                   "kind": "control", "resources": []}
         cases = [
-            ({"name": "compute", "cases": [{"args": [4, 2]}],
-              "helpers": "static uint32_t w[8];",
-              "setup": "w[0] = 0x80000000u;",
-              "reference": "w[0] >> 4"}, isa(CPU_COMMAND)),
-            ({"name": "vset", "cases": [{"args": [4, 2]}],
-              "helpers": "static uint32_t check_loaded(void) { volatile uint32_t *p = "
-                         "(volatile uint32_t *)0x80000000u; return p[0] == 4u; }",
-              "setup": "seed();", "verify": "check_loaded()"},
-             isa(VECTOR_COMMAND)),
+            # A no-role command whose verify reads memory a helper seeded.
+            (isa(control), {"name": "ctl", "cases": [{"args": []}],
+                       "helpers": "static void seed_memory(void) { volatile uint32_t *p = "
+                                  "(volatile uint32_t *)0x80000000u; p[0] = 4u; }\n"
+                                  "static uint32_t ctl_seen(void) { volatile uint32_t *p = "
+                                  "(volatile uint32_t *)0x80000000u; return p[0] == 4u; }",
+                       "setup": "seed_memory();", "verify": "ctl_seen()"}),
+            (isa(CPU_COMMAND), {"name": "compute", "cases": [{"args": [4, 2]}],
+                           "helpers": "static uint32_t w[8];",
+                           "setup": "w[0] = 0x80000000u;", "reference": "w[0] >> 4"}),
+            (isa(VECTOR_COMMAND), {"name": "vset", "cases": [{"args": [4, 2]}],
+                              "helpers": "static uint32_t check_loaded(void) { "
+                                         "volatile uint32_t *p = (volatile uint32_t *)0x80000000u; "
+                                         "return p[0] == 4u; }",
+                              "setup": "seed();", "verify": "check_loaded()"}),
+            # `p = (T *)addr` publishes an address; reading through p is the observation.
+            (isa(CPU_COMMAND), {"name": "compute", "cases": [{"args": [4, 2]}],
+                           "helpers": "static volatile uint32_t *p;",
+                           "setup": "p = (volatile uint32_t *)0x80000000u;",
+                           "reference": "p[a]"}),
         ]
-        for entry, contract in cases:
-            with self.subTest(entry=entry["reference"] if "reference" in entry else entry["verify"]):
+        for contract, entry in cases:
+            with self.subTest(expression=entry.get("verify") or entry["reference"]):
                 self.assertEqual(validate_oracle(contract, self.commands(entry)), [])
-
-    def test_pointer_setup_is_not_a_literal_decision(self) -> None:
-        # `p = (uint32_t *)0x80000000u` publishes an address; reading through p
-        # is the observation, so the comparison must not be rejected.
-        entry = {"name": "compute", "cases": [{"args": [4, 2]}],
-                 "helpers": "static volatile uint32_t *p;",
-                 "setup": "p = (volatile uint32_t *)0x80000000u;",
-                 "reference": "p[a]"}
-        self.assertEqual(self.problems(isa(CPU_COMMAND), entry), [])
 
 
 class HelperOracleIndependenceTest(unittest.TestCase):

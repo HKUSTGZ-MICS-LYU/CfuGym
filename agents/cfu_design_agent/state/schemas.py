@@ -39,7 +39,6 @@ class CommandResult(TypedDict, total=False):
 
 class RepoContext(TypedDict, total=False):
     files: dict[str, str]
-    git_status: str
     cfu_entrypoints: list[str]
     software_tests: list[str]
     # Selected visibility tier and the context files it withheld from the agent.

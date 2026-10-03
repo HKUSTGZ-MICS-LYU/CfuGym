@@ -61,8 +61,8 @@ class HardwareCodingToolset:
     observation_index: dict[str, Any] | None = None
     failure_index: dict[str, Any] | None = None
     diagnosis_required: bool = False
-    max_edits: int = 6
-    max_checks: int = 2
+    max_edits: int = 10
+    max_checks: int = 10
     max_edit_chars: int = 100_000
     edits_used: int = 0
     checks_used: int = 0

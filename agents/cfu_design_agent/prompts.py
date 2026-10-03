@@ -22,6 +22,7 @@ from typing import Iterable
 import yaml
 
 from .runtime.llm import DEFAULT_MAX_TOOL_CALLS_PER_ROUND
+from .runtime.tools import RUN_DIR_TOKEN, virtualize_run_paths
 from .state import RepoContext, WorkloadSpec
 
 
@@ -283,20 +284,23 @@ def agent_tools_block(
     )
 
 
-def context_digest(context: RepoContext, skip: Iterable[str] = ()) -> str:
+def context_digest(
+    context: RepoContext, skip: Iterable[str] = (), *, visibility: bool = True
+) -> str:
     """Render the repo context with file bodies, omitting files shown elsewhere.
 
     Legacy path for calls without a tool loop: only a caller that cannot read
     files gets bodies. ``skip`` holds the rung's own targets: they are rendered
     in full in the "Exact current contents" block, and repeating a truncated
     copy here only wastes tokens and invites the model to copy the truncated
-    text.
+    text. ``visibility=False`` drops the access-tier paragraph for a caller
+    whose shared header already states it.
     """
     files = context.get("files", {})
     skipped = {str(path) for path in skip}
     omitted = [path for path in files if path in skipped]
     parts: list[str] = []
-    guidance = visibility_guidance(str(context.get("visibility", "") or ""))
+    guidance = visibility_guidance(str(context.get("visibility", "") or "")) if visibility else ""
     if guidance:
         parts.append(guidance)
     if omitted:
@@ -314,9 +318,6 @@ def context_digest(context: RepoContext, skip: Iterable[str] = ()) -> str:
         if len(text) > len(excerpt):
             excerpt += "\n...[truncated]"
         parts.append(f"## {path}\n{excerpt}")
-    status = context.get("git_status", "").strip()
-    if status:
-        parts.append(f"## git status --short\n{status}")
     return "\n\n".join(parts)
 
 
@@ -325,12 +326,43 @@ def _under(path: str, root: str) -> bool:
     return bool(root) and (path == root or path.startswith(root + "/"))
 
 
+def artifact_paths_block(
+    artifact_paths: Iterable[str | tuple[str, str]],
+    skip: Iterable[str] = (),
+) -> str:
+    """This stage's own artifact paths, with the note that explains each one.
+
+    Stage-specific by construction, so it renders *after* the shared prefix
+    instead of inside the key-path index every stage shares.
+    """
+    skipped = {str(path) for path in skip}
+    listed: list[str] = []
+    for item in artifact_paths:
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            path, note = str(item[0]), str(item[1])
+        else:
+            path, note = str(item), ""
+        if not path or path in skipped:
+            continue
+        if any(marker in path for marker in _ARTIFACT_SENSITIVE_MARKERS):
+            continue
+        listed.append(f"- {path}" + (f" — {note}" if note else ""))
+    if not listed:
+        return ""
+    return "## Stage artifacts\n" + "\n".join(dict.fromkeys(listed))
+
+
 def paths_digest(
     context: RepoContext,
     skip: Iterable[str] = (),
     artifact_paths: Iterable[str | tuple[str, str]] = (),
 ) -> str:
-    """Path-only view of what the agent may read: where to look, never bodies."""
+    """Path-only view of what the agent may read: where to look, never bodies.
+
+    Called without ``skip``/``artifact_paths`` this is stage-independent, which
+    is what makes it part of the cached prefix ``stage_brief`` shares between
+    stages.
+    """
     files = context.get("files", {}) or {}
     skipped = {str(path) for path in skip}
     run_root = str(context.get("run_root", "") or "").strip("/")
@@ -343,16 +375,6 @@ def paths_digest(
         if path.startswith("agents/generated/runs/") and not _under(path, run_root):
             continue
         listed.append(f"- {path}")
-    for item in artifact_paths:
-        if isinstance(item, (tuple, list)) and len(item) == 2:
-            path, note = str(item[0]), str(item[1])
-        else:
-            path, note = str(item), ""
-        if not path or path in skipped:
-            continue
-        if any(marker in path for marker in _ARTIFACT_SENSITIVE_MARKERS):
-            continue
-        listed.append(f"- {path}" + (f" — {note}" if note else ""))
     parts: list[str] = []
     guidance = visibility_guidance(str(context.get("visibility", "") or ""))
     if guidance:
@@ -363,9 +385,9 @@ def paths_digest(
             "content is already covered by the run memory)\n"
             + "\n".join(dict.fromkeys(listed))
         )
-    status = context.get("git_status", "").strip()
-    if status:
-        parts.append(f"## git status --short\n{status}")
+    artifacts = artifact_paths_block(artifact_paths, skip=skip)
+    if artifacts:
+        parts.append(artifacts)
     return "\n\n".join(parts)
 
 
@@ -388,7 +410,11 @@ def working_directory_block(
             f"- working directory: {wd} (repository root; every path in this task is repo-relative)"
         )
     if rr:
-        lines.append(f"- run directory: {rr.rstrip('/')}/ (this run's workspace and artifacts)")
+        lines.append(
+            f"- run directory: {rr.rstrip('/')}/ (this run's workspace and artifacts; the token "
+            f"`{RUN_DIR_TOKEN}` in this task, in file paths and in tool calls stands for it, and "
+            "the framework translates it)"
+        )
     if not lines:
         return ""
     return "## Where you are\n" + "\n".join(lines)
@@ -409,11 +435,37 @@ def stage_brief(
     failure_ids: list[str] | None = None,
     resolved_failure_ids: list[str] | None = None,
     tools_note: str = "",
+    shared: str = "",
 ) -> str:
-    """The five-part header every stage prompt opens with."""
+    """The stage brief, ordered stable-first so the provider can cache the head.
+
+    Layout (constant -> variable):
+
+    1. ``## Where you are`` — the repo root, the run directory and visibility;
+    2. the stage-independent key-path index (``paths_digest`` without per-stage
+       skips or artifacts);
+    3. ``shared`` — digests every design stage renders byte-identically
+       (``workload_digest_block``);
+    4. the stage block proper: ``## Stage``, tools, ``## Deliverable``, this
+       stage's artifact paths, notes, and (without a tool loop) the file bodies.
+
+    Prefix caching compares the serialized request from its first byte, so a
+    stage-specific section placed early discards every later shared block; run
+    20261003-090854 shared only six characters between two stages' user prompts.
+    Keep everything after step 4 per-call (failure evidence, optimization state,
+    contracts) instead of moving it up.
+    """
     context = context or {}
-    parts = [f"## Stage: {stage}"]
+    parts: list[str] = []
     where = working_directory_block(context, workdir, run_root)
+    if where:
+        parts.append(where)
+    index = paths_digest(context)
+    if index:
+        parts.append(index)
+    if shared.strip():
+        parts.append(shared.strip())
+    parts.append(f"## Stage: {stage}")
     if agent_tools:
         tools = tool_list_block(
             tool_names,
@@ -423,20 +475,21 @@ def stage_brief(
         )
         if tools:
             parts.append(tools)
-        parts.append("## Deliverable\n" + deliverable.strip())
-        digest = paths_digest(context, skip=skip, artifact_paths=artifact_paths)
     else:
         parts.append(
             "No tool loop is available for this call: work from the material shown below."
         )
-        parts.append("## Deliverable\n" + deliverable.strip())
-        digest = context_digest(context, skip=skip)
-    if digest:
-        parts.append(digest)
+    parts.append("## Deliverable\n" + deliverable.strip())
+    if not agent_tools:
+        # The shared index above already states the visibility tier.
+        bodies = context_digest(context, skip=skip, visibility=False)
+        if bodies:
+            parts.append(bodies)
+    artifacts = artifact_paths_block(artifact_paths, skip=skip)
+    if artifacts:
+        parts.append(artifacts)
     if tools_note:
         parts.append(tools_note.strip())
-    if where:
-        parts.append(where)  # run-specific paths follow the reusable instructions
     return "\n\n".join(part for part in parts if part and part.strip())
 
 
@@ -514,6 +567,23 @@ def embench_instructions(spec: WorkloadSpec) -> str:
     )
 
 
+def workload_digest_block(spec: WorkloadSpec, profile: dict | None) -> str:
+    """The stable digests every design stage renders byte-identically.
+
+    Passed to ``stage_brief(shared=...)`` so the analysis, ISA-contract,
+    hardware and software prompts share one cached prefix: the text depends only
+    on the workload spec and the measured profile, never on the stage.
+    """
+    parts = [
+        f"Normalized WorkloadSpec:\n{spec_digest(spec)}",
+        f"Measured profile:\n{profile_digest(profile)}",
+    ]
+    embench = embench_instructions(spec)
+    if embench:
+        parts.append(embench)
+    return "\n\n".join(parts)
+
+
 def workload_prompt(
     task: str,
     spec: WorkloadSpec,
@@ -587,19 +657,14 @@ def workload_prompt(
         tool_rounds=tool_rounds,
         agent_tools=agent_tools,
         artifact_paths=artifact_paths,
+        shared=workload_digest_block(spec, profile),
     )
     return f"""Task:
 {task}
 
 {brief}
-
-Normalized WorkloadSpec:
-{spec_digest(spec)}
-
-Measured profile:
-{profile_digest(profile)}
 {ir_note}{evidence_note}
-{embench_instructions(spec)}{ROOFLINE_GUIDANCE}
+{ROOFLINE_GUIDANCE}
 {feedback}
 
 Analyze the workload. Classify the acceleration pattern, identify hardware/software state, data movement, expected bottlenecks, and the minimum validation needed.
@@ -655,20 +720,15 @@ def contract_prompt(
         tool_rounds=tool_rounds,
         agent_tools=agent_tools,
         artifact_paths=artifact_paths,
+        shared=workload_digest_block(spec, profile),
     )
     return f"""Task:
 {task}
 
 {brief}
 
-Normalized WorkloadSpec:
-{spec_digest(spec)}
-
-Measured profile:
-{profile_digest(profile)}
-
 {analysis_block}
-{embench_instructions(spec)}{ROOFLINE_DECISION_RULE}{feedback_block}
+{ROOFLINE_DECISION_RULE}{feedback_block}
 This is the ISA-CONTRACT stage only. If the measured workload has no meaningful
 CFU opportunity, return exactly `ABSTAIN` with no contract; the run will end
 without a verified CFU. Otherwise the next node parses your response directly
@@ -956,6 +1016,7 @@ def hardware_prompt(
         failure_ids=failure_ids,
         resolved_failure_ids=resolved_failure_ids,
         tools_note=tools_note,
+        shared=workload_digest_block(spec, profile),
     )
     if agent_tools:
         design_block = (
@@ -1107,14 +1168,7 @@ def hardware_prompt(
 
 {brief}
 
-Normalized WorkloadSpec:
-{spec_digest(spec)}
-
-Measured profile:
-{profile_digest(profile)}
-
 {analysis_ref}
-{embench_instructions(spec)}
 This is the HARDWARE rung only. Design the SpinalHDL CFU datapath; the
 accelerated software is written in a later step and must not appear here.
 {design_block}
@@ -1359,6 +1413,7 @@ def software_prompt(
         failure_ids=failure_ids,
         resolved_failure_ids=resolved_failure_ids,
         tools_note=tools_note,
+        shared=workload_digest_block(spec, profile),
     )
     if agent_tools:
         context_ref = (
@@ -1385,15 +1440,8 @@ def software_prompt(
 
 {brief}
 
-Normalized WorkloadSpec:
-{spec_digest(spec)}
-
-Measured profile:
-{profile_digest(profile)}
-
 {context_ref}
 {intrinsics_block}
-{embench_instructions(spec)}
 This is the SOFTWARE rung only. The hardware design is already fixed and
 already passed SoC generation; do not propose hardware changes here.
 Follow each command's CfuResource/resources declarations and the exact generated

@@ -16,6 +16,7 @@ from agents.cfu_design_agent.prompts import (
     optimization_prompt,
     paths_digest,
     software_prompt,
+    workload_digest_block,
     workload_prompt,
 )
 from agents.cfu_design_agent.stages import contract as contract_mod
@@ -377,62 +378,72 @@ class EmbenchSimLogGuidanceTest(unittest.TestCase):
         self.assertEqual(embench_instructions({"source_kind": "natural_language"}), "")
 
 
-class PromptBudgetTest(unittest.TestCase):
-    """Tools-enabled prompts are path-based briefs; bodies are never inlined."""
+PROMPT_BODY = "BODY_SENTINEL_" + ("x" * 6000)
 
-    BODY = "BODY_SENTINEL_" + ("x" * 6000)
 
-    def _context(self) -> dict:
-        return {
-            "files": {
-                "skills/cfu-designer/SKILL.md": self.BODY,
-                "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala": self.BODY,
-                "src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala": self.BODY,
-                "benchmarks/embench-iot/src/crc32/crc_32.c": self.BODY,
-            },
-            "visibility": "standard",
-            "git_status": "",
-            "workdir": "/repo/root",
-            "run_root": "agents/generated/runs/r1",
-        }
+def _prompt_context() -> dict:
+    return {
+        "files": {
+            "skills/cfu-designer/SKILL.md": PROMPT_BODY,
+            "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala": PROMPT_BODY,
+            "src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala": PROMPT_BODY,
+            "benchmarks/embench-iot/src/crc32/crc_32.c": PROMPT_BODY,
+        },
+        "visibility": "standard",
+        "workdir": "/repo/root",
+        "run_root": "agents/generated/runs/r1",
+    }
 
-    def _prompts(self, agent_tools: bool) -> dict[str, str]:
-        context = self._context()
-        spec = {"name": "w", "operation": "crc32", "unknowns": []}
-        run = "agents/generated/runs/r1"
-        return {
-            "analysis": workload_prompt(
+
+def _stage_prompts(agent_tools: bool) -> dict[str, str]:
+    context = _prompt_context()
+    spec = {"name": "w", "operation": "crc32", "unknowns": []}
+    run = "agents/generated/runs/r1"
+    return {
+        "analysis": workload_prompt(
                 "t", spec, context, agent_tools=agent_tools, tool_rounds=6,
                 artifact_paths=[(f"{run}/05_profile/result.yaml", "profile")],
             ),
-            "contract": contract_prompt(
-                "t", spec, "ANALYSIS_BODY", context, agent_tools=agent_tools, tool_rounds=6,
-                artifact_paths=[(f"{run}/07_analysis/workload_analysis.yaml", "analysis")],
-            ),
-            "conformance": conformance_prompt(
-                "t", {"commands": []}, spec, agent_tools=agent_tools, tool_rounds=6,
-                workdir="/repo/root", run_root=run,
-                artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
-            ),
-            "hardware": hardware_prompt(
-                "t", spec, "ANALYSIS_BODY", "CONTRACT_BODY", context,
-                agent_tools=agent_tools, tool_rounds=6,
-                artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
-            ),
-            "software": software_prompt(
-                "t", spec, "ANALYSIS_BODY", "CONTRACT_BODY", context,
-                agent_tools=agent_tools, tool_rounds=6,
-                targets=[(f"{run}/workspace/embench_crc32/cfu/crc_32.c", self.BODY)],
-                intrinsics_path=f"{run}/workspace/embench_crc32/cfu/cfu_intrinsics.h",
-                artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
-            ),
-            "optimize": optimization_prompt(
-                "t", spec, "score", "rounds", {}, "", "", 2, "performance",
-                agent_tools=agent_tools, tool_rounds=6,
-                workdir="/repo/root", run_root=run,
-                artifact_paths=[(f"{run}/10_validation/embench.yaml", "validation")],
-            ),
-        }
+        "contract": contract_prompt(
+            "t", spec, "ANALYSIS_BODY", context, agent_tools=agent_tools, tool_rounds=6,
+            artifact_paths=[(f"{run}/07_analysis/workload_analysis.yaml", "analysis")],
+        ),
+        "conformance": conformance_prompt(
+            "t", {"commands": []}, spec, agent_tools=agent_tools, tool_rounds=6,
+            workdir="/repo/root", run_root=run,
+            artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
+        ),
+        "hardware": hardware_prompt(
+            "t", spec, "ANALYSIS_BODY", "CONTRACT_BODY", context,
+            agent_tools=agent_tools, tool_rounds=6,
+            artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
+        ),
+        "software": software_prompt(
+            "t", spec, "ANALYSIS_BODY", "CONTRACT_BODY", context,
+            agent_tools=agent_tools, tool_rounds=6,
+            targets=[(f"{run}/workspace/embench_crc32/cfu/crc_32.c", PROMPT_BODY)],
+            intrinsics_path=f"{run}/workspace/embench_crc32/cfu/cfu_intrinsics.h",
+            artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
+        ),
+        "optimize": optimization_prompt(
+            "t", spec, "score", "rounds", {}, "", "", 2, "performance",
+            agent_tools=agent_tools, tool_rounds=6,
+            workdir="/repo/root", run_root=run,
+            artifact_paths=[(f"{run}/10_validation/embench.yaml", "validation")],
+        ),
+    }
+
+
+class PromptBudgetTest(unittest.TestCase):
+    """Tools-enabled prompts are path-based briefs; bodies are never inlined."""
+
+    BODY = PROMPT_BODY
+
+    def _context(self) -> dict:
+        return _prompt_context()
+
+    def _prompts(self, agent_tools: bool) -> dict[str, str]:
+        return _stage_prompts(agent_tools)
 
     def test_tools_enabled_prompts_are_path_briefs(self) -> None:
         budgets = {
@@ -452,9 +463,13 @@ class PromptBudgetTest(unittest.TestCase):
                 self.assertIn("run directory: agents/generated/runs/r1/", prompt)
                 self.assertIn("read_file", prompt)
                 self.assertIn("## Deliverable", prompt)
-                self.assertIn("## Key paths", prompt)
+                self.assertIn("## Stage artifacts", prompt)
                 self.assertLess(len(prompt), budgets[name], f"{name} prompt grew: {len(prompt)} chars")
         prompts = self._prompts(True)
+        # The shared repo index is present wherever the prompt has a repo context.
+        for name in ("analysis", "contract", "hardware", "software"):
+            self.assertIn("## Key paths", prompts[name])
+            self.assertIn("skills/cfu-designer/SKILL.md", prompts[name])
         self.assertIn("08_isa/cfu_isa.yaml", prompts["contract"])
         self.assertIn("08_isa/cfu_isa.yaml", prompts["conformance"])
         self.assertIn("09_implementation/hw_plan.md", prompts["optimize"])
@@ -468,7 +483,65 @@ class PromptBudgetTest(unittest.TestCase):
         self.assertIn("BODY_SENTINEL", prompts["software"])
         self.assertIn("ISA spec:", prompts["optimize"])
         self.assertIn("No tool loop is available", prompts["analysis"])
-        self.assertNotIn("## Key paths", prompts["analysis"])
+        # The stable index is shared by every stage, including body-inlining calls.
+        self.assertIn("## Key paths", prompts["analysis"])
+
+
+class PromptCacheLayoutTest(unittest.TestCase):
+    """Stable content first: the provider caches only a request's leading bytes.
+
+    Regression class (run 20261003-090854): two stages of the same run shared six
+    characters of user prompt, because ``## Stage`` and the stage-specific tool
+    block came first. Everything before ``## Stage`` must now be byte-identical.
+    """
+
+    def test_shared_head_precedes_every_stage_specific_section(self) -> None:
+        # The canonical order: every shared section first, in one fixed sequence,
+        # then the stage block. A section present in some stages only (the shared
+        # workload digests) must not jump ahead of the ones all stages share.
+        order = [
+            "## Where you are", "## Key paths", "Normalized WorkloadSpec:",
+            "Measured profile:", "Embench workload:", "## Stage:", "## Tools",
+            "## Deliverable", "## Stage artifacts",
+        ]
+        prompts = _stage_prompts(True)
+        spec = {"name": "w", "operation": "crc32", "unknowns": []}
+        shared = workload_digest_block(spec, None)
+        shared_head = prompts["analysis"][:prompts["analysis"].index("## Stage:")]
+        for name, prompt in prompts.items():
+            with self.subTest(stage=name):
+                expected = [marker for marker in order if marker in prompt]
+                found = sorted((prompt.index(marker), marker) for marker in expected)
+                self.assertEqual([marker for _, marker in found], expected, name)
+        for name in ("analysis", "contract", "hardware", "software"):
+            self.assertIn(shared, prompts[name])
+        # Everything before the first stage block is one shared prefix, and the
+        # first divergence is the stage name itself.
+        for name in ("contract", "hardware", "software"):
+            self.assertTrue(prompts[name].startswith(shared_head), f"{name} diverged early")
+        self.assertTrue(shared_head.startswith("Task:"))
+        self.assertTrue(prompts["hardware"][len(shared_head):].startswith("## Stage: hardware"))
+
+    def test_a_run_id_never_reaches_the_request(self) -> None:
+        from agents.cfu_design_agent.runtime import llm_step
+
+        sent = []
+        for run_root in ("agents/generated/runs/aaa", "agents/generated/runs/bbb"):
+            state = {"run_root": run_root}
+            required = [(f"{run_root}/07_analysis/workload_analysis.yaml", "analysis")]
+            for name, prompt in _stage_prompts(True).items():
+                with self.subTest(stage=name, run=run_root):
+                    request = llm_step._virtual_paths(state, "s", prompt)[1]
+                    self.assertNotIn(run_root, request)
+                    self.assertIn("{{run-dir}}", request)
+            sent.append(llm_step._virtual_paths(state, "s", workload_prompt(
+                "t", {"name": "w", "operation": "crc32", "unknowns": []},
+                {**_prompt_context(), "run_root": run_root}, None,
+                agent_tools=True, tool_rounds=6, artifact_paths=required))[1])
+        # Same workload, different run id: the request is byte-identical, which is
+        # what lets a provider serve the second run from its prefix cache.
+        self.assertEqual(sent[0], sent[1])
+        self.assertEqual(llm_step._virtual_paths({}, "s", "no run here"), ("s", "no run here"))
 
 
 class PathsDigestTest(unittest.TestCase):
@@ -483,7 +556,6 @@ class PathsDigestTest(unittest.TestCase):
             },
             "visibility": "standard",
             "run_root": "agents/generated/runs/mine",
-            "git_status": " M changed.scala",
         }
         digest = paths_digest(context, artifact_paths=[
             ("agents/generated/runs/mine/08_isa/cfu_isa.yaml", "contract"),
@@ -495,7 +567,6 @@ class PathsDigestTest(unittest.TestCase):
         self.assertNotIn(".git/config", digest)
         self.assertNotIn("agents/generated/runs/other/report.md", digest)
         self.assertIn("## Visibility: standard", digest)
-        self.assertIn("## git status --short", digest)
 
     def test_paths_digest_is_empty_without_anything_to_show(self) -> None:
         self.assertEqual(paths_digest({"files": {}}), "")

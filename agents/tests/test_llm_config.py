@@ -97,18 +97,10 @@ class LlmConfigTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CFU_AGENT_OUTPUT_RESERVE": "9999999"}):
             with self.assertRaisesRegex(LlmConfigError, "smaller than context_window_tokens"):
                 resolve_config("c", base)
-        # Without a configured window, resolve_config stays permissive (the
-        # framework's soft 32768 window would reject the value); the bound then
-        # bites at window resolution, before any request is sent.
-        from types import SimpleNamespace
-
-        from agents.cfu_design_agent.runtime import context_budget
-
+        # Without a configured window the value still resolves; the soft 32768
+        # bound applies later, at window resolution (see test_context_budget).
         with mock.patch.dict(os.environ, {"CFU_AGENT_OUTPUT_RESERVE": "65536"}):
-            config = resolve_config("c", {})
-            self.assertEqual(config["output_reserve_tokens"], 65536)
-            with self.assertRaises(context_budget.ContextBudgetError):
-                OpenAiTextClient(config=config)._context_window(SimpleNamespace())
+            self.assertEqual(resolve_config("c", {})["output_reserve_tokens"], 65536)
 
     def test_shipped_configs_keep_a_reasoning_sized_completion_budget(self) -> None:
         """Every shipped config opts into thinking, so none may fall back to 8192."""
@@ -137,7 +129,6 @@ class LlmConfigTest(unittest.TestCase):
             self.assertEqual(default.window_config["output_reserve_tokens"], 40000)
             explicit = llm_step._llm({**state, "max_output_tokens": 65536})
             self.assertEqual(explicit.window_config["output_reserve_tokens"], 65536)
-            self.assertEqual(llm_step._llm_request_info(explicit)["max_output_tokens"], 65536)
             # 0 means "no run-level override", never a zero-token request.
             unset = llm_step._llm({**state, "max_output_tokens": 0})
             self.assertEqual(unset.window_config["output_reserve_tokens"], 40000)

@@ -235,7 +235,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         artifact_paths=artifact_paths,
     )
     stage_user = (
-        f"Task: {state['task']}\n\n"
+        f"Task:\n{state['task']}\n\n"
         + brief
         + "\n\nHardware targets (edit with `edit_hardware`): "
         + ", ".join(sorted(hardware_targets))

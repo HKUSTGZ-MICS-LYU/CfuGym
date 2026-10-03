@@ -58,7 +58,8 @@ class HardeningTest(unittest.TestCase):
             self.assertTrue(tools.run(name, args).startswith('denied by access policy:'))
         listing = tools.run('list_dir', {'path': 'agents/generated/runs', 'glob': '**/*'})
         self.assertNotIn('/other/', listing)
-        self.assertIn(self.target, listing)
+        # Tool output renders this run's root with the {{run-dir}} token.
+        self.assertIn('{{run-dir}}/workspace/design/AgentCfu.scala', listing)
         search = tools.run('search_text', {'path': 'agents/generated/runs', 'pattern': 'private_run_marker'})
         self.assertEqual(search, '(no matches)')
 

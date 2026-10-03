@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol, TypedDict
 
 from .agent_tools import ReadOnlyToolset
+from . import tools as tools_mod
 from .llm import (
     DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     DEFAULT_MAX_TOOL_ROUNDS,
@@ -27,6 +28,28 @@ class Toolset(Protocol):
     def schemas(self) -> list[dict[str, Any]]: ...
 
     def run(self, name: str, arguments: dict[str, Any]) -> str: ...
+
+
+class _RunDirView:
+    """Delegate a toolset while rendering this run's root as ``{{run-dir}}``.
+
+    Every tool result the model sees goes through one of the two dispatch paths
+    below, so virtualizing here keeps list/search/log/failure output consistent
+    with the prompt instead of leaking a run id the model would then paste back.
+    """
+
+    def __init__(self, toolset: Any, run_root: str):
+        self._toolset = toolset
+        self._run_root = str(run_root or "").strip("/")
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return self._toolset.schemas()
+
+    def run(self, name: str, arguments: dict[str, Any]) -> str:
+        return tools_mod.virtualize_run_paths(self._toolset.run(name, arguments), self._run_root)
+
+    def __getattr__(self, item: str) -> Any:  # rollback/commit/session and friends
+        return getattr(self._toolset, item)
 
 
 @dataclass(frozen=True)
@@ -122,11 +145,14 @@ class StageExecutor:
 
         if request.native_tool_loop and request.submit_stage is None:
             raise ValueError("native tool loop requires an independent submit_stage gate")
-        toolset = self._toolset_factory(
-            toolbox,
-            observation_index=request.observation_index,
-            failure_index=request.failure_index,
-            **(request.toolset_kwargs or {}),
+        toolset = _RunDirView(
+            self._toolset_factory(
+                toolbox,
+                observation_index=request.observation_index,
+                failure_index=request.failure_index,
+                **(request.toolset_kwargs or {}),
+            ),
+            str(state.get("run_root", "") or ""),
         )
         native_trace: list[dict[str, Any]] = []
         def report_native_call(entry: dict[str, Any]) -> None:

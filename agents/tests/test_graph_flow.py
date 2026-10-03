@@ -23,7 +23,6 @@ class ContextDigestTest(unittest.TestCase):
                 ".git/config": "secret",
                 "agents/generated/runs/20260729-162009/report.md": "other run",
             },
-            "git_status": "",
             "cfu_entrypoints": [],
             "software_tests": [],
         }

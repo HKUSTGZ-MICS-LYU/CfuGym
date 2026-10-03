@@ -55,19 +55,49 @@ class ToolsTest(unittest.TestCase):
         finally:
             shutil.rmtree(run_dir, ignore_errors=True)
 
-    def test_git_status_only_exposes_visible_paths(self) -> None:
-        status = self.toolbox.git_status()
-        self.assertNotIn(".git/", status)
+    def test_run_dir_token_translates_and_rejects_misuse(self) -> None:
+        run_root = "agents/generated/runs/tools-test-00000000"
+        box = RepoToolbox(REPO_ROOT, dry_run=True, stage="implementation", run_root=run_root)
+        self.assertEqual(box.expand_run_dir("{{run-dir}}"), run_root)
+        self.assertEqual(
+            box.normalize("{{run-dir}}/08_isa/cfu_isa.yaml"), f"{run_root}/08_isa/cfu_isa.yaml"
+        )
+        self.assertEqual(box.normalize("agents/specs/cfu_isa_template.yaml"),
+                         "agents/specs/cfu_isa_template.yaml")
+        # The edit tools resolve the same token onto the approved overlay.
+        self.assertEqual(
+            box.resolve_target("{{run-dir}}/workspace/design/AgentCfu.scala"),
+            f"{run_root}/workspace/design/AgentCfu.scala",
+        )
+        with self.assertRaisesRegex(PolicyError, "must be a path prefix"):
+            box.normalize("agents/{{run-dir}}/x")
+        with self.assertRaisesRegex(PolicyError, "only valid inside a run"):
+            self.toolbox.normalize("{{run-dir}}/x")
+        # The other direction: output shown to the model renders the token back.
+        from agents.cfu_design_agent.runtime.tools import virtualize_run_paths
+
+        self.assertEqual(
+            virtualize_run_paths(f"log: {run_root}/10_validation/logs/sim_000.log", run_root),
+            "log: {{run-dir}}/10_validation/logs/sim_000.log",
+        )
+        self.assertEqual(virtualize_run_paths("no run path here", run_root), "no run path here")
 
     def test_command_allowed_matches_policy(self) -> None:
-        self.assertTrue(
+        # Command authority is per stage: load_context may run nothing, while the
+        # profile stage may run the allowlisted embench build.
+        self.assertFalse(
             self.toolbox.command_allowed(
-                ["git", "status", "--short"],
-                command_id="git_status",
+                ["make", "TARGET=vexii_soc", "compile"], command_id="make_profile"
+            )
+        )
+        profile = RepoToolbox(REPO_ROOT, dry_run=True, stage="profile")
+        self.assertTrue(
+            profile.command_allowed(
+                ["make", "TARGET=vexii_soc", "compile"], command_id="make_profile"
             )
         )
         self.assertFalse(
-            self.toolbox.command_allowed(["rm", "-rf", "/"], command_id="git_status"),
+            profile.command_allowed(["rm", "-rf", "/"], command_id="make_profile"),
         )
 
     def test_filter_output_removes_terminal_formatting_and_controls(self) -> None:

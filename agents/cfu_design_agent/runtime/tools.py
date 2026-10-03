@@ -20,6 +20,39 @@ from ..state import CommandResult, RepoContext
 
 
 MAX_FILE_CHARS = 20000
+#: Virtual path token standing for the executing run's artifact root. Prompts and
+#: tool results render it instead of ``agents/generated/runs/<run-id>``, so the
+#: task text is byte-identical across runs (provider prefix caching) and a run id
+#: never reaches the model; every path argument the model sends back is expanded
+#: to the real root before any access-policy check.
+RUN_DIR_TOKEN = "{{run-dir}}"
+
+
+def expand_run_dir(value: str, run_root: str) -> str:
+    """Server-side translation of the ``{{run-dir}}`` token, or the input.
+
+    Only a leading token is a path prefix; anything else is returned unchanged so
+    the caller's normal path validation reports it.
+    """
+    text = str(value or "")
+    root = str(run_root or "").strip("/")
+    if not root or RUN_DIR_TOKEN not in text:
+        return text
+    if text == RUN_DIR_TOKEN:
+        return root
+    if text.startswith(RUN_DIR_TOKEN + "/"):
+        return root + text[len(RUN_DIR_TOKEN):]
+    return text
+
+
+def virtualize_run_paths(text: str, run_root: str) -> str:
+    """Render this run's root as ``{{run-dir}}`` in text shown to the model."""
+    root = str(run_root or "").strip("/")
+    if not root or root not in str(text or ""):
+        return str(text or "")
+    return str(text).replace(root, RUN_DIR_TOKEN)
+
+
 _ACTIVE_TOOL_PERSISTENCE: contextvars.ContextVar[RunPersistence | None] = contextvars.ContextVar(
     "cfu_tool_persistence", default=None
 )
@@ -117,8 +150,30 @@ class RepoToolbox:
         if self.policy is None:
             self.policy = load_policy(self.workdir)
 
+    def expand_run_dir(self, rel_path: str | Path) -> str:
+        """Translate a ``{{run-dir}}`` prefix to this run's real root.
+
+        Raised before any policy check, so the access decision is always made on
+        the real path; a token outside a run (or used mid-path) is a usage error
+        the model cannot fix by rephrasing around the policy.
+        """
+        text = str(rel_path)
+        if RUN_DIR_TOKEN not in text:
+            return text
+        if not self.run_root:
+            raise PolicyError(
+                f"{RUN_DIR_TOKEN} is only valid inside a run; use a repository-relative path"
+            )
+        expanded = expand_run_dir(text, self.run_root)
+        if expanded == text:
+            raise PolicyError(
+                f"{RUN_DIR_TOKEN} must be a path prefix, for example "
+                f"{RUN_DIR_TOKEN}/08_isa/cfu_isa.yaml"
+            )
+        return expanded
+
     def normalize(self, rel_path: str | Path) -> str:
-        return normalize_repo_path(self.workdir, rel_path)
+        return normalize_repo_path(self.workdir, self.expand_run_dir(rel_path))
 
     def is_read_allowed(self, rel_path: str | Path) -> bool:
         try:
@@ -203,7 +258,6 @@ class RepoToolbox:
 
         return {
             "files": files,
-            "git_status": self.git_status(),
             "cfu_entrypoints": self.find_paths("src/main/scala/vexiiriscv/soc/mico", "*Cfu.scala"),
             "software_tests": self.find_paths("sw/tests", "*cfu*"),
         }
@@ -220,26 +274,6 @@ class RepoToolbox:
             if self.is_read_allowed(rel_path):
                 paths.append(rel_path)
         return sorted(paths)
-
-    def git_status(self) -> str:
-        result = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=self.workdir,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        visible: list[str] = []
-        for line in result.stdout.splitlines():
-            candidate = line[3:].strip() if len(line) > 3 else ""
-            try:
-                normalized = self.normalize(candidate)
-            except PolicyError:
-                continue
-            if self.policy.can_read(normalized):
-                visible.append(f"{line[:3]}{normalized}")
-        return "\n".join(visible)
 
     def command_allowed(self, args: list[str], *, command_id: str | None = None) -> bool:
         if not args:
@@ -395,6 +429,7 @@ class RepoToolbox:
         """Writable workspace path for an LLM-named repo path, or raise."""
         if not self.run_root:
             raise ValueError("cannot resolve a target without a run root")
+        target = self.expand_run_dir(target)
         resolved = redirect_target(target, self.run_root, self.embench_benchmark)
         if not resolved and self._is_run_workspace_target(target):
             resolved = self.normalize(target)
@@ -1109,7 +1144,7 @@ def repair_patch_paths(
         replaced = body
         for prefix in ("--- a/", "+++ b/"):
             if body.startswith(prefix):
-                target = body[len(prefix):]
+                target = expand_run_dir(body[len(prefix):], run_root)
                 replacement = redirect_target(target, run_root, embench_benchmark)
                 if replacement:
                     replaced = f"{prefix}{replacement}"

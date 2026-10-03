@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from . import flow_memory
+from . import tools as tools_mod
 from .policy import PolicyError
 from .tools import RepoToolbox, redirect_target
 from ..ir.observation import inspect_observation
@@ -265,13 +266,17 @@ class ReadOnlyToolset:
         if handler is None:
             return f"error: unknown tool {name!r}"
         try:
-            return handler(arguments or {})
+            return self._render(handler(arguments or {}))
         except PolicyError as exc:
             return f"denied by access policy: {exc}"
         except ToolUsageError as exc:
             return f"usage error: {exc}"
         except (OSError, ValueError) as exc:
             return f"error: {type(exc).__name__}: {exc}"
+
+    def _render(self, text: str) -> str:
+        """Show this run's real root as ``{{run-dir}}``, matching the prompt."""
+        return tools_mod.virtualize_run_paths(text, str(self.toolbox.run_root or ""))
 
     def _list_command_logs(self, args: dict[str, Any]) -> str:
         """Enumerate the run's persisted command logs so the model can read them.

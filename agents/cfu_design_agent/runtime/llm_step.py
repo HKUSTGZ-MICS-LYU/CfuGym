@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..flow import instrument
-from ..runtime import flow_memory, llm, llm_config, parsing, stage_services, tools
+from ..runtime import flow_memory, llm, llm_config, parsing, stage_services, tools as tools_mod
 from ..runtime.llm import LlmResult, OpenAiTextClient
 from ..runtime.stage_executor import StageExecutionRequest, StageExecutor
 from ..runtime.tools import RepoToolbox
@@ -180,6 +180,15 @@ def _record_llm_output(
     return str(ref["path"])
 
 
+def _virtual_paths(state: CfuDesignState, system: str, user: str) -> tuple[str, str]:
+    """Render this run's artifact root as ``{{run-dir}}`` in one request."""
+    root = str(state.get("run_root", "") or "")
+    if not root:
+        return system, user
+    return (tools_mod.virtualize_run_paths(system, root),
+            tools_mod.virtualize_run_paths(user, root))
+
+
 def _complete_llm(
     state: CfuDesignState,
     stage: str,
@@ -199,6 +208,9 @@ def _complete_llm(
         # so no individual prompt can reintroduce that failure.
         if "json" not in f"{system}\n{user}".lower():
             user = f"{user}\nRespond with a single JSON object and nothing else."
+    # Paths are rendered with the run-directory token, so the request (and its
+    # llm_raw copy) is byte-identical across runs of the same workload.
+    system, user = _virtual_paths(state, system, user)
     result = llm.clean_llm_text(
         client.complete(
             system,
@@ -314,7 +326,8 @@ def _tools_enabled(state: CfuDesignState, client) -> bool:
 
 def _has_delivery_block(text: str) -> bool:
     """True when the response carries an edit, file block, or patch."""
-    return bool(tools.extract_edit_blocks(text) or tools.extract_file_blocks(text) or tools.extract_patch(text))
+    return bool(tools_mod.extract_edit_blocks(text) or tools_mod.extract_file_blocks(text)
+                or tools_mod.extract_patch(text))
 
 
 def _with_run_memory(state: CfuDesignState, toolbox: RepoToolbox, stage: str, user: str) -> str:
@@ -363,6 +376,7 @@ def _run_agent_step(
     run artifact semantics remain stable while stages migrate incrementally.
     """
     client = client or _llm(state)
+    system, user = _virtual_paths(state, system, user)
     executor_kwargs = dict(
         complete=_complete_llm,
         record_output=_record_llm_output,

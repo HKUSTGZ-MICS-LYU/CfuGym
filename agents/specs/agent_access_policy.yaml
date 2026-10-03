@@ -103,7 +103,7 @@ stages:
     write:
       - "agents/generated/runs/**/01_context/**"
       - "agents/generated/runs/**/run.yaml"
-    commands: [git_status]
+    commands: []
   ingest_input:
     write:
       - "agents/generated/runs/**/02_workload/**"
@@ -182,9 +182,6 @@ stages:
     commands: []
 
 commands:
-  git_status:
-    executable: git
-    argv_prefix: [git, status, --short]
   make_profile:
     executable: make
     required_tokens: [TARGET=vexii_soc]
