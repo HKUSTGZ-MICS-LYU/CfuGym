@@ -11,23 +11,68 @@ This folder contains local agent frameworks for CfuGym workflows.
   handle Embench workspace, observation points, and source loop discovery.
   New benchmark suites should add adapters here rather than extend the flow
   runner with benchmark-specific workspace mechanics.
-- `flow/`: the shared node/edge specification and traversal for LangGraph and
-  the pure-Python runner (`wiring.py`). `graph.py` currently retains node
-  implementations and public `build_graph`/`run_agent` entry points, because
-  existing callers patch module-level node dependencies there. Move node
-  implementations incrementally only with explicit dependency injection.
-- `runtime/`: low-level execution services—policy, repository tools, artifacts,
-  read-only agent tools, LLM transport/config, and progress tracking. These
-  enforce access and run isolation independently of benchmark selection.
-- `ir/`: opt-in LLVM IR evidence exporter (P0) and per-observation evidence lookup. `--ir-features off` (default)
-  does nothing; `auto` tries strict target-matching export, and `require` marks
-  strict export failure as an independent run failure. `approx` explicitly
-  requests a reduced `rv32imc` Clang target with cross-toolchain headers when
-  installed Clang cannot accept the GCC target; this is **approximate static
-  evidence**, not the original target's instructions. None of these modes
-  replace per-loop measurements, infer loop cycles, or alter the reference/CFU
-  validation builds. Commands, hashes, target differences, failures, and any
-  `.ll` files are recorded in the run's `07_analysis/` directory.
+- `flow/`: the flow shape and the domain control plane. `wiring.py` is the
+  node/edge specification; `gates.py` holds the gate and budget vocabulary;
+  `ladder.py` owns routing and repair decisions; `instrument.py` owns the node
+  wrapper (progress, fingerprints, gate staleness, side-effect journaling);
+  `optimize.py` owns the optimization ledger; `policies.py` declares the
+  per-node LangGraph policies; `outcome.py` is the gate/rewind vocabulary every
+  rung records its verdict through. LangGraph is required; the
+  parallel pure-Python runner and its manual reducer simulation have been
+  removed.
+- `stages/`: one module per stage — `context.py` (load/ingest/route/prepare),
+  `profile.py` (profile, hotspot, IR), `analysis.py`, `contract.py` (ISA),
+  `feedback.py` (repair/optimization prompt blocks and attempt ledgers),
+  `fallbacks.py`, and the sub-packages `implement/` (`hw`, `sw`, `unified`,
+  `delivery`, `intrinsics`), `verify/` (`soc`, `conformance`, `software`,
+  `cost`) and `review/` (`review_and_route`, `optimize`, `report`). A stage
+  module builds prompts, applies deliveries and reports gates; it never decides
+  that a gate passed.
+- `runtime/`: low-level execution services — policy, repository tools,
+  artifacts, read-only agent tools, LLM transport/config, the single
+  `llm_step` seam for one model interaction, `checks` for command execution,
+  `commands` for state-driven argv builders, `stage_services` for the
+  per-stage toolbox/artifact writers, persistence, and progress.
+  `stage_executor.py` is the execution-plane seam: it obtains one stage
+  deliverable through a plain or bounded tool interaction, while the stage
+  modules continue to own prompts, edits, validation gates and routing.
+- `state/`: the run state, declared in four named groups (`config.py` inputs,
+  `evidence.py` observations and artifacts, `ledger.py` gate verdicts and
+  budgets, `optimization.py` the `--loop` island) composed into the single flat
+  `CfuDesignState` that LangGraph registers. `TypedDict` inheritance keeps every
+  inherited key in `__annotations__` and `get_type_hints`, so the channels and
+  reducers are unchanged; `state/__init__.py` stays the one import site.
+- `graph.py`: the composition root only (~200 lines). It builds the graph from
+  `flow/wiring.py`, exposes `build_graph` / `run_agent` / `python_nodes` /
+  `export_graph_visualization`, and re-exports the node functions that
+  `python_nodes()` resolves from its own globals.
+
+Two rules keep this decomposition stable, and `agents/tests/test_graph_modules.py`
+enforces both:
+
+1. Reach a function through its owning module — `from ..runtime import checks`
+   then `checks.run_check(...)`, never `from ..runtime.checks import run_check`.
+   An imported name is a local binding, so a test that mocks the owning module
+   would not be observed by the caller.
+2. Do not re-export moved helpers from `graph.py`. Only public entry points and
+   node functions belong there, so a stale
+   `mock.patch.object(graph, "<helper>")` raises AttributeError instead of
+   silently patching a binding nobody reads.
+- `ir/`: the LLVM IR evidence exporter (P0) and per-observation evidence lookup. `--ir-features auto`
+  (the default) prefers the exact reference target; because the requested ISA
+  (`rv32imc_zicsr_zifencei`) is GCC-only and an installed Clang 14 rejects it, `auto` then retries the
+  reduced `rv32imc` export with cross-toolchain headers and returns it **labelled**
+  (`status: approximate`, `target_match: false`, the strict reason under `fallback`), so the analysis
+  gets evidence instead of nothing. A precondition failure (unsafe input, missing clang) is never
+  retried. `off` does nothing; `require` marks strict export failure as an independent run failure and
+  never falls back; `approx` forces the approximate export. Approximate IR is **static evidence**, not
+  the original target's instructions. None of these modes replace per-loop measurements, infer loop
+  cycles, or alter the reference/CFU validation builds. Commands, hashes, target differences, failures,
+  and any `.ll` files are recorded in the run's `07_analysis/` directory. When LLVM `opt` (14.x) is
+  available, each exported TU also gets a best-effort `<stem>.features.xml` static feature report (data
+  movement, typed operation counts, SSA/loop-carried/memory dependencies, SCEV trip counts when
+  constant) surfaced through `inspect_observation(..., view='features')`; it is static IR evidence —
+  never measured cycles or runtime byte counts — and its absence never blocks the IR or profile path.
 
 The short-lived old-path alias scripts were removed; import adapters via
 `cfu_design_agent.benchmark.*` and execution services via
@@ -44,6 +89,9 @@ hardware starting point for new designs. It provides a stable CfuBus contract, a
 algorithm-neutral Vector RegFile, optional TileLink load/store channels, and MiCoSoc CLI
 integration.
 
+A practical invocation and validation walkthrough is in
+[`docs/cfu_agent_sw_hw_coding_system.md`](../docs/cfu_agent_sw_hw_coding_system.md).
+
 These two tracked files are **read-only defaults**. Every run seeds an isolated workspace copy:
 
 ```text
@@ -54,6 +102,142 @@ agents/generated/runs/<run_id>/workspace/design/AgentCfuFiber.scala
 An agent may write **only** those two files for hardware; the access policy rejects any write
 to `src/main/scala/**`. A patch that names the tracked scaffold path is redirected into the run
 workspace automatically, so the repository tree is never modified by a design run.
+
+Hardware and software implementation use the shared stage executor for bounded,
+policy-checked repository discovery before producing a final delivery. By default,
+each agent step allows 20 tool rounds, 4 calls per model round, and 96 calls total;
+`--max-tool-rounds` and `--max-tool-calls` can lower or raise the per-step limits.
+A stage can
+inspect a typed failure summary and a bounded excerpt of its run-scoped complete
+command log by failure ID; complete logs are never injected wholesale into prompts.
+Every command the flow executes — an embench build in the profile stage, an isolated
+elaboration/compile check, a SoC generation, a conformance or workload simulation, a
+Yosys synthesis — persists its complete stdout/stderr under its own stage's
+`logs/` directory (`05_profile/logs`, `10_validation/logs`, `11_cost/logs`) with an
+immutable `versions/` copy, and the tool loop can enumerate them with
+`list_command_logs(rung?, limit?)` and read any one of them with `read_file`. The
+record is written for successes as well as failures, so a repairable regression can
+be compared against the last passing run instead of guessed from a truncated tail.
+
+### Run-wide memory, context budgets, and request debugging
+
+Every node shares a bounded `flow_memory` in LangGraph state. It contains accepted
+workload/analysis/ISA facts and read-time file snapshots with byte hashes and exact
+line coverage—not an ever-growing conversation. Later stages and repair revisits
+receive relevant facts/observed excerpts. File edits, contract revisions and policy
+changes invalidate dependent entries; unchanged methodology remains reusable.
+Reference-only paths are not claimed as previously read. `--checkpoint` persists
+this state through the existing SQLite checkpointer and conservative resume checks.
+Memory never replaces the independent build/conformance/simulation gates.
+
+Each actual model request gets a conservative context preflight, including tool
+schemas and reserved output. Named LLM JSON configurations may set:
+
+```json
+{"context_window_tokens": 131072, "output_reserve_tokens": 8192}
+```
+
+An explicit capacity wins; otherwise a bounded `/models/{model}` lookup uses a
+reported context field when present. Standard OpenAI model metadata does not
+promise that field. Unknown capacity uses a **32768-token soft budget**, not a
+claim about the actual model. The offline estimator uses serialized bytes plus
+protocol overhead, so it can substantially overestimate tokens. At 80% it records
+a warning; at 90% it replaces older, completed tool exchanges with bounded historical
+memos, retaining current edits/failures and legal tool/result pairs. If protected
+content cannot fit, the request is blocked and the current coding transaction is
+rolled back. The output reservation is also sent as `max_completion_tokens` (Chat)
+or `max_output_tokens` (Responses); endpoints must support that limit. Cached tokens
+still occupy context space. Usage logs report provider cached-input tokens when
+available and `n/a` otherwise; prefix comparison is diagnostic, not a cache-hit claim.
+
+All graph-run requests are written **before sending** to
+`agents/generated/runs/<run_id>/request_audit.jsonl`, with one JSONL event per request,
+result/error, capacity discovery, compaction or blocked request. The request event
+contains the complete effective application JSON: messages/input, tool definitions,
+reasoning/stream options and output limits; transport options and authorization are
+excluded. It includes timestamp, run/stage, request ID, attempt linkage, body hash
+and context estimate. SDK implicit retries are disabled, so the framework's explicit
+stream/API fallbacks appear as separate attempts. Original stage prompt/answer
+artifacts remain compatible; this ledger is the exact per-round debugging source.
+The JSONL is mode `0600`, rejects links/unsafe paths, and audit-write failure prevents
+sending an unrecorded request. It is host-owned and excluded from model reads; because
+source text can occur in prompts, treat the ledger as sensitive run-local data.
+Pure API self-tests outside a graph run have no run ledger. Inspect it locally with:
+
+```bash
+python -m json.tool --json-lines agents/generated/runs/YOUR_RUN_ID/request_audit.jsonl
+```
+
+No real-provider cache-hit improvement or gateway window discovery is inferred from
+offline tests; those require a separate, explicitly authorized live run.
+
+With agent tools, patch application and command execution all enabled, both
+implementation stages gain narrow transactional coding capabilities:
+
+- software: graph-bound exact SEARCH/REPLACE on approved kernel targets plus a
+  no-argument isolated compile check;
+- hardware: atomic exact SEARCH/REPLACE across only the two run-workspace
+  `AgentCfu.scala`/`AgentCfuFiber.scala` overlays plus a no-argument isolated
+  `GenAgentCfu` elaboration check.
+
+The model cannot choose argv, cwd, main class, output directory, simulation, or
+Yosys. A repair begins read-only and must submit a structured diagnosis citing
+current failure IDs before mutation unlocks. Provider/tool errors or rejected
+implementation output roll all model tool edits back to the stage-entry snapshot;
+a semantically accepted implementation commits them. Internal checks are evidence
+only and bind to the current candidate bytes. The ordinary `hw_build` and
+`sw_build` nodes independently rerun the canonical graph-owned commands and remain
+the only authoritative build Gates. Conformance, simulation and cost remain fully
+graph-owned.
+
+The edit tools, `read_file`, and the EDIT/FILE/PATCH delivery agree on paths: a
+tracked scaffold path (for example `src/main/scala/.../AgentCfu.scala`) maps to
+the run-workspace overlay in all three, so the model edits exactly the bytes it
+read; denial messages list the legal target paths. Failure evidence is
+freshness-aware: every `FailureObservation` carries `status: current | resolved`
+(a later passing rung resolves it), repair prompts list only current IDs as
+valid, resolved IDs appear as context with a "do not re-fix" note, and
+`submit_repair_diagnosis` rejects resolved IDs. Sim/conformance failures are
+classified (`fail_symbol`, `assertion`, `liveness_timeout`, `sim_harness_crash`,
+`timeout`, ...). A CPU commit-progress watchdog (`hasn't committed anything for
+too long`) is a repairable `liveness_timeout`: conformance routes back to
+`implement` using the ordinary bounded design-repair budget to inspect completion,
+backpressure and test size/latency. It is not proof of a wrong computed value.
+A simulation-harness crash that produced no case verdict stops the run as "not
+attributable to the design" without spending repair budget instead of being
+routed to `implement`. The category table and the 2026-09-29 case study (the
+`--agent-cfu-no-store` platform bug, since fixed in `AgentCfuFiber.getM2sParameters`)
+are in [`docs/cfu_agent_failure_taxonomy.md`](../docs/cfu_agent_failure_taxonomy.md).
+
+Implement delivers the formal oracle through `write_conformance(oracle)`: the host
+parses/validates the independent small-case oracle and renders fixed C source. The
+oracle and source are a single rollback-capable transaction, approved by state hashes
+for ISA, oracle, generated C and generator version. First delivery requires HW, SW
+and oracle; later rounds keep the oracle **editable**: a design repair may strengthen
+(never weaken) it, because a verification contract that cannot observe the real
+failure has to be repairable. In repair mode the first oracle edit still requires a
+submitted `submit_repair_diagnosis`. In the no-tool delivery mode the oracle is
+re-authored on every repair round, and a revision the validator rejects keeps the
+approved pair instead of failing the design round. Optional
+`check_conformance_syntax()` invokes only `-fsyntax-only` (no ELF/link/simulation).
+Implement exposes no `run_conformance` or `run_simulation` capability. Verify makes
+no model calls and never authors or rewrites oracle/C/header: it checks the approved
+bytes and builds/simulates that delivery. Missing/stale oracle or test compile errors
+return to Implement in conformance-only scope using the answer-repair budget;
+healthy HW/SW need no dummy edits. A design mismatch/watchdog uses the design-repair
+pool, and the oracle travels with it so a blind contract can be fixed in the same
+round. Host/policy failures stop without reauthoring.
+A parsed PASS does not override a nonzero simulator exit or erase its diagnostics.
+Independent references must not reach CFU intrinsics through helper functions, macros
+or simple aliases; setup-only helpers may still initialize CFU state. This is bounded
+syntactic lint, not a complete C/preprocessor proof of semantic independence.
+The validator additionally rejects a check that decides its own outcome: an operand
+compared with itself (`a == a`), a `verify` built only from the case arguments (an
+acknowledgement command returns nothing), a comparison against a value the same
+oracle's `setup`/`helpers` assigned a literal to, and an all-zero case set (which
+exercises only the zero boundary). Regression class: run
+`20261003-090854-136683-d98e5be9` passed 9 conformance cases with four
+self-fulfilling checks and then failed the Embench result.
 
 The implementation rungs deliver changes with three protocols, in this order of preference:
 
@@ -105,7 +289,7 @@ The CFU design agent turns a workload request into a run-scoped, auditable CFU d
 
 `load_context → ingest_input → route_input → prepare_benchmark → profile → hotspot → analysis → isa → implementation_hw → hw_build → implementation_sw → sw_build → sim → cost → review → final_report`
 
-The `analysis` stage must include a Roofline section in `07_analysis/workload_analysis.yaml`: named memory boundary, operation and byte counts, arithmetic intensity, compute/bandwidth ceilings with provenance, ridge point, bottleneck, predicted versus achieved metric, design action, and unresolved unknowns. The ISA and implementation prompts carry this conclusion forward so vector width, RF residency, memory style, pipeline depth, instruction granularity, and software blocking address the modeled bottleneck.
+The `analysis` stage must include a Roofline section in `07_analysis/workload_analysis.yaml`: named memory boundary, operation and byte counts, arithmetic intensity, compute/bandwidth ceilings with provenance, ridge point, bottleneck, predicted versus achieved metric, design action, and unresolved unknowns. Downstream prompts do not inline that analysis: the contract and implementation prompts point at `07_analysis/workload_analysis.yaml` and require the agent to read it, so vector width, RF residency, memory style, pipeline depth, instruction granularity, and software blocking still address the modeled bottleneck.
 
 ### Fail-fast validation ladder
 
@@ -116,12 +300,12 @@ The design is checked by the tool that owns each artifact **immediately after it
 | `prepare_benchmark` | workload workspace copy + instrumentation setup (policy reads must succeed) | `prepare_benchmark` | — (input/policy failure stops the run) |
 | `isa` | CFU ISA/integration contract lints | `isa` | `design_contract` |
 | `implementation_hw` | writes `workspace/design/AgentCfu*.scala` only | `implementation_hw` | — |
-| `hw_build` | `sbt … MiCoSocGen --mico-agent-cfu` (Scala compile + SpinalHDL elaboration + Verilog) | `hw_build` | `implement_hw` |
-| `hw_conformance` | harness-generated differential micro-test of every declared instruction (`make … cfu_conformance` + `MiCoSocSim --load-elf`); must print `CFU_CONFORMANCE PASS commands=n/n …` | `hw_conformance` | `implement_hw` |
+| `hw_build` | `sbt … MiCoSocGen --mico-agent-cfu` (Scala compile + SpinalHDL elaboration + Verilog) | `hw_build` | `implement` |
+| `hw_conformance` | harness-generated differential micro-test of every declared instruction (`make … cfu_conformance` + `MiCoSocSim --load-elf`); must print `CFU_CONFORMANCE PASS commands=n/n …` | `hw_conformance` | `implement` |
 | `implementation_sw` | writes the accelerated kernel + `cfu_intrinsics.h`; the CFU build must call a CFU datapath intrinsic (not `cfu_enable()` + scalar). The rung may be **reused** instead of re-run when the kernel already in the workspace still drives this exact ISA contract | `implementation_sw` | — |
-| `sw_build` | `make … compile` | `sw_build` | `implement_sw` |
-| `sim` | `sbt … MiCoSocSim --load-elf …` plus the correctness oracle; an embench CFU build must also show >= 1.05x reference cycles (`MIN_EMBENCH_SPEEDUP_X100` in `graph.py`) | `sim` | `implement_sw` or `implement_hw`, chosen by the agent |
-| `cost` | `sbt … GenAgentCfu` elaborates the CFU alone (with the **same `--agent-cfu-*` flags as the SoC build and the simulation**, derived from the ISA spec's `datapath`/`memory`), then Yosys cost report from that standalone RTL | `cost` | `implement_hw` |
+| `sw_build` | `make … compile` | `sw_build` | `implement` |
+| `sim` | `sbt … MiCoSocSim --load-elf …` plus the correctness oracle; an embench CFU build must also show >= 1.05x reference cycles (`MIN_EMBENCH_SPEEDUP_X100` in `flow/gates.py`) | `sim` | `implement` |
+| `cost` | `sbt … GenAgentCfu` elaborates the CFU alone (with the **same `--agent-cfu-*` flags as the SoC build and the simulation**, derived from the ISA spec's `datapath`/`memory`), then Yosys cost report from that standalone RTL | `cost` | `implement` |
 
 - `--max-iters N` is the **design repair budget**: `N - 1` repair rounds for fixes to the actual hardware/software design. `--max-iters 1` allows no repair, so the first failing rung stops the run immediately with `status=failed` (CLI exit code 1) and skips every later rung — no compile, simulation, or Yosys run happens on a design that already failed to generate. Answer-only defects (a malformed conformance oracle or ISA contract) draw from a **separate** `--max-answer-repairs` pool (default 2), so an oracle build fix can never exhaust the budget the run needs for real design fixes.
 - A repair re-runs the responsible node with the exact tool output (Scala compiler / elaboration errors, `make` errors, or simulator output) embedded in its prompt. An implementation rung that produced no usable patch is likewise re-prompted with its rejection reason.
@@ -130,19 +314,23 @@ The design is checked by the tool that owns each artifact **immediately after it
 - The exact injected feedback is persisted as `09_implementation/hw_repair_feedback.txt` / `09_implementation/sw_repair_feedback.txt` for every repair attempt, so a run is auditable against the LLM raw output.
 - A rejected SEARCH block is reported with its exact location: the error names the SEARCH line and the current file line that differ, quotes both lines, and says whether an earlier pair already changed the region. Previously an unlocalized "SEARCH block not found" plus a parenthetical about earlier pairs led the model to misdiagnose the file as stale and resend the same edit.
 - Both implementation rungs detect a stuck retry: each attempt records a `(response_hash, error_hash, error_text)` (in `sw_attempts` / `hw_attempts` and the gate). When the newest attempt is byte-identical to **any** earlier attempt and failed identically (so an A-B-A oscillation is caught too), the next repair prompt carries a `REPEATED IDENTICAL ATTEMPT` directive to switch strategy (Protocol B whole-file, or a minimal SEARCH), instead of burning the remaining budget on the same rejected answer. (The hardware rung previously lacked this guard; a model that emitted one broken answer three times exhausted the whole repair budget on it.)
+- Attempts also record a `search_key` (the first content line of each SEARCH block), so a **rephrased** repeat of one approach is caught: the repair prompt carries a `REPEATED APPROACH DETECTED` directive and `_apply_agent_output` rejects a delivery whose SEARCH blocks repeat an already-rejected attempt before applying anything (observed 2026-09-29: three deliveries re-fixing one already-fixed compile error with different prose). A deterministically rejected delivery (SEARCH not found, missing deliverable, omitted `REPAIR_DIAGNOSIS`) additionally gets one corrective retry via `_delivery_retry_transition` that does **not** consume `--max-iters`; a delivered-but-broken design still does.
 - Delivery parsing tolerates a terminator glued to the next token: a degenerate sampler occasionally restarts its answer template inside the same completion, so the response arrives twice with the second copy beginning at `EDIT_ENDREPAIR_DIAGNOSIS` instead of a newline. The parser splits that glue (only outside `identifier` continuations like `EDIT_END_foo`) and collapses byte-identical duplicate sections to the first copy, so a correct edit delivered in a doubled answer is applied once instead of rejected as "missing EDIT_END".
-- Prompts render each rung's own target files exactly once: they are shown in full under "Exact current contents" and omitted from the truncated repo-context digest, so a truncated copy can never be mistaken for the text to copy. `DELIVERY_PROTOCOLS` also tells the model not to wrap long comment blocks in a SEARCH and to copy any included comment byte-for-byte.
-- Before answering, the analysis and hardware rungs may run a **bounded tool loop** (`--agent-tools`, on by default; `--no-agent-tools` disables it). The budget is `--max-tool-rounds N` (default 6, model turns that may use tools) plus `--max-tool-calls N` (default 24, cumulative calls across all rounds; `0` disables the cap) and at most 4 parallel calls per round. Tools are read-only and policy-checked: `read_file`, `list_dir`, `search_text`, plus analysis-only `inspect_observation(id, view=summary|asm|ir)` when Embench observation IDs are available. The last tool returns bounded, explicitly uncertain reference-function ASM/Clang IR candidate snippets for a measured profile label; missing cached-build ASM is reported unavailable, not invented. Every call is printed in the CLI log (`[tool] read_file(...) ok -> N chars`) and written to `09_implementation/hw_tool_calls.yaml` (hardware) or `07_analysis/analysis_tool_calls.yaml` (analysis), so the agent's reading is auditable; the effective budget is recorded as `tool_policy` in `run.yaml`. If the endpoint rejects the tools payload, the step degrades to a one-shot prompt instead of failing.
+- Prompts show a rung's own target files exactly once: with a tool loop they are listed as paths to read (`read_file` returns the live overlay bytes an edit targets), and without one they are inlined in full under "Exact current contents" and omitted from the truncated repo-context digest, so a truncated copy can never be mistaken for the text to copy. `DELIVERY_PROTOCOLS` also tells the model not to wrap long comment blocks in a SEARCH and to copy any included comment byte-for-byte.
+- **Every stage prompt is a five-part brief**: the task, the working directory and run directory, the tools the stage may call (with the tool budget), the deliverable and the artifact path it lands on, and a key-path index plus machine-generated evidence digests (WorkloadSpec, measured profile, observation IDs, generated intrinsic names, optimization score). Repository file bodies are not inlined while a tool loop is available; the agent reads them by path. Only a run without that loop (`--no-agent-tools`, or no tool-capable endpoint) falls back to inlining the bodies the stage needs, because a SEARCH/REPLACE delivery must be built from exact bytes.
+- Before answering, the analysis, ISA-contract, implementation and optimization rungs may run a **bounded tool loop** (`--agent-tools`, on by default; `--no-agent-tools` disables it). The budget is `--max-tool-rounds N` (default 20, model turns that may use tools) plus `--max-tool-calls N` (default 96, cumulative calls across all rounds; `0` disables the cap) and at most 4 parallel calls per round. Common tools are policy-checked `read_file`, `list_dir`, `search_text` and `list_command_logs` (the run's persisted build/simulation/synthesis logs, newest first); analysis can additionally use `inspect_observation(id, view=summary|asm|ir)` for available Embench observation IDs, and implementation repair can use bounded `inspect_failure`. The first-attempt software capability described above is the only mutation/check exception. Observation inspection returns bounded, explicitly uncertain reference-function ASM/Clang IR snippets; a missing cached-build disassembly says so and points at `view='ir'`. Within one implementation stage the model may edit each domain up to 6 times and check twice; a stage-gate rejection re-opens those local budgets, because the gate just asked for a change and a corrective round is already bounded by the loop's turn/call caps. Every call is printed in the CLI log as one short line that reports edit/delivery payloads by size (see **Live progress** below) and written to the stage tool-call artifact (`07_analysis/analysis_tool_calls.yaml`, `08_isa/isa_tool_calls.yaml`, `09_implementation/{hw,sw,stage3}_tool_calls.yaml`, `12_review/optimize_tool_calls.yaml`), so model actions are auditable; the effective budget is recorded as `tool_policy` in `run.yaml`. If the endpoint rejects the tools payload, the step degrades to a one-shot prompt instead of failing.
 - When the budget is exhausted the tools are withdrawn and a reminder is injected that the next reply must be the final EDIT/FILE/PATCH deliverable. That reply is then parsed as the answer, and an answer with no delivery block fails `implementation_hw` with an explicit `no EDIT_BEGIN/FILE_BEGIN/PATCH_BEGIN deliverable` error (which the repair prompt carries) instead of failing silently and being misreported as a build failure downstream.
 - If the endpoint refuses the tools payload the request is retried once; if it still fails the step degrades to a plain completion that explicitly tells the model tools are unavailable, so it does not answer with an unexecutable "Let me read …" plan. The degradation is recorded (`degraded_reason` on the raw-output metadata, a `(tools unavailable)` entry in the tool-calls artifact, `tools_degraded` on the gate). Separately, any answer that only announces reading a file is detected and reported as a `tool-intent preamble` error, which the repair prompt carries, instead of being accepted as a finished design.
 - While tool budget remains, a reply that cannot be used gets **one corrective re-ask** before the step is finalized: either the model announced a read without calling a tool, or a rung that requires a delivery block returned none (plan-only answer). The re-ask states the requirement and keeps tools available, so a dropped or forgotten tool call does not burn a ladder repair.
-- The stages that own a workload also allowlist its source (`benchmarks/embench-iot/{src,support}/**`), so a file shown in the prompt context is never denied to the tool loop. The analysis rung additionally reads the profile build's disassembly (`workspace/**/*.asm`), so the hot loop can be analyzed from real instructions rather than inferred from C.
+- The stages that own a workload also allowlist its source (`benchmarks/embench-iot/{src,support}/**`), so a file listed in the prompt's key-path index is never denied to the tool loop. The analysis rung additionally reads the profile build's disassembly (`workspace/**/*.asm`), so the hot loop can be analyzed from real instructions rather than inferred from C.
 - Hardware-target reads are redirected to the run-workspace overlay: `read_file`/`search_text` on `src/main/scala/vexiiriscv/soc/mico/AgentCfu*.scala` return the run's live copy (the same bytes the prompt shows and an edit targets), so a repair sees its own previous change instead of the pristine tracked scaffold. The redirect only applies where the stage may read the overlay, so the analysis rung still reads the tracked scaffold.
-- The build rungs are guarded by the implementation rung that feeds them: if `implementation_hw` applied nothing, `hw_build` fails without invoking `sbt` (the seeded scaffold would otherwise compile and "pass" while validating nothing) and repairs `implement_hw`; if `implementation_sw` applied nothing, `sw_build` fails without invoking `make` and repairs `implement_sw`.
-- A failed `sim` is routed by the agent, not by a fixed order: one extra LLM call (stage `route_repair`) receives the failure attribution, the measured reference/CFU cycles, the ISA contract, both implementation summaries, and the simulation-log tail, and returns `{"repair_target": "implement_sw"|"implement_hw", "root_cause", "reason"}`. Only those two targets are accepted; anything else (or no model at all) falls back to the deterministic escalation, which is keyed to simulation repairs only: the first `sim` failure retries software, the next escalates to hardware. An unrelated earlier repair (for example a `sw_build` retry) does not skip the software retry. `--repair-routing fixed` (env `CFU_AGENT_REPAIR_ROUTING`) pins the old deterministic behavior and never calls the router. The decision is written to `10_validation/sim_repair_decision.yaml` (`target`, `root_cause`, `reason`, `source` = `llm`/`fallback`/`fixed`, and the deterministic `advisory`), recorded as `repair_decision` on the `sim` gate, added to the iteration history, and the router's raw answer is kept as `10_validation/llm_raw/repair_route_*.txt`. The named root cause is also injected into the chosen rung's repair feedback as a routing-decision line, so the retry works on the identified defect instead of re-deriving it from the log.
-- After a successful `hw_build` the ladder does not have to re-write the software. The agent may decide that the kernel already in the run workspace still matches the new hardware, in which case the `implementation_sw` rung is **reused** and the run goes straight to `sw_build` → `simulate` with the existing kernel and the freshly generated `cfu_intrinsics.h`. The decision has a deterministic honesty guard: it is only taken when the current kernel bytes call a CFU datapath intrinsic **and** the ISA contract digest recorded when that kernel was written still equals the current one — a moved ABI (renamed command, new operand layout) forces the software rung. Only real datapath calls count: `cfu_enable()`, `cfu_memory_fence()` (enable/fence only) and the generated harness's `cfu_agent_counter_read()`/`cfu_agent_counter_elapsed()` cycle helpers do not; those helper names are now reserved by the ISA linter. Declared control-only operations do not count as datapath usage either. Only when the guard passes is one LLM call (stage `route_software`) made, with the ISA contract, both design summaries and the exact intrinsic call sites, to answer `{"software_change": "required"|"not_required", "reason"}`. Any failure (no model, unusable answer, or `--software-change always`, env `CFU_AGENT_SOFTWARE_CHANGE`) runs the software rung as before. The decision is written to `09_implementation/software_decision.yaml` (`software_change`, `reason`, `source` = `llm`/`guard`/`fallback`/`fixed`, `evidence`, `files`, `calls`), recorded as `software_decision` on the `hw_build` gate and as `{"ok": true, "reused": true, ...}` on the `implementation_sw` gate, added to the iteration history, and the router's raw answer is kept as `09_implementation/llm_raw/software_route_*.txt`. Reuse is never a way to skip validation: `sw_build` still compiles the kernel and `sim` still has to pass the correctness oracle and the speedup floor.
-- Before any workload software exists, the `hw_conformance` rung runs the **smallest possible program** that exercises each declared instruction and compares it against an independent scalar reference, so a contract/encoding/writeback mistake is found before a kernel is written on top of it. The C test is **harness-owned** (`conformance.render_conformance`): the model supplies only an oracle YAML, so a hardware repair can never weaken the test. A command that writes CPU `rd` is compared case-by-case against an independent scalar `reference` expression; a command with no CPU result (a vector write or an acknowledgement) cannot be read back generically, so the oracle must supply a `verify` C expression instead — that is **weaker evidence** (the model attesting its own hardware) and is recorded as such. A command that uses the vector register file must supply `setup`; the harness never guesses how to seed it. A missing `reference`/`verify`/`setup`/`cases`, an unknown command name, or an argument-count mismatch is a **coverage failure**, and a missing `CFU_CONFORMANCE` line is a failure too: silence is never evidence. Lazy oracles are rejected by the validator: a `reference`/`verify` that is a compile-time constant (no identifier), that calls a `cfu_*` intrinsic (self-reference), or that names an undeclared case argument fails with an actionable message, as does a `helpers` symbol defined by more than one command. For every rd-writing command the harness appends its own deterministic extra cases (two edge values plus three fixed-seed pseudo-random pairs; an oracle may opt out per command with `edge_cases: false` for address-taking or stateful commands) and always binds `a`/`b` at case scope, so a stale oracle cannot fail the generated C build. The rung is purely functional — it measures no cycles and asserts no performance; correctness is proved later by the `sim` rung and the workload's own oracle. A differential failure repairs `implement_hw`, while a malformed/unbuildable oracle repairs `check_conformance` from the separate answer-repair budget (see the repair-budget note above). The generated C, the oracle and the verdict are kept under `09_implementation/conformance/`.
-- Oracle `cases[i].args` values are compile-time constants in the generated C: the validator accepts only integer literals (exactly one per CPU-value role, rs1/rs2 order), and both the validator message and the prompt tell the model to move address/data preparation into `setup` (e.g. seed vectors there and give `args: [0]`). The oracle's C may call only the **generated intrinsics named in the prompt's command table** (plus `cfu_enable`/`cfu_memory_fence`); an invented name such as `cfu_load` is caught by a static lint before the build (`unknown intrinsic cfu_load (did you mean cfu_vector_load_i32?)`) instead of surfacing as a bare linker error. Conformance build/sim failures embed the compiler/linker diagnostics in the repair feedback (previously only the `make` command line reached the model, so it repaired blind), and a **recurring** rejection — validator failure or build failure — is flagged as a `REPEATED ORACLE REJECTION` with the correct shape pinned. `run.yaml` merges artifact refs across writer instances, so every oracle attempt's raw answer stays registered and numbered (`conformance_000/001/...`) instead of being dropped and overwritten.
+- The build rungs are guarded by the implementation stage that feeds them: if `implementation_hw` applied nothing, `hw_build` fails without invoking `sbt` (the seeded scaffold would otherwise compile and "pass" while validating nothing) and repairs `implement`; if `implementation_sw` applied nothing, `sw_build` fails without invoking `make` and repairs `implement`.
+- A failed rung is repaired by the single implementation stage, which receives every failing rung's evidence at once (`feedback.all_failure_feedback`) and decides there what to change.
+
+- The implementation stage writes both sides before the ladder runs, so `hw_build`, `hw_conformance`, `sw_build`, `sim` and `cost` always validate what the stage actually delivered. Whether the kernel was rewritten is the stage's own decision; the ladder compiles whatever is in the workspace and still enforces the correctness oracle and the speedup floor.
+
+- After Implement delivers hardware, software and the oracle, the `hw_conformance` rung runs the **smallest possible program** that exercises each declared instruction and compares it against an independent scalar reference, so a contract/encoding/writeback mistake is found before a kernel is written on top of it. The C test is **harness-owned** (`conformance.render_conformance`): the model supplies only an oracle YAML, so a hardware repair can never weaken the test. A command that writes CPU `rd` is compared case-by-case against an independent scalar `reference` expression; a command with no CPU result (a vector write or an acknowledgement) cannot be read back generically, so the oracle must supply a `verify` C expression instead — that is **weaker evidence** (the model attesting its own hardware) and is recorded as such. A command that uses the vector register file must supply `setup`; the harness never guesses how to seed it. A missing `reference`/`verify`/`setup`/`cases`, an unknown command name, or an argument-count mismatch is a **coverage failure**, and a missing `CFU_CONFORMANCE` line is a failure too: silence is never evidence. Lazy oracles are rejected by the validator: a `reference`/`verify` that is a compile-time constant (no identifier), that calls a `cfu_*` intrinsic (self-reference), that names an undeclared case argument, that compares an operand with itself (`a == a`), that (as `verify`) is built only from the case arguments, or that compares a value the same oracle's `setup`/`helpers` assigned a literal to fails with an actionable message, as does a `helpers` symbol defined by more than one command and an all-zero case set. The model chooses all test inputs and sizes; the harness runs exactly the declared cases, without appending hidden edge/random inputs. Prompts require small-data, quick functional tests and warn against full-width random iteration counts or lengths. The legacy `edge_cases` boolean is accepted but no longer changes coverage. The harness always binds `a`/`b` at case scope, so a stale oracle cannot fail the generated C build. The rung is purely functional — it measures no cycles and asserts no performance; correctness is proved later by the `sim` rung and the workload's own oracle. A differential failure repairs `implement_hw`, while a malformed/unbuildable oracle repairs `check_conformance` from the separate answer-repair budget (see the repair-budget note above). The generated C, the oracle and the verdict are kept under `09_implementation/conformance/`.
+- Oracle `cases[i].args` values are compile-time constants in the generated C: the validator accepts only integer literals (exactly one per CPU-value role, rs1/rs2 order), and both the validator message and the prompt tell the model to move address/data preparation into `setup` (e.g. seed the vectors/memory there and give the argument the literal value it uses, such as `args: [0x80000000]`, never an all-zero case set). The oracle's C may call only the **generated intrinsics named in the prompt's command table** (plus `cfu_enable`/`cfu_memory_fence`); an invented name such as `cfu_load` is caught by a static lint before the build (`unknown intrinsic cfu_load (did you mean cfu_vector_load_i32?)`) instead of surfacing as a bare linker error. Conformance build/sim failures embed the compiler/linker diagnostics in the repair feedback (previously only the `make` command line reached the model, so it repaired blind), and a **recurring** rejection — validator failure or build failure — is flagged as a `REPEATED ORACLE REJECTION` with the correct shape pinned. `run.yaml` merges artifact refs across writer instances, so every oracle attempt's raw answer stays registered and numbered (`conformance_000/001/...`) instead of being dropped and overwritten.
 - With `--loop` a run does not have to stop when it succeeds (see **Multi-instruction ISA evolution** below for the current exploration and delivery rules). If every gate passes **and** the `--max-iters` budget still has room, the review node asks the agent (stage `optimize`, plus at most one stop reconsideration) whether another round is worth spending on: `{"continue": true|false, "target": "implement_hw"|"implement_sw"|"extend_isa", "focus": "performance"|"cost", "reason": ...}`. A round re-enters the normal ladder (`implement_hw` → `generate_soc` → software reuse-or-rewrite → `build_sw` → `simulate` → `estimate_cost` → review, or `implement_sw` → `build_sw` → …), so it can never skip verify, the 1.05x speedup floor, or a build rung. An optimization round is budgeted like a repair: `--max-iters N` stays the single bound on the whole run, and a round with no budget left, an unusable target, or a missing "concrete change" reason stops the loop deterministically; in default explore mode a `continue: false` is reconsidered once before the framework accepts it (no model answer can extend a run). The chosen rung receives an `=== OPTIMIZATION ROUND ===` block (not a `*_REPAIR MODE` block) with the current measured result, the focus, and the rule that the accepted ISA revision is frozen during implementation; only `extend_isa` may append compatible commands before re-entering hardware and software validation. Every round that produced its own measurement is recorded in `12_review/optimization_rounds.yaml` (speedup, reference/CFU cycles, Yosys cells/wires/memories), and `simulate`/`estimate_cost` stamp their gates with the round they ran in, so a round that failed before measuring is listed as `not measured` instead of repeating the previous round's numbers. The report's `## Optimization Rounds` section and the end-of-run CLI `summary:` each print one line per round with the change against the previous measured round — for example `round 1: implement_hw speedup=2.50x cells=1300 (+0.50x, +100 cells) (best)` — so the whole progression of speedup and cost is traceable; the first round is the initial ladder. A round counts as an improvement only when it is Pareto-better than the best round so far (not slower, not larger, better on at least one axis); a final measured round that regresses is reported with an explicit warning in the report and in the CLI summary. `--loop` is off by default (env `CFU_AGENT_LOOP`); without it, review stops as before.
 - The cost rung synthesizes the CFU **in isolation** rather than the whole SoC: `GenAgentCfu` (a tracked, non-agent-editable entry point) elaborates only the overlaid `AgentCfu` class into `11_cost/cfu_rtl/AgentCfu.v`, and Yosys runs `synth -top AgentCfu` on it. Cost numbers therefore track the agent's CFU design instead of the CPU/SoC, and the cost rung needs no CPU build. If the standalone generation produces no RTL, the cost rung fails and repairs `implement_hw`.
 - The simulation rung also fails when no design change was applied, so a benchmark whose cfu build is byte-identical to the reference cannot be reported as an accelerated result.
@@ -153,42 +341,48 @@ The design is checked by the tool that owns each artifact **immediately after it
 # Planning pass (read-only): writes run artifacts, never mutates source or runs commands.
 python3 agents/run_cfu_agent.py \
   --task "Accelerate a uint8 weighted average kernel with a TileLink CFU. It reads x[i] and w[i], computes sum(x[i] * w[i]) / N, arrays are 32-byte aligned, and products should stay resident inside the CFU." \
-  --skip-sim --skip-yosys
+  --dry-run --skip-sim --skip-yosys
 ```
 
-By default the agent is **read-only** (`--dry-run` semantics). To actually apply an LLM patch and/or run allowlisted build/simulator/Yosys commands, opt in explicitly:
+By default the agent is **autonomous**: it may apply an LLM patch to CFU/software
+allowlisted paths and run allowlisted build/simulator/Yosys commands. To restrict
+it, opt out explicitly:
 
 ```bash
-# Allow the agent to apply a patch to CFU/software allowlisted paths only.
-python3 agents/run_cfu_agent.py --task "..." --apply-patch
-
-# Allow allowlisted commands (mioc-gen/sim, make TARGET=vexii_soc, yosys cost) to run.
-python3 agents/run_cfu_agent.py --task "..." --run-commands
-
-# Force read-only even if other flags might imply mutation.
+# Force read-only: never mutate source or run external commands.
 python3 agents/run_cfu_agent.py --task "..." --dry-run
+
+# Keep patch application but never execute allowlisted commands.
+python3 agents/run_cfu_agent.py --task "..." --no-run-commands
+
+# Record LLM deliverables as proposals only; allowlisted commands still run.
+python3 agents/run_cfu_agent.py --task "..." --no-apply-patch
 
 # Restrict what the agent may read (default: standard).
 python3 agents/run_cfu_agent.py --task "..." --visibility basic
 ```
 
+`--apply-patch`, `--run-commands` and `--no-dry-run` remain accepted as no-ops so
+older invocations keep working; they no longer change anything.
+
 ### Visibility levels
 
 `--visibility {basic,standard,extended}` (env `CFU_AGENT_VISIBILITY`, default `standard`)
-controls **which files the agent may read** — the prompt context, the read-only tool loop
-(`read_file`/`list_dir`/`search_text`), and any stage read. It is a read-only gate: writes,
-command allowlists, `--apply-patch`, and `--dry-run` are unchanged, and the write confinement
-to `workspace/design/AgentCfu*.scala` still applies at every level.
+controls **which files the agent may read** — the key-path index it is shown and the read-only tool loop
+(`read_file`/`list_dir`/`search_text`). The tier is flow-wide: every stage of a run sees the
+same tree. It is a read-only gate: writes, command allowlists, and the effect flags
+(`--dry-run`, `--no-apply-patch`, `--no-run-commands`) are unchanged, and the write
+confinement to `workspace/design/AgentCfu*.scala` still applies at every level.
 
 | Level | Adds | Still hidden |
 | --- | --- | --- |
 | `basic` | workload/benchmark sources, the CFU contract (`CfuBus`/`CfuPlugin`/`CfuLib`), `AgentCfu*`/`GenAgentCfu`, `MiCoSoc*`, the ISA template, `sw/tests`, run artifacts | `skills/cfu-designer/**` and sibling CFU designs (Vpu/BitNet) |
 | `standard` (default) | the cfu-designer skills and the sibling CFU designs | `ext/SpinalHDL/**` |
-| `extended` | `ext/SpinalHDL/**` in the `isa` and `implementation` stages, with prompt guidance to confirm the SpinalHDL API before writing hardware | — |
+| `extended` | `ext/SpinalHDL/**` for the whole flow, with prompt guidance to confirm the SpinalHDL API before writing hardware | — |
 
 - The gate is declarative: `agents/specs/agent_access_policy.yaml` has a `visibility` section
-  whose `gated` globs list the paths that require `standard` or `extended`. A path a stage does
-  not allowlist stays unreadable regardless of level.
+  whose `gated` globs list the paths that require `standard` or `extended`. A path outside the
+  shared `read` tree stays unreadable regardless of level.
 - Hiding a context file is expected at a lower level, so `load_context` records it under
   `withheld_files` in `01_context/manifest.yaml` (and does **not** fail the gate); only a real
   policy denial lands in `denied_files` and fails it. The chosen level is written to the
@@ -459,16 +653,21 @@ ABI migrations remain separate follow-up work.
 
 ### Access and command policy
 
-`agents/specs/agent_access_policy.yaml` is the single source of truth for what each stage may read/write and which commands it may run:
+`agents/specs/agent_access_policy.yaml` is the single source of truth for what the agent may read/write and which commands it may run:
 
+- **Reads are flow-wide.** The policy has one top-level `read` tree that every stage shares: a run's knowledge is not partitioned by stage, so `analysis`, `isa` and `implementation` see exactly the same paths. Declaring `read` inside a stage is a policy error rather than a silent narrowing.
+- **Only writes and commands are stage-scoped.** Each stage declares its own `write` allow list and command ids under `stages:`.
 - Deny rules always take precedence; paths are resolved to repo-relative form and reject absolute paths, `..` escapes, and symlinks outside the workdir.
-- Each stage has its own `read` / `write` allow lists. Secret, `.git`, build/binary (`*.elf`, `*.o`, `*.map`, `*.vcd`, `*.fst`), and non-allowlisted repo source are not exposed to the agent. Disassembly (`*.asm`) is no longer globally denied: it is text and is exposed only where a stage allowlists it (the analysis rung for the profile build, and `sw/tests/**`), while build trees stay denied. Historical runs under `agents/generated/runs/` are never auto-read.
-- Visibility is a second, read-only gate on top of the stage lists: the policy's `visibility.gated` globs mark paths that require `standard`/`extended`, and `--visibility` selects the level (see [Visibility levels](#visibility-levels)).
+- Secret, `.git` (including a submodule's `.git` pointer), build/binary (`*.elf`, `*.o`, `*.bin`, `*.map`, `*.vcd`, `*.fst`), bytecode, and non-allowlisted repo source are not exposed to the agent. Disassembly (`*.asm`) is not globally denied: it is text and is readable under the run workspace and `sw/tests/**`, while build trees stay denied. Historical runs under `agents/generated/runs/` are never auto-read: the read tree is scoped to the executing run.
+- The tools traverse the same tree they may read. `list_dir` lists sub-directories (a directory is never itself a readable path, so it is listed whenever a readable file may live below it), and both it and `search_text` prune denied/gated subtrees before those can consume an enumeration budget. A partially completed search returns the hits it already found plus the reason it stopped.
+- Visibility is a second, read-only gate on top of the read tree: the policy's `visibility.gated` globs mark paths that require `standard`/`extended`, and `--visibility` selects the level (see [Visibility levels](#visibility-levels)).
 - Commands are declared by id (e.g. `make_profile`, `soc_sim`, `cfu_generate_agent`, `yosys_cost`, `git_apply`). Shell metacharacters, absolute paths, and sensitive paths in command argv are rejected; the executable and required tokens must match the declaration.
-- `--apply-patch` is required for **all three** delivery protocols. Without it, SEARCH/REPLACE
+- Patch application (enabled by default; disabled with `--no-apply-patch` or `--dry-run`) is
+  required for **all three** delivery protocols. Without it, SEARCH/REPLACE
   edits, `FILE_BEGIN` blocks, and unified diffs are recorded as proposals only; the run never
   writes LLM-authored content into the workspace (the generated benchmark copy is framework
-  setup, not agent output). `--run-commands` on its own only allows allowlisted commands.
+  setup, not agent output). `--no-run-commands` alone only disables command execution and
+  leaves patch application on.
 - Hardware writes are confined to `workspace/design/AgentCfu.scala` and `workspace/design/AgentCfuFiber.scala`; `src/main/scala/**` is read-only for every stage.
 
 ### Run artifacts
@@ -487,6 +686,9 @@ Every run gets a unique directory `agents/generated/runs/<run_id>/` and writes:
 09_implementation/hw_plan.md, hw_patch.diff, hw_changed_files.yaml
 09_implementation/hw_tool_calls.yaml       # read_file/list_dir/search_text transcript
 07_analysis/analysis_tool_calls.yaml       # analysis-rung read/search/inspect_observation transcript
+08_isa/isa_tool_calls.yaml                 # ISA-contract read/search transcript
+09_implementation/conformance_tool_calls.yaml  # conformance-oracle read/search transcript
+12_review/optimize_tool_calls.yaml         # optimization-planner read/search transcript
 09_implementation/sw_plan.md, sw_patch.diff, sw_changed_files.yaml
 09_implementation/software_decision.yaml   # required/reused (software_change) + its evidence
 09_implementation/hw_repair_feedback.txt   # exact error log injected on a hardware retry
@@ -510,7 +712,20 @@ workspace/design/...              # isolated AgentCfu.scala + AgentCfuFiber.scal
 workspace/soc/...                 # MiCoSoc.v / soc.h generated from the overlay
 ```
 
-Each artifact records its stage, status, inputs, visible files, SHA-256, size, and timestamp. The benchmark workspace is scoped to the run so runs do not clobber each other, and C-project inputs are always copied before instrumentation so the original source tree is never modified.
+Each artifact records its stage, status, inputs, visible files, SHA-256, size, and timestamp. The benchmark workspace is scoped to the run so runs do not clobber each other, and C-project inputs are always copied before instrumentation so the original source tree is never modified. A checkpointed run also stores `checkpoint.sqlite` and `operation_journal.json` under the same run root. Current stage-input fingerprints mark affected downstream gates stale when upstream analysis, ISA or design sources change; resume refuses any previously passing gate whose source bytes no longer match. This is an evidence freshness guard, not a substitute for recomputing the independent gates.
+
+### Stage freedom and terminal decisions
+
+The macro stages in `docs/agent_v2_plan.md` specify deliverables and gates, **not a fixed order of model actions**. Within Stage 3 the agent may, for example, author a development conformance test before editing the hardware, or alternate reads, HW/SW edits and checks. The framework-owned `hw_build`, `hw_conformance`, `sw_build` and workload correctness gates remain independent and must pass after final submission.
+
+### Answer contracts
+
+Two contracts are easy to get wrong and expensive when they are, so both are stated explicitly and checked by the framework:
+
+- **The analysis answer is raw YAML.** `workload_prompt` says the reply is one YAML mapping and nothing else, because the next node parses it directly: a prose preamble or a ` ```yaml ` fence invalidates it. `parsing.parse_yaml_mapping` still tolerates a fence and a preamble for compatibility (the same candidate list the ISA contract accepts), but a genuinely malformed mapping is never guessed at. A failed analysis is an **answer** error: it is repaired from the answer-repair pool (`--max-answer-repairs`) with the parser's complaint and the reply's own opening lines quoted back, and when that budget is spent the run stops as `blocked` instead of handing `{}` to the ISA and implementation stages.
+- **The implementation deliverable is an applied edit, not a patch.** `edit_hardware`/`edit_software` write the workspace files; `submit_stage(delivery)` summarizes what changed. The gate rejects a submission that reports no applied change to a hardware and a software target, returns that specific reason, and grants one corrective retry before the stage fails — so "here is the full file" cannot end a run. The prompt names the editing tools, and no tool-loop stage carries the legacy `FILE_BEGIN`/`PATCH_BEGIN` protocol, which only applies when the tool loop is disabled.
+
+The per-stage **evidence index** (`## Key paths`) is filtered to artifacts that already exist, so it never points at a file the stage is about to write or at a name that only exists for another project kind (for example `04_benchmark/manifest.yaml` versus `04_benchmark/embench.yaml`).
 
 ### Status semantics
 
@@ -539,6 +754,16 @@ Each stage emits a live line as it runs and a second line when it finishes, e.g.
   graph node maps to exactly one slot — including `check_conformance` at
   `[11/17]` — so a clean run prints strictly increasing indices; a repair loop
   legitimately revisits an earlier index).
+- Each tool call prints exactly **one short line** and never its payload:
+  ```
+      [tool] edit_hardware(edits=[AgentCfu.scala search=2048 replace=4096]) ok -> 812 chars
+      [tool] edit_software(path=crc_32.c search=138 replace=666) ok -> 940 chars
+      [tool] submit_stage(delivery=<3463 chars>) ERROR -> 61 chars
+      [tool] read_file(path=src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala, start_line=399, end_line=560) ok -> 6104 chars
+  ```
+  Edit bodies, deliveries and oracles are reported by **size** so a run's own
+  progress is not buried behind file content; the full arguments and results
+  stay in the stage tool-call artifact.
 - `OK`/`FAIL` is `gates.<key>.ok` **and** whether this node's own update added
   errors (`errors` is an append-reducer, so the update's list is exactly this
   node's increment). A rung that fails and routes to a repair always prints
@@ -568,6 +793,8 @@ Each stage emits a live line as it runs and a second line when it finishes, e.g.
 - If an endpoint ignores or rejects `stream`/`stream_options`, the call retries without streaming and records `fallback_reason` ("streaming unavailable …" / "streaming ignored by the endpoint") in the raw-output metadata and the `[llm]` line.
 - This is separate from LangGraph's `--stream`, which streams whole-state snapshots between nodes (`stream_mode="values"`); token streaming happens one level lower, inside the LLM client.
 
+**Completion budget.** Every request is capped by `output_reserve_tokens` from the model config (shipped configs: `32768`; the framework default is `4096`). The same number is sent as `max_completion_tokens` (chat) / `max_output_tokens` (responses) *and* used as the context budget's output reservation, so it must satisfy `0 < output_reserve_tokens < context_window_tokens` and it also shifts the 80/90/100% `warning`/`compact`/`unfit` thresholds. Precedence: `--max-output-tokens N` (run-level, `0` keeps the config value) > `CFU_AGENT_OUTPUT_RESERVE` > the config file. The effective value is recorded in `run.yaml` as `llm_request.max_output_tokens`. A reasoning model shares this budget with its thinking tokens, so a small value can produce a **200 response with no content**; the tool loop re-asks **once** for an empty answer (it is a transport failure, not an answer) and fails the stage only if that retry is empty too. See `agents/llm_configs/README.md` for the field semantics.
+
 At the end the CLI prints a `summary:` headline block with the measured acceleration and cost, then cumulative token usage and per-stage results:
 
 ```
@@ -578,20 +805,22 @@ summary:
   yosys_cost    = top=AgentCfu cells=3845 wire_bits=4402 memories=0 memory_bits=0
 ```
 
-`cycles_before`/`cycles_after` are the reference and CFU-build cycles of the profiled embench target and `speedup` is their ratio (the same `speedup_x100` as `10_validation/embench.yaml`); they print `n/a (<reason>)` when the simulation was skipped, never ran, or the workload has no reference cycle count. `yosys_cost` is the parsed summary line of the last successful estimator run, so it prints `n/a` when cost was skipped or failed. The `report.md` includes `## Token Usage` (run totals **and a per-stage table sorted by input tokens**, so an input-heavy stage is immediately visible) and `## LLM Raw Outputs` sections. Each LLM call's returned text is persisted under the run's `llm_raw/` directory; retries receive a new numbered file. Inline reasoning (`<thinking>` tags, `think` blocks, or a provider reasoning field) is split out of the answer before parsing and stored beside it as `*_<n>.reasoning.txt`, so artifact parsers only ever see the final answer. The rendered system/user prompt of **every** call — including the workload-spec call — is persisted beside the answer as `*_<n>.prompt.txt` (with `prompt_sha256` and `prompt_chars` in the artifact metadata, and a `prompt_oversize` flag above ~120k chars) and listed in the report's `## LLM Prompts` section, so a run can be replayed and inspected after the prompt code changes; the error log injected into a repair prompt is kept separately as `09_implementation/{hw,sw}_repair_feedback.txt`. Token accounting is per stage everywhere it is shown: the live `[i/N] stage ... (in=... out=... tok, ...s)` line, the live `[llm] label -> in=... out=... tok` per call, and the end-of-run CLI `summary:` block (`llm_tokens:` one line per stage sorted by input tokens, with a `TOTAL` line).
+`cycles_before`/`cycles_after` are the reference and CFU-build cycles of the profiled embench target and `speedup` is their ratio (the same `speedup_x100` as `10_validation/embench.yaml`); they print `n/a (<reason>)` when the simulation was skipped, never ran, or the workload has no reference cycle count. `yosys_cost` is the parsed summary line of the last successful estimator run, so it prints `n/a` when cost was skipped or failed. The `report.md` includes `## Token Usage` (run totals **and a per-stage table sorted by input tokens**, so an input-heavy stage is immediately visible) and `## LLM Raw Outputs` sections. Each LLM call's returned text is persisted under the run's `llm_raw/` directory; retries receive a new numbered file. Inline reasoning (`<thinking>` tags, `think` blocks, or a provider reasoning field) is split out of the answer before parsing and stored beside it as `*_<n>.reasoning.txt`, so artifact parsers only ever see the final answer. The rendered system/user prompt of **every** call — including the workload-spec call — is persisted beside the answer as `*_<n>.prompt.txt` (with `prompt_sha256` and `prompt_chars` in the artifact metadata, and a `prompt_oversize` flag above ~40k chars) and listed in the report's `## LLM Prompts` section, so a run can be replayed and inspected after the prompt code changes; the error log injected into a repair prompt is kept separately as `09_implementation/{hw,sw}_repair_feedback.txt`. Token accounting is per stage everywhere it is shown: the live `[i/N] stage ... (in=... out=... tok, ...s)` line, the live `[llm] label -> in=... out=... tok` per call, and the end-of-run CLI `summary:` block (`llm_tokens:` one line per stage sorted by input tokens, with a `TOTAL` line).
 
 ### Embench-iot workloads
 
 Any embench-iot benchmark can be used as the workload input:
 
 ```bash
+# The implementation stage mutates the run workspace and runs the toolchain;
+# both effects are enabled by default (add --dry-run for a read-only planning pass).
 conda run -n mico_env python3 -B agents/run_cfu_agent.py \
-  --embench crc32 --run-commands --skip-yosys --max-iters 1
+  --embench crc32 --skip-yosys --max-iters 1
 
 # Same workload, but keep improving a passing design: up to two more rounds
 # (--max-iters 3) chosen by the agent, each fully re-validated by the ladder.
 conda run -n mico_env python3 -B agents/run_cfu_agent.py \
-  --embench crc32 --run-commands --loop --max-iters 3
+  --embench crc32 --loop --max-iters 3
 ```
 
 The run copies `benchmarks/embench-iot/{src/<bench>,support}` plus the tracked
@@ -665,14 +894,21 @@ the git revision/submodules, the normalized loop observation plan and the
 instrumenter/board-counter source hashes, so changed instrumentation, toolchain
 or scaffold invalidates it.
 Entries live in the git-ignored `agents/generated/cache/embench_profile/<key>.json` and
-are written only after a passing measurement. A hit runs no `make`/`sbt`, and the run
+are written only after a passing measurement. The same key also names a copy of the
+reference build's disassembly (`<key>.embench_main.asm`): it is a *build output*, so a
+reused measurement has none of its own, and the analysis reads it as the ASM candidate
+for a measured loop. A hit restores it into `workspace/embench_<name>/reference/` and
 records `profile_cache: {status: hit|miss|refresh|disabled, key, saved}` in
 `05_profile/embench.yaml`, `run.yaml` and `iteration_history`, so a cached baseline is
-never mistaken for a fresh one.
+never mistaken for a fresh one. A hit runs no `make`/`sbt`; that is also why
+`inspect_observation(..., view='asm')` says the disassembly is a build output and points
+at `view='ir'` when a cache entry predates the stored copy.
 
-**Closed loop (LLM):** the analysis, contract and software prompts receive the
-benchmark source, the measured loop/function profile (including the loop's source
-location), and the generated `cfu_intrinsics.h`. The LLM is asked to identify the
+**Closed loop (LLM):** the analysis prompt receives the normalized spec and the
+measured loop/function profile digest, and the contract and software prompts point
+at `07_analysis/workload_analysis.yaml`, `08_isa/cfu_isa.yaml` and the generated
+`cfu_intrinsics.h` on disk instead of inlining them; the benchmark source and the
+loop's source location are read by the agent with `read_file`. The LLM is asked to identify the
 hottest loop and its containing function and to emit a patch for
 `benchmarks/embench-iot/src/<bench>/<file>.c` guarded by `#ifdef USE_AGENT_CFU`; the
 harness redirects that path into the run's `cfu` configuration tree, so the reference
@@ -706,19 +942,20 @@ python3 agents/run_cfu_agent.py --test-api --llm-config deepseek
 # Exits 0 on success, 1 on missing key, bad config, or a failed call.
 ```
 
-Each config may set `model`, `base_url`, `api_mode` (`auto`/`responses`/`chat`), `temperature`, `timeout`, thinking (`thinking`, `reasoning_effort`, `reasoning_summary`, optional `thinking_body`; **off by default**), and an inline `api_key` or an `api_key_env` variable name. Model resolution order (highest wins) is: explicit `--model` > config `model` > `CFU_AGENT_MODEL` > built-in `gpt-5`. A config can leave `model`/`base_url` empty and still pick up `CFU_AGENT_MODEL`/`OPENAI_BASE_URL`. Prefer `api_key_env` to keep keys out of the tracked JSON. `default.json` is optional: if missing, the framework builds an environment-only config. See `agents/llm_configs/README.md`.
+Each config may set `model`, `base_url`, `api_mode` (`auto`/`responses`/`chat`), `temperature`, `timeout`, thinking (`thinking`, `reasoning_effort`, `reasoning_summary`, optional `thinking_body`; **off by default**), the request-size planning values (`context_window_tokens`, `output_reserve_tokens`), and an inline `api_key` or an `api_key_env` variable name. Model resolution order (highest wins) is: explicit `--model` > config `model` > `CFU_AGENT_MODEL` > built-in `gpt-5`. A config can leave `model`/`base_url` empty and still pick up `CFU_AGENT_MODEL`/`OPENAI_BASE_URL`. Prefer `api_key_env` to keep keys out of the tracked JSON. `default.json` is optional: if missing, the framework builds an environment-only config. See `agents/llm_configs/README.md`.
 
 ### Environment
 
-Run the agent and its tests from `conda run -n mico_env` (or an activated `mico_env`): that environment provides `langgraph` and `sbt`. Without `langgraph` the framework falls back to a pure-Python runner with equivalent state-merge semantics, but the LangGraph path is the primary one.
+Run the agent and its tests from `conda run -n mico_env` (or an activated `mico_env`): the environment must provide LangGraph, `langgraph-checkpoint-sqlite` (3.1.1 for persistent runs), and the configured HW/SW tools. Missing core dependencies are errors, not a switch to another runner. `--checkpoint --run-id <unique_id>` writes run-scoped SQLite checkpoints; `--resume <id>` verifies the run manifest, artifact hashes and operation journal before resuming an unfinished checkpoint. Graph nodes are journaled as replay units, and RepoToolbox workspace writes/commands also have operation records: a crash mid-node leaves an uncertain pending record and blocks automatic resume until reconciled. Other direct external effects still need explicit review before claiming crash-safe recovery. Checkpoints are not exactly-once transactions; do not use the same run ID concurrently.
 
-- `OPENAI_API_KEY`: required only when LLM calls are enabled. Without it (or when the selected config resolves no key), the agent uses deterministic fallbacks.
+- `OPENAI_API_KEY`: required for model-authored analysis, ISA and implementation in execution mode; an unavailable model must not produce a validated candidate. Dry-run may record planning hints without claiming complete execution.
 - `OPENAI_BASE_URL`: optional custom OpenAI-compatible endpoint.
 - `CFU_AGENT_MODEL`: optional default model name.
 - `CFU_AGENT_LLM_CONFIG`: optional default config name (otherwise `default`).
 - `CFU_AGENT_LLM_API`: optional `auto`/`responses`/`chat` override.
 - `CFU_AGENT_VISIBILITY`: optional default visibility tier (`basic`/`standard`/`extended`); otherwise `standard`.
 - `CFU_AGENT_PROFILE_CACHE`: optional default profile-cache mode (`on`/`off`/`refresh`); otherwise `on`.
+- `CFU_AGENT_IR_FEATURES`: optional default LLVM IR evidence mode (`auto`/`off`/`require`/`approx`); otherwise `auto`.
 - `CFU_AGENT_REPAIR_ROUTING`: optional default simulation-repair routing (`auto`/`fixed`); otherwise `auto`.
 - `CFU_AGENT_SOFTWARE_CHANGE`: optional default software-rung policy (`auto`/`always`); otherwise `auto`.
 - `CFU_AGENT_LOOP`: optional default for `--loop` (`on`/`off`); otherwise off.
@@ -726,12 +963,30 @@ Run the agent and its tests from `conda run -n mico_env` (or an activated `mico_
 ### Tests
 
 ```bash
-# Use the project environment: it provides langgraph and sbt.
-conda run -n mico_env python3 -m unittest discover -s agents/tests
+# Use the project environment; tests patch model/network access and use unittest.
+# The suite is kept near 15s: it is a fast contract suite, not a second
+# integration harness. Inspect fixed agents/generated/runs/ test IDs before
+# running it: several older tests delete their own fixed run directories.
+conda run -n mico_env python3 -B -m unittest discover -s agents/tests -t . -p 'test_*.py'
 ```
 
-The `unittest` suite checks path traversal, deny precedence, command allowlisting (including the agent-overlay command and positional-path confinement), visibility tiers (policy gating, withheld-vs-denied context loading, tool denial, level-specific prompt text, and CLI threading), run isolation, `WorkloadSpec`/CFU ISA validation, gate honesty, ladder routing (per-rung repair, LLM-chosen simulation repair routing with its deterministic fallback and `fixed` mode, LLM-chosen software reuse behind its intrinsic/ABI guard and its `always` mode, the `--loop` optimization ledger with its Pareto improvement test and budget bound, hard stop without budget, skipped-rung honesty), dry-run flow without any external toolchain or API key, and the targeted-edit delivery protocol (SEARCH/REPLACE parsing, unique-match enforcement, atomic multi-target application, and an end-to-end hardware rung that applies an edit instead of a whole-file rewrite).
+Two modules carry the flow itself and are the only ones that run the real graph:
 
-Run it inside `mico_env`: that environment has `langgraph`, so the LangGraph runner is the live path and its tests are not skipped. The suite also covers the pure-Python fallback runner, whose append-key merge semantics mirror LangGraph's.
+- `test_graph_routing.py` — the ladder decision table. A router is a pure
+  `state -> node` function, so every branch (per-rung repair targets, the
+  software-reuse shortcut, simulation repair escalation, the LLM repair router
+  and its deterministic fallback,   direct case instead of by a full run.
+- `test_graph_smoke.py` — exactly one offline end-to-end dry run, asserting the
+  honest `planned` outcome, the report and `run.yaml`, the planned (unwritten)
+  design overlay, IR evidence, and that every manifest artifact is
+  content-addressed on disk.
+
+Everything else is a focused unit test of one contract. Add new coverage at that
+level: a full-graph test costs seconds and still only observes the route it took,
+so per-scenario ladders are deliberately not maintained.
+
+The `unittest` suite checks path traversal, deny precedence, command allowlisting (including the agent-overlay command and positional-path confinement), visibility tiers (policy gating, withheld-vs-denied context loading, tool denial, level-specific prompt text, and CLI threading), run isolation, `WorkloadSpec`/CFU ISA validation, gate honesty, ladder routing (per-rung repair, the single implementation stage's repair routing, the `--loop` optimization ledger with its Pareto improvement test and budget bound, hard stop without budget, skipped-rung honesty), dry-run flow without any external toolchain or API key, and the targeted-edit delivery protocol (SEARCH/REPLACE parsing, unique-match enforcement, atomic multi-target application, and an end-to-end hardware rung that applies an edit instead of a whole-file rewrite).
+
+Run it inside `mico_env`: that environment has `langgraph`, so the LangGraph runner is the live path and its tests are not skipped. The suite exercises LangGraph's native state reducers and routing; there is no parallel pure-Python fallback runner.
 
 Ready-to-run examples are under `agents/examples/`.

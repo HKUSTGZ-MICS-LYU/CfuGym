@@ -58,6 +58,10 @@ class IrExportTest(unittest.TestCase):
         record = {"argv": argv, "cwd": str(cwd), "returncode": 0, "stderr": ""}
         if "--version" in argv:
             record["stdout"] = b"clang test version 99\n"
+        elif len(argv) > 1 and argv[1] == "-print-sysroot":
+            # `auto` probes the approved GCC headers only when it retries the
+            # approximate export; the fixture install is not present here.
+            record["stdout"] = b"/tmp/not-the-approved-sysroot\n"
         elif Path(argv[0]).name == "make":
             src = "../" + self.source.relative_to(self.root).as_posix()
             record["stdout"] = (
@@ -98,6 +102,59 @@ class IrExportTest(unittest.TestCase):
         self.assertEqual(auto["units"][0]["returncode"], 1)
         self.assertIn("unsupported target", auto["units"][0]["stderr"])
         self.assertEqual(files, {})
+        # `auto` retried the approximate export, got nothing back, and therefore
+        # reports the strict result rather than claiming a fallback happened.
+        self.assertNotIn("fallback", auto)
+
+    def test_auto_falls_back_to_labelled_approximate_evidence(self) -> None:
+        # The requested ISA (rv32imc_zicsr_zifencei) is GCC-only, so the
+        # installed clang rejects it. `auto` must still hand the analysis
+        # evidence — labelled approximate — instead of nothing (observed
+        # 2026-09-30: `inspect` reported "LLVM IR candidate: not recorded").
+        headers = ("/home/jzj/riscv/riscv64-unknown-elf/include",
+                   "/home/jzj/riscv/lib/gcc/riscv64-unknown-elf/15.1.0/include")
+        arches = []
+
+        def clang(argv, *, cwd, limit):
+            record = {"argv": argv, "cwd": str(cwd), "returncode": 0, "stderr": ""}
+            if "--version" in argv:
+                record["stdout"] = b"clang test version 99\n"
+            elif Path(argv[0]).name == "make":
+                src = "../" + self.source.relative_to(self.root).as_posix()
+                record["stdout"] = (
+                    "riscv64-unknown-elf-gcc -O3 -march=rv32imc_zicsr_zifencei "
+                    "-mabi=ilp32 -DHAVE_BOARDSUPPORT_H -I./ -c -o obj.o " + src + "\n"
+                ).encode()
+            elif "-march=rv32imc" in argv:
+                arches.append("rv32imc")
+                record["stdout"] = b"; approximate LLVM IR\n"
+            else:
+                arches.append("strict")
+                record.update(returncode=1, stdout=b"",
+                              stderr="invalid arch name 'rv32imc_zicsr_zifencei'")
+            return record
+
+        with patch("agents.cfu_design_agent.ir.export._discover_clang", return_value="/usr/bin/clang"), \
+             patch("agents.cfu_design_agent.ir.export._approx_headers", return_value=headers), \
+             patch("agents.cfu_design_agent.ir.export._execute", side_effect=clang):
+            summary, files = export_embench_ir(self.root, RUN, NAME, "auto")
+        self.assertEqual(arches, ["strict", "rv32imc"])
+        self.assertEqual(summary["status"], "approximate")
+        self.assertIs(summary["toolchain"]["target_match"], False)
+        self.assertEqual(list(files), ["07_analysis/ir/crc_32.ll"])
+        self.assertEqual(summary["fallback"]["from"], "auto")
+        self.assertIn("invalid arch name", summary["fallback"]["strict_reason"])
+        self.assertIn("approximate", summary["reason"])
+
+    def test_auto_does_not_retry_a_precondition_failure(self) -> None:
+        # A missing clang (or an unsafe input) cannot be fixed by changing the
+        # target ISA, so `auto` must not pretend the approximate export helps.
+        with patch("agents.cfu_design_agent.ir.export._discover_clang", return_value=None), \
+             patch("agents.cfu_design_agent.ir.export._execute", side_effect=AssertionError("executed")):
+            summary, files = export_embench_ir(self.root, RUN, NAME, "auto")
+        self.assertEqual(summary["status"], "unavailable")
+        self.assertNotIn("fallback", summary)
+        self.assertFalse(files)
 
     def test_approx_uses_explicit_arch_and_approved_headers(self) -> None:
         headers = ("/home/jzj/riscv/riscv64-unknown-elf/include",

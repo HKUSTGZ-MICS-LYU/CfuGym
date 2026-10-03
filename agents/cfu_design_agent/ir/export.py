@@ -221,13 +221,50 @@ def export_embench_ir(
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Return ``(audit_summary, {artifact_relative_path: LLVM_text})``.
 
-    ``off`` does not inspect inputs or invoke tools. ``auto`` reports an
-    unavailable/partial status and never interrupts benchmarking. ``require``
-    reports failed for missing or partial IR; no exceptions for tool failure.
-    ``approx`` must be requested explicitly and uses rv32imc plus approved GCC
-    system headers; it never claims the requested GCC ISA or faithful code.
-    Files are never persisted here; the caller writes via RunArtifacts.
+    ``off`` does not inspect inputs or invoke tools. ``require`` reports failed
+    for missing or partial IR; no exceptions for tool failure. ``approx`` uses
+    rv32imc plus approved GCC system headers; it never claims the requested GCC
+    ISA or faithful code.
+
+    ``auto`` prefers the exact reference target, but the requested ISA
+    (``rv32imc_zicsr_zifencei``) is GCC-only, so the installed clang often
+    rejects it. In that case ``auto`` retries the approximate export and returns
+    it **labelled** (``status: approximate``, ``target_match: false``, the strict
+    reason under ``fallback``) instead of handing the analysis no evidence at
+    all. A precondition failure (unsafe input, missing clang) is never retried,
+    because changing the target ISA cannot fix it. Files are never persisted
+    here; the caller writes via RunArtifacts.
     """
+    if mode not in ("off", "auto", "require", "approx"):
+        raise ValueError("mode must be off, auto, require, or approx")
+    summary, files = _export_target_ir(workdir, run_root, benchmark, mode)
+    if mode != "auto" or files:
+        return summary, files
+    if not any(
+        isinstance(unit, dict) and unit.get("status") == "failed"
+        for unit in summary.get("units", []) or []
+    ):
+        return summary, files
+    approximate, approx_files = _export_target_ir(workdir, run_root, benchmark, "approx")
+    if not approx_files:
+        return summary, files
+    approximate["fallback"] = {
+        "from": "auto",
+        "strict_status": str(summary.get("status", "")),
+        "strict_reason": str(summary.get("reason", ""))[:512],
+    }
+    approximate["reason"] = (
+        "exact target export unavailable ("
+        + (str(summary.get("reason", "")) or str(summary.get("status", "")))[:256]
+        + "); reported the approximate rv32imc export instead"
+    )
+    return approximate, approx_files
+
+
+def _export_target_ir(
+    workdir: Path, run_root: str, benchmark: str, mode: str
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """One export attempt for exactly one mode; the caller owns any fallback."""
     if mode not in ("off", "auto", "require", "approx"):
         raise ValueError("mode must be off, auto, require, or approx")
     summary: dict[str, Any] = {

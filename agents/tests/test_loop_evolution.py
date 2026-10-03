@@ -13,8 +13,16 @@ from agents.cfu_design_agent.runtime.artifacts import RunArtifacts
 from agents.cfu_design_agent.cli import build_parser
 from agents.cfu_design_agent.runtime.llm import LlmResult
 from agents.cfu_design_agent.runtime.policy import load_policy
-from agents.tests.common import REPO_ROOT
-from agents.tests.test_graph_ladder import VALID_ISA
+from agents.cfu_design_agent import isa as isa_mod
+from agents.cfu_design_agent.flow import optimize as flow_optimize
+from agents.cfu_design_agent.runtime import llm_step
+from agents.cfu_design_agent.runtime import stage_services as services
+from agents.cfu_design_agent.stages import contract
+from agents.cfu_design_agent.stages import feedback
+from agents.cfu_design_agent.stages import review
+from agents.cfu_design_agent.stages.implement import intrinsics
+from agents.cfu_design_agent.stages.review import optimize as review_optimize
+from agents.tests.common import REPO_ROOT, VALID_ISA
 
 
 class EvolutionLoopTest(unittest.TestCase):
@@ -45,15 +53,15 @@ class EvolutionLoopTest(unittest.TestCase):
     def test_stop_is_reconsidered_and_can_extend_isa(self):
         replies = [self.complete('{"continue":false,"reason":"reasonable speedup"}'),
                    self.complete('{"continue":true,"target":"extend_isa","reason":"batch updates"}')]
-        with mock.patch.object(graph, "_complete_llm", side_effect=replies) as call:
-            target, decision, _ = graph._choose_optimization(self.state, [])
+        with mock.patch.object(llm_step, "_complete_llm", side_effect=replies) as call:
+            target, decision, _ = review_optimize._choose_optimization(self.state, [])
         self.assertEqual(target, "extend_isa")
         self.assertEqual(call.call_count, 2)
         self.assertIn("RECONSIDER EARLY STOP", call.call_args.args[4])
 
     def test_reconsideration_is_bounded(self):
-        with mock.patch.object(graph, "_complete_llm", return_value=self.complete('{"continue":false}')) as call:
-            target, decision, _ = graph._choose_optimization(self.state, [])
+        with mock.patch.object(llm_step, "_complete_llm", return_value=self.complete('{"continue":false}')) as call:
+            target, decision, _ = review_optimize._choose_optimization(self.state, [])
         self.assertEqual(target, "")
         self.assertEqual(call.call_count, 2)
         self.assertEqual(decision["source"], "planner_exhausted")
@@ -61,16 +69,16 @@ class EvolutionLoopTest(unittest.TestCase):
     def test_patience_is_framework_owned(self):
         rounds = [{"target": "baseline", "improved": True}] + [
             {"target": "implement_sw", "improved": False} for _ in range(3)]
-        with mock.patch.object(graph, "_complete_llm") as call:
-            target, decision, _ = graph._choose_optimization(self.state, rounds)
+        with mock.patch.object(llm_step, "_complete_llm") as call:
+            target, decision, _ = review_optimize._choose_optimization(self.state, rounds)
         call.assert_not_called()
         self.assertEqual(decision["source"], "patience")
 
     def test_extension_accepts_new_encoding_and_keeps_base(self):
-        with mock.patch.object(graph, "_complete_llm", return_value=self.complete(json.dumps(self.candidate()))):
-            update = graph.extend_isa(self.state)
+        with mock.patch.object(llm_step, "_complete_llm", return_value=self.complete(json.dumps(self.candidate()))):
+            update = contract.extend_isa(self.state)
         self.assertTrue(update["gates"]["isa"]["ok"])
-        self.assertEqual(update["gates"]["isa"]["next"], "implement_hw")
+        self.assertEqual(update["gates"]["isa"]["next"], "implement")
         self.assertEqual(update["isa_revision"], 1)
         self.assertEqual(update["isa_added_symbols"], ["cfu_batch"])
         self.assertEqual(update["isa_extension_base"], self.isa)
@@ -79,26 +87,38 @@ class EvolutionLoopTest(unittest.TestCase):
     def test_rejected_extension_does_not_replace_incumbent(self):
         candidate = self.candidate()
         candidate["commands"][0]["semantics"] = "incompatible"
-        with mock.patch.object(graph, "_complete_llm", return_value=self.complete(json.dumps(candidate))):
-            update = graph.extend_isa(self.state)
+        with mock.patch.object(llm_step, "_complete_llm", return_value=self.complete(json.dumps(candidate))):
+            update = contract.extend_isa(self.state)
         self.assertFalse(update["gates"]["isa"]["ok"])
         self.assertEqual(update["gates"]["isa"]["next"], "extend_isa")
         self.assertNotIn("isa_spec", update)
         self.assertEqual(self.state["isa_spec"], self.isa)
 
-    def test_extension_prevents_software_reuse(self):
-        with mock.patch.object(graph, "_software_targets", return_value=[("kernel.c", "cfu_compute(a,b);")]):
-            ok, reason, _, _ = graph._software_reuse_evidence(self.state, mock.Mock())
+    def test_an_isa_extension_forces_software_adaptation(self):
+        """The surviving guard: a kernel that does not drive the CFU is refused.
+
+        The software-reuse decision went away with the separate software rung, but
+        the submit gate still refuses a kernel that only enables the CFU or falls
+        back to scalar code, so an ISA extension cannot silently ship unadapted
+        software.
+        """
+        # (repo-relative path, text); the guard reads the applied bytes itself.
+        targets = [("workspace/kernel.c", "")]
+        toolbox = mock.Mock()
+        toolbox.read_text.side_effect = lambda path, limit=None: "int k(void) { return cfu_compute(1, 2); }"
+        self.assertTrue(intrinsics._software_exercises_cfu(self.state, toolbox, targets)[0])
+        toolbox.read_text.side_effect = lambda path, limit=None: "int k(void) { cfu_enable(); return 1; }"
+        ok, reason = intrinsics._software_exercises_cfu(self.state, toolbox, targets)
         self.assertFalse(ok)
-        self.assertIn("adaptation", reason)
+        self.assertTrue(reason)
 
     def test_precise_cycles_rank_same_display_speedup(self):
         old = {"reference_cycles": 26650231, "cfu_cycles": 14352815,
                "speedup_x100": 185, "cost": {"cells": 98238}}
         new = {**old, "cfu_cycles": 14334785}
-        self.assertTrue(graph._round_improved(new, old))
-        self.assertFalse(graph._round_improved(old, new))
-        self.assertFalse(graph._round_improved({**new, "validated": False}, old))
+        self.assertTrue(flow_optimize._round_improved(new, old))
+        self.assertFalse(flow_optimize._round_improved(old, new))
+        self.assertFalse(flow_optimize._round_improved({**new, "validated": False}, old))
 
     def test_artifact_versions_survive_latest_overwrite(self):
         run = RunArtifacts.create(REPO_ROOT, load_policy(REPO_ROOT), run_id=self.run_id)
@@ -113,7 +133,7 @@ class EvolutionLoopTest(unittest.TestCase):
         results = [{"rung": "hw_build", "returncode": 1, "stdout_tail": "old"},
                    {"rung": "hw_build", "returncode": 0},
                    {"rung": "hw_build", "returncode": 1, "stdout_tail": "current"}]
-        text = graph.check_feedback({"validation_results": results}, "hw_build")
+        text = feedback.check_feedback({"validation_results": results}, "hw_build")
         self.assertNotIn("old", text)
         self.assertIn("current", text)
 
@@ -126,7 +146,7 @@ class EvolutionLoopTest(unittest.TestCase):
         )
         stdout = "[info] welcome to sbt\n[error] Vec address width mismatch.\n" + stack
         results = [{"rung": "hw_build", "returncode": 1, "stdout_tail": stdout}]
-        text = graph.check_feedback({"validation_results": results}, "hw_build")
+        text = feedback.check_feedback({"validation_results": results}, "hw_build")
         self.assertIn("Vec address width mismatch.", text)
         self.assertLess(len(text), 6000)
 
@@ -137,7 +157,7 @@ class EvolutionLoopTest(unittest.TestCase):
             '[error] Vec address width mismatch.\n'
             '[error]     at vexiiriscv.soc.mico.AgentCfuBase.vectorRead(AgentCfuLib.scala:97)\n'
         )
-        out = graph.output_excerpt(platform, 2500)
+        out = feedback.output_excerpt(platform, 2500)
         self.assertIn('read-only platform note', out)
         self.assertIn('AgentCfuLib.scala', out)
         self.assertIn('AgentCfu.scala', out)
@@ -145,7 +165,7 @@ class EvolutionLoopTest(unittest.TestCase):
             '[error] WIDTH MISMATCH (32 bits <- 31 bits) on (Bits ^ Bits)[32 bits]\n'
             '[error]     at vexiiriscv.soc.mico.AgentCfu.x(AgentCfu.scala:155)\n'
         )
-        self.assertNotIn('read-only platform note', graph.output_excerpt(design, 2500))
+        self.assertNotIn('read-only platform note', feedback.output_excerpt(design, 2500))
 
     def test_output_excerpt_keeps_spinal_diagnostics_over_stack_frames(self):
         # Elaboration failure: banner, message, "- key : value" details, then frames.
@@ -164,7 +184,7 @@ class EvolutionLoopTest(unittest.TestCase):
             + "[error] Design's errors are listed above.\n"
             "[error] Nonzero exit code returned from runner: 1\n"
         )
-        out = graph.output_excerpt(text, 2500)
+        out = feedback.output_excerpt(text, 2500)
         for kept in (
             'Vec address width mismatch.',
             '- Vec : vectorRegs : Vec of 1 elements',
@@ -192,7 +212,7 @@ class EvolutionLoopTest(unittest.TestCase):
                 for i in range(200)
             )
         )
-        out = graph.output_excerpt(text, 2500)
+        out = feedback.output_excerpt(text, 2500)
         self.assertIn('WIDTH MISMATCH (32 bits <- 31 bits)', out)
         self.assertIn('- Left  operand : (UInt -> Bits of 31 bits)', out)
         self.assertIn('- Right operand :', out)
@@ -213,7 +233,7 @@ class EvolutionLoopTest(unittest.TestCase):
                 for i in range(200)
             )
         )
-        out = graph.output_excerpt(text, 2500)
+        out = feedback.output_excerpt(text, 2500)
         self.assertIn('Simulation failed at time=421', out)
         self.assertIn('assertion failed: boom', out)
         self.assertIn('first source location', out)
@@ -228,30 +248,31 @@ class EvolutionLoopTest(unittest.TestCase):
             '[error] one error found\n'
             '[error] (Compile / compileIncremental) Compilation failed\n'
         )
-        out = graph.output_excerpt(text, 2500)
+        out = feedback.output_excerpt(text, 2500)
         self.assertIn('not found: type CfuResource', out)
         self.assertIn('one error found', out)
         self.assertIn('Compilation failed', out)
 
     def test_output_excerpt_falls_back_to_window_without_diagnostics(self):
-        out = graph.output_excerpt('[info] nothing useful\n' * 500, 2500)
+        out = feedback.output_excerpt('[info] nothing useful\n' * 500, 2500)
         self.assertLessEqual(len(out), 2600)
         self.assertIn('[truncated]', out)
 
     def test_isa_artifact_survives_a_rejected_candidate(self):
-        # The isa rung writes the markdown for a REJECTED candidate too, so a
-        # malformed field must not crash the run before the problems are reported.
+        # A rejected candidate retains its YAML and lint problems; it does not
+        # fabricate Markdown from an invalid ISA structure.
         malformed = {"spec_version": "1", "identity": {"name": "x"}, "commands": [],
                      "assumptions": ["free-form"], "unknowns": ["u"]}
-        graph._write_isa_artifact(self.state, malformed, ["assumptions must be a mapping"])
-        path = self.root / "08_isa/cfu_isa.md"
-        self.assertTrue(path.exists(), path)
-        self.assertIn("- free-form", path.read_text())
+        services._write_isa_artifact(self.state, malformed, ["assumptions must be a mapping"])
+        self.assertFalse((self.root / "08_isa/cfu_isa.md").exists())
+        self.assertTrue((self.root / "08_isa/cfu_isa.yaml").is_file())
+        self.assertIn("assumptions must be a mapping", (self.root / "08_isa/validation.yaml").read_text())
 
-    def test_isa_artifact_survives_a_formatter_crash(self):
-        with mock.patch.object(graph, "render_isa_markdown", side_effect=RuntimeError("boom")):
-            graph._write_isa_artifact(self.state, {"commands": []}, ["bad"])
-        self.assertIn("Markdown rendering failed", (self.root / "08_isa/cfu_isa.md").read_text())
+    def test_invalid_isa_never_calls_markdown_formatter(self):
+        with mock.patch.object(isa_mod, "render_isa_markdown", side_effect=RuntimeError("boom")) as render:
+            services._write_isa_artifact(self.state, {"commands": []}, ["bad"])
+        render.assert_not_called()
+        self.assertFalse((self.root / "08_isa/cfu_isa.md").exists())
 
     def test_call_evidence_ignores_strings_and_inactive_cfu_branches(self):
         source = '''const char *s = "cfu_batch(a,b)";
@@ -266,10 +287,10 @@ cfu_compute(a,b);
 '''
         toolbox = mock.Mock()
         toolbox.read_text.return_value = source
-        sites = graph._cfu_call_sites(self.state, toolbox, [("kernel.c", source)], max_sites=None)
+        sites = intrinsics._cfu_call_sites(self.state, toolbox, [("kernel.c", source)], max_sites=None)
         self.assertEqual([s["name"] for s in sites], ["cfu_compute"])
         toolbox.read_text.return_value = "cfu_compute(a,b);\n" * 30 + "cfu_batch(a,b);"
-        sites = graph._cfu_call_sites(self.state, toolbox, [("kernel.c", "")], max_sites=None)
+        sites = intrinsics._cfu_call_sites(self.state, toolbox, [("kernel.c", "")], max_sites=None)
         self.assertIn("cfu_batch", {s["name"] for s in sites})
 
     def test_second_extension_preserves_first_added_command(self):
@@ -278,8 +299,8 @@ cfu_compute(a,b);
         second["commands"].append({"function_id": 1, "subfunction_id": 2,
                                     "name": "finish", "semantics": "finish batch"})
         state = {**self.state, "isa_spec": first, "isa_extension_base": first, "isa_revision": 1}
-        with mock.patch.object(graph, "_complete_llm", return_value=self.complete(json.dumps(second))):
-            update = graph.extend_isa(state)
+        with mock.patch.object(llm_step, "_complete_llm", return_value=self.complete(json.dumps(second))):
+            update = contract.extend_isa(state)
         self.assertEqual(update["isa_revision"], 2)
         self.assertEqual(update["isa_added_symbols"], ["cfu_finish"])
         self.assertEqual(update["isa_spec"]["commands"][:2], first["commands"])
@@ -292,8 +313,8 @@ cfu_compute(a,b);
                                            "measured": True, "speedup_x100": 200}],
                  "gates": {"workload_spec": {"ok": True}, "isa": {"ok": True},
                            "implementation_hw": {"ok": False}, "hw_build": {"ok": False}}}
-        with mock.patch.object(graph, "_choose_optimization") as choose:
-            result = graph.review_and_route(state)
+        with mock.patch.object(review_optimize, "_choose_optimization") as choose:
+            result = review.review_and_route(state)
         choose.assert_not_called()
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["best_candidate"], candidate)
@@ -305,18 +326,17 @@ cfu_compute(a,b);
         path.write_text("verified hardware")
         state = {**self.state, "design_files": [path.relative_to(REPO_ROOT).as_posix()]}
         entry = {"round": 0}
-        result = graph._snapshot_candidate(state, entry)
+        result = review_optimize._snapshot_candidate(state, entry)
         snapshot = REPO_ROOT / result["files"][0]["snapshot"]
         self.assertEqual(snapshot.read_text(), "verified hardware")
         path.write_text("later broken hardware")
         self.assertEqual(snapshot.read_text(), "verified hardware")
         state["design_files"] = [str(self.root.relative_to(REPO_ROOT) / "workspace/design/AgentCfuFiber.scala")]
         with self.assertRaisesRegex(ValueError, "missing"):
-            graph._snapshot_candidate(state, {"round": 1})
+            review_optimize._snapshot_candidate(state, {"round": 1})
 
-    def test_both_runners_have_extension_node(self):
-        self.assertIs(graph.python_nodes()["extend_isa"], graph.extend_isa)
-        self.assertIs(graph.PY_ROUTERS["extend_isa"], graph._route_after_isa)
+    def test_graph_has_extension_node(self):
+        self.assertIs(graph.python_nodes()["extend_isa"], contract.extend_isa)
 
 
 if __name__ == "__main__":

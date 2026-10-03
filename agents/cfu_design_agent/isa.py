@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import yaml
+
+from .runtime import parsing
 
 
 ISA_SPEC_VERSION = "1"
@@ -337,10 +339,12 @@ def validate_isa_extension(previous: dict[str, Any], candidate: dict[str, Any]) 
 
 
 def _document_candidates(text: str) -> Iterable[str]:
-    """Yield the full response and fenced JSON/YAML blocks for compatibility."""
-    yield text
-    for match in re.finditer(r"```(?:json|yaml|yml)\s*\n(?P<body>.*?)```", text, re.IGNORECASE | re.DOTALL):
-        yield match.group("body")
+    """Yield the full response and fenced JSON/YAML blocks for compatibility.
+
+    Shared with every other YAML answer (``parsing.document_candidates``) so the
+    contract and the workload analysis accept exactly the same shapes.
+    """
+    return parsing.document_candidates(text)
 
 
 # A model can wrap the contract in an envelope instead of returning it directly.
@@ -670,6 +674,3 @@ def render_cfu_intrinsics(data: dict[str, Any]) -> str:
         ]
     lines += [f"#endif /* CFU_INTRINSICS_H - {name} */", ""]
     return "\n".join(lines)
-
-def render_list(value: Iterable[Any]) -> str:
-    return "\n".join(f"- {item}" for item in value or [])

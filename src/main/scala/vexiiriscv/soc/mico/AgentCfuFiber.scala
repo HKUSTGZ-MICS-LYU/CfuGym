@@ -38,8 +38,21 @@ object AgentCfuFiber {
   )
 
   def getM2sParameters(name: Nameable, p: AgentCfuParameter): tilelink.M2sParameters = {
-    val get = if (p.withLoad) tilelink.SizeRange(1, p.beatBytes) else tilelink.SizeRange.none
-    val putFull = if (p.withStore) tilelink.SizeRange(1, p.beatBytes) else tilelink.SizeRange.none
+    // Declare BOTH A-channel transfers whenever the TileLink bus exists, even
+    // when withLoad/withStore disable one of them. The A-channel payload fields
+    // (data/mask/corrupt) only exist when a PUT is declared: a get-only master
+    // (e.g. `--agent-cfu-no-store`) loses those fields while the fabric keeps
+    // the aggregate fields on its internal arbiters, so the fabric ties this
+    // input to `x` literals (MiCoSoc.v: `io_inputs_2_payload_mask = 4'bxxxx`).
+    // Undefined constants inside the shared fabric corrupt the CPU memory
+    // streams (observed: LsuCacheless/FetchCacheless "Stream ... persistence
+    // failed" and VexiiRiscvProbe `fetchId == -1` crashes at ~time=10000) even
+    // when the CFU is never exercised. Over-declaring an unused transfer is
+    // safe: the master simply never emits that opcode. withLoad/withStore still
+    // gate the CfuLsu FSM states and the instruction table, so a disabled store
+    // builds no store logic -- only the unused A-channel wires remain.
+    val get = tilelink.SizeRange(1, p.beatBytes)
+    val putFull = tilelink.SizeRange(1, p.beatBytes)
     tilelink.M2sParameters(
       addressWidth = p.addressWidth,
       dataWidth = p.xlen,

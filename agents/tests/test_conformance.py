@@ -6,13 +6,13 @@ import unittest
 
 from agents.cfu_design_agent.conformance import (
     _c_literal,
-    _extra_cases,
     cpu_value_roles,
     parse_conformance,
     render_conformance,
     validate_oracle,
     writes_cpu_rd,
 )
+from agents.cfu_design_agent.runtime import commands as commands_mod
 
 CPU_COMMAND = {
     "function_id": 1,
@@ -261,13 +261,13 @@ class ParseVerdictTest(unittest.TestCase):
         state = {"run_root": "agents/generated/runs/x-00000000", "run_id": "x-00000000"}
         header = ("agents/generated/runs/x-00000000/workspace/embench_crc32/cfu/"
                   "include/cfu_intrinsics.h")
-        argv, elf = graph._conformance_build_command(state, header)
+        argv, elf = commands_mod._conformance_build_command(state, header)
         joined = " ".join(argv)
-        self.assertIn(graph.CONFORMANCE_BIN, joined)
+        self.assertIn(commands_mod.CONFORMANCE_BIN, joined)
         self.assertIn("MAIN=", joined)
         self.assertIn("EXTRA_INCLUDES=", joined)
         self.assertNotIn("EXTRA_SOURCES=", joined)
-        self.assertTrue(elf.endswith(f"{graph.CONFORMANCE_BIN}.elf"), elf)
+        self.assertTrue(elf.endswith(f"{commands_mod.CONFORMANCE_BIN}.elf"), elf)
 
     def test_sbt_prefixed_verdict_is_parsed(self) -> None:
         # Real MiCoSocSim output is sbt-framed ("[info] CFU_CONFORMANCE PASS ...").
@@ -433,6 +433,239 @@ class LazyOracleRejectionTest(unittest.TestCase):
                 )
 
 
+class InformativeOracleTest(unittest.TestCase):
+    """An oracle that decides its own outcome is rejected, not just a constant.
+
+    Regression class (2026-10-03, run 20261003-090854-136683-d98e5be9): nine
+    conformance cases passed while the benchmark computed a wrong digest, because
+    every check was self-fulfilling — ``verify: "a == a"``, ``verify:
+    "(a | b) == 0u"`` with the single case ``[0, 0]``, ``verify:
+    "probe_marker == 1u"`` where setup had written ``probe_marker = 1u``, and a
+    readback ``reference`` that returned the reset IV table.
+    """
+
+    def commands(self, *entries: dict) -> dict:
+        return {"commands": list(entries)}
+
+    def problems(self, contract: dict, entry: dict) -> list[str]:
+        return validate_oracle(contract, self.commands(entry))
+
+    def assert_message(self, problems: list[str], needle: str) -> None:
+        message = next((p for p in problems if needle in p), None)
+        self.assertIsNotNone(message, problems)
+
+    def test_operand_compared_with_itself_is_rejected(self) -> None:
+        for expression in ("a == a", "(a) == a", "b != b"):
+            with self.subTest(expression=expression):
+                entry = {"name": "vset", "cases": [{"args": [1, 2]}],
+                         "setup": "seed();", "verify": expression}
+                self.assert_message(self.problems(isa(VECTOR_COMMAND), entry),
+                                    "compares an operand with itself")
+
+    def test_argument_only_verify_is_rejected(self) -> None:
+        entry = {"name": "vset", "cases": [{"args": [1, 0]}],
+                 "setup": "seed();", "verify": "(a | b) == 0u"}
+        self.assert_message(self.problems(isa(VECTOR_COMMAND), entry),
+                            "verify only references the case arguments")
+
+    def test_verify_comparing_its_own_setup_constant_is_rejected(self) -> None:
+        entry = {
+            "name": "vset", "cases": [{"args": [1, 2]}],
+            "setup": "static volatile uint32_t marker = 1u; seed(); marker = 1u;",
+            "verify": "marker == 1u",
+        }
+        self.assert_message(self.problems(isa(VECTOR_COMMAND), entry),
+                            "assigned a literal to")
+
+    def test_reference_comparing_its_own_helper_constant_is_rejected(self) -> None:
+        entry = {"name": "compute", "cases": [{"args": [1, 2]}],
+                 "helpers": "static uint32_t expected;\nstatic void set_expected(void) { expected = 4u; }",
+                 "setup": "set_expected();", "reference": "expected"}
+        self.assert_message(self.problems(isa(CPU_COMMAND), entry),
+                            "assigned a literal to")
+
+    def test_all_zero_case_arguments_are_rejected(self) -> None:
+        entry = {"name": "compute", "cases": [{"args": [0, 0]}], "reference": "a + b"}
+        self.assert_message(self.problems(isa(CPU_COMMAND), entry),
+                            "only zero arguments")
+        # One representative non-zero case is enough.
+        entry = {"name": "compute", "cases": [{"args": [0, 0]}, {"args": [3, 4]}],
+                 "reference": "a + b"}
+        self.assertEqual(self.problems(isa(CPU_COMMAND), entry), [])
+
+    def test_zero_argument_commands_are_unaffected(self) -> None:
+        control = {"function_id": 3, "subfunction_id": 0, "name": "ctl", "kind": "control",
+                   "resources": []}
+        entry = {"name": "ctl", "cases": [{"args": []}],
+                 "helpers": "static void seed_memory(void) { volatile uint32_t *p = "
+                            "(volatile uint32_t *)0x80000000u; p[0] = 4u; }\n"
+                            "static uint32_t ctl_seen(void) { volatile uint32_t *p = "
+                            "(volatile uint32_t *)0x80000000u; return p[0] == 4u; }",
+                 "setup": "seed_memory();",
+                 "verify": "ctl_seen()"}
+        self.assertEqual(self.problems(isa(control), entry), [])
+
+    def test_real_observations_still_validate(self) -> None:
+        # Memory state seeded in setup and a helper that reads memory back are
+        # genuine observations and must keep validating.
+        cases = [
+            ({"name": "compute", "cases": [{"args": [4, 2]}],
+              "helpers": "static uint32_t w[8];",
+              "setup": "w[0] = 0x80000000u;",
+              "reference": "w[0] >> 4"}, isa(CPU_COMMAND)),
+            ({"name": "vset", "cases": [{"args": [4, 2]}],
+              "helpers": "static uint32_t check_loaded(void) { volatile uint32_t *p = "
+                         "(volatile uint32_t *)0x80000000u; return p[0] == 4u; }",
+              "setup": "seed();", "verify": "check_loaded()"},
+             isa(VECTOR_COMMAND)),
+        ]
+        for entry, contract in cases:
+            with self.subTest(entry=entry["reference"] if "reference" in entry else entry["verify"]):
+                self.assertEqual(validate_oracle(contract, self.commands(entry)), [])
+
+    def test_pointer_setup_is_not_a_literal_decision(self) -> None:
+        # `p = (uint32_t *)0x80000000u` publishes an address; reading through p
+        # is the observation, so the comparison must not be rejected.
+        entry = {"name": "compute", "cases": [{"args": [4, 2]}],
+                 "helpers": "static volatile uint32_t *p;",
+                 "setup": "p = (volatile uint32_t *)0x80000000u;",
+                 "reference": "p[a]"}
+        self.assertEqual(self.problems(isa(CPU_COMMAND), entry), [])
+
+
+class HelperOracleIndependenceTest(unittest.TestCase):
+    """Oracle expressions cannot hide DUT evaluation in shared C helpers."""
+
+    def entry(self, **fields) -> dict:
+        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
+
+    def assert_rejected(self, contract: dict, oracle: dict, name: str, *symbols: str) -> None:
+        problems = validate_oracle(contract, oracle)
+        message = next((p for p in problems if p.startswith(name + ":") and
+                        "must not call cfu_*" in p), None)
+        self.assertIsNotNone(message, problems)
+        for symbol in symbols:
+            self.assertIn(symbol, message)
+        # Defense in depth: a caller bypassing validate must still render FAIL,
+        # not evaluate the self-grading expression or count the command covered.
+        text = render_conformance(contract, oracle)
+        self.assertIn(f"CFU_CONFORMANCE_MISSING {name}:", text)
+        section = text.split(f"/* ---- {name} ---- */", 1)[1].split("/* ----", 1)[0]
+        self.assertIn("int cmd_ok = 0;", section)
+        self.assertNotIn("g_cases++;", section)
+
+    def test_reference_helper_directly_calls_dut(self) -> None:
+        entry = self.entry(
+            helpers="static uint32_t ref_sum(uint32_t x, uint32_t y) { return cfu_compute(x, y); }",
+            reference="ref_sum(a, b)",
+        )
+        self.assert_rejected(isa(CPU_COMMAND), {"commands": [entry]}, "compute", "ref_sum", "cfu_compute")
+
+    def test_reference_transitively_calls_dut(self) -> None:
+        entry = self.entry(helpers="""
+            static uint32_t leaf(uint32_t x, uint32_t y) { return cfu_compute(x, y); }
+            static uint32_t middle(uint32_t x, uint32_t y) { if (x) { return leaf(x, y); } return y; }
+            static uint32_t ref_sum(uint32_t x, uint32_t y) { return middle(x, y); }
+            """, reference="ref_sum(a, b)")
+        self.assert_rejected(isa(CPU_COMMAND), {"commands": [entry]}, "compute",
+                             "ref_sum", "middle", "leaf", "cfu_compute")
+
+    def test_verify_helper_calls_dut(self) -> None:
+        entry = {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                 "helpers": "static int observe(uint32_t x, uint32_t y) { cfu_vset(x, y); return x; }",
+                 "verify": "observe(a, b)"}
+        self.assert_rejected(isa(VECTOR_COMMAND), {"commands": [entry]}, "vset", "observe", "cfu_vset")
+
+    def test_cross_entry_helper_is_shared_for_reference_and_verify(self) -> None:
+        for helpers in (
+            "static uint32_t shared(uint32_t x, uint32_t y) { return cfu_compute(x, y); }",
+            "#define shared(x, y) DUT((x), (y))\n#define DUT cfu_compute",
+        ):
+            with self.subTest(helpers=helpers):
+                oracle = {"commands": [
+                    self.entry(reference="shared(a, b)"),
+                    {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                     "helpers": helpers, "verify": "shared(a, b)"},
+                ]}
+                for name in ("compute", "vset"):
+                    self.assert_rejected(isa(CPU_COMMAND, VECTOR_COMMAND), oracle, name,
+                                         "shared", "cfu_compute")
+
+    def test_macro_wrappers_and_object_aliases(self) -> None:
+        wrappers = (
+            "#define REF(x, y) cfu_compute((x), (y))",
+            "#define DUT cfu_compute\n#define REF(x, y) DUT((x), (y))",
+            "#define REF(x, y) \\\n  cfu_compute((x), (y))",
+            "#define DUT(x, y) cfu_compute((x), (y))\n"
+            "static uint32_t REF(uint32_t x, uint32_t y) { return DUT(x, y); }",
+        )
+        for helpers in wrappers:
+            with self.subTest(helpers=helpers):
+                oracle = {"commands": [self.entry(helpers=helpers, reference="REF(a, b)")]}
+                self.assert_rejected(isa(CPU_COMMAND), oracle, "compute", "REF", "cfu_compute")
+
+    def test_pointer_aliases_and_callback_references(self) -> None:
+        forms = (
+            {"helpers": "static uint32_t (*ref_ptr)(uint32_t, uint32_t) = &cfu_compute;",
+             "reference": "ref_ptr(a, b)"},
+            {"helpers": "static uint32_t (*ref_ptr)(uint32_t, uint32_t);",
+             "setup": "ref_ptr = cfu_compute;", "reference": "(*ref_ptr)(a, b)"},
+            {"helpers": "static uint32_t ref_sum(uint32_t x, uint32_t y) {"
+                        " uint32_t (*f)(uint32_t, uint32_t) = cfu_compute; return f(x, y); }",
+             "reference": "ref_sum(a, b)"},
+            {"helpers": "static uint32_t bad(uint32_t x, uint32_t y) { return cfu_compute(x, y); }"
+                        " static uint32_t (*ref_ptr)(uint32_t, uint32_t) = bad;",
+             "reference": "ref_ptr(a, b)"},
+            {"reference": "apply(cfu_compute, a, b)"},
+        )
+        for fields in forms:
+            with self.subTest(fields=fields):
+                self.assert_rejected(isa(CPU_COMMAND), {"commands": [self.entry(**fields)]},
+                                     "compute", "cfu_compute")
+
+    def test_pure_shared_helpers_and_macros_are_accepted(self) -> None:
+        oracle = {"commands": [
+            self.entry(reference="REF(a, b)", helpers="""
+                #define REF(x, y) ref_sum((x), (y))
+                static uint32_t add(uint32_t x, uint32_t y) { return x + y; }
+                static uint32_t ref_sum(uint32_t x, uint32_t y) {
+                  /* cfu_compute(x, y) */
+                  const char *note = "cfu_compute(x, y) { }"; (void)note;
+                  if (x) { return add(x, y); } return y;
+                }
+                """),
+            {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();", "verify": "REF(a, b)"},
+        ]}
+        self.assertEqual(validate_oracle(isa(CPU_COMMAND, VECTOR_COMMAND), oracle), [])
+        self.assertNotIn("CFU_CONFORMANCE_MISSING", render_conformance(isa(CPU_COMMAND, VECTOR_COMMAND), oracle))
+
+    def test_setup_only_helper_and_macro_may_call_approved_dut(self) -> None:
+        entry = self.entry(helpers="""
+            #define SEED(x, y) cfu_compute((x), (y))
+            static void seed_inner(void) { cfu_enable(); SEED(1, 2); cfu_memory_fence(); }
+            static void seed(void) { seed_inner(); }
+            static uint32_t ref_sum(uint32_t x, uint32_t y) { return x + y; }
+            """, setup="seed();", reference="ref_sum(a, b)")
+        oracle = {"commands": [entry]}
+        self.assertEqual(validate_oracle(isa(CPU_COMMAND), oracle), [])
+        text = render_conformance(isa(CPU_COMMAND), oracle)
+        self.assertNotIn("CFU_CONFORMANCE_MISSING", text)
+        self.assertIn("seed();", text)
+        self.assertIn("uint32_t ref = (uint32_t)(ref_sum(a, b));", text)
+
+    def test_cycles_terminate_and_still_find_dut(self) -> None:
+        for leaf in ("first(x, y)", "first(x, y) + cfu_compute(x, y)"):
+            entry = self.entry(helpers=
+                "static uint32_t first(uint32_t x, uint32_t y) { return second(x, y); }"
+                f" static uint32_t second(uint32_t x, uint32_t y) {{ return {leaf}; }}",
+                reference="first(a, b)")
+            oracle = {"commands": [entry]}
+            if "cfu_" in leaf:
+                self.assert_rejected(isa(CPU_COMMAND), oracle, "compute", "cfu_compute")
+            else:
+                self.assertEqual(validate_oracle(isa(CPU_COMMAND), oracle), [])
+
+
 class UndeclaredArgumentLintTest(unittest.TestCase):
     """The generated case scope only binds declared roles' arguments.
 
@@ -517,61 +750,60 @@ class HelperCollisionTest(unittest.TestCase):
         self.assertIn("other_h", text)
 
 
-class HarnessExtraCasesTest(unittest.TestCase):
-    """Harness-side deterministic extra differential cases.
-
-    The model picks its own oracle cases and wrote the hardware, so the harness
-    appends fixed edge + seeded pseudo-random inputs for rd-writing commands.
-    Trade-off (accepted): ``reference`` must model these arbitrary inputs; an
-    address-taking or stateful command opts out with ``edge_cases: false``,
-    keeping the model's cases only — weaker coverage instead of wrong
-    comparisons.
-    """
+class ModelChosenCasesTest(unittest.TestCase):
+    """The model owns every input and size: no hidden random/edge expansion."""
 
     def entry(self, **fields) -> dict:
         return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
 
-    def test_edge_case_extras_rendered_and_counted(self) -> None:
-        entry = self.entry(reference="a + b")
-        extras = _extra_cases(CPU_COMMAND, entry)
-        self.assertEqual(len(extras), 5)  # bounded at MAX_EXTRA_CASES
+    def test_only_declared_cases_are_rendered_in_order(self) -> None:
+        entry = self.entry(reference="a + b", cases=[{"args": [11, 2]}, {"args": [22, 8]}])
         text = render_conformance(isa(CPU_COMMAND), {"commands": [entry]})
-        # Model case + extras all count into g_cases.
-        self.assertEqual(text.count("g_cases++;"), 1 + len(extras))
-        for case_args in extras:
-            for value in case_args:
-                self.assertIn(_c_literal(value), text)
-        # The deterministic edge sweep renders the fixed edge values verbatim.
-        self.assertIn("(uint32_t)0u", text)
-        self.assertIn("(uint32_t)1u", text)
-        self.assertIn("(uint32_t)2147483648u", text)
-        self.assertIn("(uint32_t)4294967295u", text)
+        self.assertEqual(text.count("g_cases++;"), 2)
+        self.assertEqual(text.count("uint32_t got ="), 2)
+        self.assertLess(text.index("a = (uint32_t)11u"), text.index("a = (uint32_t)22u"))
+        self.assertNotIn("2147483648u", text)
+        self.assertNotIn("4294967295u", text)
 
-    def test_edge_cases_opt_out_renders_no_extras(self) -> None:
-        entry = self.entry(reference="a + b", edge_cases=False)
-        self.assertEqual(validate_oracle(isa(CPU_COMMAND), {"commands": [entry]}), [])
-        self.assertEqual(_extra_cases(CPU_COMMAND, entry), [])
+    def test_large_seed_does_not_invent_large_iteration_counts(self) -> None:
+        entry = self.entry(reference="a ^ b", cases=[
+            {"args": [0, 0]}, {"args": [0, 1]}, {"args": [4294967295, 8]},
+            {"args": [12345, 1024]},
+        ])
         text = render_conformance(isa(CPU_COMMAND), {"commands": [entry]})
-        self.assertEqual(text.count("g_cases++;"), 1)
+        self.assertEqual(text.count("g_cases++;"), 4)
+        self.assertIn("a = (uint32_t)4294967295u", text)
+        self.assertNotIn("b = (uint32_t)4294967295u", text)
+        self.assertNotIn("b = (uint32_t)880296978u", text)
 
-    def test_edge_cases_must_be_boolean(self) -> None:
-        problems = validate_oracle(
-            isa(CPU_COMMAND), {"commands": [self.entry(reference="a + b", edge_cases="no")]}
-        )
+    def test_legacy_edge_flag_never_adds_cases(self) -> None:
+        for flag in (True, False):
+            with self.subTest(flag=flag):
+                entry = self.entry(reference="a + b", edge_cases=flag)
+                self.assertEqual(validate_oracle(isa(CPU_COMMAND), {"commands": [entry]}), [])
+                text = render_conformance(isa(CPU_COMMAND), {"commands": [entry]})
+                self.assertEqual(text.count("g_cases++;"), 1)
+
+    def test_legacy_edge_flag_must_still_be_boolean(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
+            self.entry(reference="a + b", edge_cases="no")]})
         self.assertTrue(any("edge_cases must be a boolean" in p for p in problems), problems)
 
-    def test_extras_are_deterministic_per_command_name(self) -> None:
-        entry = self.entry(reference="a + b")
-        self.assertEqual(_extra_cases(CPU_COMMAND, entry), _extra_cases(CPU_COMMAND, entry))
-        other = _extra_cases(dict(CPU_COMMAND, name="compute2"), entry)
-        # The seeded pseudo-random tail differs between command names.
-        self.assertNotEqual(_extra_cases(CPU_COMMAND, entry)[2:], other[2:])
-
-    def test_extras_skipped_for_non_rd_commands(self) -> None:
+    def test_non_rd_cases_are_not_expanded(self) -> None:
         entry = {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();", "verify": "slot_is(1)"}
-        self.assertEqual(_extra_cases(VECTOR_COMMAND, entry), [])
         text = render_conformance(isa(VECTOR_COMMAND), {"commands": [entry]})
         self.assertEqual(text.count("g_cases++;"), 1)
+
+    def test_prompt_requires_model_chosen_small_quick_tests(self) -> None:
+        from agents.cfu_design_agent.prompts import conformance_prompt
+        for tools in (True, False):
+            with self.subTest(tools=tools):
+                prompt = conformance_prompt("test", isa(CPU_COMMAND), {}, agent_tools=tools)
+                self.assertIn("You choose ALL test inputs and data sizes", prompt)
+                self.assertIn("SMALL DATA", prompt)
+                self.assertIn("32000 cycles", prompt)
+                self.assertIn("never appends hidden edge or random inputs", prompt)
+                self.assertIn("do NOT use 0xFFFFFFFF", prompt)
 
     def test_case_scope_binds_a_and_b_unconditionally(self) -> None:
         # Render backstop for stale oracles: undeclared identifiers must never

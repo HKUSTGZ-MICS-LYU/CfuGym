@@ -11,6 +11,7 @@ from agents.cfu_design_agent.runtime.policy import PolicyError
 RUN = "agents/generated/runs/evidence-test"
 ASM = f"{RUN}/workspace/embench_crc32/reference/embench_main.asm"
 IR = f"{RUN}/07_analysis/ir/crc_32.ll"
+FEATURES = f"{RUN}/07_analysis/ir/crc_32.features.xml"
 
 
 class ReadOnlyToolbox:
@@ -68,6 +69,77 @@ class ObservationEvidenceTest(unittest.TestCase):
         self.assertEqual((row["cycles"], row["calls"], row["asm_path"], row["ir_path"]),
                          (125, 4, ASM, None))
         self.assertEqual(self.index()["observations"]["obs_loop_crc"]["ir_path"], IR)
+
+    def test_features_view_targets_the_loop_and_does_not_read_other_artifacts(self):
+        xml_text = (
+            '<ir_features schema_version="1" provenance="static_ir">'
+            '<function name="crc_32">'
+            '<loop id="loop:crc_32:head" source_line="12" function="crc_32">'
+            '<data_movement><totals bytes_total="unknown" trip_count="64"/></data_movement>'
+            '</loop>'
+            '<loop id="loop:crc_32:other" source_line="99" function="crc_32">'
+            '<data_movement><totals bytes_total="unknown" trip_count="1"/></data_movement>'
+            '</loop>'
+            '</function></ir_features>'
+        )
+        index = self.index(ir_result={"ir_files": [IR], "feature_files": [FEATURES]})
+        self.assertEqual(index["observations"]["obs_loop_crc"]["features_path"], FEATURES)
+        toolbox = ReadOnlyToolbox({FEATURES: xml_text, IR: self.ir_text, ASM: self.asm_text})
+        output = inspect_observation(index, toolbox, "obs_loop_crc", "features")
+        self.assertIn("loop/function-focused excerpt (static_ir)", output)
+        self.assertIn('trip_count="64"', output)
+        self.assertNotIn('trip_count="1"', output)
+        self.assertIn("target match unknown", output)
+        self.assertEqual([p for p, _ in toolbox.reads], [FEATURES])
+        summary = inspect_observation(index, toolbox, "obs_loop_crc")
+        self.assertIn("Feature XML: " + FEATURES, summary)
+        self.assertIn("view='features'", summary)
+
+    def test_features_missing_unparseable_or_unmatched_do_not_fabricate(self):
+        index = self.index(ir_result={"ir_files": [IR], "feature_files": [FEATURES]})
+        output = inspect_observation(index, ReadOnlyToolbox(), "obs_loop_crc", "features")
+        self.assertIn("Feature XML unavailable: missing or empty", output)
+        bad = inspect_observation(index, ReadOnlyToolbox({FEATURES: "<ir_features>"}), "obs_loop_crc", "features")
+        self.assertIn("unparseable feature XML", bad)
+        other = ("<ir_features schema_version='1'><loop id='x' source_line='77' "
+                 "function='crc_32'><a/></loop></ir_features>")
+        fallback = inspect_observation(index, ReadOnlyToolbox({FEATURES: other}), "obs_loop_crc", "features")
+        self.assertIn("whole document (no loop matched this observation)", fallback)
+        no_func_attr = ("<ir_features schema_version='1'><loop id='y' source_line='12'>"
+                        "<data_movement/></loop><loop id='z' source_line='55'>"
+                        "<data_movement/></loop></ir_features>")
+        line_match = inspect_observation(index, ReadOnlyToolbox({FEATURES: no_func_attr}),
+                                         "obs_loop_crc", "features")
+        self.assertIn("loop/function-focused excerpt (static_ir)", line_match)
+        self.assertIn('id="y"', line_match)
+        self.assertNotIn('id="z"', line_match)
+        unrecorded = inspect_observation(self.index(), ReadOnlyToolbox(), "obs_loop_crc", "features")
+        self.assertIn("Feature XML unavailable: not recorded", unrecorded)
+
+    def test_a_missing_reference_disassembly_explains_itself(self):
+        # Observed 2026-09-30: a cached profile run has no build output, so the
+        # view said "missing or empty" with no hint that the IR view carries the
+        # evidence. That reads as "this evidence does not exist at all".
+        toolbox = ReadOnlyToolbox({IR: self.ir_text})
+        asm_view = inspect_observation(self.index(), toolbox, "obs_loop_crc", "asm")
+        self.assertIn("no reference disassembly in this run's workspace", asm_view)
+        self.assertIn("use view='ir'", asm_view)
+
+    def test_the_exported_ir_and_feature_files_are_reachable(self):
+        # `collect_ir_evidence` writes 07_analysis/ir/<stem>.ll and
+        # <stem>.features.xml; the analysis index must find exactly those.
+        features = ('<function name="crc_32" kind="loop" hotspot_match="true">'
+                    '<summary loop_carried_edges="1" /></function>')
+        toolbox = ReadOnlyToolbox({IR: self.ir_text, FEATURES: features})
+        index = self.index(ir_result={"ir_files": [IR], "feature_files": [FEATURES],
+                                      "status": "approximate", "mode": "auto"})
+        summary = inspect_observation(index, toolbox, "obs_loop_crc")
+        self.assertIn("LLVM IR candidate: " + IR, summary)
+        self.assertIn("Feature XML: " + FEATURES, summary)
+        ir_view = inspect_observation(index, toolbox, "obs_loop_crc", "ir")
+        self.assertIn("candidate instruction", ir_view)
+        features_view = inspect_observation(index, toolbox, "obs_loop_crc", "features")
+        self.assertIn("loop_carried_edges", features_view)
 
     def test_summary_and_missing_cache_asm_do_not_fabricate(self):
         toolbox = ReadOnlyToolbox({IR: self.ir_text})

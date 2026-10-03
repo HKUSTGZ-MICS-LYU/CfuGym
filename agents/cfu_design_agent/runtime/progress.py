@@ -19,16 +19,46 @@ STAGE_LABELS: dict[str, str] = {
     "analyze_workload": "analyze workload",
     "design_contract": "design CFU ISA",
     "extend_isa": "extend CFU ISA",
-    "implement_hw": "implement HW",
+    "implement": "implement HW/SW",
     "generate_soc": "generate SoC",
     "check_conformance": "check conformance",
-    "implement_sw": "implement SW",
     "build_sw": "compile SW",
     "simulate": "simulate",
     "estimate_cost": "cost (yosys)",
     "review_and_route": "review & route",
     "final_report": "final report",
 }
+
+
+# The macro stages of the run (docs/agent_v2_plan.md). The live log reports
+# position *within a macro stage* rather than a flat step counter, because "which
+# phase is this run in, and how far through it" is the question an operator
+# actually has while a long toolchain run is in flight.
+STEP_GROUPS: dict[str, str] = {
+    "load_context": "DISCOVER",
+    "ingest_input": "DISCOVER",
+    "route_input": "DISCOVER",
+    "prepare_benchmark": "DISCOVER",
+    "profile": "DISCOVER",
+    "hotspot": "DISCOVER",
+    "ir": "DISCOVER",
+    "analysis": "DISCOVER",
+    "isa": "CONTRACT",
+    "implement": "IMPLEMENT",
+    "hw_build": "VERIFY",
+    "hw_conformance": "VERIFY",
+    "sw_build": "VERIFY",
+    "sim": "VERIFY",
+    "cost": "VERIFY",
+    "review": "DECIDE",
+    "final_report": "DECIDE",
+}
+
+GROUP_ORDER: tuple[str, ...] = ("DISCOVER", "CONTRACT", "IMPLEMENT", "VERIFY", "DECIDE")
+
+
+def stage_group(step: str) -> str:
+    return STEP_GROUPS.get(step, "OTHER")
 
 
 def stage_label(name: str) -> str:
@@ -55,10 +85,9 @@ NODE_TO_STEP: dict[str, str] = {
     "analyze_workload": "analysis",
     "design_contract": "isa",
     "extend_isa": "isa",
-    "implement_hw": "implementation_hw",
+    "implement": "implement",
     "generate_soc": "hw_build",
     "check_conformance": "hw_conformance",
-    "implement_sw": "implementation_sw",
     "build_sw": "sw_build",
     "simulate": "sim",
     "estimate_cost": "cost",
@@ -70,8 +99,12 @@ NODE_TO_STEP: dict[str, str] = {
 class StageProgress:
     """Prints one line when a stage starts and one when it finishes.
 
-    Line 1 (stage begins): ``[ 7/17] analyze workload ... running``
-    Line 2 (stage ends):   ``[ 7/17] analyze workload ... OK (321 tok, 2.4s)``
+    Line 1 (stage begins): ``[DISCOVER 8/8] analyze workload ... running``
+    Line 2 (stage ends):   ``[DISCOVER 8/8] analyze workload ... OK (in=… out=… tok, 2.4s)``
+
+    The counter is the position *within the macro stage* (see ``STEP_GROUPS``), so
+    a repair that revisits an earlier rung legitimately moves the counter back
+    instead of appearing to restart the run.
     """
 
     def __init__(self, stages: list[str]) -> None:
@@ -79,20 +112,32 @@ class StageProgress:
         self.slot_by_step = {name: i for i, name in enumerate(self.stages)}
         self.count = len(self.stages)
         self.results: dict[str, dict[str, Any]] = {}
+        # Slot order inside each group, taken from the plan order rather than the
+        # execution order, so the denominator is stable for the whole run.
+        self.group_slots: dict[str, list[str]] = {
+            group: [step for step in self.stages if stage_group(step) == group]
+            for group in GROUP_ORDER
+        }
+
+    def _position(self, name: str) -> tuple[str, int, int]:
+        step = NODE_TO_STEP.get(name, name)
+        group = stage_group(step)
+        slots = self.group_slots.get(group, [])
+        index = slots.index(step) + 1 if step in slots else len(slots) + 1
+        return group, index, len(slots)
+
+    def _prefix(self, name: str) -> str:
+        group, index, total = self._position(name)
+        return f"[{group} {index}/{total}]"
 
     def _index_of(self, name: str) -> int:
         step = NODE_TO_STEP.get(name, name)
         return self.slot_by_step.get(step, len(self.stages))
 
     def begin(self, name: str) -> None:
-        idx = self._index_of(name)
-        print(
-            f"[{idx + 1:>2}/{self.count:>2}] {stage_label(name)} ... running",
-            flush=True,
-        )
+        print(f"{self._prefix(name)} {stage_label(name)} ... running", flush=True)
 
     def end(self, name: str, *, ok: bool, elapsed: float, tokens: int) -> None:
-        idx = self._index_of(name)
         status = "OK" if ok else "FAIL"
         # Input/output split straight from the usage ledger: the point of the
         # line is to show which step's input is big at a glance.
@@ -100,7 +145,7 @@ class StageProgress:
 
         usage = stage_usage(name)
         print(
-            f"[{idx + 1:>2}/{self.count:>2}] {stage_label(name)} ... "
+            f"{self._prefix(name)} {stage_label(name)} ... "
             f"{status} (in={usage['input']} out={usage['output']} tok, {elapsed:.1f}s)",
             flush=True,
         )

@@ -600,7 +600,7 @@ class AggregateTest(unittest.TestCase):
                 pass_at_3=None, pass_at_5=None,
                 failure={"failure_class": "hw_build", "failure_rung": "hw_build",
                          "failure_detail": "scala error", "budget_exhausted": True},
-                episodes=[{"kind": "repair", "trigger_rung": "hw_build", "repair_target": "implement_hw",
+                episodes=[{"kind": "repair", "trigger_rung": "hw_build", "repair_target": "implement",
                            "decision_source": "fixed", "detail": "d", "evidence": "e"}],
             )
             for name, record in (("good", good), ("bad", bad)):

@@ -1,4 +1,4 @@
-"""Single workflow specification shared by LangGraph and the Python runner.
+"""Workflow specification for the LangGraph runner.
 
 Node implementations and routing decisions stay in ``graph.py`` so existing
 module-level patch targets continue to work. This module owns the graph shape.
@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 
 # (node, static successor, router function name, allowed conditional targets).
-# Exactly one of a static successor or a router is used; final_report ends the walk.
+# Exactly one of a static successor or a router is used; final_report terminates.
 _NODE_LAYOUT: tuple[tuple[str, str | None, str | None, tuple[str, ...]], ...] = (
     ("load_context", "ingest_input", None, ()),
     ("ingest_input", "route_input", None, ()),
@@ -26,25 +26,29 @@ _NODE_LAYOUT: tuple[tuple[str, str | None, str | None, tuple[str, ...]], ...] = 
     ("instrument_and_profile", "extract_hotspot", None, ()),
     ("extract_hotspot", "collect_ir_evidence", None, ()),
     ("collect_ir_evidence", "analyze_workload", None, ()),
-    ("analyze_workload", "design_contract", None, ()),
+    # A workload analysis that is not a parseable mapping is an answer error:
+    # repair it from the answer pool or stop, but never hand the empty mapping
+    # to every later stage.
+    ("analyze_workload", None, "_route_after_analysis",
+     ("analyze_workload", "design_contract", "review_and_route")),
+    # One implementation stage; every repair below routes back into it.
     ("design_contract", None, "_route_after_isa",
-     ("design_contract", "implement_hw", "review_and_route")),
+     ("design_contract", "implement", "review_and_route")),
     ("extend_isa", None, "_route_after_isa",
-     ("extend_isa", "implement_hw", "review_and_route")),
-    ("implement_hw", "generate_soc", None, ()),
+     ("extend_isa", "implement", "review_and_route")),
+    ("implement", "generate_soc", None, ()),
     ("generate_soc", None, "_route_after_hw_build",
-     ("check_conformance", "build_sw", "implement_hw", "review_and_route")),
+     ("check_conformance", "implement", "review_and_route")),
     ("check_conformance", None, "_route_after_hw_conformance",
-     ("implement_sw", "build_sw", "check_conformance", "implement_hw", "review_and_route")),
-    ("implement_sw", "build_sw", None, ()),
+     ("build_sw", "implement", "review_and_route")),
     ("build_sw", None, "_route_after_sw_build",
-     ("simulate", "implement_sw", "review_and_route")),
+     ("simulate", "implement", "review_and_route")),
     ("simulate", None, "_route_after_sim",
-     ("estimate_cost", "implement_sw", "implement_hw", "review_and_route")),
+     ("estimate_cost", "implement", "review_and_route")),
     ("estimate_cost", None, "_route_after_cost",
-     ("review_and_route", "implement_hw")),
+     ("review_and_route", "implement")),
     ("review_and_route", None, "_route_after_review",
-     ("final_report", "implement_hw", "implement_sw", "extend_isa")),
+     ("final_report", "implement", "extend_isa")),
     ("final_report", None, None, ()),
 )
 
@@ -88,39 +92,26 @@ def register_langgraph(
     wrap: Callable[[Callable[..., Any]], Callable[..., Any]],
     start: Any,
     end: Any,
-    retry_policy: Any,
+    node_options: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    """Register the same workflow traversed by the fallback runner."""
+    """Register the workflow with LangGraph.
+
+    ``node_options`` carries the declarative per-node LangGraph policies
+    (``retry_policy``, ``error_handler``, ...) declared in ``flow/policies.py``;
+    they are applied here so a node body never has to encode them.
+    """
     if set(nodes) != set(NODE_NAMES):
         raise ValueError("flow node registry differs from workflow specification")
     if set(routers) != set(ROUTER_NAMES):
         raise ValueError("flow router registry differs from workflow specification")
+    options = dict(node_options or {})
+    unknown = set(options) - set(NODE_NAMES)
+    if unknown:
+        raise ValueError(f"node options for unknown flow nodes: {sorted(unknown)}")
     for name in NODE_NAMES:
-        kwargs = {"retry_policy": retry_policy} if name == "load_context" else {}
-        graph.add_node(name, wrap(nodes[name]), **kwargs)
+        graph.add_node(name, wrap(nodes[name]), **options.get(name, {}))
     graph.add_edge(start, "load_context")
     for source, destination in SUCCESSORS.items():
         graph.add_edge(source, end if destination is None else destination)
     for source, targets in ROUTE_TARGETS.items():
         graph.add_conditional_edges(source, routers[source], {target: target for target in targets})
-
-
-def walk_python(
-    state: dict[str, Any],
-    nodes: dict[str, Callable[[dict[str, Any]], Any]],
-    routers: dict[str, Callable[[dict[str, Any]], str]],
-    *,
-    invoke: Callable[[Callable[..., Any], dict[str, Any]], Any],
-    merge: Callable[[dict[str, Any], Any], None],
-    limit: int,
-) -> None:
-    """Traverse the shared edge specification; caller owns node execution."""
-    node: str | None = "load_context"
-    guard = 0
-    while node is not None:
-        guard += 1
-        if guard > limit:
-            raise RuntimeError(f"python runner did not terminate at node {node!r}")
-        merge(state, invoke(nodes[node], state))
-        router = routers.get(node)
-        node = router(state) if router is not None else SUCCESSORS.get(node)

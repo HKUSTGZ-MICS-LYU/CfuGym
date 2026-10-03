@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import unittest
 
-from agents.cfu_design_agent.graph import _isa_from_template, deterministic_roofline_analysis
+from agents.cfu_design_agent.stages.contract import _isa_from_template
+from agents.cfu_design_agent.stages.fallbacks import deterministic_roofline_analysis
 from agents.cfu_design_agent.isa import render_isa_markdown
 from agents.cfu_design_agent.prompts import (
     HARDWARE_TARGETS,
+    conformance_prompt,
     contract_prompt,
     embench_instructions,
     hardware_prompt,
-    repair_routing_prompt,
-    software_need_prompt,
+    optimization_prompt,
+    paths_digest,
     software_prompt,
     workload_prompt,
 )
+from agents.cfu_design_agent.stages import contract as contract_mod
+from agents.cfu_design_agent.stages import fallbacks
 
 
 class RooflinePromptTest(unittest.TestCase):
@@ -60,6 +64,28 @@ class RooflinePromptTest(unittest.TestCase):
         self.assertIn("independent optional knobs", contract)
         self.assertIn("regDepth: 0", contract)
         self.assertIn("achieved", prompt)
+
+    def test_analysis_prompt_states_the_raw_yaml_wire_format(self) -> None:
+        # Observed 2026-09-29 (twice): a prose preamble plus a ```yaml fence made
+        # the whole analysis unparseable. The prompt must say the reply is a raw
+        # YAML mapping and nothing else.
+        prompt = workload_prompt("accelerate it", self.spec, self.context)
+        self.assertIn("and nothing else", prompt)
+        self.assertIn("Markdown fences", prompt)
+        self.assertIn("YAML parser", prompt)
+        self.assertIn("not valid YAML", prompt)
+
+    def test_analysis_repair_prompt_quotes_the_previous_rejection(self) -> None:
+        prompt = workload_prompt(
+            "accelerate it", self.spec, self.context,
+            feedback="\n## Previous attempt rejected\n- not a mapping\n",
+        )
+        self.assertIn("## Previous attempt rejected", prompt)
+        self.assertIn("not a mapping", prompt)
+        self.assertNotIn(
+            "Previous attempt rejected",
+            workload_prompt("accelerate it", self.spec, self.context),
+        )
 
     def test_opt_in_approximate_ir_prompt_is_bounded_and_not_measured(self) -> None:
         evidence = {
@@ -351,79 +377,127 @@ class EmbenchSimLogGuidanceTest(unittest.TestCase):
         self.assertEqual(embench_instructions({"source_kind": "natural_language"}), "")
 
 
-class RouterPromptTest(unittest.TestCase):
-    """Both routers must state what each answer actually changes."""
+class PromptBudgetTest(unittest.TestCase):
+    """Tools-enabled prompts are path-based briefs; bodies are never inlined."""
 
-    ISA = {
-        "identity": {"name": "depthconv_cfu"},
-        "commands": [{"function_id": 1, "name": "compute"}],
-    }
+    BODY = "BODY_SENTINEL_" + ("x" * 6000)
 
-    def test_repair_routing_explains_the_consequence_of_each_target(self) -> None:
-        text = repair_routing_prompt(
-            "accelerate it", "verify failed", "log", {"name": "depthconv"}, isa_spec=self.ISA
-        )
-        # Software only: the hardware is not rebuilt.
-        self.assertIn("hardware is\n  left untouched and only the software changes", text)
-        # Hardware: the software is re-checked, so both sides may change.
-        self.assertIn("software is re-checked against the new hardware", text)
-        self.assertIn("updated as well when the new hardware needs it", text)
+    def _context(self) -> dict:
+        return {
+            "files": {
+                "skills/cfu-designer/SKILL.md": self.BODY,
+                "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala": self.BODY,
+                "src/main/scala/vexiiriscv/soc/mico/AgentCfuFiber.scala": self.BODY,
+                "benchmarks/embench-iot/src/crc32/crc_32.c": self.BODY,
+            },
+            "visibility": "standard",
+            "git_status": "",
+            "workdir": "/repo/root",
+            "run_root": "agents/generated/runs/r1",
+        }
 
-    def test_software_need_prompt_explains_both_answers(self) -> None:
-        text = software_need_prompt(
-            "accelerate it",
-            {"name": "depthconv"},
-            self.ISA,
-            hardware_summary="hw",
-            software_summary="sw",
-            calls=[{"file": "a.c", "line": 3, "name": "cfu_compute", "text": "cfu_compute(1,2);"}],
-            evidence="the current kernel already calls cfu_compute",
-        )
-        self.assertIn('"software_change": "required" or "not_required"', text)
-        self.assertIn("a.c:3", text)
-        self.assertIn("only risk breaking working software", text)
+    def _prompts(self, agent_tools: bool) -> dict[str, str]:
+        context = self._context()
+        spec = {"name": "w", "operation": "crc32", "unknowns": []}
+        run = "agents/generated/runs/r1"
+        return {
+            "analysis": workload_prompt(
+                "t", spec, context, agent_tools=agent_tools, tool_rounds=6,
+                artifact_paths=[(f"{run}/05_profile/result.yaml", "profile")],
+            ),
+            "contract": contract_prompt(
+                "t", spec, "ANALYSIS_BODY", context, agent_tools=agent_tools, tool_rounds=6,
+                artifact_paths=[(f"{run}/07_analysis/workload_analysis.yaml", "analysis")],
+            ),
+            "conformance": conformance_prompt(
+                "t", {"commands": []}, spec, agent_tools=agent_tools, tool_rounds=6,
+                workdir="/repo/root", run_root=run,
+                artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
+            ),
+            "hardware": hardware_prompt(
+                "t", spec, "ANALYSIS_BODY", "CONTRACT_BODY", context,
+                agent_tools=agent_tools, tool_rounds=6,
+                artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
+            ),
+            "software": software_prompt(
+                "t", spec, "ANALYSIS_BODY", "CONTRACT_BODY", context,
+                agent_tools=agent_tools, tool_rounds=6,
+                targets=[(f"{run}/workspace/embench_crc32/cfu/crc_32.c", self.BODY)],
+                intrinsics_path=f"{run}/workspace/embench_crc32/cfu/cfu_intrinsics.h",
+                artifact_paths=[(f"{run}/08_isa/cfu_isa.yaml", "contract")],
+            ),
+            "optimize": optimization_prompt(
+                "t", spec, "score", "rounds", {}, "", "", 2, "performance",
+                agent_tools=agent_tools, tool_rounds=6,
+                workdir="/repo/root", run_root=run,
+                artifact_paths=[(f"{run}/10_validation/embench.yaml", "validation")],
+            ),
+        }
+
+    def test_tools_enabled_prompts_are_path_briefs(self) -> None:
+        budgets = {
+            "analysis": 9000,
+            "contract": 12000,
+            "conformance": 9000,
+            "hardware": 14000,
+            "software": 14000,
+            "optimize": 9000,
+        }
+        for name, prompt in self._prompts(True).items():
+            with self.subTest(stage=name):
+                self.assertNotIn("BODY_SENTINEL", prompt)
+                self.assertNotIn("ANALYSIS_BODY", prompt)
+                self.assertNotIn("CONTRACT_BODY", prompt)
+                self.assertIn("working directory: /repo/root", prompt)
+                self.assertIn("run directory: agents/generated/runs/r1/", prompt)
+                self.assertIn("read_file", prompt)
+                self.assertIn("## Deliverable", prompt)
+                self.assertIn("## Key paths", prompt)
+                self.assertLess(len(prompt), budgets[name], f"{name} prompt grew: {len(prompt)} chars")
+        prompts = self._prompts(True)
+        self.assertIn("08_isa/cfu_isa.yaml", prompts["contract"])
+        self.assertIn("08_isa/cfu_isa.yaml", prompts["conformance"])
+        self.assertIn("09_implementation/hw_plan.md", prompts["optimize"])
+        self.assertIn("cfu_intrinsics.h", prompts["software"])
+
+    def test_no_tools_prompts_keep_the_legacy_bodies(self) -> None:
+        prompts = self._prompts(False)
+        self.assertIn("BODY_SENTINEL", prompts["analysis"])
+        self.assertIn("ANALYSIS_BODY", prompts["contract"])
+        self.assertIn("ANALYSIS_BODY", prompts["hardware"])
+        self.assertIn("BODY_SENTINEL", prompts["software"])
+        self.assertIn("ISA spec:", prompts["optimize"])
+        self.assertIn("No tool loop is available", prompts["analysis"])
+        self.assertNotIn("## Key paths", prompts["analysis"])
 
 
-class CacheFriendlyOrderingTest(unittest.TestCase):
-    """Dynamic repair/optimization blocks must sit AFTER the static prompt body.
+class PathsDigestTest(unittest.TestCase):
+    """The path index lists where to look and never a file body."""
 
-    The ordering keeps the prompt prefix byte-stable across repair rounds (so a
-    provider can cache it) and puts the repair instructions where the model
-    reads them last.
-    """
+    def test_paths_digest_lists_paths_without_bodies(self) -> None:
+        context = {
+            "files": {
+                "skills/cfu-designer/SKILL.md": "BODY_SENTINEL",
+                ".git/config": "secret",
+                "agents/generated/runs/other/report.md": "other run body",
+            },
+            "visibility": "standard",
+            "run_root": "agents/generated/runs/mine",
+            "git_status": " M changed.scala",
+        }
+        digest = paths_digest(context, artifact_paths=[
+            ("agents/generated/runs/mine/08_isa/cfu_isa.yaml", "contract"),
+        ])
+        self.assertIn("skills/cfu-designer/SKILL.md", digest)
+        self.assertIn("agents/generated/runs/mine/08_isa/cfu_isa.yaml", digest)
+        self.assertIn("contract", digest)
+        self.assertNotIn("BODY_SENTINEL", digest)
+        self.assertNotIn(".git/config", digest)
+        self.assertNotIn("agents/generated/runs/other/report.md", digest)
+        self.assertIn("## Visibility: standard", digest)
+        self.assertIn("## git status --short", digest)
 
-    def setUp(self) -> None:
-        self.spec = {"name": "t", "operation": "op", "pattern": "vector_to_scalar", "unknowns": []}
-        self.context = {"files": {"a.scala": "// a"}, "visibility": "standard"}
-
-    def test_hardware_feedback_block_comes_after_delivery_protocol(self) -> None:
-        prompt = hardware_prompt(
-            "task", self.spec, "analysis", "contract", self.context,
-            feedback="EXACT ERROR LOG BODY",
-        )
-        self.assertGreater(
-            prompt.index("=== HARDWARE REPAIR MODE ==="),
-            prompt.index("Protocol A (preferred): targeted edits"),
-        )
-        self.assertGreater(
-            prompt.index("=== HARDWARE REPAIR MODE ==="),
-            prompt.index("Allowed target paths"),
-        )
-        # The dynamic block is last: nothing static follows it.
-        self.assertTrue(prompt.rstrip().endswith("before the next build."))
-
-    def test_software_feedback_block_comes_after_delivery_protocol(self) -> None:
-        prompt = software_prompt(
-            "task", self.spec, "analysis", "contract", self.context,
-            targets=[("run/main.c", "int main(void){return 0;}")],
-            feedback="EXACT ERROR LOG BODY",
-        )
-        self.assertGreater(
-            prompt.index("=== SOFTWARE REPAIR MODE ==="),
-            prompt.index("Protocol A (preferred): targeted edits"),
-        )
-        self.assertTrue(prompt.rstrip().endswith("and keep the scalar fallback."))
+    def test_paths_digest_is_empty_without_anything_to_show(self) -> None:
+        self.assertEqual(paths_digest({"files": {}}), "")
 
 
-if __name__ == "__main__":
-    unittest.main()

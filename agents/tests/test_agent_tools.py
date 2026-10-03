@@ -150,9 +150,8 @@ class ToolLoopTest(unittest.TestCase):
         self.assertIn("tools", fake.requests[0])
         self.assertNotIn("tools", fake.requests[1])
 
-    def test_tools_payload_rejection_degrades_to_plain_completion(self) -> None:
+    def test_tools_payload_rejection_fails_closed(self) -> None:
         client = self._client()
-        outer = self
 
         class Completions:
             def __init__(self):
@@ -166,17 +165,14 @@ class ToolLoopTest(unittest.TestCase):
 
         fake = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
         with mock.patch("openai.OpenAI", return_value=fake):
-            result = client.complete_with_tools(
-                "s",
-                "u",
-                tools=[{"type": "function", "function": {"name": "read_file"}}],
-                tool_runner=lambda name, args: "obs",
-                max_rounds=3,
-            )
-        self.assertEqual(result.text, "PLAIN")
-        self.assertEqual(result.tool_calls, ())
+            with self.assertRaisesRegex(RuntimeError, "tool-enabled model request failed"):
+                client.complete_with_tools(
+                    "s", "u", tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    tool_runner=lambda name, args: "obs", max_rounds=3,
+                )
+        self.assertEqual(fake.chat.completions.calls, 1)
 
-    def test_tools_rejection_degrades_with_a_tools_unavailable_note(self) -> None:
+    def test_tools_rejection_never_uses_plain_completion(self) -> None:
         client = self._client()
         requests: list[dict] = []
 
@@ -189,20 +185,13 @@ class ToolLoopTest(unittest.TestCase):
 
         fake = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
         with mock.patch("openai.OpenAI", return_value=fake):
-            result = client.complete_with_tools(
-                "s",
-                "u",
-                tools=[{"type": "function", "function": {"name": "read_file"}}],
-                tool_runner=lambda name, args: "obs",
-                max_rounds=3,
-            )
-        self.assertEqual(result.text, "PLAIN")
-        self.assertTrue(result.degraded_reason)
-        # The tools request is retried once before the loop gives up.
-        self.assertEqual(sum(1 for request in requests if "tools" in request), 2)
-        # The degraded plain call must tell the model that tools are gone.
-        final_user = requests[-1]["messages"][-1]["content"]
-        self.assertIn("TOOL CALLING UNAVAILABLE", final_user)
+            with self.assertRaisesRegex(RuntimeError, "tools not supported"):
+                client.complete_with_tools(
+                    "s", "u", tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    tool_runner=lambda name, args: "obs", max_rounds=3,
+                )
+        self.assertEqual(len(requests), 1)
+        self.assertIn("tools", requests[0])
 
     def test_budget_reminder_precedes_the_forced_final_turn(self) -> None:
         client = self._client()
@@ -332,6 +321,64 @@ class ToolLoopTest(unittest.TestCase):
         self.assertEqual(result.text, deferral)
         self.assertEqual(len(fake.requests), 2, "only one corrective re-ask")
 
+    def test_empty_answer_is_retried_once(self) -> None:
+        # Observed failure (run 20261003-095209): after five productive tool
+        # rounds the endpoint returned a 200 with no content and no tool call,
+        # and the loop raised immediately, killing the whole run.
+        client = self._client()
+        fake = _FakeChatClient([_final_response(""), _final_response("FINAL")])
+        executed: list[str] = []
+        with mock.patch("openai.OpenAI", return_value=fake):
+            result = client.complete_with_tools(
+                "s",
+                "u",
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                tool_runner=lambda name, args: executed.append(name) or "obs",
+                max_rounds=3,
+            )
+        self.assertEqual(result.text, "FINAL")
+        self.assertEqual(executed, [])
+        self.assertEqual(len(fake.requests), 2)
+        nudged = [m for m in fake.requests[1]["messages"]
+                  if "previous reply was empty" in str(m.get("content", ""))]
+        self.assertEqual(len(nudged), 1)
+        self.assertEqual(nudged[0]["role"], "user")
+
+    def test_empty_answer_retry_is_bounded(self) -> None:
+        client = self._client()
+        fake = _FakeChatClient([_final_response(""), _final_response("")])
+        with mock.patch("openai.OpenAI", return_value=fake):
+            with self.assertRaisesRegex(RuntimeError, "empty stage answer"):
+                client.complete_with_tools(
+                    "s",
+                    "u",
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    tool_runner=lambda name, args: "obs",
+                    max_rounds=3,
+                )
+        self.assertEqual(len(fake.requests), 2, "at most one empty-answer re-ask")
+
+    def test_empty_answer_retry_survives_a_withdrawn_tool_budget(self) -> None:
+        # The re-ask must not depend on tool rounds remaining: it is a transport
+        # retry, not a tool round.
+        client = self._client()
+        fake = _FakeChatClient([
+            _tool_call_response("read_file", '{"path": "a"}'),
+            _final_response(""),
+            _final_response("DONE"),
+        ])
+        with mock.patch("openai.OpenAI", return_value=fake):
+            result = client.complete_with_tools(
+                "s",
+                "u",
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                tool_runner=lambda name, args: "obs",
+                max_rounds=3,
+                max_total_calls=1,
+            )
+        self.assertEqual(result.text, "DONE")
+        self.assertEqual(len(fake.requests), 3)
+
     def test_missing_deliverable_is_nudged_when_required(self) -> None:
         # A rung that requires a block must not accept a plan-only answer while
         # tools are still available.
@@ -402,6 +449,84 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         )
         self.assertIn("main.c:2:", hits)
 
+    def test_list_dir_lists_sub_directories(self) -> None:
+        # Observed failure: a directory whose children are all directories
+        # answered "(no visible entries)", so the model could not find
+        # workspace/design and burned its whole exploration budget on dead ends.
+        listing = self.toolset.run("list_dir", {"path": self.run_root})
+        self.assertIn(f"{self.run_root}/workspace/", listing)
+        self.assertNotIn("(no visible entries)", listing)
+
+    def test_list_command_logs_finds_the_runs_build_and_simulation_logs(self) -> None:
+        # Every executed command persists its full output; the tool is how the
+        # model finds those logs without guessing numbered filenames.
+        logs = self.run_dir / "10_validation/logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "sim_003.log").write_text(
+            "command: sbt runMain MiCoSocSim --load-elf x.elf\n"
+            "command_id: soc_sim\n"
+            "cwd: /repo\n"
+            "returncode: 1\n"
+            "timed_out: False\n\n=== STDOUT ===\nEMBENCH_VERIFY_FAIL result=7\n")
+        cost = self.run_dir / "11_cost/logs"
+        cost.mkdir(parents=True, exist_ok=True)
+        (cost / "cost_000.log").write_text(
+            "command: yosys -s cost.ys\ncommand_id: yosys_cost\ncwd: /repo\n"
+            "returncode: 0\n\n=== STDOUT ===\ncells: 42\n")
+        listing = self.toolset.run("list_command_logs", {})
+        self.assertIn("2 command log(s)", listing)
+        self.assertIn(f"{self.run_root}/10_validation/logs/sim_003.log", listing)
+        self.assertIn("rung=sim rc=1", listing)
+        self.assertIn("sbt runMain MiCoSocSim --load-elf x.elf", listing)
+        filtered = self.toolset.run("list_command_logs", {"rung": "cost", "limit": 1})
+        self.assertIn("1 command log(s)", filtered)
+        self.assertIn("cost_000.log", filtered)
+        self.assertNotIn("sim_003.log", filtered)
+        missing = self.toolset.run("list_command_logs", {"rung": "nope"})
+        self.assertIn("no command log", missing)
+
+    def test_list_command_logs_rejects_a_bad_limit(self) -> None:
+        out = self.toolset.run("list_command_logs", {"limit": "many"})
+        self.assertTrue(out.startswith("usage error:"), out)
+
+    def test_the_platform_library_is_discoverable_without_a_repo_wide_search(self) -> None:
+        # Observed failure: the implementation stage never found
+        # AgentCfuLib.scala (the read-only ISA vocabulary) and guessed the API
+        # from a docstring instead. Both navigation routes must reach it.
+        tools = ReadOnlyToolset(
+            RepoToolbox(REPO_ROOT, dry_run=True, stage="implementation")
+        )
+        listing = tools.run("list_dir", {"path": "src/main/scala/vexiiriscv/soc/mico"})
+        self.assertIn("AgentCfuLib.scala", listing)
+        hits = tools.run("search_text", {"pattern": "class AgentCfuBase", "path": "."})
+        self.assertIn("AgentCfuLib.scala:", hits)
+        self.assertNotIn("usage error", hits)
+
+    def test_a_missing_path_says_so_and_suggests_where_it_lives(self) -> None:
+        # Observed failure: `path=vexiiriscv` answered "no such path" with no
+        # suggestion, and a typo answered "denied", which cannot be fixed by
+        # rephrasing.
+        out = self.toolset.run("search_text", {"pattern": "x", "path": "vexiiriscv"})
+        self.assertTrue(out.startswith("usage error: no such path"), out)
+        self.assertIn("did you mean: src/main/scala/vexiiriscv", out)
+        missing = self.toolset.run("read_file", {"path": "nowhere/AgentCfu.scala"})
+        self.assertIn("no such file", missing)
+        self.assertNotIn("denied by access policy", missing)
+
+    def test_an_invisible_tree_is_denied_not_reported_empty(self) -> None:
+        # "docs" exists but is outside the read tree; "(no visible entries)"
+        # would read as "empty directory" and invite retries.
+        denied = self.toolset.run("list_dir", {"path": "docs"})
+        self.assertIn("denied by access policy", denied)
+        self.assertIn("outside the shared read allowlist", denied)
+        self.assertIn(
+            "denied by access policy", self.toolset.run("list_dir", {"path": "target"})
+        )
+        self.assertIn(
+            "denied by access policy",
+            self.toolset.run("search_text", {"pattern": "x", "path": "ext/SpinalHDL"}),
+        )
+
     def test_paths_outside_the_stage_policy_are_denied(self) -> None:
         out = self.toolset.run("read_file", {"path": "README.md"})
         self.assertIn("denied by access policy", out)
@@ -433,21 +558,24 @@ class ReadOnlyToolsetTest(unittest.TestCase):
             ),
         )
 
-    def test_analysis_keeps_reading_the_tracked_scaffold(self) -> None:
-        # analysis may read the tracked scaffold but not the design workspace, so
-        # the overlay redirect must not turn a valid read into a policy denial.
-        RepoToolbox(
+    def test_every_stage_reads_the_same_live_copy(self) -> None:
+        # The redirect is not stage-conditioned: what the flow can see is shared,
+        # so `analysis` reads the same live overlay bytes as `implementation`.
+        toolbox = RepoToolbox(
             REPO_ROOT, dry_run=False, stage="implementation", run_root=self.run_root
-        ).seed_design_workspace()
-        analysis = ReadOnlyToolset(
-            RepoToolbox(REPO_ROOT, dry_run=False, stage="analysis", run_root=self.run_root)
         )
-        out = analysis.run(
-            "read_file",
-            {"path": "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala", "end_line": 1},
+        toolbox.seed_design_workspace()
+        tracked = "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"
+        overlay = design_workspace_paths(self.run_root)[tracked]
+        (REPO_ROOT / overlay).write_text(
+            "// CFU_AGENT_SHARED_VISIBILITY\n" + (REPO_ROOT / overlay).read_text()
         )
-        self.assertNotIn("denied by access policy", out)
-        self.assertIn("SPDX", out)
+        for stage in ("analysis", "isa", "implementation"):
+            tools = ReadOnlyToolset(
+                RepoToolbox(REPO_ROOT, dry_run=False, stage=stage, run_root=self.run_root)
+            )
+            out = tools.run("read_file", {"path": tracked, "end_line": 1})
+            self.assertIn("CFU_AGENT_SHARED_VISIBILITY", out, stage)
 
 
 if __name__ == "__main__":

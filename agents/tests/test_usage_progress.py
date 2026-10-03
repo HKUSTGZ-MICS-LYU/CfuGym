@@ -2,13 +2,82 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from agents.cfu_design_agent.runtime import llm
-from agents.cfu_design_agent.graph import _node_ok, _update_ok
+from agents.cfu_design_agent.runtime import llm, llm_step
+from agents.cfu_design_agent.flow.instrument import _node_ok, _update_ok
 from agents.cfu_design_agent.runtime.progress import NODE_TO_STEP, STAGE_LABELS, StageProgress
+from agents.cfu_design_agent.flow import instrument
+
+
+class ToolLogTest(unittest.TestCase):
+    """The live CLI log keeps one short line per tool call.
+
+    Observed 2026-09-30: `edit_hardware(edits=[{...2048-char body...}])` printed
+    the whole edit, so a run's own progress scrolled away behind file content.
+    """
+
+    def _line(self, record: dict) -> str:
+        stub = types.SimpleNamespace(
+            _PROGRESS=object(), _LIVE_LINE=types.SimpleNamespace(clear=lambda: None)
+        )
+        out = io.StringIO()
+        with mock.patch.object(llm_step, "instrument", stub), contextlib.redirect_stdout(out):
+            llm_step._log_tool_call(record)
+        return out.getvalue().strip()
+
+    def test_edit_payloads_are_reported_by_size_not_content(self) -> None:
+        body = "class AgentCfu {" + "\n  // design body\n" * 400 + "}"
+        line = self._line({
+            "name": "edit_hardware", "ok": True, "result": "diff\n" * 200,
+            "arguments": {"edits": [
+                {"path": "agents/generated/runs/x/workspace/design/AgentCfu.scala",
+                 "search": body, "replace": body},
+                {"path": "agents/generated/runs/x/workspace/design/AgentCfuFiber.scala",
+                 "search": "a", "replace": "b"},
+            ]},
+        })
+        self.assertIn("edit_hardware(", line)
+        self.assertIn("AgentCfu.scala", line)
+        self.assertIn(f"search={len(body)}", line)
+        self.assertNotIn("// design body", line)
+        self.assertEqual(len(line.splitlines()), 1)
+        self.assertLess(len(line), 200)
+        self.assertIn("ok ->", line)
+
+    def test_software_and_submission_payloads_are_sized(self) -> None:
+        software = self._line({
+            "name": "edit_software", "ok": False,
+            "arguments": {"path": "runs/x/workspace/embench_crc32/cfu/src/crc_32.c",
+                          "search": "int i;" * 100, "replace": "int j;" * 100},
+            "result": "error: software edit budget exhausted",
+        })
+        self.assertIn("crc_32.c", software)
+        self.assertIn("search=600", software)
+        self.assertNotIn("int i;", software)
+        self.assertIn("ERROR", software)
+        submit = self._line({
+            "name": "submit_stage", "ok": False,
+            "arguments": {"delivery": "# Stage 3 delivery\n" * 200},
+            "result": "stage gate rejected delivery: no hardware target was edited",
+        })
+        self.assertIn("delivery=<3800 chars>", submit)
+        self.assertNotIn("Stage 3 delivery", submit)
+
+    def test_selector_arguments_stay_readable(self) -> None:
+        line = self._line({
+            "name": "read_file", "ok": True,
+            "arguments": {"path": "src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala",
+                          "start_line": 399, "end_line": 560},
+            "result": "line\n" * 10,
+        })
+        self.assertIn("path=src/main/scala/vexiiriscv/soc/mico/AgentCfuLib.scala", line)
+        self.assertIn("start_line=399", line)
 
 
 class UsageByStageTest(unittest.TestCase):
@@ -19,13 +88,14 @@ class UsageByStageTest(unittest.TestCase):
         llm.set_stage("")
 
     def test_by_stage_aggregates_in_first_seen_order(self) -> None:
-        llm.record_usage("implement_hw", 100, 10, 110)
+        llm.record_usage("implement", 100, 10, 110)
         llm.record_usage("design_contract", 5, 1, 6)
-        llm.record_usage("implement_hw", 200, 20, 220)
+        llm.record_usage("implement", 200, 20, 220)
         by_stage = llm.usage_by_stage()
-        self.assertEqual(list(by_stage), ["implement_hw", "design_contract"])
+        self.assertEqual(list(by_stage), ["implement", "design_contract"])
         self.assertEqual(
-            by_stage["implement_hw"], {"calls": 2, "input": 300, "output": 30, "total": 330}
+            by_stage["implement"], {"calls": 2, "input": 300, "output": 30, "total": 330,
+                                     "cached_input": 0, "cached_usage_reported": 0}
         )
         self.assertEqual(by_stage["design_contract"]["input"], 5)
 
@@ -33,13 +103,13 @@ class UsageByStageTest(unittest.TestCase):
         self.assertEqual(llm.usage_by_stage(), {})
 
     def test_stage_line_and_summary_split_input_output(self) -> None:
-        llm.set_stage("implement_hw")
-        llm.record_usage("implement_hw", 42, 7, 49)
+        llm.set_stage("implement")
+        llm.record_usage("implement", 42, 7, 49)
         progress = StageProgress(list(NODE_TO_STEP.values()))
-        progress.end("implement_hw", ok=True, elapsed=1.5, tokens=49)
-        self.assertEqual(progress.results["implement_hw"]["input_tokens"], 42)
-        self.assertEqual(progress.results["implement_hw"]["output_tokens"], 7)
-        stage = progress.summary()["stages"]["implement_hw"]
+        progress.end("implement", ok=True, elapsed=1.5, tokens=49)
+        self.assertEqual(progress.results["implement"]["input_tokens"], 42)
+        self.assertEqual(progress.results["implement"]["output_tokens"], 7)
+        stage = progress.summary()["stages"]["implement"]
         self.assertEqual(stage["input_tokens"], 42)
         self.assertEqual(stage["output_tokens"], 7)
 
@@ -82,9 +152,21 @@ class UsageLedgerTest(unittest.TestCase):
         llm.set_stage("design_contract")
         llm.record_usage("design_contract", 10, 5, 15)
         llm.record_usage("design_contract", 20, 10, 30)
-        self.assertEqual(llm.usage_totals(), {"calls": 2, "input": 30, "output": 15, "total": 45})
+        self.assertEqual(llm.usage_totals(), {"calls": 2, "input": 30, "output": 15, "total": 45,
+                                              "cached_input": 0, "cached_usage_reported": 0})
         self.assertEqual(llm.stage_usage("design_contract")["total"], 45)
         self.assertEqual(llm.stage_usage("other")["calls"], 0)
+
+    def test_cached_usage_is_a_subset_and_missing_is_unknown(self) -> None:
+        llm.record_usage("implement", 100, 10, 110, cached_input_tokens=40)
+        llm.record_usage("implement", 30, 5, 35)
+        usage = llm.usage_totals()
+        self.assertEqual(usage["input"], 130)
+        self.assertEqual(usage["cached_input"], 40)
+        self.assertEqual(usage["cached_usage_reported"], 1)
+        self.assertIsNone(llm._cached_usage(None, "chat"))
+        self.assertEqual(llm._cached_usage({"prompt_tokens_details": {"cached_tokens": 12}}, "chat"), 12)
+        self.assertEqual(llm._cached_usage({"input_tokens_details": {"cached_tokens": 8}}, "responses"), 8)
 
     def test_extract_chat_usage(self) -> None:
         fake = types.SimpleNamespace(
@@ -125,8 +207,8 @@ class NodeOkTest(unittest.TestCase):
 class StageProgressTest(unittest.TestCase):
     ORDER = [
         "load_context", "ingest_input", "route_input", "prepare_benchmark",
-        "profile", "hotspot", "ir", "analysis", "isa", "implementation_hw",
-        "hw_build", "hw_conformance", "implementation_sw", "sw_build", "sim",
+        "profile", "hotspot", "ir", "analysis", "isa", "implement",
+        "hw_build", "hw_conformance", "sw_build", "sim",
         "cost", "review", "final_report",
     ]
 
@@ -135,8 +217,8 @@ class StageProgressTest(unittest.TestCase):
         self.assertEqual(progress._index_of("load_context"), 0)
         self.assertEqual(progress._index_of("instrument_and_profile"), 4)
         self.assertEqual(progress._index_of("check_conformance"), 11)
-        self.assertEqual(progress._index_of("review_and_route"), 16)
-        self.assertEqual(progress._index_of("final_report"), 17)
+        self.assertEqual(progress._index_of("review_and_route"), 15)
+        self.assertEqual(progress._index_of("final_report"), 16)
         # Unknown node falls back to the end of the list (count), not negative.
         self.assertEqual(progress._index_of("bogus"), len(self.ORDER))
 

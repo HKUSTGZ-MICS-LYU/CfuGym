@@ -10,13 +10,29 @@ from unittest import mock
 
 from agents.cfu_design_agent import graph
 from agents.cfu_design_agent.runtime.llm import LlmResult
-from agents.tests.common import REPO_ROOT
-
-try:
-    from agents.cfu_design_agent.graph import _LANGRAPH_AVAILABLE
-except ImportError:  # pragma: no cover
-    _LANGRAPH_AVAILABLE = False
-
+from agents.cfu_design_agent.flow import gates
+from agents.cfu_design_agent.flow import instrument
+from agents.cfu_design_agent.flow import ladder
+from agents.cfu_design_agent.flow import optimize as flow_optimize
+from agents.cfu_design_agent.runtime import checks
+from agents.cfu_design_agent.runtime import commands
+from agents.cfu_design_agent.runtime import llm_step
+from agents.cfu_design_agent.runtime import stage_services as services
+from agents.cfu_design_agent.stages import analysis
+from agents.cfu_design_agent.stages import feedback
+from agents.cfu_design_agent.stages import review
+from agents.cfu_design_agent.stages.implement import delivery
+from agents.cfu_design_agent.stages.implement import hw as impl_hw
+from agents.cfu_design_agent.stages.implement import intrinsics
+from agents.cfu_design_agent.stages.implement import sw as impl_sw
+from agents.cfu_design_agent.stages.review import optimize as review_optimize
+from agents.cfu_design_agent.stages.review import report
+from agents.cfu_design_agent.stages.verify import soc as verify_soc
+from agents.cfu_design_agent.stages.verify import software as verify_software
+from agents.tests.common import REPO_ROOT, offline_llm
+from agents.cfu_design_agent.flow import gates as gates_mod
+from agents.cfu_design_agent.stages import feedback as feedback_mod
+from agents.cfu_design_agent.stages.review import report as report_mod
 
 GOOD_PATCH = """PATCH_BEGIN
 --- a/src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala
@@ -134,53 +150,6 @@ def _base_state(run_id: str, **overrides) -> dict:
     return state
 
 
-class MergeSemanticsTest(unittest.TestCase):
-    def _run(self, run_id: str) -> dict:
-        run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
-        shutil.rmtree(run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, run_dir, True)
-        return graph.run_agent_python({
-            "workdir": str(REPO_ROOT),
-            "task": "Accelerate a uint8 weighted average kernel with a TileLink CFU.",
-            "input_mode": "natural_language",
-            "dry_run": True,
-            "run_commands": False,
-            "apply_patch": False,
-            "skip_sim": True,
-            "skip_yosys": True,
-            "max_iters": 1,
-            "run_id": run_id,
-            "errors": ["seed-error"],
-        })
-
-    def test_python_runner_appends_history_and_keeps_errors_once(self) -> None:
-        final = self._run("merge-python-00000000")
-        self.assertEqual(final.get("errors"), ["seed-error"])
-        self.assertGreaterEqual(len(final.get("iteration_history", [])), 10)
-
-    @unittest.skipUnless(_LANGRAPH_AVAILABLE, "langgraph is not installed")
-    def test_langgraph_runner_does_not_duplicate_errors(self) -> None:
-        run_id = "merge-langgraph-00000000"
-        run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
-        shutil.rmtree(run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, run_dir, True)
-        final = graph.run_agent({
-            "workdir": str(REPO_ROOT),
-            "task": "Accelerate a uint8 weighted average kernel with a TileLink CFU.",
-            "input_mode": "natural_language",
-            "dry_run": True,
-            "run_commands": False,
-            "apply_patch": False,
-            "skip_sim": True,
-            "skip_yosys": True,
-            "max_iters": 1,
-            "run_id": run_id,
-            "errors": ["seed-error"],
-        })
-        self.assertEqual(final.get("errors"), ["seed-error"])
-        self.assertGreaterEqual(len(final.get("iteration_history", [])), 10)
-
-
 class ImplementationGateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.run_id = "gate-impl-00000000"
@@ -201,8 +170,8 @@ class ImplementationGateTest(unittest.TestCase):
     def _implement(self, patch: str, **overrides):
         self._seed()
         state = _base_state(self.run_id, **overrides)
-        with mock.patch.object(graph, "_llm", lambda state: _FakeLlm(patch)):
-            return graph.implement_hw(state)
+        with mock.patch.object(llm_step, "_llm", lambda state: _FakeLlm(patch)):
+            return impl_hw.implement_hw(state)
 
     def test_gate_ok_only_when_patch_applies(self) -> None:
         result = self._implement(GOOD_PATCH)
@@ -240,7 +209,7 @@ class ImplementationGateTest(unittest.TestCase):
             any("tool-intent preamble" in err for err in result["errors"]),
             result["errors"],
         )
-        feedback = graph.implementation_feedback({"gates": result["gates"]}, "implementation_hw")
+        feedback = feedback_mod.implementation_feedback({"gates": result["gates"]}, "implementation_hw")
         self.assertIn("no EDIT_BEGIN/FILE_BEGIN/PATCH_BEGIN", feedback)
 
     def test_unterminated_edit_block_is_reported(self) -> None:
@@ -269,10 +238,10 @@ class ImplementationGateTest(unittest.TestCase):
         self.assertFalse(looks_like_tool_intent("PATCH_BEGIN\n--- a/x\n+++ b/x\n"))
         self.assertFalse(looks_like_tool_intent(""))
 
-        reason = graph.tool_intent_error(narration, "RuntimeError: tools rejected")
+        reason = feedback_mod.tool_intent_error(narration, "RuntimeError: tools rejected")
         self.assertIn("tool-intent preamble", reason)
         self.assertIn("RuntimeError: tools rejected", reason)
-        self.assertEqual(graph.tool_intent_error("a finished design", ""), "")
+        self.assertEqual(feedback_mod.tool_intent_error("a finished design", ""), "")
 
     def test_repair_edits_compose_on_the_live_workspace(self) -> None:
         # The prompt shows, and the protocol edits, the live run-workspace copy.
@@ -280,8 +249,8 @@ class ImplementationGateTest(unittest.TestCase):
         # being reset against the tracked original (which the prompt never shows).
         self._seed()
         state = _base_state(self.run_id, iteration=0)
-        with mock.patch.object(graph, "_llm", lambda state: _FakeLlm(GOOD_PATCH)):
-            first = graph.implement_hw(state)
+        with mock.patch.object(llm_step, "_llm", lambda state: _FakeLlm(GOOD_PATCH)):
+            first = impl_hw.implement_hw(state)
         self.assertTrue(first["gates"]["implementation_hw"]["applied"], first["implementation_hw_summary"])
 
         target = REPO_ROOT / f"agents/generated/runs/{self.run_id}/workspace/design/AgentCfu.scala"
@@ -294,8 +263,8 @@ class ImplementationGateTest(unittest.TestCase):
         state2 = dict(state)
         state2.update(first)
         state2["iteration"] = 1
-        with mock.patch.object(graph, "_llm", lambda state: _FakeLlm(second_patch)):
-            second = graph.implement_hw(state2)
+        with mock.patch.object(llm_step, "_llm", lambda state: _FakeLlm(second_patch)):
+            second = impl_hw.implement_hw(state2)
         self.assertTrue(second["gates"]["implementation_hw"]["applied"], second["implementation_hw_summary"])
         text = target.read_text()
         self.assertIn("val compute = 7", text)
@@ -329,13 +298,13 @@ class ImplementationGateTest(unittest.TestCase):
     def test_reasoning_sidecar_does_not_shift_raw_output_numbering(self) -> None:
         self._seed()
         state = _base_state(self.run_id, iteration=0)
-        with mock.patch.object(graph, "_llm", lambda state: _FakeLlm(THINKING_PATCH)):
-            first = graph.implement_hw(state)
+        with mock.patch.object(llm_step, "_llm", lambda state: _FakeLlm(THINKING_PATCH)):
+            first = impl_hw.implement_hw(state)
         state2 = dict(state)
         state2.update(first)
         state2["iteration"] = 1
-        with mock.patch.object(graph, "_llm", lambda state: _FakeLlm(THINKING_PATCH)):
-            second = graph.implement_hw(state2)
+        with mock.patch.object(llm_step, "_llm", lambda state: _FakeLlm(THINKING_PATCH)):
+            second = impl_hw.implement_hw(state2)
         self.assertTrue(first["llm_raw_outputs"][0].endswith("hardware_000.txt"))
         self.assertTrue(second["llm_raw_outputs"][0].endswith("hardware_001.txt"))
 
@@ -344,8 +313,8 @@ class ImplementationGateTest(unittest.TestCase):
         state = _base_state(self.run_id)
         read_path = f"agents/generated/runs/{self.run_id}/workspace/design/AgentCfu.scala"
         llm = _ToolUsingLlm(GOOD_PATCH, read_path)
-        with mock.patch.object(graph, "_llm", lambda state: llm):
-            result = graph.implement_hw(state)
+        with mock.patch.object(llm_step, "_llm", lambda state: llm):
+            result = impl_hw.implement_hw(state)
         gate = result["gates"]["implementation_hw"]
         self.assertTrue(gate["ok"], result["implementation_hw_summary"])
         self.assertEqual(gate["tool_calls"], 1)
@@ -377,13 +346,14 @@ class ImplementationGateTest(unittest.TestCase):
                 }
             ],
         )
-        report = graph.render_report(state)
+        report = report_mod.render_report(state)
         self.assertIn("## Tool Calls", report)
         self.assertIn("read_file", report)
 
     def test_agent_content_is_not_written_without_apply_patch(self) -> None:
-        # --run-commands (apply_patch=False) must not let Protocols A/B/C mutate
-        # the run workspace; the response has to stay a proposal.
+        # apply_patch=False (--no-apply-patch) must not let Protocols A/B/C
+        # mutate the run workspace; the response has to stay a proposal even
+        # when command execution is still allowed.
         edit_text = (
             "EDIT_BEGIN src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala\n"
             "<<<<<<< SEARCH\n"
@@ -407,14 +377,14 @@ class ImplementationGateTest(unittest.TestCase):
                 )
                 before = target.read_text()
                 state = _base_state(self.run_id, apply_patch=False)
-                with mock.patch.object(graph, "_llm", lambda state: _FakeLlm(text)):
-                    result = graph.implement_hw(state)
+                with mock.patch.object(llm_step, "_llm", lambda state: _FakeLlm(text)):
+                    result = impl_hw.implement_hw(state)
                 gate = result["gates"]["implementation_hw"]
                 self.assertFalse(gate["ok"], label)
                 self.assertFalse(gate["applied"], label)
                 self.assertEqual(result["changed_design_files"], [], label)
                 self.assertTrue(
-                    any("--apply-patch" in error for error in result["errors"]),
+                    any("patch application is disabled" in error for error in result["errors"]),
                     result["errors"],
                 )
                 self.assertEqual(target.read_text(), before, label)
@@ -424,6 +394,7 @@ class ReviewDecisionTest(unittest.TestCase):
     def _gates(self, **overrides) -> dict:
         gates = {
             "workload_spec": {"ok": True},
+            "analysis": {"ok": True},
             "isa": {"ok": True},
             "implementation_hw": {"ok": True},
             "hw_build": {"ok": True},
@@ -438,20 +409,20 @@ class ReviewDecisionTest(unittest.TestCase):
 
     def test_all_executed_and_passing_is_complete(self) -> None:
         state = _base_state("review-complete", gates=self._gates())
-        self.assertEqual(graph._review_decision(state), ("final_report", "complete"))
+        self.assertEqual(gates_mod._review_decision(state), ("final_report", "complete"))
 
     def test_ir_require_failure_is_separate_from_validation(self) -> None:
         gates = self._gates(ir={"ok": False, "status": "unavailable", "required": True})
         state = _base_state("review-ir-required", gates=gates, ir_features="require")
-        self.assertEqual(graph._review_decision(state), ("final_report", "failed"))
-        self.assertFalse(graph._is_complete(state))
+        self.assertEqual(gates_mod._review_decision(state), ("final_report", "failed"))
+        self.assertFalse(gates_mod._is_complete(state))
         optional = _base_state("review-ir-optional", gates=gates, ir_features="auto")
-        self.assertEqual(graph._review_decision(optional), ("final_report", "complete"))
+        self.assertEqual(gates_mod._review_decision(optional), ("final_report", "complete"))
 
     def test_skipped_rung_reports_planned(self) -> None:
         gates = self._gates(cost={"ok": False, "skipped": True, "reason": "execution-disabled"})
         state = _base_state("review-skip", gates=gates)
-        self.assertEqual(graph._review_decision(state), ("final_report", "planned"))
+        self.assertEqual(gates_mod._review_decision(state), ("final_report", "planned"))
 
     def test_nothing_executed_reports_planned(self) -> None:
         gates = self._gates(
@@ -461,24 +432,24 @@ class ReviewDecisionTest(unittest.TestCase):
             cost={"ok": False, "skipped": True, "reason": "dry-run"},
         )
         state = _base_state("review-noexec", gates=gates)
-        self.assertEqual(graph._review_decision(state), ("final_report", "planned"))
+        self.assertEqual(gates_mod._review_decision(state), ("final_report", "planned"))
 
     def test_executed_failure_is_failed(self) -> None:
         gates = self._gates(sim={"ok": False, "skipped": False})
         state = _base_state("review-fail", gates=gates)
-        self.assertEqual(graph._review_decision(state), ("final_report", "failed"))
+        self.assertEqual(gates_mod._review_decision(state), ("final_report", "failed"))
 
     def test_invalid_workload_is_blocked(self) -> None:
         gates = self._gates(workload_spec={"ok": False, "problems": ["missing"]})
         state = _base_state("review-blocked", gates=gates)
-        self.assertEqual(graph._review_decision(state), ("final_report", "blocked"))
+        self.assertEqual(gates_mod._review_decision(state), ("final_report", "blocked"))
 
     def test_missing_rung_cannot_be_complete(self) -> None:
         gates = self._gates()
         gates.pop("sim")
         state = _base_state("review-missing", gates=gates)
-        self.assertEqual(graph._review_decision(state), ("final_report", "blocked"))
-        self.assertFalse(graph._is_complete(state))
+        self.assertEqual(gates_mod._review_decision(state), ("final_report", "blocked"))
+        self.assertFalse(gates_mod._is_complete(state))
 
 VALID_ISA = """spec_version: \"1\"
 identity:
@@ -527,9 +498,9 @@ class _ContractLlm:
 
 
 class NoExecutionStatusTest(unittest.TestCase):
-    """--no-dry-run without --run-commands must not report failed/blocked."""
+    """--no-apply-patch --no-run-commands must not report failed/blocked."""
 
-    def _run(self, runner) -> dict:
+    def _run(self) -> dict:
         run_id = "status-noexec-00000000"
         run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -546,30 +517,24 @@ class NoExecutionStatusTest(unittest.TestCase):
             "max_iters": 2,
             "run_id": run_id,
         }
-        with mock.patch.object(graph, "_llm", lambda state: _ContractLlm()):
-            return runner(state)
+        with mock.patch.object(llm_step, "_llm", lambda state: _ContractLlm()):
+            return graph.run_agent(state)
 
-    def test_python_runner_reports_planned_when_nothing_runs(self) -> None:
-        final = self._run(graph.run_agent_python)
+    def test_run_agent_reports_planned_when_nothing_runs(self) -> None:
+        final = self._run()
         self.assertEqual(final["status"], "planned")
         self.assertEqual(final.get("iteration", 0), 0)
         self.assertEqual(final["gates"]["hw_build"]["skipped"], True)
-
-    @unittest.skipUnless(_LANGRAPH_AVAILABLE, "langgraph is not installed")
-    def test_langgraph_runner_reports_planned_when_nothing_runs(self) -> None:
-        final = self._run(graph.run_agent)
-        self.assertEqual(final["status"], "planned")
-        self.assertEqual(final.get("iteration", 0), 0)
 
     def test_failed_rung_with_budget_repairs_instead_of_reviewing(self) -> None:
         gates = {
             "workload_spec": {"ok": True},
             "isa": {"ok": True},
             "implementation_hw": {"ok": True},
-            "hw_build": {"ok": False, "skipped": False, "next": "implement_hw"},
+            "hw_build": {"ok": False, "skipped": False, "next": "implement"},
         }
         state = _base_state("review-repair", gates=gates, repairs_used=0, max_iters=3)
-        self.assertEqual(graph._route_after_hw_build(state), "implement_hw")
+        self.assertEqual(graph._route_after_hw_build(state), "implement")
 
     def test_failed_rung_without_budget_stops(self) -> None:
         gates = {
@@ -601,10 +566,59 @@ class AnalysisToolLoopTest(unittest.TestCase):
         shutil.rmtree(self.run_dir, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.run_dir, True)
 
+    def test_analysis_accepts_a_fenced_answer_with_a_preamble(self) -> None:
+        # Observed 2026-09-29 (twice): the model prefixed a sentence and wrapped
+        # the mapping in a ```yaml fence, and the whole analysis was discarded.
+        state = _base_state(self.run_id, workload_spec={"name": "depthconv"})
+        llm = _ToolUsingLlm(
+            "Here is the analysis.\n\n```yaml\n" + self.ANALYSIS_YAML + "```\n",
+            "benchmarks/embench-iot/src/depthconv/depthconv.c",
+        )
+        with mock.patch.object(llm_step, "_llm", lambda state: llm):
+            result = analysis.analyze_workload(state)
+        self.assertIn("hot_function: depthconv", result["workload_analysis"])
+        self.assertTrue(result["gates"]["analysis"]["ok"])
+        self.assertEqual(result["gates"]["analysis"]["next"], "design_contract")
+
+    def test_an_unparseable_analysis_is_repaired_not_handed_on_as_empty(self) -> None:
+        # The empty mapping used to reach every later stage as "{}".
+        state = _base_state(self.run_id, workload_spec={"name": "depthconv"})
+        llm = _ToolUsingLlm("I could not produce YAML this time.", "unused")
+        with mock.patch.object(llm_step, "_llm", lambda state: llm):
+            result = analysis.analyze_workload(state)
+        gate = result["gates"]["analysis"]
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["next"], "analyze_workload")
+        self.assertEqual(result["stage_jobs"], "analyze_workload")
+        self.assertEqual(result["answer_repairs_used"], 1)
+        self.assertIn("did not deliver a valid YAML mapping", " ".join(gate["problems"]))
+        # The repair feedback quotes what the model actually sent.
+        self.assertIn("could not produce YAML", " ".join(gate["problems"]))
+        self.assertEqual(result["workload_analysis"].strip(), "{}")
+        self.assertEqual(
+            graph._route_after_analysis({**state, "gates": result["gates"]}),
+            "analyze_workload",
+        )
+
+    def test_an_unparseable_analysis_blocks_the_run_when_repairs_are_spent(self) -> None:
+        state = _base_state(self.run_id, workload_spec={"name": "depthconv"},
+                            max_answer_repairs=0)
+        llm = _ToolUsingLlm("still not YAML", "unused")
+        with mock.patch.object(llm_step, "_llm", lambda state: llm):
+            result = analysis.analyze_workload(state)
+        gate = result["gates"]["analysis"]
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["next"], "review_and_route")
+        self.assertEqual(result["stopped_at"], "analysis")
+        self.assertEqual(
+            graph._route_after_analysis({**state, "gates": result["gates"]}),
+            "review_and_route",
+        )
+
     def test_analysis_offers_observation_tool_for_applied_profile_id(self) -> None:
         ident = "obs_loop_517c0167_md5_3"
         state = _base_state(
-            "gate-analysis-lookup-00000000",
+            self.run_id,
             benchmark_name="md5sum",
             benchmark_project={"kind": "embench_benchmark", "benchmark": "md5sum"},
             observation_report={"applied": [ident], "points": [{
@@ -626,8 +640,8 @@ class AnalysisToolLoopTest(unittest.TestCase):
                     "result": answer, "ok": True,
                 },), tool_rounds=1)
         llm = LookupLlm(self.ANALYSIS_YAML, "unused")
-        with mock.patch.object(graph, "_llm", lambda state: llm):
-            result = graph.analyze_workload(state)
+        with mock.patch.object(llm_step, "_llm", lambda state: llm):
+            result = analysis.analyze_workload(state)
         self.assertEqual(result["tool_calls"][0]["tool"], "inspect_observation")
 
     def test_analysis_records_tool_calls_and_parses_the_answer(self) -> None:
@@ -639,8 +653,8 @@ class AnalysisToolLoopTest(unittest.TestCase):
         llm = _ToolUsingLlm(
             self.ANALYSIS_YAML, "benchmarks/embench-iot/src/depthconv/depthconv.c"
         )
-        with mock.patch.object(graph, "_llm", lambda state: llm):
-            result = graph.analyze_workload(state)
+        with mock.patch.object(llm_step, "_llm", lambda state: llm):
+            result = analysis.analyze_workload(state)
         self.assertEqual(len(result["tool_calls"]), 1)
         self.assertEqual(result["tool_calls"][0]["tool"], "read_file")
         # The answer is parsed as analysis YAML, not treated as a patch.
@@ -653,7 +667,7 @@ class AnalysisToolLoopTest(unittest.TestCase):
         self.assertEqual(data["call_count"], 1)
         self.assertEqual(data["calls"][0]["tool"], "read_file")
 
-    def test_analysis_tool_loop_degrades_when_the_endpoint_rejects_tools(self) -> None:
+    def test_analysis_tool_loop_fails_closed_when_the_endpoint_rejects_tools(self) -> None:
         class _NoToolsLlm:
             available = True
             config_name = "no-tools"
@@ -674,11 +688,9 @@ class AnalysisToolLoopTest(unittest.TestCase):
                 raise RuntimeError("tools not supported")
 
         state = _base_state(self.run_id, workload_spec={"name": "x"})
-        with mock.patch.object(graph, "_llm", lambda state: _NoToolsLlm(self.ANALYSIS_YAML)):
-            result = graph.analyze_workload(state)
-        # The step degrades to a plain completion and the failure is auditable.
-        self.assertEqual(result["tool_calls"], [])
-        self.assertIn("hot_function: depthconv", result["workload_analysis"])
+        with mock.patch.object(llm_step, "_llm", lambda state: _NoToolsLlm(self.ANALYSIS_YAML)):
+            with self.assertRaisesRegex(RuntimeError, "tools not supported"):
+                analysis.analyze_workload(state)
         log = self.run_dir / "07_analysis/analysis_tool_calls.yaml"
         self.assertTrue(log.is_file())
         self.assertIn("tool loop failed", log.read_text())
@@ -704,10 +716,10 @@ class SoftwareRetryBreakerTest(unittest.TestCase):
 
     def test_directive_fires_only_for_identical_consecutive_attempts(self) -> None:
         identical = {"sw_attempts": [{"response_hash": "a", "error_hash": "b"}] * 2}
-        self.assertIn("REPEATED IDENTICAL ATTEMPT", graph.software_stuck_directive(identical))
-        self.assertEqual(graph.software_stuck_directive({"sw_attempts": []}), "")
+        self.assertIn("REPEATED IDENTICAL ATTEMPT", feedback_mod.software_stuck_directive(identical))
+        self.assertEqual(feedback_mod.software_stuck_directive({"sw_attempts": []}), "")
         self.assertEqual(
-            graph.software_stuck_directive(
+            feedback_mod.software_stuck_directive(
                 {"sw_attempts": [{"response_hash": "a", "error_hash": "b"}]}
             ),
             "",
@@ -718,7 +730,142 @@ class SoftwareRetryBreakerTest(unittest.TestCase):
                 {"response_hash": "c", "error_hash": "b"},
             ]
         }
-        self.assertEqual(graph.software_stuck_directive(changed), "")
+        self.assertEqual(feedback_mod.software_stuck_directive(changed), "")
+
+    def test_software_uses_read_only_stage_tools_and_records_them(self) -> None:
+        target = (
+            f"agents/generated/runs/{self.run_id}/workspace/embench_depthconv/cfu/"
+            "src/depthconv.c"
+        )
+        body = "#ifdef USE_AGENT_CFU\nint kernel(void){ return 0; }\n#endif\n"
+        patch = (
+            "EDIT_BEGIN\n"
+            f"PATH: {target}\n"
+            "SEARCH\n"
+            "int kernel(void){ return 0; }\n"
+            "REPLACE\n"
+            "int kernel(void){ return cfu_compute(1, 2); }\n"
+            "EDIT_END"
+        )
+        state = self._state()
+        state.update({"agent_tools": True, "apply_patch": True})
+        llm = _ToolUsingLlm(patch, target)
+        with mock.patch.object(services, "_software_targets", return_value=[(target, body)]), \
+                mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=""), \
+                mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
+                mock.patch.object(llm_step, "_llm", lambda s: llm):
+            result = impl_sw.implement_sw(state)
+        self.assertEqual(result["tool_calls"][0]["tool"], "read_file")
+        self.assertEqual(result["gates"]["implementation_sw"]["tool_calls"], 1)
+        log = self.run_dir / "09_implementation/sw_tool_calls.yaml"
+        self.assertTrue(log.is_file())
+        self.assertIn("read_file", log.read_text())
+
+    def test_software_coding_tools_are_capability_gated_and_do_not_set_sw_build(self) -> None:
+        target = (
+            f"agents/generated/runs/{self.run_id}/workspace/embench_depthconv/cfu/"
+            "src/depthconv.c"
+        )
+        path = REPO_ROOT / target
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("int kernel(void){ return 0; }\n")
+
+        class CodingLlm(_ToolUsingLlm):
+            def complete_with_tools(self, system, user, *, tools, tool_runner, **kwargs):
+                names = [item["function"]["name"] for item in tools]
+                assert "edit_software" in names, names
+                edit = tool_runner("edit_software", {
+                    "path": target,
+                    "search": "int kernel(void){ return 0; }",
+                    "replace": "int kernel(void){ return cfu_compute(1, 2); }",
+                })
+                assert "Agent" not in edit  # only bounded diff/result text
+                check = tool_runner("check_software_compile", {})
+                return LlmResult(
+                    "EDIT_BEGIN\nPATH: " + target + "\nSEARCH\nint kernel(void){ return 0; }\n"
+                    "REPLACE\nint kernel(void){ return cfu_compute(1, 2); }\nEDIT_END",
+                    used_llm=True,
+                    tool_calls=(
+                        {"round": 1, "name": "edit_software", "arguments": {}, "result": edit, "ok": True},
+                        {"round": 2, "name": "check_software_compile", "arguments": {}, "result": check, "ok": True},
+                    ),
+                )
+
+        state = self._state()
+        state.update({"agent_tools": True, "apply_patch": True, "run_commands": True, "dry_run": False})
+        check_result = {"returncode": 0, "full_log_path": "check.log"}
+        with mock.patch.object(services, "_software_targets", return_value=[(target, path.read_text())]), \
+                mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=""), \
+                mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
+                mock.patch.object(commands, "_isolated_software_check_commands", return_value=[["fake"]]), \
+                mock.patch.object(checks, "_run_check", return_value=check_result) as check, \
+                mock.patch.object(llm_step, "_llm", lambda s: CodingLlm("", target)):
+            result = impl_sw.implement_sw(state)
+        check.assert_called_once()
+        self.assertTrue(result["gates"]["implementation_sw"]["ok"])
+        self.assertNotIn("sw_build", result["gates"])
+        self.assertIn("cfu_compute", path.read_text())
+
+    def test_software_repair_requires_diagnosis_before_editing(self) -> None:
+        target = (
+            f"agents/generated/runs/{self.run_id}/workspace/embench_depthconv/cfu/"
+            "src/depthconv.c"
+        )
+        path = REPO_ROOT / target
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("int kernel(void){ return 0; }\n")
+
+        class RepairLlm(_ToolUsingLlm):
+            def complete_with_tools(self, system, user, *, tools, tool_runner, **kwargs):
+                names = [item["function"]["name"] for item in tools]
+                assert "submit_repair_diagnosis" in names, names
+                assert "edit_software" in names, names
+                locked = tool_runner("edit_software", {
+                    "path": target, "search": "int kernel(void){ return 0; }", "replace": "int kernel(void){ return 1; }",
+                })
+                assert "diagnosis" in locked
+                failure_ids = next(
+                    item["function"]["parameters"]["properties"]["failure_ids"]
+                    for item in tools if item["function"]["name"] == "submit_repair_diagnosis"
+                )
+                del failure_ids  # schema presence is the contract; use known state ID below
+                diagnosis = tool_runner("submit_repair_diagnosis", {
+                    "failure_ids": ["fail_sw"], "observed_errors": ["compile error"],
+                    "root_cause": "scalar placeholder", "repair_mapping": ["call CFU"],
+                    "regression_risks": ["result semantics"],
+                })
+                assert "accepted" in diagnosis
+                edit = tool_runner("edit_software", {
+                    "path": target, "search": "int kernel(void){ return 0; }", "replace": "int kernel(void){ return cfu_compute(1, 2); }",
+                })
+                return LlmResult(
+                    "EDIT_BEGIN\nPATH: " + target + "\nSEARCH\nreturn 0;\nREPLACE\n"
+                    "return cfu_compute(1, 2);\nEDIT_END",
+                    used_llm=True,
+                    tool_calls=({"round": 1, "name": "edit_software", "arguments": {}, "result": edit, "ok": True},),
+                )
+        state = self._state()
+        state.update({
+            "agent_tools": True, "apply_patch": True, "run_commands": True, "dry_run": False,
+            "validation_results": [{
+                "rung": "sw_build", "returncode": 1, "stderr_tail": "error",
+                "failure_observation": {
+                    "schema_version": "1", "id": "fail_sw", "rung": "sw_build",
+                    "category": "compile", "command": "make", "cwd": str(REPO_ROOT),
+                    "returncode": 1, "timed_out": False, "summary": "compile error",
+                    "source_locations": [], "signature": "failure-v1:" + "0" * 64,
+                    "log_path": "",
+                },
+            }],
+        })
+        with mock.patch.object(services, "_software_targets", return_value=[(target, path.read_text())]), \
+                mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=""), \
+                mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
+                mock.patch.object(commands, "_isolated_software_check_commands", return_value=[["fake"]]), \
+                mock.patch.object(llm_step, "_llm", lambda s: RepairLlm("", target)):
+            result = impl_sw.implement_sw(state)
+        self.assertTrue(result["gates"]["implementation_sw"]["ok"], result["gates"]["implementation_sw"])
+        self.assertIsInstance(result["gates"]["implementation_sw"]["repair_diagnosis"], dict)
 
     def test_repeated_identical_answers_get_a_strategy_directive(self) -> None:
         class _RecordingLlm(_FakeLlm):
@@ -732,8 +879,8 @@ class SoftwareRetryBreakerTest(unittest.TestCase):
 
         llm = _RecordingLlm("just a plan; no delivery block")
         state = self._state()
-        with mock.patch.object(graph, "_llm", lambda s: llm):
-            first = graph.implement_sw(state)
+        with mock.patch.object(llm_step, "_llm", lambda s: llm):
+            first = impl_sw.implement_sw(state)
         self.assertEqual(len(first["sw_attempts"]), 1)
         gate = first["gates"]["implementation_sw"]
         self.assertTrue(gate["response_hash"])
@@ -741,8 +888,8 @@ class SoftwareRetryBreakerTest(unittest.TestCase):
         self.assertNotIn("REPEATED IDENTICAL ATTEMPT", llm.prompts[0])
 
         state2 = {**state, **first}
-        with mock.patch.object(graph, "_llm", lambda s: llm):
-            second = graph.implement_sw(state2)
+        with mock.patch.object(llm_step, "_llm", lambda s: llm):
+            second = impl_sw.implement_sw(state2)
         # Only one prior attempt exists, so the second try is not yet flagged.
         self.assertNotIn("REPEATED IDENTICAL ATTEMPT", llm.prompts[1])
 
@@ -751,8 +898,8 @@ class SoftwareRetryBreakerTest(unittest.TestCase):
             **second,
             "sw_attempts": [*first["sw_attempts"], *second["sw_attempts"]],
         }
-        with mock.patch.object(graph, "_llm", lambda s: llm):
-            graph.implement_sw(state3)
+        with mock.patch.object(llm_step, "_llm", lambda s: llm):
+            impl_sw.implement_sw(state3)
         self.assertIn("REPEATED IDENTICAL ATTEMPT", llm.prompts[2])
 
 
@@ -770,7 +917,7 @@ class SimAttributionTest(unittest.TestCase):
         results = [
             {"returncode": 1, "parsed": parse_command_output(log), "stdout_tail": log, "stderr_tail": ""}
         ]
-        text = graph.sim_attribution(results, log)
+        text = feedback_mod.sim_attribution(results, log)
         self.assertIn("verify failed for depthconv", text)
         self.assertIn("verify_benchmark returned 0", text)
         self.assertIn("wrong-result", text)
@@ -778,11 +925,11 @@ class SimAttributionTest(unittest.TestCase):
     def test_fail_symbol_without_the_diagnostic_is_still_attributed(self) -> None:
         log = "SimFailure: Software reached the fail symbol :("
         results = [{"returncode": 1, "stdout_tail": log, "stderr_tail": ""}]
-        self.assertIn("fail symbol", graph.sim_attribution(results, log))
+        self.assertIn("fail symbol", feedback_mod.sim_attribution(results, log))
 
     def test_timeout_is_attributed_to_a_hang(self) -> None:
         results = [{"returncode": -9, "timed_out": True, "stdout_tail": "", "stderr_tail": ""}]
-        self.assertIn("timed out", graph.sim_attribution(results, ""))
+        self.assertIn("timed out", feedback_mod.sim_attribution(results, ""))
 
     def test_passing_sim_with_a_speedup_failure_has_no_attribution(self) -> None:
         # Regression: verify PASS + rc 0 means correctness held; the remaining
@@ -798,14 +945,14 @@ class SimAttributionTest(unittest.TestCase):
         results = [
             {"returncode": 0, "parsed": parse_command_output(log), "stdout_tail": log, "stderr_tail": ""}
         ]
-        self.assertEqual(graph.sim_attribution(results, log), "")
+        self.assertEqual(feedback_mod.sim_attribution(results, log), "")
 
     def test_sim_feedback_puts_the_attribution_with_the_log(self) -> None:
         state = {
             "gates": {"sim": {"attribution": "ATTRIBUTION_TEXT"}},
             "validation_results": [],
         }
-        text = graph.sim_feedback(state)
+        text = feedback_mod.sim_feedback(state)
         self.assertIn("ATTRIBUTION_TEXT", text)
         self.assertIn("sim (simulation) errors", text)
 
@@ -815,7 +962,7 @@ class SimAttributionTest(unittest.TestCase):
                 "sim": {
                     "attribution": "ATTRIBUTION_TEXT",
                     "repair_decision": {
-                        "target": "implement_hw",
+                        "target": "implement",
                         "root_cause": "the CFU never returns a response",
                         "source": "llm",
                     },
@@ -823,501 +970,19 @@ class SimAttributionTest(unittest.TestCase):
             },
             "validation_results": [],
         }
-        text = graph.sim_feedback(state)
-        self.assertIn("assigned this failure to implement_hw", text)
+        text = feedback_mod.sim_feedback(state)
+        self.assertIn("assigned this failure to implement", text)
         self.assertIn("never returns a response", text)
         # A deterministic decision is bookkeeping, not a diagnosis to inject.
         fallback = {
             "gates": {
                 "sim": {
-                    "repair_decision": {"target": "implement_sw", "source": "fallback", "reason": "x"}
+                    "repair_decision": {"target": "implement", "source": "fallback", "reason": "x"}
                 }
             },
             "validation_results": [],
         }
-        self.assertNotIn("assigned this failure", graph.sim_feedback(fallback))
-
-
-class RepairRoutingTest(unittest.TestCase):
-    """A failed simulation is routed by the agent, not by a fixed software first."""
-
-    def setUp(self) -> None:
-        self.run_id = "gate-repair-00000000"
-        self.run_dir = REPO_ROOT / f"agents/generated/runs/{self.run_id}"
-        shutil.rmtree(self.run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, self.run_dir, True)
-
-    def _state(self, **overrides) -> dict:
-        fields = {
-            "workload_spec": {"name": "depthconv", "benchmark_name": "depthconv"},
-            "benchmark_project": {"benchmark": "depthconv", "kind": "embench_benchmark"},
-            "isa_spec": {},
-            "repair_routing": "auto",
-        }
-        fields.update(overrides)
-        return _base_state(self.run_id, **fields)
-
-    def _choose(self, state: dict, text: str) -> tuple[str, dict, str]:
-        with mock.patch.object(graph, "_llm", lambda s: _UsedLlm(text)):
-            return graph._choose_repair_target(
-                state, attribution="verify failed for depthconv", sim_text="log", results=[]
-            )
-
-    def test_the_llm_may_route_the_repair_to_hardware(self) -> None:
-        target, decision, raw = self._choose(
-            self._state(),
-            '{"repair_target": "implement_hw", "root_cause": "CFU returns the wrong lane", '
-            '"reason": "the datapath signedness is wrong"}',
-        )
-        self.assertEqual(target, "implement_hw")
-        self.assertEqual(decision["source"], "llm")
-        self.assertIn("wrong lane", decision["root_cause"])
-        self.assertTrue(raw)
-        self.assertTrue((REPO_ROOT / raw).exists())
-
-    def test_the_llm_may_route_the_repair_to_software(self) -> None:
-        target, decision, raw = self._choose(
-            self._state(),
-            '{"repair_target": "implement_sw", "root_cause": "packing is wrong", '
-            '"reason": "the kernel offsets are wrong"}',
-        )
-        self.assertEqual(target, "implement_sw")
-        self.assertEqual(decision["source"], "llm")
-        self.assertTrue(raw)
-
-    def test_an_unusable_answer_falls_back_to_the_escalation(self) -> None:
-        target, decision, _ = self._choose(self._state(), '{"repair_target": "implement_ql"}')
-        self.assertEqual(target, "implement_sw")
-        self.assertEqual(decision["source"], "fallback")
-        # With one simulation repair already spent the escalation moves on to the
-        # hardware, and the router must record that as its advisory.
-        target, decision, _ = self._choose(
-            self._state(attempts={"sim": 1}), "not even json"
-        )
-        self.assertEqual(target, "implement_hw")
-        self.assertEqual(decision["advisory"], "implement_hw")
-
-    def test_a_broken_router_never_breaks_the_ladder(self) -> None:
-        def _boom(*args, **kwargs):
-            raise RuntimeError("gateway exploded")
-
-        with mock.patch.object(graph, "_complete_llm", _boom):
-            target, decision, raw = graph._choose_repair_target(
-                self._state(attempts={"sim": 1}), attribution="", sim_text="", results=[]
-            )
-        self.assertEqual(target, "implement_hw")
-        self.assertEqual(decision["source"], "fallback")
-        self.assertIn("gateway exploded", decision["reason"])
-        self.assertEqual(raw, "")
-
-    def test_fixed_mode_never_calls_the_llm(self) -> None:
-        def _boom(_state):  # pragma: no cover - must not run
-            raise AssertionError("fixed mode must not consult the model")
-
-        with mock.patch.object(graph, "_llm", _boom):
-            target, decision, raw = graph._choose_repair_target(
-                self._state(repair_routing="fixed"), attribution="", sim_text="", results=[]
-            )
-        self.assertEqual(target, "implement_sw")
-        self.assertEqual(decision["source"], "fixed")
-        self.assertEqual(raw, "")
-
-    def test_prefixed_profile_passes_sim_gate_with_measured_speedup(self) -> None:
-        from agents.cfu_design_agent.runtime.tools import parse_command_output
-
-        log = (
-            "[info] CFU_AGENT_PROFILE depthconv=900\n"
-            "[info] EMBENCH_VERIFY_PASS benchmark=depthconv verify=1 result=0\n"
-        )
-        state = self._state(
-            run_commands=True,
-            dry_run=False,
-            max_iters=1,
-            benchmark_project={"benchmark": "depthconv", "kind": "embench_benchmark", "verification": "bench_verify"},
-            embench_profiles={"reference": {"depthconv": {"cycles": 1000}}},
-            changed_design_files=["src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"],
-            gates={},
-        )
-        passed = {
-            "command": "fake-sim", "returncode": 0,
-            "parsed": parse_command_output(log), "stdout_tail": log, "stderr_tail": "",
-        }
-        with mock.patch.object(graph, "_toolbox_for_stage", lambda s, stage: object()), \
-                mock.patch.object(graph, "_software_sim_commands", lambda s, tb: [["fake-sim"]]), \
-                mock.patch.object(graph, "_run_check", lambda *a, **k: passed):
-            update = graph.simulate(state)
-        gate = update["gates"]["sim"]
-        self.assertTrue(gate["ok"])
-        self.assertEqual(gate["reference_cycles"], 1000)
-        self.assertEqual(gate["cfu_cycles"], 900)
-        self.assertEqual(gate["speedup_x100"], 111)
-        self.assertEqual(gate["next"], "estimate_cost")
-
-    def test_simulate_records_and_follows_the_agent_decision(self) -> None:
-        from agents.cfu_design_agent.runtime.tools import parse_command_output
-
-        log = (
-            "EMBENCH_VERIFY_FAIL benchmark=depthconv verify=0 result=0\n"
-            "SimFailure: Software reached the fail symbol :(\n"
-        )
-        state = self._state(
-            run_commands=True,
-            dry_run=False,
-            max_iters=2,
-            embench_profiles={"reference": {"depthconv": {"cycles": 1000}}},
-            changed_design_files=["src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"],
-            gates={},
-        )
-        failure = {
-            "command": "fake-sim",
-            "returncode": 1,
-            "parsed": parse_command_output(log),
-            "stdout_tail": log,
-            "stderr_tail": "",
-        }
-        with mock.patch.object(graph, "_toolbox_for_stage", lambda s, stage: object()), \
-                mock.patch.object(graph, "_software_sim_commands", lambda s, tb: [["fake-sim"]]), \
-                mock.patch.object(graph, "_run_check", lambda *a, **k: failure), \
-                mock.patch.object(graph, "_llm", lambda s: _UsedLlm(
-                    '{"repair_target": "implement_hw", "root_cause": "missing response", '
-                    '"reason": "the transaction never completes"}'
-                )):
-            update = graph.simulate(state)
-        gate = update["gates"]["sim"]
-        self.assertFalse(gate["ok"])
-        self.assertEqual(gate["repair_decision"]["target"], "implement_hw")
-        self.assertEqual(gate["next"], "implement_hw")
-        self.assertEqual(update["stage_jobs"], "implement_hw")
-        self.assertTrue(
-            (self.run_dir / "10_validation/sim_repair_decision.yaml").exists()
-        )
-        self.assertTrue(
-            any("Repair routing chose implement_hw" in line for line in update["iteration_history"])
-        )
-
-    def test_simulate_stays_deterministic_in_fixed_mode(self) -> None:
-        from agents.cfu_design_agent.runtime.tools import parse_command_output
-
-        log = "EMBENCH_VERIFY_FAIL benchmark=depthconv verify=0 result=0\n"
-        state = self._state(
-            run_commands=True,
-            dry_run=False,
-            max_iters=2,
-            repair_routing="fixed",
-            embench_profiles={"reference": {"depthconv": {"cycles": 1000}}},
-            changed_design_files=["src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"],
-            gates={},
-        )
-        failure = {
-            "command": "fake-sim",
-            "returncode": 1,
-            "parsed": parse_command_output(log),
-            "stdout_tail": log,
-            "stderr_tail": "",
-        }
-
-        def _boom(_state):  # pragma: no cover - must not run
-            raise AssertionError("fixed mode must not consult the model")
-
-        with mock.patch.object(graph, "_toolbox_for_stage", lambda s, stage: object()), \
-                mock.patch.object(graph, "_software_sim_commands", lambda s, tb: [["fake-sim"]]), \
-                mock.patch.object(graph, "_run_check", lambda *a, **k: failure), \
-                mock.patch.object(graph, "_llm", _boom):
-            update = graph.simulate(state)
-        gate = update["gates"]["sim"]
-        self.assertEqual(gate["repair_decision"]["source"], "fixed")
-        self.assertEqual(gate["next"], "implement_sw")
-
-
-class SoftwareChangeRoutingTest(unittest.TestCase):
-    """After the hardware is built the agent may keep a kernel that already drives it."""
-
-    ISA = {
-        "spec_version": "1",
-        "identity": {"name": "depthconv_cfu", "opcode": "custom0 (0x0B)", "function_id_width": 3},
-        "commands": [
-            {
-                "function_id": 1,
-                "name": "compute",
-                "operand": "a0,a1",
-                "result": "a0",
-                "semantics": "depthwise convolution step",
-                "response": "value",
-            }
-        ],
-    }
-    SCALAR_KERNEL = "int kernel(void) { return 7; }\n"
-    CFU_KERNEL = "int kernel(void) { return cfu_compute(1, 2); }\n"
-
-    def setUp(self) -> None:
-        self.run_id = "gate-swroute-00000000"
-        self.run_dir = REPO_ROOT / f"agents/generated/runs/{self.run_id}"
-        shutil.rmtree(self.run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, self.run_dir, True)
-
-    def _kernel_path(self) -> "Path":
-        from pathlib import Path
-
-        return (
-            REPO_ROOT
-            / f"agents/generated/runs/{self.run_id}/workspace/embench_depthconv/cfu/src/depthconv.c"
-        )
-
-    def _write_kernel(self, body: str) -> None:
-        path = self._kernel_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body)
-
-    def _state(self, **overrides) -> dict:
-        fields = {
-            "workload_spec": {"name": "depthconv", "benchmark_name": "depthconv"},
-            "benchmark_project": {"benchmark": "depthconv", "kind": "embench_benchmark"},
-            "isa_spec": self.ISA,
-            "software_change": "auto",
-            "run_commands": True,
-            "dry_run": False,
-            "gates": {},
-        }
-        fields.update(overrides)
-        return _base_state(self.run_id, **fields)
-
-    def _choose(self, state: dict, text: str) -> tuple[bool, dict, str]:
-        with mock.patch.object(graph, "_llm", lambda s: _UsedLlm(text)):
-            return graph._choose_software_change(
-                state, graph._toolbox_for_stage(state, "implementation")
-            )
-
-    def test_a_kernel_without_a_cfu_call_forces_the_software_rung(self) -> None:
-        self._write_kernel(self.SCALAR_KERNEL)
-
-        def _boom(_state):  # pragma: no cover - the guard must answer first
-            raise AssertionError("a kernel that does not drive the CFU needs no router call")
-
-        with mock.patch.object(graph, "_llm", _boom):
-            reuse, decision, raw = graph._choose_software_change(
-                self._state(), graph._toolbox_for_stage(self._state(), "implementation")
-            )
-        self.assertFalse(reuse)
-        self.assertEqual(decision["source"], "guard")
-        self.assertIn("does not call any CFU datapath intrinsic", decision["reason"])
-        self.assertEqual(raw, "")
-
-    def test_the_agent_may_reuse_a_kernel_that_already_drives_the_cfu(self) -> None:
-        self._write_kernel(self.CFU_KERNEL)
-        reuse, decision, raw = self._choose(
-            self._state(), '{"software_change": "not_required", "reason": "the ABI is unchanged"}'
-        )
-        self.assertTrue(reuse)
-        self.assertEqual(decision["source"], "llm")
-        self.assertEqual(decision["software_change"], "not_required")
-        self.assertTrue(decision["calls"])
-        self.assertEqual(decision["calls"][0]["name"], "cfu_compute")
-        self.assertTrue(raw)
-
-    def test_required_answer_keeps_the_software_rung(self) -> None:
-        self._write_kernel(self.CFU_KERNEL)
-        reuse, decision, raw = self._choose(
-            self._state(), '{"software_change": "required", "reason": "the kernel must call the new command"}'
-        )
-        self.assertFalse(reuse)
-        self.assertEqual(decision["source"], "llm")
-        self.assertEqual(decision["software_change"], "required")
-        self.assertTrue(raw)
-
-    def test_an_unusable_answer_falls_back_to_the_software_rung(self) -> None:
-        self._write_kernel(self.CFU_KERNEL)
-        reuse, decision, _ = self._choose(self._state(), "sure, keep it")
-        self.assertFalse(reuse)
-        self.assertEqual(decision["source"], "fallback")
-        self.assertIn("usable software_change", decision["reason"])
-
-    def test_always_pins_the_software_rung(self) -> None:
-        self._write_kernel(self.CFU_KERNEL)
-
-        def _boom(_state):  # pragma: no cover - `always` never consults the model
-            raise AssertionError("--software-change always must not call the router")
-
-        state = self._state(software_change="always")
-        with mock.patch.object(graph, "_llm", _boom):
-            reuse, decision, raw = graph._choose_software_change(
-                state, graph._toolbox_for_stage(state, "implementation")
-            )
-        self.assertFalse(reuse)
-        self.assertEqual(decision["source"], "fixed")
-        self.assertEqual(raw, "")
-
-    def test_a_changed_isa_contract_forces_the_software_rung(self) -> None:
-        self._write_kernel(self.CFU_KERNEL)
-        state = self._state(
-            gates={"implementation_sw": {"ok": True, "applied": True, "isa_hash": "0000000000000000"}}
-        )
-
-        def _boom(_state):  # pragma: no cover - a moved ABI is not a judgement call
-            raise AssertionError("a changed ISA contract must not be routed by the model")
-
-        with mock.patch.object(graph, "_llm", _boom):
-            reuse, decision, _ = graph._choose_software_change(
-                state, graph._toolbox_for_stage(state, "implementation")
-            )
-        self.assertFalse(reuse)
-        self.assertEqual(decision["source"], "guard")
-        self.assertIn("ISA contract changed", decision["reason"])
-
-    def test_a_matching_isa_digest_allows_reuse(self) -> None:
-        self._write_kernel(self.CFU_KERNEL)
-        state = self._state()
-        current = graph._isa_digest(state)
-        state = self._state(
-            gates={"implementation_sw": {"ok": True, "applied": True, "isa_hash": current}}
-        )
-        reuse, decision, _ = self._choose(
-            state, '{"software_change": "not_required", "reason": "same contract"}'
-        )
-        self.assertTrue(reuse)
-        self.assertEqual(decision["source"], "llm")
-
-    def test_harness_counter_calls_are_not_datapath_evidence(self) -> None:
-        # The generated benchmark wrapper always calls cfu_agent_counter_read();
-        # that reports cycles and must not make an untouched kernel look
-        # accelerated.
-        self._write_kernel(
-            '#include "cfu_agent_counter.h"\n'
-            "int kernel(void) { cfu_agent_counter_read(); return 7; }\n"
-        )
-        state = self._state()
-        toolbox = graph._toolbox_for_stage(state, "implementation")
-        targets = graph._software_targets(state, toolbox)
-        self.assertFalse(graph._software_exercises_cfu(state, toolbox, targets)[0])
-        self.assertFalse(graph._software_reuse_evidence(state, toolbox)[0])
-
-    def test_control_intrinsic_named_like_a_helper_does_not_count(self) -> None:
-        self._write_kernel("int kernel(void) { return cfu_enable(); }\n")
-        isa = {
-            **self.ISA,
-            "commands": [
-                {
-                    "function_id": 2,
-                    "name": "enable",
-                    "operand": "a0",
-                    "result": "a0",
-                    "semantics": "declared by this contract",
-                    "response": "value",
-                }
-            ],
-        }
-        state = self._state(isa_spec=isa)
-        toolbox = graph._toolbox_for_stage(state, "implementation")
-        targets = graph._software_targets(state, toolbox)
-        self.assertFalse(graph._software_exercises_cfu(state, toolbox, targets)[0])
-
-    def test_a_broken_router_never_breaks_the_ladder(self) -> None:
-        self._write_kernel(self.CFU_KERNEL)
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("gateway exploded")
-
-        with mock.patch.object(graph, "_complete_llm", _boom):
-            reuse, decision, raw = graph._choose_software_change(
-                self._state(), graph._toolbox_for_stage(self._state(), "implementation")
-            )
-        self.assertFalse(reuse)
-        self.assertEqual(decision["source"], "fallback")
-        self.assertIn("gateway exploded", decision["reason"])
-        self.assertEqual(raw, "")
-
-    def _generate(self, state: dict, decision: tuple) -> dict:
-        with mock.patch.object(graph, "_missing_design_files", lambda s: []), \
-                mock.patch.object(graph, "agent_cfu_overlay_commands", lambda s, isa: [["fake-gen"]]), \
-                mock.patch.object(graph, "_run_check", lambda *a, **k: {"returncode": 0, "command": "fake-gen"}), \
-                mock.patch.object(graph, "_soc_rtl_path", lambda s: None), \
-                mock.patch.object(graph, "_choose_software_change", lambda s, tb: decision), \
-                mock.patch.object(graph, "_write_intrinsics_header", lambda s, tb: "kernel/include/cfu_intrinsics.h"):
-            return graph.generate_soc(state)
-
-    def test_generate_soc_skips_to_the_software_build_when_reusing(self) -> None:
-        self._write_kernel(self.CFU_KERNEL)
-        decision = {
-            "software_change": "not_required",
-            "reason": "the kernel already calls cfu_compute",
-            "source": "llm",
-            "evidence": "the current kernel already calls cfu_compute",
-            "files": [f"agents/generated/runs/{self.run_id}/workspace/embench_depthconv/cfu/src/depthconv.c"],
-            "calls": [{"file": "x.c", "line": 1, "name": "cfu_compute", "text": "cfu_compute(1, 2);"}],
-        }
-        update = self._generate(self._state(), (True, decision, "09_implementation/llm_raw/software_route_000.txt"))
-        gate = update["gates"]["hw_build"]
-        self.assertTrue(gate["ok"])
-        # The conformance micro-test runs before the software rung; the reuse decision
-        # is preserved and applied once conformance passes.
-        self.assertEqual(gate["next"], "check_conformance")
-        self.assertEqual(
-            graph._route_after_hw_conformance({"gates": update["gates"]}), "build_sw"
-        )
-        self.assertEqual(gate["software_decision"]["software_change"], "not_required")
-        sw_gate = update["gates"]["implementation_sw"]
-        self.assertTrue(sw_gate["ok"])
-        self.assertTrue(sw_gate["reused"])
-        self.assertFalse(sw_gate["skipped"])
-        self.assertTrue(sw_gate["intrinsics_header"])
-        self.assertIn("reused unchanged", update["implementation_sw_summary"])
-        self.assertEqual(update["llm_raw_outputs"], ["09_implementation/llm_raw/software_route_000.txt"])
-        history = "\n".join(update["iteration_history"])
-        self.assertIn("Generated the SoC from the agent design.", history)
-        self.assertIn("Software reused unchanged", history)
-        self.assertTrue((self.run_dir / "09_implementation/software_decision.yaml").exists())
-
-    def test_generate_soc_runs_the_software_rung_when_required(self) -> None:
-        decision = {
-            "software_change": "required",
-            "reason": "the kernel must be updated",
-            "source": "llm",
-            "evidence": "the current kernel already calls cfu_compute",
-            "files": [],
-            "calls": [],
-        }
-        update = self._generate(self._state(), (False, decision, ""))
-        self.assertEqual(update["gates"]["hw_build"]["next"], "check_conformance")
-        self.assertNotIn("implementation_sw", update["gates"])
-        self.assertNotIn("implementation_sw_summary", update)
-
-    def test_build_sw_compiles_the_reused_kernel(self) -> None:
-        state = self._state(
-            gates={"implementation_sw": {"ok": True, "reused": True, "files": ["k.c"]}},
-        )
-        ran: list[list[str]] = []
-
-        def _run(*args, **kwargs):
-            ran.append(list(args[2]))
-            return {"returncode": 0, "command": "fake-make"}
-
-        with mock.patch.object(graph, "_toolbox_for_stage", lambda s, stage: object()), \
-                mock.patch.object(graph, "_software_build_commands", lambda s, tb: [["fake-make"]]), \
-                mock.patch.object(graph, "_run_check", _run), \
-                mock.patch.object(graph, "_software_elf", lambda s: ""):
-            update = graph.build_sw(state)
-        self.assertTrue(update["gates"]["sw_build"]["ok"])
-        self.assertTrue(update["gates"]["sw_build"]["software_reused"])
-        self.assertEqual(ran, [["fake-make"]])
-        self.assertIn("reused software unchanged", "\n".join(update["iteration_history"]))
-        self.assertNotIn(
-            "did not apply a change", "\n".join(update["errors"])
-        )
-
-    def test_review_still_reports_complete_with_a_reused_software_gate(self) -> None:
-        state = self._state(
-            gates={
-                "workload_spec": {"ok": True},
-                "isa": {"ok": True},
-                "implementation_hw": {"ok": True},
-                "hw_build": {"ok": True},
-                "hw_conformance": {"ok": True},
-                "implementation_sw": {"ok": True, "reused": True},
-                "sw_build": {"ok": True, "software_reused": True},
-                "sim": {"ok": True},
-                "cost": {"ok": True},
-            }
-        )
-        self.assertEqual(graph._review_decision(state), ("final_report", "complete"))
+        self.assertNotIn("assigned this failure", feedback_mod.sim_feedback(fallback))
 
 
 class LoopOptimizationTest(unittest.TestCase):
@@ -1332,6 +997,7 @@ class LoopOptimizationTest(unittest.TestCase):
     def _gates(self, **overrides) -> dict:
         gates = {
             "workload_spec": {"ok": True},
+            "analysis": {"ok": True},
             "isa": {"ok": True},
             "implementation_hw": {"ok": True},
             "hw_build": {"ok": True},
@@ -1369,25 +1035,25 @@ class LoopOptimizationTest(unittest.TestCase):
 
     def test_a_round_only_counts_as_improved_when_it_is_pareto_better(self) -> None:
         base = {"speedup_x100": 200, "cost": {"cells": 1200}}
-        self.assertTrue(graph._round_improved({"speedup_x100": 250, "cost": {"cells": 1200}}, base))
-        self.assertTrue(graph._round_improved({"speedup_x100": 200, "cost": {"cells": 900}}, base))
+        self.assertTrue(flow_optimize._round_improved({"speedup_x100": 250, "cost": {"cells": 1200}}, base))
+        self.assertTrue(flow_optimize._round_improved({"speedup_x100": 200, "cost": {"cells": 900}}, base))
         # Slower, or faster but bigger: neither is an improvement.
-        self.assertFalse(graph._round_improved({"speedup_x100": 150, "cost": {"cells": 1200}}, base))
-        self.assertFalse(graph._round_improved({"speedup_x100": 250, "cost": {"cells": 1500}}, base))
-        self.assertFalse(graph._round_improved({"speedup_x100": 200, "cost": {"cells": 1200}}, base))
-        self.assertTrue(graph._round_improved({"speedup_x100": 200, "cost": {"cells": 900}}, None))
+        self.assertFalse(flow_optimize._round_improved({"speedup_x100": 150, "cost": {"cells": 1200}}, base))
+        self.assertFalse(flow_optimize._round_improved({"speedup_x100": 250, "cost": {"cells": 1500}}, base))
+        self.assertFalse(flow_optimize._round_improved({"speedup_x100": 200, "cost": {"cells": 1200}}, base))
+        self.assertTrue(flow_optimize._round_improved({"speedup_x100": 200, "cost": {"cells": 900}}, None))
 
     def _choose(self, state: dict, text: str) -> tuple[str, dict, str]:
-        with mock.patch.object(graph, "_llm", lambda s: _UsedLlm(text)):
-            return graph._choose_optimization(state, state.get("optimization_rounds") or [])
+        with mock.patch.object(llm_step, "_llm", lambda s: _UsedLlm(text)):
+            return review_optimize._choose_optimization(state, state.get("optimization_rounds") or [])
 
     def test_the_agent_may_start_another_round(self) -> None:
         target, decision, raw = self._choose(
             self._state(),
-            '{"continue": true, "target": "implement_hw", "focus": "cost", '
+            '{"continue": true, "target": "implement", "focus": "cost", '
             '"reason": "replace the vector RF with a streamed datapath"}',
         )
-        self.assertEqual(target, "implement_hw")
+        self.assertEqual(target, "implement")
         self.assertEqual(decision["source"], "llm")
         self.assertEqual(decision["focus"], "cost")
         self.assertTrue(raw)
@@ -1402,7 +1068,7 @@ class LoopOptimizationTest(unittest.TestCase):
 
     def test_spending_budget_requires_a_concrete_change(self) -> None:
         target, decision, _ = self._choose(
-            self._state(), '{"continue": true, "target": "implement_hw", "reason": ""}'
+            self._state(), '{"continue": true, "target": "implement", "reason": ""}'
         )
         self.assertEqual(target, "")
         self.assertIn("concrete change", decision["reason"])
@@ -1426,8 +1092,8 @@ class LoopOptimizationTest(unittest.TestCase):
         def _boom(*args, **kwargs):
             raise RuntimeError("gateway exploded")
 
-        with mock.patch.object(graph, "_complete_llm", _boom):
-            target, decision, raw = graph._choose_optimization(self._state(), [])
+        with mock.patch.object(llm_step, "_complete_llm", _boom):
+            target, decision, raw = review_optimize._choose_optimization(self._state(), [])
         self.assertEqual(target, "")
         self.assertEqual(decision["source"], "fallback")
         self.assertIn("gateway exploded", decision["reason"])
@@ -1437,8 +1103,8 @@ class LoopOptimizationTest(unittest.TestCase):
         def _boom(_state):  # pragma: no cover - --loop is off
             raise AssertionError("the optimizer must not be consulted without --loop")
 
-        with mock.patch.object(graph, "_llm", _boom):
-            target, decision, _ = graph._choose_optimization(
+        with mock.patch.object(llm_step, "_llm", _boom):
+            target, decision, _ = review_optimize._choose_optimization(
                 self._state(loop_optimize=False), []
             )
         self.assertEqual((target, decision), ("", {}))
@@ -1449,7 +1115,7 @@ class LoopOptimizationTest(unittest.TestCase):
         self.assertEqual(decision["source"], "budget")
 
     def test_review_records_the_baseline_round_even_without_the_loop(self) -> None:
-        update = graph.review_and_route(self._state(loop_optimize=False))
+        update = review.review_and_route(self._state(loop_optimize=False))
         rounds = update["optimization_rounds"]
         self.assertEqual(len(rounds), 1)
         self.assertEqual(rounds[0]["target"], "baseline")
@@ -1462,20 +1128,20 @@ class LoopOptimizationTest(unittest.TestCase):
 
     def test_review_starts_a_round_and_spends_budget(self) -> None:
         state = self._state()
-        with mock.patch.object(graph, "_llm", lambda s: _UsedLlm(
-            '{"continue": true, "target": "implement_sw", "focus": "cost", '
+        with mock.patch.object(llm_step, "_llm", lambda s: _UsedLlm(
+            '{"continue": true, "target": "implement", "focus": "cost", '
             '"reason": "block the loop to cut scalar traffic"}'
         )):
-            update = graph.review_and_route(state)
-        self.assertEqual(update["gates"]["review"]["next"], "implement_sw")
-        self.assertEqual(update["gates"]["review"]["decision"], "optimize:implement_sw")
+            update = review.review_and_route(state)
+        self.assertEqual(update["gates"]["review"]["next"], "implement")
+        self.assertEqual(update["gates"]["review"]["decision"], "optimize:implement")
         self.assertEqual(update["status"], "complete")
         self.assertEqual(update["repairs_used"], 1)
         self.assertEqual(update["iteration"], 1)
         self.assertEqual(update["attempts"]["optimize"], 1)
-        self.assertEqual(update["stage_jobs"], "implement_sw")
+        self.assertEqual(update["stage_jobs"], "implement")
         plan = update["optimization_plan"]
-        self.assertEqual((plan["round"], plan["target"], plan["focus"]), (1, "implement_sw", "cost"))
+        self.assertEqual((plan["round"], plan["target"], plan["focus"]), (1, "implement", "cost"))
         self.assertIn("Started optimization round 1", "\n".join(update["iteration_history"]))
         self.assertEqual(len(update["optimization_rounds"]), 1)
         self.assertTrue((self.run_dir / "12_review/optimization_rounds.yaml").is_file())
@@ -1485,7 +1151,7 @@ class LoopOptimizationTest(unittest.TestCase):
         self.assertTrue((REPO_ROOT / raw[0]).is_file())
 
     def test_review_stops_at_the_budget_and_records_why(self) -> None:
-        update = graph.review_and_route(self._state(max_iters=1))
+        update = review.review_and_route(self._state(max_iters=1))
         self.assertEqual(update["gates"]["review"]["next"], "final_report")
         self.assertEqual(update["gates"]["review"]["optimization"]["source"], "budget")
         self.assertEqual(update["optimization_plan"], {})
@@ -1496,15 +1162,15 @@ class LoopOptimizationTest(unittest.TestCase):
             raise AssertionError("an incomplete run must not be optimized")
 
         state = self._state(gates=self._gates(sim={"ok": False, "skipped": False}))
-        with mock.patch.object(graph, "_llm", _boom):
-            update = graph.review_and_route(state)
+        with mock.patch.object(llm_step, "_llm", _boom):
+            update = review.review_and_route(state)
         self.assertEqual(update["status"], "failed")
         self.assertEqual(update["gates"]["review"]["next"], "final_report")
 
     def test_the_route_reads_the_review_gate(self) -> None:
         self.assertEqual(
-            graph._route_after_review({"gates": {"review": {"next": "implement_hw"}}}),
-            "implement_hw",
+            graph._route_after_review({"gates": {"review": {"next": "implement"}}}),
+            "implement",
         )
         self.assertEqual(graph._route_after_review({"gates": {}}), "final_report")
 
@@ -1512,26 +1178,26 @@ class LoopOptimizationTest(unittest.TestCase):
         state = self._state(
             optimization_plan={
                 "round": 2,
-                "target": "implement_hw",
+                "target": "implement",
                 "focus": "cost",
                 "reason": "shrink the RF",
             }
         )
-        text = graph.optimization_directive(state)
+        text = feedback_mod.optimization_directive(state)
         self.assertIn("reduce the synthesized CFU cost", text)
         self.assertIn("shrink the RF", text)
         self.assertIn("ISA contract is frozen", text)
         self.assertIn("2.00x", text)
-        self.assertEqual(graph.optimization_directive(self._state()), "")
+        self.assertEqual(feedback_mod.optimization_directive(self._state()), "")
 
     def test_the_optimization_prompt_is_not_a_repair_prompt(self) -> None:
         from agents.cfu_design_agent.prompts import hardware_prompt, software_prompt
 
-        optimization = graph.optimization_directive(
+        optimization = feedback_mod.optimization_directive(
             self._state(
                 optimization_plan={
                     "round": 1,
-                    "target": "implement_hw",
+                    "target": "implement",
                     "focus": "performance",
                     "reason": "widen",
                 }
@@ -1549,12 +1215,12 @@ class LoopOptimizationTest(unittest.TestCase):
         rounds = [
             {"round": 0, "target": "baseline", "improved": True, "measured": True,
              "speedup_x100": 200, "cost": {"cells": 1200}, "reason": "initial ladder"},
-            {"round": 1, "target": "implement_hw", "improved": True, "measured": True,
+            {"round": 1, "target": "implement", "improved": True, "measured": True,
              "speedup_x100": 250, "cost": {"cells": 1300}, "reason": "widen the datapath"},
-            {"round": 2, "target": "implement_sw", "improved": False, "measured": True,
+            {"round": 2, "target": "implement", "improved": False, "measured": True,
              "speedup_x100": 210, "cost": {"cells": 1300}, "reason": "block the loop"},
         ]
-        report = graph.render_report(self._state(optimization_rounds=rounds))
+        report = report_mod.render_report(self._state(optimization_rounds=rounds))
         self.assertIn("## Optimization Rounds", report)
         self.assertIn("best round 1, final round 2", report)
         self.assertIn("WARNING: the final round is not the best round", report)
@@ -1566,14 +1232,14 @@ class LoopOptimizationTest(unittest.TestCase):
         rounds = [
             {"round": 0, "target": "baseline", "improved": True, "measured": True,
              "speedup_x100": 200, "cost": {"cells": 1200}, "reason": "initial ladder"},
-            {"round": 1, "target": "implement_hw", "improved": False, "measured": False,
+            {"round": 1, "target": "implement", "improved": False, "measured": False,
              "speedup_x100": 0, "cost": {}, "reason": "the SoC build failed"},
         ]
-        report = graph.render_report(self._state(optimization_rounds=rounds))
+        report = report_mod.render_report(self._state(optimization_rounds=rounds))
         # The failed round must not repeat the baseline numbers as its own.
-        self.assertIn("round 1: implement_hw not measured", report)
+        self.assertIn("round 1: implement not measured", report)
         self.assertNotIn("speedup=2.00x cells=1200 improved=False", report)
-        self.assertFalse(graph._round_improved(rounds[1], rounds[0]))
+        self.assertFalse(flow_optimize._round_improved(rounds[1], rounds[0]))
 
     def test_the_graph_step_budget_grows_with_the_iteration_budget(self) -> None:
         # The loop makes the ladder a cycle, so LangGraph's default step limit
@@ -1586,7 +1252,7 @@ class LoopOptimizationTest(unittest.TestCase):
         )
 
     def test_the_report_has_no_section_without_rounds(self) -> None:
-        self.assertNotIn("## Optimization Rounds", graph.render_report(self._state()))
+        self.assertNotIn("## Optimization Rounds", report_mod.render_report(self._state()))
 
 
 class RepairBudgetSplitTest(unittest.TestCase):
@@ -1597,21 +1263,23 @@ class RepairBudgetSplitTest(unittest.TestCase):
     """
 
     def _transition(self, state, rung, target):
-        return graph._ladder_transition(
-            state, rung, ok=False, default="implement_sw", repair_target=target
+        return ladder._ladder_transition(
+            state, rung, ok=False, default="implement",
+            repair_target="implement" if target == "check_conformance" else target,
+            repair_kind="answer" if target == "check_conformance" else None,
         )
 
     def test_answer_repair_spends_only_the_answer_pool(self) -> None:
         state = _base_state("budget-split-00000000", max_iters=2, repairs_used=1)
         update, target = self._transition(state, "hw_conformance", "check_conformance")
-        self.assertEqual(target, "check_conformance")
+        self.assertEqual(target, "implement")
         self.assertEqual(update.get("answer_repairs_used"), 1)
         self.assertNotIn("repairs_used", update)
 
     def test_answer_repair_works_with_an_exhausted_design_pool(self) -> None:
         state = _base_state("budget-split-00000001", max_iters=1, repairs_used=0)
         update, target = self._transition(state, "hw_conformance", "check_conformance")
-        self.assertEqual(target, "check_conformance")
+        self.assertEqual(target, "implement")
 
     def test_answer_pool_exhaustion_stops_with_a_named_budget(self) -> None:
         state = _base_state(
@@ -1626,8 +1294,8 @@ class RepairBudgetSplitTest(unittest.TestCase):
     def test_design_repair_still_spends_only_the_design_pool(self) -> None:
         # max_iters=3 gives the design pool 2 rounds; one is already spent.
         state = _base_state("budget-split-00000003", max_iters=3, repairs_used=1)
-        update, target = self._transition(state, "sim", "implement_hw")
-        self.assertEqual(target, "implement_hw")
+        update, target = self._transition(state, "sim", "implement")
+        self.assertEqual(target, "implement")
         self.assertEqual(update.get("repairs_used"), 2)
         self.assertNotIn("answer_repairs_used", update)
 
@@ -1640,7 +1308,7 @@ class RepairDiagnosisEnforcementTest(unittest.TestCase):
     )
 
     def test_repair_without_diagnosis_is_rejected(self) -> None:
-        outcome = graph._apply_agent_output(
+        outcome = delivery._apply_agent_output(
             {}, self.TEXT, toolbox=object(), require_diagnosis=True
         )
         self.assertFalse(outcome["applied"])
@@ -1649,14 +1317,14 @@ class RepairDiagnosisEnforcementTest(unittest.TestCase):
 
     def test_repair_with_diagnosis_passes_the_contract(self) -> None:
         text = "REPAIR_DIAGNOSIS\nObserved errors: x\n" + self.TEXT
-        outcome = graph._apply_agent_output(
+        outcome = delivery._apply_agent_output(
             {"dry_run": True}, text, toolbox=object(), require_diagnosis=True
         )
         self.assertTrue(outcome["gate_ok"])
         self.assertTrue(outcome["proposed"])
 
     def test_first_attempt_needs_no_diagnosis(self) -> None:
-        outcome = graph._apply_agent_output(
+        outcome = delivery._apply_agent_output(
             {"dry_run": True}, self.TEXT, toolbox=object(), require_diagnosis=False
         )
         self.assertTrue(outcome["gate_ok"])
@@ -1669,26 +1337,26 @@ class AttemptMemoryTest(unittest.TestCase):
     B = {"response_hash": "bbb", "error_hash": "e2", "applied": False, "error_text": "no deliverable"}
 
     def test_a_b_a_oscillation_is_detected(self) -> None:
-        directive = graph._repeated_attempt_directive([self.A, self.B, dict(self.A)])
+        directive = feedback_mod._repeated_attempt_directive([self.A, self.B, dict(self.A)])
         self.assertIn("REPEATED IDENTICAL ATTEMPT", directive)
 
     def test_distinct_attempts_produce_no_directive(self) -> None:
-        self.assertEqual(graph._repeated_attempt_directive([self.A, self.B]), "")
+        self.assertEqual(feedback_mod._repeated_attempt_directive([self.A, self.B]), "")
 
     def test_ledger_lists_every_try_with_its_rejection(self) -> None:
-        ledger = graph.attempt_ledger_block([self.A, self.B])
+        ledger = feedback_mod.attempt_ledger_block([self.A, self.B])
         self.assertIn("aaa", ledger)
         self.assertIn("SEARCH not found", ledger)
         self.assertIn("rejected", ledger)
-        self.assertEqual(graph.attempt_ledger_block([]), "")
+        self.assertEqual(feedback_mod.attempt_ledger_block([]), "")
 
     def test_prior_attempts_alone_never_make_a_repair_prompt(self) -> None:
         # Regression: the attempt ledger must be repair-context only. Appending
         # it to a clean feedback string turned every re-run (e.g. an --loop
         # optimization round) into "REPAIR MODE" demanding a REPAIR_DIAGNOSIS.
         state = {"hw_attempts": [{"response_hash": "aaa", "error_hash": "e", "applied": True}]}
-        self.assertEqual(graph.hardware_repair_feedback(state), "")
-        self.assertEqual(graph._repeated_attempt_directive(state["hw_attempts"]), "")
+        self.assertEqual(feedback_mod.hardware_repair_feedback(state), "")
+        self.assertEqual(feedback_mod._repeated_attempt_directive(state["hw_attempts"]), "")
 
 
 class _FakeTty(io.StringIO):
@@ -1701,13 +1369,13 @@ class StreamLogTest(unittest.TestCase):
 
     def setUp(self) -> None:
         graph.enable_progress(["analysis", "implementation"])
-        graph._LIVE_LINE.clear()
+        instrument._LIVE_LINE.clear()
         self.addCleanup(graph.disable_progress)
 
     def _capture(self, payload: dict, *, tty: bool = True) -> str:
         stream = _FakeTty() if tty else io.StringIO()
         with mock.patch.object(sys, "stdout", stream):
-            graph._log_stream_progress(payload)
+            instrument._log_stream_progress(payload)
         return stream.getvalue()
 
     def test_tty_updates_rewrite_one_line_without_newlines(self) -> None:
@@ -1725,7 +1393,7 @@ class StreamLogTest(unittest.TestCase):
         # Clearing erases the line so the next normal print starts clean.
         stream = _FakeTty()
         with mock.patch.object(sys, "stdout", stream):
-            graph._LIVE_LINE.clear()
+            instrument._LIVE_LINE.clear()
         self.assertIn("\r", stream.getvalue())
 
     def test_no_intermediate_output_when_stdout_is_redirected(self) -> None:
@@ -1769,7 +1437,7 @@ class StreamLogTest(unittest.TestCase):
         self._capture({"phase": "content", "stage": "analyze_workload", "chars": 500})
         self.assertEqual(self._capture({"phase": "start"}), "")
         printed = self._capture(
-            {"phase": "content", "stage": "implement_hw", "chars": 50}
+            {"phase": "content", "stage": "implement", "chars": 50}
         )
         self.assertIn("implement HW", printed)
 
@@ -1798,20 +1466,20 @@ class AgentCfuCostParityTest(unittest.TestCase):
         return state
 
     def test_cost_carries_the_same_agent_cfu_flags_as_the_soc_path(self) -> None:
-        cost = " ".join(graph.agent_cfu_cost_commands(self._state())[0])
-        for flag in graph.agent_cfu_datapath_flags(self.ISA):
+        cost = " ".join(commands.agent_cfu_cost_commands(self._state())[0])
+        for flag in commands.agent_cfu_datapath_flags(self.ISA):
             self.assertIn(flag, cost, f"cost command is missing {flag}")
 
     def test_cost_flags_come_from_the_isa_spec_not_a_workload_spec(self) -> None:
         # The exact bug: a workload spec (no datapath section) reached the flag
         # builder. The helper now always derives from state["isa_spec"].
         workload = {"benchmark_name": "md5sum", "operation": "md5"}
-        cost = " ".join(graph.agent_cfu_cost_commands(self._state(workload_spec=workload))[0])
+        cost = " ".join(commands.agent_cfu_cost_commands(self._state(workload_spec=workload))[0])
         self.assertIn("--agent-cfu-vlen 512", cost)
         self.assertIn("--agent-cfu-no-store", cost)
 
     def test_memory_options_are_forwarded(self) -> None:
-        flags = graph.agent_cfu_datapath_flags(
+        flags = commands.agent_cfu_datapath_flags(
             {"datapath": {"vlen": 128, "xlen": 32, "regDepth": 2},
              "memory": {"load": False, "store": False}}
         )
@@ -1819,7 +1487,7 @@ class AgentCfuCostParityTest(unittest.TestCase):
         self.assertIn("--agent-cfu-no-store", flags)
         self.assertIn("--agent-cfu-no-tilelink", flags)
         # A contract with load but no store must not lose the bus.
-        flags = graph.agent_cfu_datapath_flags(
+        flags = commands.agent_cfu_datapath_flags(
             {"datapath": {"vlen": 128, "xlen": 32, "regDepth": 2},
              "memory": {"load": True, "store": False}}
         )
@@ -1828,11 +1496,146 @@ class AgentCfuCostParityTest(unittest.TestCase):
 
     def test_soc_and_cost_stay_in_lockstep_for_a_plain_contract(self) -> None:
         isa = {"datapath": {"vlen": 256, "xlen": 32, "regDepth": 2}}
-        cost = " ".join(graph.agent_cfu_cost_commands(self._state(isa_spec=isa))[0])
-        gen = " ".join(graph.agent_cfu_gen_flags(isa))
+        cost = " ".join(commands.agent_cfu_cost_commands(self._state(isa_spec=isa))[0])
+        gen = " ".join(commands.agent_cfu_gen_flags(isa))
         shared = [t for t in gen.split() if t.startswith("--agent-cfu-") or t.isdigit()]
         for token in shared:
             self.assertIn(token, cost, f"cost/SoC flag divergence on {token}")
+
+
+class ConformanceFailureAttributionTest(unittest.TestCase):
+    """A conformance crash must be reported for what it is, and routed honestly."""
+
+    def _sim_result(self, category: str) -> dict:
+        return {"returncode": 1, "failure_observation": {"category": category}}
+
+    def test_sim_error_wording_matches_the_evidence(self) -> None:
+        harness = feedback_mod.conformance_sim_error(
+            self._sim_result("sim_harness_crash"),
+            "java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds",
+        )
+        self.assertIn("simulation harness", harness)
+        self.assertNotIn("reached the fail symbol", harness)
+
+        assertion = feedback_mod.conformance_sim_error(
+            self._sim_result("assertion"), "FAILURE config: defer requires a tick handler"
+        )
+        self.assertIn("HDL assertion failure", assertion)
+        self.assertNotIn("reached the fail symbol", assertion)
+
+        fail_symbol = feedback_mod.conformance_sim_error(
+            self._sim_result("fail_symbol"), "FAILURE Software reached the fail symbol :("
+        )
+        self.assertIn("reached the fail symbol", fail_symbol)
+
+        untyped = feedback_mod.conformance_sim_error({"returncode": 1}, "")
+        self.assertIn("without reaching the pass or fail symbol", untyped)
+
+    def test_commit_watchdog_routes_to_repair_with_progress_guidance(self) -> None:
+        result = self._sim_result("liveness_timeout")
+        self.assertEqual(feedback_mod.conformance_repair_target(False, [result]), "implement")
+        message = feedback_mod.conformance_sim_error(result, "waiting on uop 0x6FD6")
+        self.assertIn("repairable progress failure", message)
+        self.assertIn("small bounded cases", message)
+        self.assertIn("completion/backpressure", message)
+        self.assertNotIn("this is not evidence about the CFU design", message)
+
+    def test_harness_crash_does_not_route_a_design_repair(self) -> None:
+        self.assertIsNone(feedback_mod.conformance_repair_target(
+            False, [self._sim_result("sim_harness_crash")]
+        ))
+        self.assertIsNone(feedback_mod.conformance_repair_target(
+            False, [self._sim_result("environment")]
+        ))
+        self.assertEqual(
+            feedback_mod.conformance_repair_target(False, [self._sim_result("fail_symbol")]),
+            "implement",
+        )
+        self.assertEqual(
+            feedback_mod.conformance_repair_target(False, [self._sim_result("assertion")]),
+            "implement",
+        )
+        # Host/harness faults are not repaired by re-authoring an oracle even
+        # when the caller initially attributed the failed build to its C body.
+        for category in ("sim_harness_crash", "environment", "policy"):
+            with self.subTest(category=category):
+                self.assertIsNone(feedback_mod.conformance_repair_target(
+                    True, [self._sim_result(category)]))
+        self.assertEqual(feedback_mod.conformance_repair_target(True, []), "implement")
+
+
+class DeliveryLoopDetectionTest(unittest.TestCase):
+    """Semantic repetition of one approach must stop before the budget does."""
+
+    DELIVERY_A = (
+        "EDIT_BEGIN a/AgentCfu.scala\n"
+        "<<<<<<< SEARCH\n"
+        "          val iMod16 = round(3 downto 0).asUInt\n"
+        "=======\n"
+        "          val iMod16 = round(3 downto 0)\n"
+        ">>>>>>> REPLACE\n"
+        "EDIT_END"
+    )
+    DELIVERY_A_REPHRASED = (
+        "Here is the fix.\n" + DELIVERY_A + "\nLet me know if you need anything else."
+    )
+    DELIVERY_B = (
+        "EDIT_BEGIN a/AgentCfu.scala\n"
+        "<<<<<<< SEARCH\n"
+        "          val rotated = sum.asBits.rotateLeft(roundShifts(round)).asUInt\n"
+        "=======\n"
+        "          val rotated = sum.asBits.rotateLeft(roundShifts(round))\n"
+        ">>>>>>> REPLACE\n"
+        "EDIT_END"
+    )
+
+    def test_search_key_tracks_the_targeted_line_not_the_prose(self) -> None:
+        key = feedback_mod.delivery_search_key(self.DELIVERY_A)
+        self.assertTrue(key)
+        self.assertEqual(key, feedback_mod.delivery_search_key(self.DELIVERY_A_REPHRASED))
+        self.assertNotEqual(key, feedback_mod.delivery_search_key(self.DELIVERY_B))
+        self.assertEqual(feedback_mod.delivery_search_key("no delivery here"), "")
+
+    def test_repeated_rejected_approach_is_rejected_before_application(self) -> None:
+        attempts = [{"applied": False, "search_key": feedback_mod.delivery_search_key(self.DELIVERY_A)}]
+        error = feedback_mod._repeated_delivery_error(attempts, self.DELIVERY_A_REPHRASED)
+        self.assertIn("REPEATED APPROACH", error)
+        self.assertEqual(feedback_mod._repeated_delivery_error(attempts, self.DELIVERY_B), "")
+        # The same SEARCH line from an APPLIED attempt is stale, not a loop: it
+        # is left to the deterministic SEARCH-not-found rejection.
+        applied = [{"applied": True, "search_key": feedback_mod.delivery_search_key(self.DELIVERY_A)}]
+        self.assertEqual(feedback_mod._repeated_delivery_error(applied, self.DELIVERY_A), "")
+
+    def test_approach_directive_fires_across_rephrased_attempts(self) -> None:
+        attempts = [
+            {"applied": False, "search_key": feedback_mod.delivery_search_key(self.DELIVERY_A),
+             "response_hash": "h1", "error_hash": "e1"},
+            {"applied": False, "search_key": feedback_mod.delivery_search_key(self.DELIVERY_A_REPHRASED),
+             "response_hash": "h2", "error_hash": "e2"},
+        ]
+        directive = feedback_mod._repeated_attempt_directive(attempts)
+        self.assertIn("REPEATED APPROACH DETECTED", directive)
+        attempts.append(
+            {"applied": False, "search_key": feedback_mod.delivery_search_key(self.DELIVERY_B),
+             "response_hash": "h3", "error_hash": "e3"}
+        )
+        self.assertEqual(feedback_mod._repeated_attempt_directive(attempts), "")
+
+    def test_delivery_retry_does_not_touch_the_repair_budget(self) -> None:
+        state = {"delivery_retries": 0, "iteration": 3}
+        retry = ladder._delivery_retry_transition(state, "hw_build", "implement", False, True)
+        self.assertIsNotNone(retry)
+        update, target = retry
+        self.assertEqual(target, "implement")
+        self.assertEqual(update["delivery_retries"], 1)
+        self.assertNotIn("repairs_used", update)
+        self.assertEqual(update["iteration"], 4)
+        # The free retry is capped; after it a rejection burns the normal budget.
+        state["delivery_retries"] = gates_mod.DELIVERY_RETRY_MAX
+        self.assertIsNone(ladder._delivery_retry_transition(state, "hw_build", "implement", False, True))
+        # A delivered-but-broken design is a real repair, never a free retry.
+        self.assertIsNone(ladder._delivery_retry_transition(state, "hw_build", "implement", False, False))
+        self.assertIsNone(ladder._delivery_retry_transition(state, "hw_build", "implement", True, True))
 
 
 if __name__ == "__main__":

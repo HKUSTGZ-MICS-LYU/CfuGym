@@ -39,11 +39,13 @@ def _number(value: object, *, minimum: int = 0) -> int | None:
     return value if type(value) is int and value >= minimum else None
 
 
-def _paths(root: str, benchmark: str, filename: str) -> tuple[str, str]:
+def _paths(root: str, benchmark: str, filename: str) -> tuple[str, str, str]:
     if not (_safe(root, _RUN) and _safe(benchmark, _NAME) and _safe(filename, _FILE)):
         raise ValueError("unsafe run root, benchmark or source file")
+    stem = filename[:-2]
     return (f"{root}/workspace/embench_{benchmark}/reference/embench_main.asm",
-            f"{root}/07_analysis/ir/{filename[:-2]}.ll")
+            f"{root}/07_analysis/ir/{stem}.ll",
+            f"{root}/07_analysis/ir/{stem}.features.xml")
 
 
 def build_observation_index(*, run_root: str, benchmark: str, observation: dict,
@@ -79,7 +81,7 @@ def build_observation_index(*, run_root: str, benchmark: str, observation: dict,
         ordinal = _number(point.get("ordinal")) if "ordinal" in point else None
         if ("line" in point and line is None) or ("ordinal" in point and ordinal is None):
             continue
-        asm, expected_ir = _paths(run_root, benchmark, filename)
+        asm, expected_ir, expected_features = _paths(run_root, benchmark, filename)
         row = measured.get(ident, {}) if isinstance(measured, dict) else {}
         row = row if isinstance(row, dict) else {}
         target_match = (ir_result.get("toolchain", {}).get("target_match")
@@ -89,6 +91,10 @@ def build_observation_index(*, run_root: str, benchmark: str, observation: dict,
             "line": line, "ordinal": ordinal,
             "cycles": _number(row.get("cycles")), "calls": _number(row.get("calls")),
             "asm_path": asm, "ir_path": expected_ir if expected_ir in records else None,
+            "features_path": (expected_features if isinstance(ir_result, dict)
+                              and expected_features in set(
+                                  item for item in ir_result.get("feature_files", [])
+                                  if isinstance(item, str)) else None),
             "ir_target_match": target_match if type(target_match) is bool else None,
         }
     for ident in duplicate:
@@ -107,6 +113,20 @@ def _read(toolbox: RepoToolbox, path: str) -> tuple[list[str], bool, str]:
     if not isinstance(text, str) or not text:
         return [], False, "missing or empty"
     return text[:MAX_READ_CHARS].splitlines(), len(text) > MAX_READ_CHARS, "readable"
+
+
+def _asm_absence(state: str) -> str:
+    """Say what a missing reference disassembly means and where to look instead.
+
+    It is a *build output*: a run that reused the cached measurement has none, so
+    "missing or empty" alone reads as "this evidence does not exist at all".
+    """
+    if state == "readable":
+        return "function symbol not found"
+    if state == "missing or empty":
+        return ("no reference disassembly in this run's workspace (it is a reference "
+                "build output; a reused profile measurement has none) — use view='ir'")
+    return state
 
 
 def _asm_candidates(lines: list[str], function: str, excerpt_limit: int
@@ -202,6 +222,48 @@ def _ir_candidates(lines: list[str], function: str, filename: str, source_line: 
                      "header-line candidate only, not loop-body or loop-address mapping")
 
 
+def _features_excerpt(text: str, function: str, source_line: int | None,
+                      budget: int) -> tuple[list[str], str]:
+    """Pick the smallest feature-XML subtree for this observation, schema-tolerant."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        return [], f"unparseable feature XML ({type(exc).__name__})"
+    # Match by priority: explicit hotspot flag, function+line, line alone
+    # (loops may omit the function attribute), then function scope alone.
+    ranked: list[tuple[int, object]] = []
+    for element in root.iter():
+        if element is root:
+            continue
+        name = element.get("function", "") or element.get("name", "")
+        line = element.get("source_line", "")
+        hotspot = element.get("hotspot_match", "")
+        rank = 0
+        if hotspot == "true":
+            rank = 1
+        elif name == function and source_line is not None and line == str(source_line):
+            rank = 2
+        elif not name and source_line is not None and line == str(source_line):
+            rank = 3
+        elif name == function and source_line is None:
+            rank = 4
+        if rank:
+            ranked.append((rank, element))
+    ranked.sort(key=lambda item: item[0])
+    chosen = ranked[0][1] if ranked else root
+    try:
+        rendered = ET.tostring(chosen, encoding="unicode")
+    except (TypeError, ValueError) as exc:
+        return [], f"cannot render feature XML ({type(exc).__name__})"
+    lines = rendered.splitlines()
+    if len(lines) > budget:
+        lines = lines[:budget - 1] + ["... feature excerpt line limit reached"]
+    if chosen is root:
+        return lines, "whole document (no loop matched this observation)"
+    return lines, "loop/function-focused excerpt (static_ir)"
+
+
 def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
                         view: str = "summary", max_lines: int = 60) -> str:
     """Read only approved artifact paths through ``toolbox.read_text``.
@@ -209,8 +271,8 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
     Results are capped to 8..100 output lines and 12,000 characters. ASM
     symbols and LLVM debug locations are candidate evidence, not loop identity.
     """
-    if view not in ("summary", "asm", "ir"):
-        raise ValueError("view must be summary, asm or ir")
+    if view not in ("summary", "asm", "ir", "features"):
+        raise ValueError("view must be summary, asm, ir or features")
     if not isinstance(index, dict) or not _safe(observation_id, _IDENT):
         raise ValueError("unknown observation ID")
     records = index.get("observations")
@@ -220,11 +282,12 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
     if not isinstance(item, dict) or item.get("id") != observation_id:
         raise ValueError("invalid observation index")
     root, benchmark, filename = index.get("run_root"), index.get("benchmark"), item.get("file")
-    asm, expected_ir = _paths(root, benchmark, filename)
+    asm, expected_ir, expected_features = _paths(root, benchmark, filename)
     function = item.get("function")
     if not _safe(function, _IDENT) or item.get("kind") not in ("function", "loop"):
         raise ValueError("invalid observation index")
-    if item.get("asm_path") != asm or item.get("ir_path") not in (None, expected_ir):
+    if (item.get("asm_path") != asm or item.get("ir_path") not in (None, expected_ir)
+            or item.get("features_path") not in (None, expected_features)):
         raise ValueError("invalid observation artifact path")
     if getattr(toolbox, "run_root", None) != root:
         raise ValueError("observation belongs to another run")
@@ -251,6 +314,14 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
         raise ValueError("invalid observation index")
     target_note = ("approximate target; not faithful GCC machine code" if target_match is False
                    else "target match reported" if target_match is True else "target match unknown")
+    features_path = item.get("features_path")
+    feature_lines: list[str] = []
+    feature_cut = False
+    feature_state = "not recorded"
+    if view == "features" and features_path:
+        feature_lines, feature_cut, feature_state = _read(toolbox, features_path)
+    elif features_path:
+        feature_state = "not inspected in this view"
     measured = (f"cycles={item.get('cycles') if _number(item.get('cycles')) is not None else 'unavailable'} "
                 f"calls={item.get('calls') if _number(item.get('calls')) is not None else 'unavailable'}")
     output = [f"Observation {observation_id}: {item['kind']} {filename}:{line or '?'} "
@@ -258,11 +329,13 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
               f"Measured profile (instrumented): {measured}",
               f"ASM reference candidate: {asm} — " +
               (f"{len(sections)} function symbol(s); {'ambiguous clones' if len(sections) > 1 else 'function-level only'}"
-               if sections else f"{asm_state if asm_state != 'readable' else 'function symbol not found'}") +
+               if sections else _asm_absence(asm_state)) +
               (" [bounded scan truncated; further symbols may exist]" if asm_cut else ""),
               f"LLVM IR candidate: {ir_path or 'not recorded'} — " +
               (ir_mapping if ir_lines else ir_state) + f" [{target_note}]" +
               (" [bounded scan truncated; mapping incomplete]" if ir_cut else ""),
+              f"Feature XML: {features_path or 'not recorded'} — " +
+              ("available (view='features')" if features_path and view != "features" else feature_state),
               "Caution: static reference candidates are not measured loop addresses or cycle estimates."]
     if view == "asm" and sections:
         output.append("ASM symbols (function-level only; no source-line link):")
@@ -274,6 +347,15 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
     if view == "ir" and matches:
         output.append("LLVM IR candidate !dbg instruction lines (may be discontiguous; not an exact loop match):")
         output.extend(f"{ir_path}:{lineno} {text}" for lineno, text in matches)
+    if view == "features":
+        if feature_lines:
+            excerpt, focus = _features_excerpt("\n".join(feature_lines), function, line, budget)
+            output.append(f"Feature XML excerpt: {focus} [{target_note}]")
+            output.extend(excerpt)
+            if feature_cut:
+                output.append(f"Feature XML scan truncated to {MAX_READ_CHARS} characters.")
+        else:
+            output.append(f"Feature XML unavailable: {feature_state}")
     if (view == "asm" and asm_cut) or (view == "ir" and ir_cut):
         output.append(f"Artifact scan truncated to {MAX_READ_CHARS} characters; mapping may be incomplete.")
     if len(output) > budget:

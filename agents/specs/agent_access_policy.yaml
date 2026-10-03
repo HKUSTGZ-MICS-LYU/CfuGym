@@ -3,14 +3,14 @@ version: "1"
 # Visibility tiers gate what the agent may READ. A path matched by a level's
 # globs is readable only at that level or above; everything not listed is
 # readable at every level. `basic` is the floor and therefore has no entries.
-# This is a read-only gate: writes, command allowlists, --apply-patch and
-# --dry-run semantics are unchanged.
+# This is a read-only gate: writes, command allowlists, and the effect flags
+# (--dry-run / --no-apply-patch / --no-run-commands) are unchanged. Tiers are
+# flow-wide: a level applies to every stage, never to one stage alone.
 #
 #   basic    - workload/integration/sw plus the AgentCfu surface only;
 #              skills and existing sibling CFU designs are hidden.
 #   standard - default: basic + skills + sibling CFU designs (Vpu/BitNet).
-#   extended - standard + the SpinalHDL source tree, for the isa and
-#              implementation stages only.
+#   extended - standard + the SpinalHDL source tree.
 visibility:
   default: standard
   levels: [basic, standard, extended]
@@ -24,15 +24,48 @@ visibility:
       - "src/main/scala/vexiiriscv/soc/mico/BitQuant.scala"
       - "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuFiber.scala"
       - "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuV2Fiber.scala"
-      # Not in any stage read list today; declared so a future stage cannot
-      # accidentally expose the BitNet plugin below `standard`.
+      # Not in the read tree today; declared so nothing can expose the BitNet
+      # plugin below `standard`.
       - "src/main/scala/vexiiriscv/execute/BitNetPlugin.scala"
     extended:
       - "ext/SpinalHDL/**"
 
-# Deny rules always take precedence over stage allow rules.
+# What the agent may READ. This is ONE list for the whole flow: a run's
+# knowledge is shared, so every stage sees the same tree and only what a stage
+# may WRITE (see `stages:`) differs. Declaring `read` inside a stage is a
+# policy error rather than a silent narrowing.
+read:
+  # Run artifacts. The toolbox scopes these to the executing run, so a stage can
+  # never read another run's workspace or results.
+  - "agents/generated/runs/**"
+  # Cross-run measurement cache (git-ignored).
+  - "agents/generated/cache/**"
+  # Repository sources and build inputs the design touches.
+  - "MiCoSoc.v"
+  - "src/main/scala/vexiiriscv/execute/cfu/**"
+  - "src/main/scala/vexiiriscv/soc/cfu/**"
+  - "src/main/scala/vexiiriscv/soc/mico/**"
+  - "sw/**"
+  - "benchmarks/embench-iot/src/**"
+  - "benchmarks/embench-iot/support/**"
+  # Agent inputs: the policy and ISA spec, worked examples, methodology.
+  - "agents/specs/**"
+  - "agents/examples/**"
+  - "skills/cfu-designer/**"
+  # SpinalHDL syntax/API, gated to the `extended` visibility level above.
+  - "ext/SpinalHDL/**"
+
+# Deny rules always take precedence over the read tree.
 deny:
+  # Request debug logs contain whole application prompts; the host may audit
+  # them, but they are never an input source for the model or run memory.
+  - "agents/generated/runs/**/request_audit.jsonl"
   - ".git/**"
+  # A submodule's `.git` is a pointer file, not a directory, so the rule above
+  # does not reach it.
+  - "**/.git"
+  - "**/.git/**"
+  - "**/__pycache__/**"
   - "**/.env"
   - "**/.env.*"
   - "**/*secret*"
@@ -46,6 +79,8 @@ deny:
   - "**/*.o"
   - "**/*.a"
   - "**/*.so"
+  - "**/*.bin"
+  - "**/*.pyc"
   - "**/*.map"
   - "**/*.vcd"
   - "**/*.fst"
@@ -61,72 +96,31 @@ write_roots:
   - "agents/generated/cache"
   - "sw/tests"
 
+# Per-stage authority. Only writes and commands are stage-scoped; reads come
+# from the shared top-level `read` tree.
 stages:
   load_context:
-    read:
-      - "agents/specs/agent_access_policy.yaml"
-      - "agents/specs/cfu_isa_template.yaml"
-      - "skills/cfu-designer/SKILL.md"
-      - "skills/cfu-designer/references/**"
-      - "src/main/scala/vexiiriscv/execute/cfu/CfuBus.scala"
-      - "src/main/scala/vexiiriscv/execute/cfu/CfuPlugin.scala"
-      - "src/main/scala/vexiiriscv/soc/cfu/**"
-      - "src/main/scala/vexiiriscv/soc/mico/**"
-      - "benchmarks/embench-iot/src/**"
-      - "benchmarks/embench-iot/support/**"
-      - "sw/embench/**"
-      - "sw/MiCo-Lib/targets/vexii_soc/**"
-      - "sw/tests/**"
     write:
       - "agents/generated/runs/**/01_context/**"
       - "agents/generated/runs/**/run.yaml"
     commands: [git_status]
   ingest_input:
-    read:
-      - "agents/specs/cfu_isa_template.yaml"
-      - "agents/specs/*.spec"
-      - "agents/specs/*.yaml"
-      - "agents/examples/**"
-      - "benchmarks/embench-iot/src/**"
-      - "benchmarks/embench-iot/support/**"
-      - "sw/embench/**"
-      - "src/main/scala/vexiiriscv/soc/cfu/**"
-      - "src/main/scala/vexiiriscv/soc/mico/**"
-      - "sw/tests/**"
     write:
       - "agents/generated/runs/**/02_workload/**"
       - "agents/generated/runs/**/run.yaml"
     commands: []
   route_input:
-    read: ["agents/generated/runs/**/02_workload/**"]
     write:
       - "agents/generated/runs/**/03_route/**"
       - "agents/generated/runs/**/run.yaml"
     commands: []
   prepare_benchmark:
-    read:
-      - "agents/generated/runs/**/02_workload/**"
-      - "agents/generated/runs/**/03_route/**"
-      # Instrumentation reads the run's own project copy after copying it.
-      - "agents/generated/runs/**/workspace/**"
-      - "agents/examples/**"
-      - "benchmarks/embench-iot/src/**"
-      - "benchmarks/embench-iot/support/**"
-      - "sw/embench/**"
-      - "sw/tests/**"
     write:
       - "agents/generated/runs/**/04_benchmark/**"
       - "agents/generated/runs/**/workspace/**"
       - "agents/generated/runs/**/run.yaml"
     commands: []
   profile:
-    read:
-      - "agents/generated/runs/**/02_workload/**"
-      - "agents/generated/runs/**/04_benchmark/**"
-      - "agents/generated/runs/**/workspace/**"
-      - "agents/generated/cache/**"
-      - "benchmarks/embench-iot/src/**"
-      - "sw/embench/**"
     write:
       - "agents/generated/runs/**/05_profile/**"
       - "agents/generated/runs/**/workspace/**"
@@ -134,156 +128,56 @@ stages:
       - "agents/generated/cache/**"
     commands: [make_profile, project_test, embench_build, soc_sim]
   hotspot:
-    read:
-      - "agents/generated/runs/**/02_workload/**"
-      - "agents/generated/runs/**/04_benchmark/**"
-      - "agents/generated/runs/**/05_profile/**"
     write:
       - "agents/generated/runs/**/06_hotspot/**"
       - "agents/generated/runs/**/run.yaml"
     commands: []
   analysis:
-    read:
-      - "agents/generated/runs/**/02_workload/**"
-      - "agents/generated/runs/**/06_hotspot/**"
-      - "agents/generated/runs/**/07_analysis/ir/**"
-      # The profile build's disassembly, so the analysis can read the real
-      # instructions of the hot loop instead of inferring them from C.
-      - "agents/generated/runs/**/workspace/**/*.asm"
-      - "benchmarks/embench-iot/src/**"
-      - "benchmarks/embench-iot/support/**"
-      - "skills/cfu-designer/SKILL.md"
-      - "skills/cfu-designer/references/acceleration-patterns.md"
-      - "skills/cfu-designer/references/roofline-analysis.md"
-      - "skills/cfu-designer/references/u8-weighted-average-experiment.md"
-      - "skills/cfu-designer/references/vector-rf-vpu-pattern.md"
-      - "src/main/scala/vexiiriscv/execute/cfu/CfuBus.scala"
-      - "src/main/scala/vexiiriscv/execute/cfu/CfuPlugin.scala"
-      - "src/main/scala/vexiiriscv/soc/cfu/**"
-      - "src/main/scala/vexiiriscv/soc/mico/**"
-      - "sw/tests/**"
     write:
       - "agents/generated/runs/**/07_analysis/**"
       - "agents/generated/runs/**/run.yaml"
     commands: []
   isa:
-    read:
-      - "agents/generated/runs/**/02_workload/**"
-      - "agents/generated/runs/**/06_hotspot/**"
-      - "agents/generated/runs/**/07_analysis/**"
-      - "agents/specs/cfu_isa_template.yaml"
-      - "skills/cfu-designer/references/vexii-cfu-methodology.md"
-      - "skills/cfu-designer/references/vector-rf-vpu-pattern.md"
-      - "src/main/scala/vexiiriscv/execute/cfu/CfuBus.scala"
-      - "src/main/scala/vexiiriscv/execute/cfu/CfuPlugin.scala"
-      - "src/main/scala/vexiiriscv/soc/cfu/**"
-      - "src/main/scala/vexiiriscv/soc/mico/**"
-      - "sw/MiCo-Lib/targets/vexii_soc/custom_asm.h"
-      - "sw/tests/**"
-      # Same reasoning as the implementation stage: the workload source shown in
-      # the context must stay readable when the ISA contract is drafted.
-      - "benchmarks/embench-iot/src/**"
-      - "benchmarks/embench-iot/support/**"
-      # SpinalHDL syntax/API is only exposed at the `extended` visibility level
-      # (see the `visibility` section); it is never pre-read into the prompt.
-      - "ext/SpinalHDL/**"
     write:
       - "agents/generated/runs/**/08_isa/**"
       - "agents/generated/runs/**/run.yaml"
     commands: []
   implementation:
-    read:
-      - "agents/generated/runs/**/02_workload/**"
-      - "agents/generated/runs/**/07_analysis/**"
-      - "agents/generated/runs/**/08_isa/**"
-      - "agents/generated/runs/**/workspace/design/**"
-      # Software rung targets: the accelerated kernel lives in the run workspace.
-      - "agents/generated/runs/**/workspace/embench_*/cfu/**"
-      - "agents/generated/runs/**/workspace/*_benchmark/**"
-      - "agents/generated/runs/**/workspace/*_project_profile/**"
-      - "agents/examples/**"
-      # The workload source is shown in the prompt context at load_context, so
-      # it must also be readable here: otherwise the tool loop is denied a file
-      # the model can already see.
-      - "benchmarks/embench-iot/src/**"
-      - "benchmarks/embench-iot/support/**"
-      - "skills/cfu-designer/assets/templates/**"
-      - "src/main/scala/vexiiriscv/execute/cfu/**"
-      - "src/main/scala/vexiiriscv/soc/cfu/**"
-      - "src/main/scala/vexiiriscv/soc/mico/**"
-      - "sw/MiCo-Lib/targets/vexii_soc/**"
-      - "sw/tests/**"
-      # SpinalHDL syntax/API is only exposed at the `extended` visibility level
-      # (see the `visibility` section); it is never pre-read into the prompt.
-      - "ext/SpinalHDL/**"
     write:
       - "agents/generated/runs/**/09_implementation/**"
       - "agents/generated/runs/**/run.yaml"
       # Only these two files may carry agent hardware design changes.
       - "agents/generated/runs/**/workspace/design/AgentCfu.scala"
       - "agents/generated/runs/**/workspace/design/AgentCfuFiber.scala"
+      # Agent-authored development self-tests only; never the formal conformance oracle.
+      - "agents/generated/runs/**/workspace/dev_tests/**"
       # The accelerated software lives in the workload's run workspace copy.
       - "agents/generated/runs/**/workspace/embench_*/cfu/**"
       - "agents/generated/runs/**/workspace/*_benchmark/**"
       - "agents/generated/runs/**/workspace/*_project_profile/**"
       - "sw/tests/**"
-    commands: [git_apply_check, git_apply]
-  # Hardware conformance: a harness-generated differential micro-test of the new
-  # instructions, run between the SoC build and the software rung. The C test is
-  # produced by the harness (never a model write target); only its oracle and the
-  # build products live in the run workspace.
+    commands: [git_apply_check, git_apply, cfu_check_agent, conformance_syntax]
+  # Formal conformance consumes the implementation-owned oracle, C source and
+  # intrinsics header; it may record metadata but cannot replace any test input.
   conformance:
-    read:
-      - "agents/generated/runs/**/02_workload/**"
-      - "agents/generated/runs/**/08_isa/**"
-      - "agents/generated/runs/**/09_implementation/**"
-      - "agents/generated/runs/**/10_validation/**"
-      - "agents/generated/runs/**/workspace/**"
-      - "sw/MiCo-Lib/**"
-      - "src/main/scala/vexiiriscv/execute/cfu/**"
-      - "src/main/scala/vexiiriscv/soc/cfu/**"
-      - "src/main/scala/vexiiriscv/soc/mico/**"
     write:
-      - "agents/generated/runs/**/09_implementation/**"
+      - "agents/generated/runs/**/09_implementation/conformance/result.yaml"
+      - "agents/generated/runs/**/09_implementation/conformance/versions/result.yaml.*"
       - "agents/generated/runs/**/run.yaml"
-      # The generated intrinsics header lives beside the workload software.
-      - "agents/generated/runs/**/workspace/embench_*/cfu/**"
-      - "agents/generated/runs/**/workspace/*_benchmark/**"
-      - "agents/generated/runs/**/workspace/*_project_profile/**"
     commands: [conformance_build, soc_sim]
   validation:
-    read:
-      - "agents/generated/runs/**/02_workload/**"
-      - "agents/generated/runs/**/04_benchmark/**"
-      - "agents/generated/runs/**/06_hotspot/**"
-      - "agents/generated/runs/**/07_analysis/**"
-      - "agents/generated/runs/**/08_isa/**"
-      - "agents/generated/runs/**/09_implementation/**"
-      - "agents/generated/runs/**/workspace/**"
-      - "benchmarks/embench-iot/src/**"
-      - "sw/embench/**"
-      - "src/main/scala/vexiiriscv/soc/mico/**"
-      - "src/main/scala/vexiiriscv/soc/cfu/**"
-      - "sw/tests/**"
     write:
       - "agents/generated/runs/**/10_validation/**"
       - "agents/generated/runs/**/workspace/**"
       - "agents/generated/runs/**/run.yaml"
     commands: [make_profile, project_test, embench_build, soc_generate_agent, soc_sim]
   cost:
-    read:
-      - "agents/generated/runs/**/08_isa/**"
-      - "agents/generated/runs/**/09_implementation/**"
-      - "agents/generated/runs/**/10_validation/**"
-      - "agents/generated/runs/**/workspace/**"
-      - "MiCoSoc.v"
     write:
       - "agents/generated/runs/**/11_cost/**"
       - "agents/generated/runs/**/workspace/**"
       - "agents/generated/runs/**/run.yaml"
     commands: [cfu_generate_agent, yosys_cost]
   review:
-    read: ["agents/generated/runs/**/**"]
     write: ["agents/generated/runs/**/12_review/**", "agents/generated/runs/**/report.md", "agents/generated/runs/**/run.yaml"]
     commands: []
 
@@ -303,6 +197,13 @@ commands:
     required_tokens: [TARGET=vexii_soc]
     required_substrings: ["EXTRA_SOURCES="]
     priority: 10
+  # Implementation-only preflight; no make, assembly, link, SoC or simulation.
+  conformance_syntax:
+    executable: riscv64-unknown-elf-gcc
+    argv_prefix: [riscv64-unknown-elf-gcc, -fsyntax-only, -std=c99, -Werror=implicit-function-declaration, -march=rv32imc_zicsr_zifencei, -mabi=ilp32]
+    required_tokens: [-fsyntax-only, -std=c99, -Werror=implicit-function-declaration, -march=rv32imc_zicsr_zifencei, -mabi=ilp32]
+    required_substring: "cfu_conformance.c"
+    priority: 20
   # Hardware conformance micro-test build: the same make shape as a benchmark build,
   # but it must name the harness-owned test so a benchmark build cannot stand in.
   conformance_build:
@@ -333,6 +234,13 @@ commands:
     required_substring: "runMain vexiiriscv.soc.mico.GenAgentCfu"
     required_substrings: ["--out-dir"]
     priority: 10
+  # Coding-loop fast check: same standalone elaborator, but the graph binds its
+  # output under the run workspace checks directory. It is not a cost Gate.
+  cfu_check_agent:
+    executable: sbt
+    required_substring: "runMain vexiiriscv.soc.mico.GenAgentCfu"
+    required_substrings: ["--out-dir", "workspace/checks/hw/attempt_"]
+    priority: 20
   yosys_cost:
     executable: python3
     argv_prefix: [python3, skills/cfu-designer/scripts/yosys_cost_report.py]

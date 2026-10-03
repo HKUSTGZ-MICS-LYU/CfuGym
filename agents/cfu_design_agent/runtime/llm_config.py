@@ -130,6 +130,33 @@ def resolve_config(name: str, data: dict[str, Any]) -> dict[str, Any]:
     elif not summary:
         summary = DEFAULT_REASONING_SUMMARY
 
+    context_options: dict[str, int] = {}
+    # ``CFU_AGENT_OUTPUT_RESERVE`` overrides the file's completion budget so a
+    # reasoning model can be given more room without editing every config. The
+    # value is also the context-budget output reservation, so it stays subject to
+    # the same ``< context_window_tokens`` bound.
+    env_reserve = (os.environ.get("CFU_AGENT_OUTPUT_RESERVE") or "").strip()
+    configured: dict[str, Any] = {field: data.get(field)
+                                  for field in ("context_window_tokens", "output_reserve_tokens")}
+    if env_reserve:
+        configured["output_reserve_tokens"] = env_reserve
+    for field, value in configured.items():
+        if value is None:
+            continue
+        if field == "output_reserve_tokens" and isinstance(value, str):
+            try:
+                value = int(value, 10)
+            except ValueError as exc:
+                raise LlmConfigError(
+                    f"CFU_AGENT_OUTPUT_RESERVE must be a positive integer, got {value!r}"
+                ) from exc
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise LlmConfigError(f"{field} must be a positive integer")
+        context_options[field] = value
+    if (context_options.get("context_window_tokens") is not None
+            and context_options.get("output_reserve_tokens", 4096) >= context_options["context_window_tokens"]):
+        raise LlmConfigError("output_reserve_tokens must be smaller than context_window_tokens")
+
     # Token streaming: config may opt out; unset keeps the client default (on).
     stream_raw = data.get("stream")
     stream = None if stream_raw in (None, "") else _coerce_bool(stream_raw, "stream")
@@ -148,6 +175,7 @@ def resolve_config(name: str, data: dict[str, Any]) -> dict[str, Any]:
         "reasoning_summary": summary or None,
         "stream": stream,
         "thinking_body": dict(thinking_body) if isinstance(thinking_body, dict) else None,
+        **context_options,
     }
 
 

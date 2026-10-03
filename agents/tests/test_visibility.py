@@ -16,6 +16,8 @@ from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.prompts import context_digest, hardware_prompt
 from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
+from agents.cfu_design_agent.stages import context
+from agents.cfu_design_agent.stages.review import report as report_mod
 
 SKILL = "skills/cfu-designer/SKILL.md"
 AGENT_CFU = "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"
@@ -41,7 +43,7 @@ class LoadContextVisibilityTest(unittest.TestCase):
             "run_id": run_id,
             "visibility": level,
         }
-        return graph.load_context(state), run_dir
+        return context.load_context(state), run_dir
 
     def test_basic_withholds_skills_without_failing_the_gate(self) -> None:
         final, run_dir = self._load("basic")
@@ -73,33 +75,47 @@ class VisibilityToolTest(unittest.TestCase):
         return ReadOnlyToolset(RepoToolbox(REPO_ROOT, dry_run=True, policy=policy, stage=stage))
 
     def test_basic_denies_skill_read_but_allows_the_scaffold(self) -> None:
-        # SKILL.md is allowlisted for load_context, so the only reason to deny it
-        # there is the visibility tier.
+        # SKILL.md is inside the shared read tree, so the only reason to deny it
+        # is the visibility tier.
         tools = self._toolset("basic", stage="load_context")
         denied = tools.run("read_file", {"path": SKILL})
         self.assertIn("denied by access policy", denied)
         self.assertIn("requires visibility level 'standard'", denied)
         self.assertIn("class AgentCfu", tools.run("read_file", {"path": AGENT_CFU}))
 
-    def test_standard_allows_skill_in_its_stage(self) -> None:
-        tools = self._toolset("standard", stage="load_context")
-        self.assertNotIn("denied by access policy", tools.run("read_file", {"path": SKILL}))
+    def test_standard_allows_skill_for_any_stage(self) -> None:
+        # Visibility is flow-wide: the tier does not depend on the stage.
+        for stage in ("load_context", "analysis", "isa", "implementation"):
+            tools = self._toolset("standard", stage=stage)
+            self.assertNotIn(
+                "denied by access policy", tools.run("read_file", {"path": SKILL}), stage
+            )
 
-    def test_standard_denies_spinalhdl_in_implementation(self) -> None:
+    def test_standard_denies_spinalhdl(self) -> None:
         tools = self._toolset("standard")
         self.assertIn("denied by access policy", tools.run("read_file", {"path": SPINAL}))
 
-    def test_list_dir_skips_gated_paths(self) -> None:
+    def test_list_dir_hides_a_gated_subtree_but_says_why(self) -> None:
         tools = self._toolset("basic", stage="load_context")
         listing = tools.run("list_dir", {"path": "skills/cfu-designer"})
+        self.assertIn("requires visibility level 'standard'", listing)
         self.assertNotIn("SKILL.md", listing)
+        # The only readable content under `skills` at this tier is the gated
+        # subtree, so navigating there explains the tier instead of saying the
+        # path is unknown.
+        self.assertIn(
+            "requires visibility level 'standard'", tools.run("list_dir", {"path": "skills"})
+        )
+        # ...and at `standard` the subtree opens.
+        self.assertIn("SKILL.md", self._toolset("standard").run("list_dir", {"path": "skills/cfu-designer"}))
 
-    @unittest.skipUnless((REPO_ROOT / SPINAL).is_file(), "ext/SpinalHDL submodule not checked out")
-    def test_extended_allows_spinalhdl_in_implementation(self) -> None:
-        tools = self._toolset("extended")
-        text = tools.run("read_file", {"path": SPINAL})
-        self.assertNotIn("denied by access policy", text)
-        self.assertIn("package spinal.core", text)
+    def test_extended_exposes_spinalhdl_to_every_stage(self) -> None:
+        for stage in ("analysis", "isa", "implementation"):
+            tools = self._toolset("extended", stage=stage)
+            text = tools.run("read_file", {"path": SPINAL})
+            if (REPO_ROOT / SPINAL).is_file():
+                self.assertNotIn("denied by access policy", text, stage)
+            self.assertIn("ext/SpinalHDL/", tools.run("list_dir", {"path": "ext"}), stage)
 
 
 class VisibilityPromptTest(unittest.TestCase):
@@ -163,7 +179,7 @@ class VisibilityCliTest(unittest.TestCase):
 
 class VisibilityReportTest(unittest.TestCase):
     def test_report_lists_the_level_and_what_was_withheld(self) -> None:
-        report = graph.render_report(
+        report = report_mod.render_report(
             {
                 "task": "t",
                 "visibility": "basic",

@@ -11,6 +11,7 @@ from agents.cfu_design_agent import graph, profile_cache
 from agents.cfu_design_agent.benchmark.embench_loops import loop_id
 from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
+from agents.cfu_design_agent.stages import profile
 
 
 def _sim_stdout(args: list[str]) -> str:
@@ -125,7 +126,7 @@ class ProfileCacheTest(unittest.TestCase):
         with mock.patch.object(
             RepoToolbox, "run_command", lambda self, args, **kw: scripted(self, args, **kw)
         ):
-            out = graph.profile_embench(self._state(mode, run_root))
+            out = profile.profile_embench(self._state(mode, run_root))
         return out, scripted
 
     def test_cache_is_reused_across_run_roots(self) -> None:
@@ -189,6 +190,27 @@ class ProfileCacheTest(unittest.TestCase):
         self.assertTrue(report["saved"])
         self.assertTrue(scripted.calls, "refresh must recompute instead of reusing")
 
+    def test_profile_builds_and_simulations_leave_readable_logs(self) -> None:
+        """Every profile-stage build/simulation keeps a log the agent can read.
+
+        Regression class (run 20261003-090854-136683-d98e5be9): the profile
+        stage ran its embench builds and SoC simulations through the raw
+        ``RepoToolbox.run_command``, so those commands left no trace at all.
+        """
+        _, scripted = self._run("off")
+        self.assertIn("embench_build", scripted.calls)
+        self.assertIn("soc_sim", scripted.calls)
+        log_dir = self.run_dir / "05_profile/logs"
+        build_logs = sorted(log_dir.glob("embench_build_*.log"))
+        sim_logs = sorted(log_dir.glob("soc_sim_*.log"))
+        self.assertTrue(build_logs, sorted(path.name for path in log_dir.glob("*")))
+        self.assertTrue(sim_logs)
+        text = build_logs[0].read_text()
+        self.assertIn("command_id: embench_build", text)
+        self.assertIn("=== STDOUT ===", text)
+        # The immutable copy travels with the run too.
+        self.assertTrue((log_dir / "versions").is_dir())
+
     def test_key_changes_with_cpu_flags_and_with_the_design_overlay(self) -> None:
         def key() -> str:
             return profile_cache.build_key(
@@ -216,6 +238,48 @@ class ProfileCacheTest(unittest.TestCase):
 
         (self.run_dir / "workspace" / "design" / "AgentCfu.scala").write_text("// changed\n")
         self.assertNotEqual(base, key(), "a different design overlay must invalidate the key")
+
+    def test_the_reference_disassembly_travels_with_the_cache_entry(self) -> None:
+        # The disassembly is a build output, so a reused measurement has none and
+        # the analysis could not read the ASM candidate (observed 2026-09-30).
+        toolbox = RepoToolbox(REPO_ROOT, dry_run=False, stage="profile",
+                              run_root=self.run_root)
+        asm = profile._reference_disassembly_rel(self.run_root, "depthconv")
+        cached = REPO_ROOT / profile_cache.artifact_relpath(
+            "a" * 64, profile_cache.DISASSEMBLY_NAME
+        )
+        self.addCleanup(cached.unlink, missing_ok=True)
+        (REPO_ROOT / asm).parent.mkdir(parents=True, exist_ok=True)
+        (REPO_ROOT / asm).write_text("0000 <hot>:\n  ret\n")
+        profile._store_reference_disassembly(toolbox, self.run_root, "depthconv", "a" * 64, "on")
+        self.assertIn("hot", cached.read_text())
+        # A cache hit restores it into the workspace...
+        (REPO_ROOT / asm).unlink()
+        profile._restore_reference_disassembly(toolbox, self.run_root, "depthconv", "a" * 64, "on")
+        self.assertIn("hot", (REPO_ROOT / asm).read_text())
+        # ...never overwriting a build that did happen...
+        (REPO_ROOT / asm).write_text("newer\n")
+        profile._restore_reference_disassembly(toolbox, self.run_root, "depthconv", "a" * 64, "on")
+        self.assertEqual((REPO_ROOT / asm).read_text(), "newer\n")
+        # ...and staying out of the way when the cache is off.
+        (REPO_ROOT / asm).unlink()
+        profile._restore_reference_disassembly(toolbox, self.run_root, "depthconv", "a" * 64, "off")
+        self.assertFalse((REPO_ROOT / asm).exists())
+        profile._store_reference_disassembly(toolbox, self.run_root, "depthconv", "b" * 64, "off")
+        self.assertFalse(
+            (REPO_ROOT / profile_cache.artifact_relpath(
+                "b" * 64, profile_cache.DISASSEMBLY_NAME)).exists()
+        )
+
+    def test_artifact_relpath_requires_a_safe_key_and_name(self) -> None:
+        with self.assertRaises(ValueError):
+            profile_cache.artifact_relpath("../escape", "x.asm")
+        with self.assertRaises(ValueError):
+            profile_cache.artifact_relpath("a" * 64, "../../etc/passwd")
+        self.assertEqual(
+            profile_cache.artifact_relpath("a" * 64, "embench_main.asm"),
+            f"{profile_cache.CACHE_SUBDIR}/{'a' * 64}.embench_main.asm",
+        )
 
     def test_parse_rejects_foreign_or_incomplete_entries(self) -> None:
         text = profile_cache.serialize(

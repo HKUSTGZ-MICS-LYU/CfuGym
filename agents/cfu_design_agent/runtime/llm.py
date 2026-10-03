@@ -16,6 +16,8 @@ from dataclasses import dataclass, is_dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from . import context_budget, request_audit
+
 DEFAULT_MODEL = "gpt-5"
 # Reasoning/thinking is OFF unless a config opts in. ``reasoning_effort`` values
 # follow the OpenAI spelling; ``thinking_body`` lets a gateway use its own switch
@@ -28,8 +30,9 @@ DEFAULT_REASONING_SUMMARY = "auto"
 DEFAULT_THINKING_BODY: dict[str, Any] = {"thinking": {"type": "enabled"}}
 # Bounded tool loop defaults: rounds are model turns that may use tools, calls
 # per round caps parallel fan-out, and total calls caps the whole step.
+DEFAULT_MAX_TOOL_ROUNDS = 20
 DEFAULT_MAX_TOOL_CALLS_PER_ROUND = 4
-DEFAULT_MAX_TOOL_CALLS = 24
+DEFAULT_MAX_TOOL_CALLS = 96
 # Injected before the forced final turn so the model stops exploring and emits
 # the deliverable instead of narrating what it would read next. The rung passes
 # its own deliverable description (a patch block, an analysis mapping, ...).
@@ -45,18 +48,6 @@ TOOL_BUDGET_REMINDER = (
 
 def tool_budget_reminder(deliverable: str = "") -> str:
     return TOOL_BUDGET_REMINDER + (deliverable or DEFAULT_TOOL_DELIVERABLE) + "."
-
-
-# Appended to the user message when the endpoint rejects the tools payload: the
-# original prompt promised tools, so without this the model tends to answer with
-# "Let me read ..." and stop, producing no deliverable.
-TOOLS_UNAVAILABLE_NOTE = (
-    "\n\n=== TOOL CALLING UNAVAILABLE ===\n"
-    "Tool calling failed for this request, so no tool can be used. Do not reply "
-    "with a statement that you will read, inspect, or look at a file. Answer now "
-    "using only the context above and emit the final deliverable required by this "
-    "rung."
-)
 
 
 def looks_like_tool_intent(text: str) -> bool:
@@ -91,6 +82,13 @@ TOOL_INTENT_NUDGE = (
     "- if the context above is already sufficient, emit the final deliverable "
     "immediately.\n"
     "Do not reply with another description of what you plan to read."
+)
+
+# Sent when a 200 response carried no content and no tool call. Retried once,
+# because that is a transport-level failure rather than an answer.
+EMPTY_ANSWER_NUDGE = (
+    "Your previous reply was empty: it contained no text and no tool call. "
+    "Answer now — call the tool you need, or emit the final deliverable."
 )
 
 # Sent when a rung that requires a delivery block got none while tools were
@@ -155,6 +153,7 @@ class LlmResult:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    cached_input_tokens: int | None = None
     # Reasoning/thinking text, kept out of ``text`` so artifact parsers never
     # see it. Persisted separately for auditability.
     reasoning: str = ""
@@ -279,6 +278,7 @@ def record_usage(
     input_tokens: int = 0,
     output_tokens: int = 0,
     total_tokens: int = 0,
+    cached_input_tokens: int | None = None,
 ) -> None:
     _USAGE_LOG.append(
         {
@@ -286,6 +286,7 @@ def record_usage(
             "input": int(input_tokens or 0),
             "output": int(output_tokens or 0),
             "total": int(total_tokens or 0),
+            "cached_input": None if cached_input_tokens is None else int(cached_input_tokens),
         }
     )
 
@@ -297,6 +298,8 @@ def usage_totals() -> dict[str, int]:
         "input": sum(entry["input"] for entry in _USAGE_LOG),
         "output": sum(entry["output"] for entry in _USAGE_LOG),
         "total": sum(entry["total"] for entry in _USAGE_LOG),
+        "cached_input": sum(entry["cached_input"] or 0 for entry in _USAGE_LOG),
+        "cached_usage_reported": sum(entry["cached_input"] is not None for entry in _USAGE_LOG),
     }
 
 
@@ -307,6 +310,8 @@ def stage_usage(stage: str) -> dict[str, int]:
         "input": sum(entry["input"] for entry in matched),
         "output": sum(entry["output"] for entry in matched),
         "total": sum(entry["total"] for entry in matched),
+        "cached_input": sum(entry["cached_input"] or 0 for entry in matched),
+        "cached_usage_reported": sum(entry["cached_input"] is not None for entry in matched),
     }
 
 
@@ -320,11 +325,14 @@ def usage_by_stage() -> dict[str, dict[str, int]]:
     stages: dict[str, dict[str, int]] = {}
     for entry in _USAGE_LOG:
         name = str(entry.get("stage") or "(unset)")
-        bucket = stages.setdefault(name, {"calls": 0, "input": 0, "output": 0, "total": 0})
+        bucket = stages.setdefault(name, {"calls": 0, "input": 0, "output": 0, "total": 0,
+                                          "cached_input": 0, "cached_usage_reported": 0})
         bucket["calls"] += 1
         bucket["input"] += int(entry.get("input") or 0)
         bucket["output"] += int(entry.get("output") or 0)
         bucket["total"] += int(entry.get("total") or 0)
+        bucket["cached_input"] += int(entry.get("cached_input") or 0)
+        bucket["cached_usage_reported"] += entry.get("cached_input") is not None
     return stages
 
 
@@ -356,6 +364,16 @@ def _extract_usage(response, kind: str) -> tuple[int, int, int]:
     if not total:
         total = inp + out
     return inp, out, total
+
+
+def _cached_usage(usage: Any, kind: str) -> int | None:
+    if usage is None:
+        return None
+    details = _read(usage, "input_tokens_details" if kind == "responses" else "prompt_tokens_details")
+    if not details:
+        return None
+    cached = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+    return int(cached) if cached is not None and cached != "" else None
 
 
 def _scalar_text(value: Any) -> str:
@@ -512,6 +530,7 @@ class _ChatRound:
     output_tokens: int
     total_tokens: int
     message: Any
+    cached_input_tokens: int | None = None
     fallback_reason: str = ""
 
 
@@ -535,6 +554,7 @@ def _chat_round_from_response(response: Any) -> "_ChatRound":
         output_tokens=out,
         total_tokens=total,
         message=message,
+        cached_input_tokens=_cached_usage(getattr(response, "usage", None), "chat"),
     )
 
 
@@ -614,6 +634,7 @@ def _chat_round_from_stream(stream: Any) -> "_ChatRound":
         output_tokens=out,
         total_tokens=total,
         message=message,
+        cached_input_tokens=_cached_usage(usage, "chat"),
     )
 
 
@@ -641,6 +662,13 @@ class OpenAiTextClient:
         self.base_url = cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL")
         self.temperature = cfg.get("temperature")
         self.timeout = cfg.get("timeout")
+        self.window_config = {key: cfg[key] for key in ("context_window_tokens", "output_reserve_tokens")
+                              if cfg.get(key) is not None}
+        self._window = None
+        self._last_budget_metadata: dict[str, Any] = {}
+        self._last_request_id: str | None = None
+        self._request_attempt = 0
+        self._previous_payload: str | None = None
         mode = cfg.get("api_mode") or os.environ.get("CFU_AGENT_LLM_API") or "auto"
         self.api_mode = str(mode).lower() if isinstance(mode, str) else "auto"
         # Thinking defaults to off: no reasoning parameter is sent unless the
@@ -670,6 +698,71 @@ class OpenAiTextClient:
     def available(self) -> bool:
         return bool(self.api_key)
 
+    def _context_window(self, sdk) -> context_budget.WindowSpec:
+        if self._window is not None:
+            return self._window
+        key = (self.base_url or "", self.model)
+        metadata = request_audit.model_metadata(key)
+        if metadata is None:
+            metadata = {}
+            if not self.window_config.get("context_window_tokens") and hasattr(sdk, "models"):
+                request_id = request_audit.record_request(
+                    {"model": self.model}, {"stage": current_stage(), "endpoint": "models.retrieve"})
+                try:
+                    response = sdk.models.retrieve(self.model, timeout=3)
+                    raw = response if isinstance(response, dict) else response.model_dump()
+                    # Keep only known capacity fields, never arbitrary gateway
+                    # metadata, credentials or transport configuration.
+                    metadata = {name: raw[name] for name in (
+                        "context_window", "context_window_tokens", "context_length",
+                        "max_context_tokens", "max_context_length", "max_model_len",
+                        "max_position_embeddings") if name in raw}
+                    try:
+                        context_budget.resolve_window(self.window_config, metadata)
+                    except context_budget.ContextBudgetError:
+                        metadata = {}  # malformed discovery is unknown, not authoritative
+                    request_audit.record_result(request_id, result={"model_metadata": metadata})
+                except request_audit.RequestAuditError:
+                    raise
+                except Exception as exc:
+                    request_audit.record_result(request_id, error={"type": type(exc).__name__})
+            request_audit.remember_model_metadata(key, metadata)
+        self._window = context_budget.resolve_window(self.window_config, metadata)
+        return self._window
+
+    def _budget_messages(self, messages, *, tools=None, response_config=None, sdk=None):
+        window = self._context_window(sdk)
+        status = context_budget.evaluate_budget(
+            messages, tools=tools, response_config=response_config, window=window)
+        self._last_budget_metadata = {
+            "estimated_input_tokens": status.estimated_input_tokens,
+            "reserved_output_tokens": status.reserved_output_tokens,
+            "window_tokens": window.window_tokens, "window_source": window.source,
+            "capacity_known": window.known, "estimator": "serialized-byte-upper-bound",
+            "before_total_tokens": status.total_tokens, "level": status.level,
+        }
+        if status.level in {"compact", "unfit"}:
+            try:
+                reduced = context_budget.compact_completed_tool_turns(
+                    messages, tools=tools, response_config=response_config, window=window)
+            except context_budget.ContextBudgetError:
+                request_audit.record_event("blocked", {
+                    "stage": current_stage(), "model": self.model, "sent": False,
+                    **self._last_budget_metadata})
+                raise
+            messages = reduced.messages
+            status = reduced.after
+            self._last_budget_metadata.update(
+                estimated_input_tokens=status.estimated_input_tokens,
+                after_total_tokens=status.total_tokens, removed_batches=reduced.removed_batches,
+                level=status.level)
+            request_audit.record_event("compaction", {
+                "stage": current_stage(), "model": self.model, **self._last_budget_metadata})
+        elif status.level == "warning":
+            request_audit.record_event("context_warning", {
+                "stage": current_stage(), "model": self.model, **self._last_budget_metadata})
+        return messages, status
+
     def _chat_reasoning_kwargs(self) -> dict[str, Any]:
         """extra_body/reasoning args for a chat completion, or {} when off."""
         if not self.thinking:
@@ -696,7 +789,7 @@ class OpenAiTextClient:
 
         from openai import OpenAI
 
-        client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        client = OpenAI(api_key=self.api_key, base_url=self.base_url, max_retries=0)
 
         try:
             if self.api_mode == "chat":
@@ -709,6 +802,8 @@ class OpenAiTextClient:
             # auto: try Responses first, then fall back to chat completions.
         try:
             return self._responses(client, system, user, response_format=response_format)
+        except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
+            raise
         except Exception as responses_error:
             try:
                 result = self._chat(client, system, user, response_format=response_format)
@@ -734,7 +829,7 @@ class OpenAiTextClient:
         *,
         tools: list[dict[str, Any]],
         tool_runner: Callable[[str, dict[str, Any]], str],
-        max_rounds: int = 6,
+        max_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         max_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
         max_total_calls: int = DEFAULT_MAX_TOOL_CALLS,
         fallback: str = "",
@@ -755,26 +850,28 @@ class OpenAiTextClient:
         the transcript in ``LlmResult.tool_calls``.
 
         Implemented on the chat-completions path because that is what
-        OpenAI-compatible gateways expose. If the endpoint rejects the tools
-        payload, the loop degrades to a plain completion so enabling tools can
-        never break a run.
+        OpenAI-compatible gateways expose. An endpoint that rejects the tools
+        payload fails explicitly rather than silently answering without tools.
         """
         if not self.available:
             return LlmResult(fallback, used_llm=False)
 
         from openai import OpenAI
 
-        client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        client = OpenAI(api_key=self.api_key, base_url=self.base_url, max_retries=0)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
         transcript: list[dict[str, Any]] = []
         total_in = total_out = total_total = 0
+        total_cached = 0
+        cached_reported = False
         tool_rounds = 0
         total_calls = 0
         nudges = 0
         max_nudges = 1 if nudge_on_tool_intent else 0
+        empty_retries = 0
         max_tool_rounds = max(0, int(max_rounds))
         round_cap = max(1, int(max_calls_per_round))
         total_cap = max(0, int(max_total_calls))
@@ -797,38 +894,19 @@ class OpenAiTextClient:
             except Exception as exc:
                 if not allow_tools:
                     raise
-                # The gateway may reject the tools payload (transiently or by
-                # design). Retry once, then degrade to a plain call that tells
-                # the model tools are gone, so it does not answer with a read
-                # plan it cannot execute.
-                try:
-                    round_ = self._chat_round(
-                        client,
-                        messages,
-                        allow_tools=allow_tools,
-                        tools=tools,
-                        response_format=response_format if not allow_tools else None,
-                    )
-                except Exception as retry_exc:
-                    degraded = self._chat(
-                        client,
-                        system,
-                        user + TOOLS_UNAVAILABLE_NOTE,
-                        response_format=response_format,
-                    )
-                    try:
-                        degraded.degraded_reason = (
-                            f"{type(retry_exc).__name__}: {retry_exc}"
-                        )
-                    except Exception:  # pragma: no cover - foreign result object
-                        pass
-                    return degraded
+                raise RuntimeError(
+                    f"tool-enabled model request failed: {type(exc).__name__}: {exc}"
+                ) from exc
 
+            messages = list(getattr(self, "_prepared_messages", messages))
             inp, out, total = round_.input_tokens, round_.output_tokens, round_.total_tokens
             total_in += inp
             total_out += out
             total_total += total
-            record_usage(current_stage(), inp, out, total)
+            if round_.cached_input_tokens is not None:
+                cached_reported = True
+                total_cached += round_.cached_input_tokens
+            record_usage(current_stage(), inp, out, total, round_.cached_input_tokens)
 
             message = round_.message
             tool_calls = list(getattr(message, "tool_calls", None) or [])
@@ -840,6 +918,17 @@ class OpenAiTextClient:
                     and is_deliverable is not None
                     and not is_deliverable(text)
                 )
+                empty_answer = not text.strip()
+                if empty_answer and empty_retries < 1:
+                    # A 200 response with no content and no tool call is a
+                    # transport-level failure, not a design decision (run
+                    # 20261003-095209: the analysis loop died on the sixth such
+                    # answer after five productive rounds). Re-ask once; the
+                    # answer still may not be fabricated, so a second empty
+                    # reply raises below.
+                    empty_retries += 1
+                    messages.append({"role": "user", "content": EMPTY_ANSWER_NUDGE})
+                    continue
                 if nudges < max_nudges and (intent_only or missing_deliverable):
                     # The model's reply cannot be used: either it announced a read
                     # without calling a tool, or a rung that requires a delivery
@@ -855,15 +944,18 @@ class OpenAiTextClient:
                     )
                     continue
                 # Either the model answered, or it kept asking for tools after
-                # they were withdrawn. Its text is the final answer either way;
-                # never silently substitute the fallback for real content.
+                # they were withdrawn. Do not turn an empty answer into a
+                # fabricated success when no deliverable was submitted.
+                if empty_answer:
+                    raise RuntimeError("tool-enabled model returned an empty stage answer")
                 return clean_llm_text(
                     LlmResult(
-                        text or fallback,
+                        text,
                         used_llm=True,
                         input_tokens=total_in,
                         output_tokens=total_out,
                         total_tokens=total_total,
+                        cached_input_tokens=total_cached if cached_reported else None,
                         reasoning=round_.reasoning,
                         model=self.model,
                         api_mode_used=mode,
@@ -919,17 +1011,7 @@ class OpenAiTextClient:
                     }
                 )
 
-        return LlmResult(
-            fallback,
-            used_llm=True,
-            input_tokens=total_in,
-            output_tokens=total_out,
-            total_tokens=total_total,
-            model=self.model,
-            api_mode_used=mode,
-            tool_calls=tuple(transcript),
-            tool_rounds=tool_rounds,
-        )
+        raise RuntimeError("tool-enabled model exhausted its rounds without a stage answer")
 
     def _responses_stream(self, stream) -> LlmResult:
         """Consume a Responses event stream into a result.
@@ -986,13 +1068,15 @@ class OpenAiTextClient:
         summary = "".join(reason_parts).strip()
         api_source = "responses.reasoning_summary.delta" if summary else ""
         inp, out, total = _usage_counts(usage, "responses")
-        record_usage(stage, inp, out, total)
+        cached = _cached_usage(usage, "responses")
+        record_usage(stage, inp, out, total, cached)
         result = LlmResult(
             text,
             used_llm=True,
             input_tokens=inp,
             output_tokens=out,
             total_tokens=total,
+            cached_input_tokens=cached,
             reasoning=_merge_reasoning(summary, inline),
             model=self.model,
             api_mode_used="responses",
@@ -1010,7 +1094,7 @@ class OpenAiTextClient:
         *,
         response_format: dict[str, Any] | None = None,
     ) -> LlmResult:
-        kwargs: dict = {}
+        kwargs: dict = {"max_output_tokens": self._context_window(client).output_reserve_tokens}
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
         if self.timeout:
@@ -1029,15 +1113,14 @@ class OpenAiTextClient:
         fallback_reason = ""
         if self.stream:
             try:
-                stream = client.responses.create(
-                    model=self.model,
-                    input=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    stream=True,
-                    **kwargs,
-                )
+                inputs, budget = self._budget_messages(
+                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    response_config={k: v for k, v in kwargs.items() if k != "timeout"}, sdk=client)
+                stream, request_id = self._sdk_request(
+                    client, "responses", {"model": self.model, "input": inputs, "stream": True, **kwargs},
+                    budget=budget)
+            except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
+                raise
             except Exception as exc:
                 fallback_reason = f"streaming unavailable: {type(exc).__name__}: {exc}"
             else:
@@ -1045,7 +1128,14 @@ class OpenAiTextClient:
                     # Some gateways ignore stream=True and return the response.
                     fallback_reason = "streaming ignored by the endpoint"
                     return self._responses_result(stream, fallback_reason)
-                return self._responses_stream(stream)
+                try:
+                    result = self._responses_stream(stream)
+                except Exception as exc:
+                    request_audit.record_result(request_id, error={"type": type(exc).__name__})
+                    raise
+                request_audit.record_result(request_id, result={"status": "completed", "input_tokens": result.input_tokens,
+                                                               "cached_input_tokens": result.cached_input_tokens})
+                return result
         return self._responses_result(
             self._responses_create(client, system, user, kwargs), fallback_reason
         )
@@ -1056,19 +1146,28 @@ class OpenAiTextClient:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
+        inputs, budget = self._budget_messages(
+            inputs, response_config={k: v for k, v in kwargs.items() if k != "timeout"}, sdk=client)
         try:
-            return client.responses.create(model=self.model, input=inputs, **kwargs)
+            response, _ = self._sdk_request(
+                client, "responses", {"model": self.model, "input": inputs, **kwargs}, budget=budget)
+            return response
+        except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
+            raise
         except Exception:
             # A gateway that rejects the summary request must not fail the call.
             reasoning = kwargs.get("reasoning")
             if not isinstance(reasoning, dict) or "summary" not in reasoning:
                 raise
             kwargs["reasoning"] = {k: v for k, v in reasoning.items() if k != "summary"}
-            return client.responses.create(model=self.model, input=inputs, **kwargs)
+            response, _ = self._sdk_request(
+                client, "responses", {"model": self.model, "input": inputs, **kwargs}, budget=budget)
+            return response
 
     def _responses_result(self, response, fallback_reason: str = "") -> LlmResult:
         inp, out, total = _extract_usage(response, "responses")
-        record_usage(current_stage(), inp, out, total)
+        cached = _cached_usage(getattr(response, "usage", None), "responses")
+        record_usage(current_stage(), inp, out, total, cached)
         text, inline = split_reasoning(getattr(response, "output_text", "") or "")
         api_reasoning, api_source = _extract_responses_reasoning(response)
         result = LlmResult(
@@ -1077,6 +1176,7 @@ class OpenAiTextClient:
             input_tokens=inp,
             output_tokens=out,
             total_tokens=total,
+            cached_input_tokens=cached,
             reasoning=_merge_reasoning(api_reasoning, inline),
             model=self.model,
             api_mode_used="responses",
@@ -1086,6 +1186,58 @@ class OpenAiTextClient:
             fallback_reason=fallback_reason,
         )
         return clean_llm_text(result)
+
+    @staticmethod
+    def _audit_usage(response, endpoint: str) -> dict[str, int | None]:
+        usage = getattr(response, "usage", None)
+        inp, out, total = _extract_usage(response, "chat" if endpoint == "chat" else "responses")
+        return {"input_tokens": inp, "output_tokens": out, "total_tokens": total,
+                "cached_input_tokens": _cached_usage(usage, "chat" if endpoint == "chat" else "responses")}
+
+    def _sdk_request(self, sdk, endpoint: str, body: dict[str, Any], *, budget=None):
+        from urllib.parse import urlsplit
+        metadata = {"stage": current_stage(), "endpoint": endpoint,
+                    "base_url_host": urlsplit(self.base_url or "").hostname or "", "model": self.model}
+        self._request_attempt += 1
+        metadata.update(attempt=self._request_attempt, parent_request_id=self._last_request_id)
+        if budget is not None:
+            metadata["context_budget"] = dict(self._last_budget_metadata)
+        # SDK-only options do not belong to HTTP JSON. extra_body is merged by
+        # the SDK, so audit the actual application body rather than its wrapper.
+        payload = {key: value for key, value in body.items() if key not in {"timeout", "extra_body"}}
+        payload.update(body.get("extra_body") or {})
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        import hashlib
+        metadata["request_body_sha256"] = hashlib.sha256(serialized.encode()).hexdigest()
+        prior_payload = request_audit.previous_payload(
+            (self.base_url or "", self.model, endpoint), serialized) or self._previous_payload
+        if prior_payload is not None:
+            common = 0
+            for left, right in zip(serialized, prior_payload):
+                if left != right:
+                    break
+                common += 1
+            metadata["common_prefix_chars"] = common  # diagnostic, NOT provider cached tokens
+        self._previous_payload = serialized
+        request_id = request_audit.record_request(payload, metadata=metadata)
+        self._last_request_id = request_id
+        target = sdk.chat.completions.create if endpoint == "chat" else sdk.responses.create
+        try:
+            response = target(**body)
+            # Streaming responses are consumed by their caller. Persist the
+            # initiating request immediately; record completion after consumption.
+            if body.get("stream") and not hasattr(response, "choices") and not hasattr(response, "output"):
+                return response, request_id
+            usage = self._audit_usage(response, endpoint)
+            request_audit.record_result(request_id, result={"status": "received",
+                "response_id": str(getattr(response, "id", "") or ""),
+                "usage": usage,
+                "input_estimate_error": (usage["input_tokens"] - budget.estimated_input_tokens)
+                if budget is not None and usage["input_tokens"] else None})
+            return response, request_id
+        except Exception as exc:
+            request_audit.record_result(request_id, error={"type": type(exc).__name__})
+            raise
 
     def _chat_round(
         self,
@@ -1097,7 +1249,9 @@ class OpenAiTextClient:
         response_format: dict[str, Any] | None = None,
     ) -> "_ChatRound":
         """One chat completion, streamed when enabled (falls back if refused)."""
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {
+            "max_completion_tokens": self._context_window(client).output_reserve_tokens,
+        }
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
         if self.timeout:
@@ -1108,16 +1262,21 @@ class OpenAiTextClient:
             kwargs["tool_choice"] = "auto"
         elif response_format is not None:
             kwargs["response_format"] = response_format
+        messages, budget = self._budget_messages(
+            messages, tools=kwargs.get("tools"), response_config={k: v for k, v in kwargs.items()
+            if k not in {"tools", "timeout"}}, sdk=client)
+        self._prepared_messages = messages
         if not self.stream:
-            response = client.chat.completions.create(
-                model=self.model, messages=messages, **kwargs
-            )
+            response, _ = self._sdk_request(
+                client, "chat", {"model": self.model, "messages": messages, **kwargs}, budget=budget)
             return _chat_round_from_response(response)
         stream_kwargs = {**kwargs, "stream": True, "stream_options": {"include_usage": True}}
         try:
-            stream = client.chat.completions.create(
-                model=self.model, messages=messages, **stream_kwargs
-            )
+            stream, request_id = self._sdk_request(
+                client, "chat", {"model": self.model, "messages": messages, **stream_kwargs},
+                budget=budget)
+        except context_budget.ContextBudgetError:
+            raise
         except Exception as exc:
             if "stream" not in str(exc).lower():
                 # Not a streaming problem (for example the tools payload was
@@ -1126,9 +1285,8 @@ class OpenAiTextClient:
                 raise
             # Streaming or stream_options is unsupported: retry without either,
             # and record why so the log can explain a missing live line.
-            response = client.chat.completions.create(
-                model=self.model, messages=messages, **kwargs
-            )
+            response, _ = self._sdk_request(
+                client, "chat", {"model": self.model, "messages": messages, **kwargs}, budget=budget)
             round_ = _chat_round_from_response(response)
             round_.fallback_reason = f"streaming unavailable: {type(exc).__name__}: {exc}"
             return round_
@@ -1137,7 +1295,15 @@ class OpenAiTextClient:
             round_ = _chat_round_from_response(stream)
             round_.fallback_reason = "streaming ignored by the endpoint"
             return round_
-        return _chat_round_from_stream(stream)
+        try:
+            round_ = _chat_round_from_stream(stream)
+        except Exception as exc:
+            request_audit.record_result(request_id, error={"type": type(exc).__name__})
+            raise
+        request_audit.record_result(request_id, result={"status": "completed", "input_tokens": round_.input_tokens,
+                                                         "output_tokens": round_.output_tokens,
+                                                         "cached_input_tokens": round_.cached_input_tokens})
+        return round_
 
     def _chat(
         self,
@@ -1154,13 +1320,15 @@ class OpenAiTextClient:
         round_ = self._chat_round(
             client, messages, allow_tools=False, tools=None, response_format=response_format
         )
-        record_usage(current_stage(), round_.input_tokens, round_.output_tokens, round_.total_tokens)
+        record_usage(current_stage(), round_.input_tokens, round_.output_tokens,
+                     round_.total_tokens, round_.cached_input_tokens)
         result = LlmResult(
             round_.text,
             used_llm=True,
             input_tokens=round_.input_tokens,
             output_tokens=round_.output_tokens,
             total_tokens=round_.total_tokens,
+            cached_input_tokens=round_.cached_input_tokens,
             reasoning=round_.reasoning,
             model=self.model,
             api_mode_used="chat",

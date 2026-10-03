@@ -17,6 +17,7 @@ import unittest
 
 from agents.cfu_design_agent import graph
 from agents.cfu_design_agent.runtime import tools
+from agents.cfu_design_agent.stages import feedback
 
 
 # One completion containing the same edit twice, second copy glued to the first
@@ -202,16 +203,16 @@ class StuckAttemptDirectiveTest(unittest.TestCase):
 
     def test_identical_hardware_attempts_trigger_directive(self) -> None:
         state = {"hw_attempts": [self._attempt("a"), self._attempt("a")]}
-        self.assertIn("REPEATED IDENTICAL ATTEMPT", graph.hardware_stuck_directive(state))
+        self.assertIn("REPEATED IDENTICAL ATTEMPT", feedback.hardware_stuck_directive(state))
 
     def test_changed_hardware_attempt_stays_quiet(self) -> None:
         state = {"hw_attempts": [self._attempt("a"), self._attempt("b")]}
-        self.assertEqual(graph.hardware_stuck_directive(state), "")
-        self.assertEqual(graph.hardware_stuck_directive({"hw_attempts": []}), "")
+        self.assertEqual(feedback.hardware_stuck_directive(state), "")
+        self.assertEqual(feedback.hardware_stuck_directive({"hw_attempts": []}), "")
 
     def test_software_directive_unchanged(self) -> None:
         state = {"sw_attempts": [self._attempt("a"), self._attempt("a")]}
-        self.assertIn("REPEATED IDENTICAL ATTEMPT", graph.software_stuck_directive(state))
+        self.assertIn("REPEATED IDENTICAL ATTEMPT", feedback.software_stuck_directive(state))
 
 
 class ConformanceOracleDirectiveTest(unittest.TestCase):
@@ -225,7 +226,7 @@ class ConformanceOracleDirectiveTest(unittest.TestCase):
     def test_recurrence_triggers_directive(self) -> None:
         a, b = self._attempt("count-error"), self._attempt("literal-error")
         state = {"conformance_attempts": [a, b, a]}
-        directive = graph.conformance_oracle_directive(state)
+        directive = feedback.conformance_oracle_directive(state)
         self.assertIn("REPEATED ORACLE REJECTION", directive)
         self.assertIn("setup", directive)
         self.assertIn("args: [0]", directive)
@@ -233,8 +234,8 @@ class ConformanceOracleDirectiveTest(unittest.TestCase):
 
     def test_first_rejection_stays_quiet(self) -> None:
         a, b = self._attempt("count-error"), self._attempt("literal-error")
-        self.assertEqual(graph.conformance_oracle_directive({"conformance_attempts": [a, b]}), "")
-        self.assertEqual(graph.conformance_oracle_directive({"conformance_attempts": []}), "")
+        self.assertEqual(feedback.conformance_oracle_directive({"conformance_attempts": [a, b]}), "")
+        self.assertEqual(feedback.conformance_oracle_directive({"conformance_attempts": []}), "")
 
 
 class ConformanceBuildFeedbackTest(unittest.TestCase):
@@ -249,13 +250,13 @@ class ConformanceBuildFeedbackTest(unittest.TestCase):
                 "collect2: error: ld returned 1 exit status"
             ),
         }
-        message = graph.conformance_build_error(build, ["make", "-C", "sw", "compile"])
+        message = feedback.conformance_build_error(build, ["make", "-C", "sw", "compile"])
         self.assertIn("conformance test build failed", message)
         self.assertIn("build diagnostics:", message)
         self.assertIn("undefined reference to `cfu_load'", message)
 
     def test_build_failure_without_output_stays_compact(self) -> None:
-        message = graph.conformance_build_error({"returncode": 2}, ["make"])
+        message = feedback.conformance_build_error({"returncode": 2}, ["make"])
         self.assertIn("conformance test build failed", message)
         self.assertNotIn("diagnostics", message)
 
@@ -266,15 +267,15 @@ class RejectionAttemptTest(unittest.TestCase):
             "conformance test build failed: make ...",
             "undefined reference to `cfu_load'",
         ]
-        a = graph._rejection_attempt(list(common), "")
-        b = graph._rejection_attempt(
+        a = feedback._rejection_attempt(list(common), "")
+        b = feedback._rejection_attempt(
             common + ["ld: warning: LOAD segment with RWX permissions"], ""
         )
         self.assertIsNotNone(a)
         self.assertEqual(a["problems_hash"], b["problems_hash"])
 
     def test_no_problems_no_entry(self) -> None:
-        self.assertIsNone(graph._rejection_attempt([]))
+        self.assertIsNone(feedback._rejection_attempt([]))
 
 
 if __name__ == "__main__":

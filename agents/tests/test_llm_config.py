@@ -59,6 +59,89 @@ class LlmConfigTest(unittest.TestCase):
         self.assertIn("api_mode", cfg)
         self.assertIn("api_key", cfg)
 
+    def test_context_options_survive_named_configuration(self) -> None:
+        from agents.cfu_design_agent.runtime.llm_config import resolve_config
+        from types import SimpleNamespace
+        config = resolve_config("explicit", {"context_window_tokens": 64000,
+                                              "output_reserve_tokens": 8000})
+        client = OpenAiTextClient(config=config)
+        window = client._context_window(SimpleNamespace())
+        self.assertEqual((window.window_tokens, window.output_reserve_tokens), (64000, 8000))
+        self.assertEqual(window.source, "config")
+        for invalid in (True, "64000", 0, -1):
+            with self.subTest(invalid=invalid), self.assertRaises(LlmConfigError):
+                resolve_config("bad", {"context_window_tokens": invalid})
+        with self.assertRaises(LlmConfigError):
+            resolve_config("bad", {"context_window_tokens": 4096})
+
+    def test_output_reserve_env_overrides_the_config_file(self) -> None:
+        """A reasoning model's completion budget is configurable without editing JSON.
+
+        The reserve is both ``max_completion_tokens``/``max_output_tokens`` and the
+        context-budget output reservation, so it must stay below the window.
+        """
+        import os
+        from unittest import mock
+
+        from agents.cfu_design_agent.runtime.llm_config import resolve_config
+
+        base = {"context_window_tokens": 922000, "output_reserve_tokens": 8192}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CFU_AGENT_OUTPUT_RESERVE", None)
+            self.assertEqual(resolve_config("c", base)["output_reserve_tokens"], 8192)
+        with mock.patch.dict(os.environ, {"CFU_AGENT_OUTPUT_RESERVE": "65536"}):
+            self.assertEqual(resolve_config("c", base)["output_reserve_tokens"], 65536)
+        with mock.patch.dict(os.environ, {"CFU_AGENT_OUTPUT_RESERVE": "bogus"}):
+            with self.assertRaisesRegex(LlmConfigError, "positive integer"):
+                resolve_config("c", base)
+        with mock.patch.dict(os.environ, {"CFU_AGENT_OUTPUT_RESERVE": "9999999"}):
+            with self.assertRaisesRegex(LlmConfigError, "smaller than context_window_tokens"):
+                resolve_config("c", base)
+        # Without a configured window, resolve_config stays permissive (the
+        # framework's soft 32768 window would reject the value); the bound then
+        # bites at window resolution, before any request is sent.
+        from types import SimpleNamespace
+
+        from agents.cfu_design_agent.runtime import context_budget
+
+        with mock.patch.dict(os.environ, {"CFU_AGENT_OUTPUT_RESERVE": "65536"}):
+            config = resolve_config("c", {})
+            self.assertEqual(config["output_reserve_tokens"], 65536)
+            with self.assertRaises(context_budget.ContextBudgetError):
+                OpenAiTextClient(config=config)._context_window(SimpleNamespace())
+
+    def test_shipped_configs_keep_a_reasoning_sized_completion_budget(self) -> None:
+        """Every shipped config opts into thinking, so none may fall back to 8192."""
+        import json
+
+        from agents.cfu_design_agent.runtime.llm_config import resolve_config
+
+        configs = sorted((REPO_ROOT / "agents/llm_configs").glob("*.json"))
+        self.assertTrue(configs)
+        for path in configs:
+            data = json.loads(path.read_text())
+            with self.subTest(config=path.name):
+                cfg = resolve_config(path.stem, data)
+                self.assertGreaterEqual(cfg["output_reserve_tokens"], 32768)
+                self.assertLess(cfg["output_reserve_tokens"], cfg["context_window_tokens"])
+
+    def test_run_level_max_output_tokens_wins_over_env_and_config(self) -> None:
+        import os
+        from unittest import mock
+
+        from agents.cfu_design_agent.runtime import llm_step
+
+        state = {"workdir": str(REPO_ROOT), "llm_config": "gpt-5.6-luna"}
+        with mock.patch.dict(os.environ, {"CFU_AGENT_OUTPUT_RESERVE": "40000"}):
+            default = llm_step._llm(state)
+            self.assertEqual(default.window_config["output_reserve_tokens"], 40000)
+            explicit = llm_step._llm({**state, "max_output_tokens": 65536})
+            self.assertEqual(explicit.window_config["output_reserve_tokens"], 65536)
+            self.assertEqual(llm_step._llm_request_info(explicit)["max_output_tokens"], 65536)
+            # 0 means "no run-level override", never a zero-token request.
+            unset = llm_step._llm({**state, "max_output_tokens": 0})
+            self.assertEqual(unset.window_config["output_reserve_tokens"], 40000)
+
     def test_client_uses_config_fields(self) -> None:
         client = OpenAiTextClient(
             config={

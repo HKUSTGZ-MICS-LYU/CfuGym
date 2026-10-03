@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import difflib
-import json
+import contextlib
+import contextvars
+import hashlib
 import os
 import re
 import shutil
@@ -12,11 +14,41 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .persistence import RunPersistence
 from .policy import AccessPolicy, PolicyError, load_policy, normalize_repo_path
 from ..state import CommandResult, RepoContext
 
 
 MAX_FILE_CHARS = 20000
+_ACTIVE_TOOL_PERSISTENCE: contextvars.ContextVar[RunPersistence | None] = contextvars.ContextVar(
+    "cfu_tool_persistence", default=None
+)
+
+
+def set_tool_persistence(value: RunPersistence | None):
+    """Scope tool-level mutation journaling to one graph invocation."""
+    return _ACTIVE_TOOL_PERSISTENCE.set(value)
+
+
+def reset_tool_persistence(token) -> None:
+    _ACTIVE_TOOL_PERSISTENCE.reset(token)
+
+
+@contextlib.contextmanager
+def _tool_operation(toolbox: "RepoToolbox", action: str, target: str):
+    persisted = _ACTIVE_TOOL_PERSISTENCE.get()
+    if persisted is None:
+        yield
+        return
+    if not toolbox.run_root or toolbox.workdir / toolbox.run_root != persisted.run_root:
+        raise RuntimeError("tool mutation does not belong to the active persisted run")
+    digest = hashlib.sha256(target.encode()).hexdigest()[:16]
+    attempt = len(persisted.journal._load()["operations"]) + 1
+    with persisted.journal.external_operation(
+        action, f"{action}-{attempt:08d}-{digest}",
+        {"stage": toolbox.stage, "target": target[:500]},
+    ):
+        yield
 
 # ANSI CSI/OSC sequences and terminal control bytes are presentation metadata,
 # not useful model input. Keep tabs/newlines while removing cursor/color noise.
@@ -44,6 +76,7 @@ DESIGN_SOURCE_FILES = (
 DESIGN_SCAFFOLD_ROOT = "src/main/scala/vexiiriscv/soc/mico"
 DESIGN_WORKSPACE_SUBDIR = "workspace/design"
 SOC_WORKSPACE_SUBDIR = "workspace/soc"
+RUN_ARTIFACT_ROOT = "agents/generated/runs/"
 
 DEFAULT_CONTEXT_FILES = (
     "skills/cfu-designer/SKILL.md",
@@ -92,14 +125,39 @@ class RepoToolbox:
             normalized = self.normalize(rel_path)
         except PolicyError:
             return False
-        return self.is_current_run_path(normalized) and self.policy.can_read(self.stage, normalized)
+        return self.is_current_run_path(normalized) and self.policy.can_read(normalized)
 
     def is_current_run_path(self, normalized: str) -> bool:
-        """Only run artifacts are scoped; tracked sources/cache remain unchanged."""
-        if not self.run_root or not normalized.startswith("agents/generated/runs/"):
+        """Run artifacts belong to the executing run, and this fails closed.
+
+        The shared read tree exposes the whole `agents/generated/runs/**` area,
+        so a toolbox without a run root would otherwise see every historical
+        run. Everything outside the runs area is unaffected.
+        """
+        if not normalized.startswith(RUN_ARTIFACT_ROOT):
             return True
+        if not self.run_root:
+            return False
         root = self.run_root.strip("/")
         return normalized == root or normalized.startswith(root + "/")
+
+    def visible_subtree(self, rel_path: str) -> bool:
+        """True when a readable file may live at or below ``rel_path``.
+
+        Directory navigation uses this instead of ``is_read_allowed``: a
+        directory is never itself in the read tree, so asking whether it is
+        readable would hide every directory-only tree.
+        """
+        raw = str(rel_path).strip()
+        if raw in ("", ".", "./"):
+            return True
+        try:
+            normalized = self.normalize(raw)
+        except PolicyError:
+            return False
+        if not self.is_current_run_path(normalized):
+            return False
+        return self.policy.may_contain_readable(normalized)
 
     def resolve(self, rel_path: str | Path) -> Path:
         return (self.workdir / self.normalize(rel_path)).resolve()
@@ -116,7 +174,7 @@ class RepoToolbox:
         normalized = self.normalize(rel_path)
         if not self.is_current_run_path(normalized):
             raise PolicyError(f"read path belongs to another run: {normalized}")
-        self.policy.check_read(self.stage, normalized)
+        self.policy.check_read(normalized)
         path = self.workdir / normalized
         if not path.exists() or not path.is_file():
             return ""
@@ -131,8 +189,9 @@ class RepoToolbox:
         path = self.workdir / normalized
         if self.dry_run and not is_dry_run_artifact(normalized):
             return f"dry-run: would write {normalized}"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        with _tool_operation(self, "write_text", normalized):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
         return f"wrote {normalized}"
 
     def discover_context(self, extra_files: Iterable[str] = ()) -> RepoContext:
@@ -178,7 +237,7 @@ class RepoToolbox:
                 normalized = self.normalize(candidate)
             except PolicyError:
                 continue
-            if self.policy.can_read(self.stage, normalized):
+            if self.policy.can_read(normalized):
                 visible.append(f"{line[:3]}{normalized}")
         return "\n".join(visible)
 
@@ -202,6 +261,7 @@ class RepoToolbox:
         mutate: bool = False,
         command_id: str | None = None,
         execute: bool = True,
+        capture_full: bool = False,
     ) -> CommandResult:
         selected = command_id or infer_command_id(args, self.policy)
         self.policy.check_command(self.stage, selected, args, self.workdir)
@@ -220,24 +280,40 @@ class RepoToolbox:
         execution_args = [arg for arg in args if arg != "--unsafe-paths"] if selected in {
             "git_apply", "git_apply_check"
         } else args
-        result = subprocess.run(
-            execution_args,
-            cwd=run_cwd,
-            input=input_text,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
-        return {
+        with _tool_operation(self, "command", " ".join(execution_args)):
+            result = subprocess.run(
+                execution_args,
+                cwd=run_cwd,
+                input=input_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        stdout = filter_output(result.stdout)
+        stderr = filter_output(result.stderr)
+        command_result: CommandResult = {
             "command": " ".join(args),
             "cwd": str(run_cwd),
             "returncode": result.returncode,
-            "stdout_tail": tail(filter_output(result.stdout)),
-            "stderr_tail": tail(filter_output(result.stderr)),
-            "parsed": parse_command_output(result.stdout + "\n" + result.stderr),
+            "stdout_tail": tail(stdout),
+            "stderr_tail": tail(stderr),
+            "parsed": parse_command_output(stdout + "\n" + stderr),
         }
+        if capture_full:
+            # Machine-readable domain verdicts are extracted before output tails
+            # are truncated, so a long simulator epilogue cannot hide them.
+            from ..benchmark.embench import parse_profile
+            from ..conformance import parse_conformance
+
+            command_result["parsed"]["embench_profile"] = parse_profile(stdout + "\n" + stderr)
+            command_result["parsed"]["conformance"] = parse_conformance(stdout + "\n" + stderr)
+            # Private transport fields: graph._run_check persists these as a
+            # run-scoped artifact and removes them before state serialization.
+            command_result["_stdout_full"] = stdout  # type: ignore[typeddict-unknown-key]
+            command_result["_stderr_full"] = stderr  # type: ignore[typeddict-unknown-key]
+        return command_result
 
     def apply_patch_text(self, patch_text: str) -> CommandResult:
         # Redirect tracked scaffold targets into the run workspace before any
@@ -445,7 +521,8 @@ class RepoToolbox:
             )
 
         try:
-            self._commit_files(pending)
+            with _tool_operation(self, "edit_files", ",".join(sorted(pending))):
+                self._commit_files(pending)
         except OSError as exc:
             return CommandResult(command="edit", cwd=str(self.workdir), returncode=1,
                                  stdout_tail="", stderr_tail=str(exc), parsed={"touched_paths": []})
@@ -504,7 +581,8 @@ class RepoToolbox:
                 pending[resolved] = content
             if not pending:
                 raise ValueError("no file blocks supplied")
-            self._commit_files(pending)
+            with _tool_operation(self, "file_blocks", ",".join(sorted(pending))):
+                self._commit_files(pending)
         except (ValueError, PolicyError, OSError) as exc:
             return CommandResult(command="file", cwd=str(self.workdir), returncode=1,
                                  stdout_tail="", stderr_tail=str(exc), parsed={"touched_paths": []})
@@ -535,7 +613,7 @@ class RepoToolbox:
                 raise PolicyError("copy does not permit symbolic links")
         src_normalized = self.normalize(src_rel)
         dst_normalized = self.normalize(dst_rel)
-        self.policy.check_read(self.stage, src_normalized)
+        self.policy.check_read(src_normalized)
         self.policy.check_write(self.stage, dst_normalized)
         src = self.workdir / src_normalized
         dst = self.workdir / dst_normalized
@@ -566,7 +644,7 @@ class RepoToolbox:
                 raise PolicyError("copy does not permit symbolic links")
             source_rel = self.normalize(source.relative_to(self.workdir))
             target_rel = self.normalize(target.relative_to(self.workdir))
-            self.policy.check_read(self.stage, source_rel)
+            self.policy.check_read(source_rel)
             self.policy.check_write(self.stage, target_rel)
             if source.is_dir():
                 with os.scandir(source) as entries:
@@ -582,13 +660,14 @@ class RepoToolbox:
                 files.append((source, target))
             else:
                 raise PolicyError("copy source is not a regular file or directory")
-        if src.is_dir():
-            if dst.exists():
-                shutil.rmtree(dst)
-            dst.mkdir(parents=True, exist_ok=True)
-        for source, target in files:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+        with _tool_operation(self, "copy_tree", dst_rel):
+            if src.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                dst.mkdir(parents=True, exist_ok=True)
+            for source, target in files:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
         return f"copied {src_rel} to {dst_rel}"
 
 
@@ -1319,10 +1398,3 @@ def extract_patch(text: str) -> str:
 
 def is_dry_run_artifact(rel_path: str) -> bool:
     return rel_path.startswith("agents/generated/runs/") or rel_path.startswith("agents/generated/graph/")
-
-
-def read_yosys_summary(path: Path) -> dict[str, object]:
-    json_path = path / "summary.json"
-    if not json_path.exists():
-        return {}
-    return json.loads(json_path.read_text())

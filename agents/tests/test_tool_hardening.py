@@ -42,8 +42,12 @@ class HardeningTest(unittest.TestCase):
             result = ReadOnlyToolset(self.box).run('read_file', {'path': path})
             self.assertTrue(result.startswith('denied by access policy:'), result)
         self.assertEqual(self.box.read_text(self.target), 'old\n')
+        # A toolbox with no run root fails closed: the shared read tree exposes
+        # the whole runs area, so an unbound toolbox would see every run.
         self.box.run_root = ''
-        self.assertEqual(self.box.read_text(path), 'other-run fixture')
+        self.assertFalse(self.box.is_read_allowed(self.target))
+        with self.assertRaises(PolicyError):
+            self.box.read_text(path)
 
     def test_tools_do_not_list_or_search_other_run(self):
         other = 'agents/generated/runs/other/workspace/design/AgentCfu.scala'
@@ -161,14 +165,63 @@ class HardeningTest(unittest.TestCase):
             self.assertEqual(self.box.read_text(self.target, limit=3), 'abc')
             read.assert_called_once_with(3)
 
-    def test_unsafe_regex_and_enumeration_fail_safely(self):
-        tools = ReadOnlyToolset(self.box, max_files=1)
+    def test_unsafe_regex_is_rejected(self):
+        tools = ReadOnlyToolset(self.box)
         result = tools.run('search_text', {'pattern': '(a+)+$', 'path': self.run})
         self.assertTrue(result.startswith('error:'), result)
-        for i in range(25):
-            self.put(self.run + f'/hidden{i}.txt', 'x')
-        result = tools.run('list_dir', {'path': self.run, 'glob': '**/*'})
-        self.assertIn('budget exceeded', result)
+
+    def test_list_dir_truncates_instead_of_failing(self):
+        target = self.run + '/workspace/cfu_benchmark'
+        for i in range(5):
+            self.put(f'{target}/m{i}.txt', 'x')
+        out = ReadOnlyToolset(self.box, max_files=2).run('list_dir', {'path': target})
+        self.assertIn('m0.txt', out)
+        self.assertIn('truncated at 2 entries', out)
+
+    def test_enumeration_budget_keeps_the_results_it_already_found(self):
+        # Observed failure: one budget hit discarded every hit collected so far
+        # and told the model to narrow a path it had already narrowed.
+        target = self.run + '/workspace/cfu_benchmark'
+        for i in range(5):
+            self.put(f'{target}/m{i}.txt', 'x')
+        out = ReadOnlyToolset(self.box, max_entries=2).run(
+            'search_text', {'pattern': 'x', 'path': target, 'glob': '*.txt'}
+        )
+        self.assertIn('m0.txt:1: x', out)
+        self.assertIn('search stopped early:', out)
+        self.assertIn('enumeration budget exceeded', out)
+        self.assertIn('narrow path', out)
+        self.assertIn('tighten glob', out)
+        self.assertNotIn('denied by access policy', out)
+
+    def test_unreadable_subtrees_never_consume_the_walk_budget(self):
+        target = self.run + '/workspace/cfu_benchmark'
+        self.put(f'{target}/keep.txt', 'needle')
+        for i in range(40):
+            # `**/build/**` is denied, so this subtree must be pruned before it
+            # is counted; otherwise it would exhaust the budget on its own.
+            self.put(self.run + f'/workspace/build/noise{i}.txt', 'needle')
+        out = ReadOnlyToolset(self.box, max_entries=3).run(
+            'search_text',
+            {'pattern': 'needle', 'path': self.run + '/workspace', 'glob': '**/*.txt'},
+        )
+        self.assertIn('cfu_benchmark/keep.txt:1: needle', out)
+        self.assertNotIn('noise0.txt', out)
+        self.assertNotIn('budget exceeded', out)
+
+    def test_long_generated_lines_are_skipped_not_fatal(self):
+        # xgboost.c carries 20k-char data lines; one of them used to abort a
+        # whole multi-file search.
+        target = self.run + '/workspace/cfu_benchmark'
+        self.put(f'{target}/blob.c', 'x' * 20001 + '\n')
+        self.put(f'{target}/match.c', 'int needle;\n')
+        out = ReadOnlyToolset(self.box).run(
+            'search_text', {'pattern': 'needle', 'path': target, 'glob': '*.c'}
+        )
+        self.assertIn('match.c:1: int needle;', out)
+        self.assertIn('skipped 1 line(s) longer than', out)
+        self.assertIn('blob.c', out)
+        self.assertNotIn('usage error', out)
 
     def test_search_accepts_a_file_path_as_root(self):
         # Observed failure: five wasted retries because search_text refused a
@@ -202,37 +255,30 @@ class HardeningTest(unittest.TestCase):
         self.assertIn('AgentCfu.scala:5: hit 4', last)
         self.assertNotIn('truncated', last)
         past = tools.run('search_text', {'pattern': 'hit', 'path': self.target, 'skip': 5})
-        self.assertIn('no matches after skip=5', past)
-        self.assertIn('5 earlier hit(s) were skipped', past)
+        self.assertIn('no new matches after skip=5', past)
+        self.assertIn('5 hit(s) were skipped', past)
         bad = tools.run('search_text', {'pattern': 'hit', 'path': self.target, 'skip': -1})
         self.assertTrue(bad.startswith('usage error:'), bad)
 
-    def test_budget_errors_are_quantitative_and_suggest_narrowing(self):
+    def test_budget_messages_are_quantitative_and_suggest_narrowing(self):
+        # max_files caps a listing, and a search is bounded by the candidate
+        # walk: either way the message must name the limit and a way forward.
         for i in range(5):
             self.put(self.run + f'/workspace/cfu_benchmark/m{i}.txt', 'x')
-        tools = ReadOnlyToolset(self.box, max_files=2)
-        out = tools.run(
+        listing = ReadOnlyToolset(self.box, max_files=2).run(
+            'list_dir', {'path': self.run + '/workspace/cfu_benchmark'}
+        )
+        self.assertIn('truncated at 2 entries', listing)
+        self.assertNotIn('denied by access policy', listing)
+        out = ReadOnlyToolset(self.box, max_entries=2).run(
             'search_text',
             {'pattern': 'x', 'path': self.run + '/workspace/cfu_benchmark', 'glob': '*.txt'},
         )
-        self.assertTrue(out.startswith('usage error:'), out)
-        self.assertIn('visible file budget exceeded', out)
-        self.assertIn('2+ files matched (limit 2)', out)
+        self.assertIn('enumeration budget exceeded', out)
+        self.assertIn('(limit 2)', out)
         self.assertIn('narrow path', out)
         self.assertIn('tighten glob', out)
         self.assertNotIn('denied by access policy', out)
-        # Enumeration budget: many entries, none matching the glob.
-        for i in range(30):
-            self.put(self.run + f'/workspace/cfu_benchmark/e{i}.dat', 'x')
-        tools = ReadOnlyToolset(self.box, max_files=1)
-        out = tools.run(
-            'search_text',
-            {'pattern': 'x', 'path': self.run + '/workspace/cfu_benchmark', 'glob': '*.nomatch'},
-        )
-        self.assertTrue(out.startswith('usage error:'), out)
-        self.assertIn('directory enumeration budget exceeded', out)
-        self.assertIn('entries visited (limit 20)', out)
-        self.assertIn('narrow path', out)
 
     def test_read_file_distinguishes_missing_empty_and_denied(self):
         tools = ReadOnlyToolset(self.box)

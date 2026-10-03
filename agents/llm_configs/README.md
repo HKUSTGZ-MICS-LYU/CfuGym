@@ -27,6 +27,35 @@ python3 agents/run_cfu_agent.py --task "..." --llm-config deepseek --dry-run
 | `reasoning_summary` | no | Responses `reasoning.summary`: `auto` \| `concise` \| `detailed`, or `""` to disable | `auto` when thinking is on |
 | `stream` | no | Stream output tokens (live progress, per-chunk read timeout) | `true` |
 | `thinking_body` | no | Exact `extra_body` used to enable thinking on a chat endpoint | `{"thinking": {"type": "enabled"}}` |
+| `context_window_tokens` | no | Context window used by the request-size budget (no endpoint query) | soft `32768` when neither config nor `/models` metadata reports one |
+| `output_reserve_tokens` | no | Completion budget: sent as `max_completion_tokens` (chat) / `max_output_tokens` (responses), and reserved for the answer by the context budget | `4096`; shipped configs use `32768` |
+
+## Context window and completion budget
+
+`context_window_tokens` and `output_reserve_tokens` are **planning** values: no
+endpoint is queried for a capability the gateway does not report. The completion
+budget is a request field, so it must satisfy
+`0 < output_reserve_tokens < context_window_tokens`; a violation is a
+`LlmConfigError` before any request is sent.
+
+The same number is the context-budget output reservation, so it also decides when
+a transcript is `warning` (80%), `compact` (90%) or `unfit` (100%) for the window:
+
+```
+level = (estimated_input + output_reserve_tokens) / context_window_tokens
+```
+
+A reasoning model spends its thinking tokens from this budget too, so a small
+value can produce a **200 response with no content** (see
+`docs/cfu_agent_failure_taxonomy.md` and run `20261003-095209`). Precedence:
+
+1. `--max-output-tokens N` (run-level; `0` keeps the config/env value),
+2. `CFU_AGENT_OUTPUT_RESERVE=N` (environment),
+3. the config's `output_reserve_tokens`,
+4. `4096` when nothing sets it.
+
+The effective value is recorded in `run.yaml` under `llm_request` as
+`max_output_tokens`, so a run's budget stays auditable after the fact.
 
 ## Thinking / reasoning
 

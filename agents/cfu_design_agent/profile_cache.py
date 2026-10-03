@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -26,7 +27,14 @@ from typing import Any
 CACHE_SUBDIR = "agents/generated/cache/embench_profile"
 SCHEMA_VERSION = "1"
 # Bump when the key composition changes so old entries cannot be reused.
-KEY_VERSION = "5"  # [info]-prefixed simulator profile lines now produce measurements
+KEY_VERSION = "6"  # entries now also carry the reference disassembly (asm evidence)
+# The reference build's disassembly, stored beside the entry under the same key:
+# a reused measurement has no build outputs of its own, and the analysis reads
+# this file as the ASM candidate for a measured loop.
+DISASSEMBLY_NAME = "embench_main.asm"
+# A cache key is a hex digest; an artifact name is a plain file name.
+_NAME = re.compile(r"[0-9a-f]{16,128}")
+_ARTIFACT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 # Placeholder substituted for the run root before hashing, so the same
 # benchmark measured in two different runs shares one cache entry.
 RUN_PLACEHOLDER = "<run>"
@@ -194,6 +202,17 @@ def build_key(
 
 def cache_relpath(key: str) -> str:
     return f"{CACHE_SUBDIR}/{key}.json"
+
+
+def artifact_relpath(key: str, name: str) -> str:
+    """Cache-side copy of one reference build artifact, under the same key.
+
+    The key already hashes the sources, commands, flags and toolchain, so an
+    artifact stored with it is exactly as reusable as the measurement itself.
+    """
+    if not _NAME.fullmatch(key or "") or not _ARTIFACT_NAME.fullmatch(name or ""):
+        raise ValueError("unsafe cache key or artifact name")
+    return f"{CACHE_SUBDIR}/{key}.{name}"
 
 
 def parse(text: str, key: str) -> dict[str, Any] | None:

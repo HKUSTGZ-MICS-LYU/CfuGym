@@ -7,8 +7,11 @@ import os
 from pathlib import Path
 
 from .graph import enable_progress, export_graph_visualization, run_agent
-from .runtime.llm import OpenAiTextClient
+from .runtime.llm import (
+    DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS, OpenAiTextClient,
+)
 from .runtime.llm_config import LlmConfigError, effective_config, list_configs
+from .flow import optimize as flow_optimize
 from .state import CfuDesignState
 
 
@@ -75,10 +78,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Separate repair budget for answer-only defects (a malformed conformance "
         "oracle or ISA contract), so they cannot exhaust --max-iters (default: 2).",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Force read-only: never mutate source or run external commands.")
-    parser.add_argument("--apply-patch", action="store_true", help="Allow an LLM patch to be applied to CFU/software allowlisted paths.")
-    parser.add_argument("--run-commands", action="store_true", help="Allow allowlisted build/simulator/Yosys commands to execute.")
-    parser.add_argument("--no-dry-run", action="store_true", help="Allow mutation and command execution (implies apply/run unless --dry-run).")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Force read-only: never mutate source or run external commands "
+                        "(the opt-out; applying patches and running allowlisted commands is the default).")
+    parser.add_argument(
+        "--apply-patch",
+        dest="apply_patch",
+        action="store_true",
+        default=True,
+        help="Deprecated no-op: an LLM patch may be applied to CFU/software allowlisted "
+        "paths by default (use --no-apply-patch to disable).",
+    )
+    parser.add_argument(
+        "--no-apply-patch",
+        dest="apply_patch",
+        action="store_false",
+        help="Record LLM deliverables as proposals only; never write them into the workspace.",
+    )
+    parser.add_argument(
+        "--run-commands",
+        dest="run_commands",
+        action="store_true",
+        default=True,
+        help="Deprecated no-op: allowlisted build/simulator/Yosys commands execute by "
+        "default (use --no-run-commands to disable).",
+    )
+    parser.add_argument(
+        "--no-run-commands",
+        dest="run_commands",
+        action="store_false",
+        help="Never execute allowlisted build/simulator/Yosys commands.",
+    )
+    parser.add_argument("--no-dry-run", action="store_true",
+                        help="Deprecated no-op: mutation and command execution are the default "
+                        "(use --dry-run or the --no-* effect flags to restrict).")
     parser.add_argument("--skip-sim", action="store_true", help="Skip SBT generation/simulation.")
     parser.add_argument("--skip-yosys", action="store_true", help="Skip Yosys cost estimation.")
     parser.add_argument(
@@ -97,14 +130,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-tool-rounds",
         type=int,
-        default=6,
-        help="Maximum tool-calling rounds per agent step (default: 6).",
+        default=DEFAULT_MAX_TOOL_ROUNDS,
+        help=f"Maximum tool-calling rounds per agent step (default: {DEFAULT_MAX_TOOL_ROUNDS}).",
     )
     parser.add_argument(
         "--max-tool-calls",
         type=int,
-        default=24,
-        help="Maximum tool calls per agent step, across all rounds (default: 24; 0 disables the cap).",
+        default=DEFAULT_MAX_TOOL_CALLS,
+        help=(f"Maximum tool calls per agent step, across all rounds "
+              f"(default: {DEFAULT_MAX_TOOL_CALLS}; 0 disables the cap)."),
     )
     parser.add_argument(
         "--profile-cache",
@@ -116,19 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ir-features",
         choices=("off", "auto", "require", "approx"),
-        default="off",
-        help="Optional P0 LLVM IR export from uninstrumented Embench reference sources: "
-        "off (default), auto (strict best-effort), require (strict mandatory), or "
-        "approx (explicit rv32imc target fallback; NOT equivalent to GCC ISA). "
-        "IR never replaces measured cycles or selects loops.",
-    )
-    parser.add_argument(
-        "--repair-routing",
-        choices=("auto", "fixed"),
-        default=os.environ.get("CFU_AGENT_REPAIR_ROUTING", "auto"),
-        help="Who repairs a failed simulation: auto lets the agent choose software vs "
-        "hardware from the failure evidence (default); fixed keeps the deterministic "
-        "software-then-hardware escalation.",
+        default=os.environ.get("CFU_AGENT_IR_FEATURES", "auto"),
+        help="LLVM IR evidence from the uninstrumented Embench reference sources: "
+        "auto (default; prefers the exact reference target and falls back to the "
+        "labelled approximate rv32imc export when the installed clang rejects the "
+        "GCC-only ISA), off, require (strict; a mismatch fails the run), or approx "
+        "(force the approximate export). IR never replaces measured cycles or "
+        "selects loops.",
     )
     parser.add_argument(
         "--loop",
@@ -143,14 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Explore reconsiders a stop once and allows append-only ISA extensions (default).")
     parser.add_argument("--loop-patience", type=int, default=3,
                         help="Stop after this many consecutive non-improving measured optimization rounds (default: 3).")
-    parser.add_argument(
-        "--software-change",
-        choices=("auto", "always"),
-        default=os.environ.get("CFU_AGENT_SOFTWARE_CHANGE", "auto"),
-        help="Whether the software rung must run after the hardware is built: auto lets "
-        "the agent keep the existing kernel when it already drives the CFU and the ISA "
-        "contract is unchanged (default); always re-writes the software every iteration.",
-    )
+    parser.add_argument("--max-evals", type=int, default=0,
+                        help="Maximum measured evaluation reports including the baseline (0: bounded only by --max-iters).")
     parser.add_argument(
         "--stream-llm",
         dest="stream_llm",
@@ -167,16 +189,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable provider token streaming (single non-streaming completion).",
     )
     parser.add_argument(
+        "--max-output-tokens",
+        dest="max_output_tokens",
+        type=int,
+        default=0,
+        help="Completion budget for every request (max_completion_tokens / max_output_tokens). "
+        "0 keeps the config's output_reserve_tokens, or CFU_AGENT_OUTPUT_RESERVE when set. "
+        "Reasoning models share this budget with their thinking tokens, so a small value can "
+        "return an empty answer; it is also the context-budget output reservation and must "
+        "stay below the configured context_window_tokens.",
+    )
+    parser.add_argument(
         "--visibility",
         choices=("basic", "standard", "extended"),
         default=os.environ.get("CFU_AGENT_VISIBILITY", "standard"),
-        help="Read-only file visibility tier. basic: workload/integration/AgentCfu only "
-        "(no skills, no sibling CFU designs); standard: adds skills and sibling designs; "
-        "extended: adds ext/SpinalHDL for the isa and implementation stages. Default: standard.",
+        help="Read-only file visibility tier, shared by every stage. basic: workload/"
+        "integration/AgentCfu only (no skills, no sibling CFU designs); standard: adds "
+        "skills and sibling designs; extended: adds ext/SpinalHDL. Default: standard.",
     )
     parser.add_argument("--export-graph", default="", help="Directory for Mermaid/ASCII graph visualization.")
-    parser.add_argument("--checkpoint", action="store_true", help="Compile with an in-memory LangGraph checkpointer.")
-    parser.add_argument("--thread-id", default="", help="Thread id used when checkpointing a graph run.")
+    parser.add_argument("--checkpoint", action="store_true", help="Persist LangGraph checkpoints within this run (requires an explicit --run-id to resume later).")
+    parser.add_argument("--thread-id", default="", help="Deprecated; when checkpointing the thread is always the run id.")
+    parser.add_argument("--resume", default="", metavar="RUN_ID", help="Resume a checkpointed run after validating its run artifacts.")
     parser.add_argument("--stream", action="store_true", help="Run through LangGraph streaming state snapshots.")
     return parser
 
@@ -188,9 +222,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.test_api:
         return run_api_test(workdir, args)
 
+    if args.resume and args.run_id and args.resume != args.run_id:
+        raise SystemExit("--resume and --run-id must name the same run")
+    if args.thread_id and args.thread_id != (args.resume or args.run_id):
+        raise SystemExit("--thread-id must equal --run-id (or --resume)")
+    if args.checkpoint and not (args.run_id or args.resume):
+        raise SystemExit("--checkpoint requires --run-id for safe recovery")
+    if args.max_evals < 0:
+        raise SystemExit("--max-evals must be zero or positive")
+    if args.max_output_tokens < 0:
+        raise SystemExit("--max-output-tokens must be zero or positive")
+    if args.resume and any((args.task, args.embench, args.project_root, args.kernel_file,
+                            args.kernel_function, args.build_cmd, args.run_cmd, args.test_cmd)):
+        raise SystemExit("--resume accepts only the prior run id and execution options, not a new workload")
     input_mode = infer_input_mode(args)
-    task = args.task or default_task(args)
-    dry_run = True if args.dry_run else not (args.apply_patch or args.run_commands or args.no_dry_run)
+    task = args.task or ("" if args.resume else default_task(args))
+    dry_run = bool(args.dry_run)
     state: CfuDesignState = {
         "task": task,
         "input_kind": input_mode,
@@ -215,9 +262,9 @@ def main(argv: list[str] | None = None) -> int:
         "loop_optimize": args.loop_optimize,
         "loop_policy": args.loop_policy,
         "loop_patience": max(1, args.loop_patience),
-        "repair_routing": args.repair_routing,
-        "software_change": args.software_change,
+        "max_evals": args.max_evals,
         "stream_llm": args.stream_llm,
+        "max_output_tokens": args.max_output_tokens,
         "visibility": args.visibility,
         "apply_patch": args.apply_patch and not dry_run,
         "run_commands": args.run_commands and not dry_run,
@@ -228,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         "max_answer_repairs": args.max_answer_repairs,
         "iteration": 0,
         "thread_id": args.thread_id,
-        "run_id": args.run_id,
+        "run_id": args.resume or args.run_id,
         # This agent designs the AgentCfu scaffold only; the flag keeps the
         # choice explicit instead of inferring it from an always-set run root.
         "agent_cfu": True,
@@ -239,18 +286,20 @@ def main(argv: list[str] | None = None) -> int:
     final_state = run_agent(
         state,
         thread_id=args.thread_id,
-        checkpoint=args.checkpoint,
+        checkpoint=args.checkpoint or bool(args.resume),
         stream=args.stream,
+        resume=bool(args.resume),
     )
     print(f"status={final_state.get('status')}")
+    print(f"termination={final_state.get('termination_reason', '')}")
     print(f"visibility={final_state.get('visibility', '')}")
     if final_state.get("stopped_at"):
         print(f"stopped_at={final_state['stopped_at']}")
     print(f"report={final_state.get('final_report_path')}")
     print(f"graph_mermaid={graph_paths.get('mermaid')}")
     print(f"graph_ascii={graph_paths.get('ascii')}")
-    if args.checkpoint:
-        print(f"thread_id={(args.thread_id or 'cfu-design-agent')[:255]}")
+    if args.checkpoint or args.resume:
+        print(f"thread_id={final_state.get('run_id', args.resume or args.run_id)}")
     for event in final_state.get("graph_events", []):
         print(f"event={event}")
     if final_state.get("errors"):
@@ -262,13 +311,6 @@ def main(argv: list[str] | None = None) -> int:
     _print_token_summary(final_state)
     # planned/complete are successful planning or execution outcomes.
     return 0 if final_state.get("status") in {"complete", "planned"} else 1
-
-
-def _graph_module():
-    """The graph module, imported lazily so CLI tests can stub it cleanly."""
-    from . import graph
-
-    return graph
 
 
 def _sim_gate(final_state: CfuDesignState) -> dict:
@@ -297,18 +339,23 @@ def _print_token_usage(final_state: CfuDesignState) -> None:
     by_stage = final_state.get("token_usage_by_stage") or {}
     if not by_stage:
         return
+
+    def cached_text(bucket: dict) -> str:
+        reported = int(bucket.get("cached_usage_reported", 0) or 0)
+        return f"cached={int(bucket.get('cached_input', 0) or 0):>8}" if reported else "cached=n/a    "
+
     print("  llm_tokens:")
     for name, bucket in sorted(
         by_stage.items(), key=lambda item: (-int(item[1].get("input", 0)), item[0])
     ):
         print(
-            f"    {name:<24} in={int(bucket.get('input', 0)):>8} "
+            f"    {name:<24} in={int(bucket.get('input', 0)):>8} {cached_text(bucket)} "
             f"out={int(bucket.get('output', 0)):>7} calls={int(bucket.get('calls', 0))}"
         )
     total = final_state.get("token_usage") or {}
     if total:
         print(
-            f"    {'TOTAL':<24} in={int(total.get('input', 0)):>8} "
+            f"    {'TOTAL':<24} in={int(total.get('input', 0)):>8} {cached_text(total)} "
             f"out={int(total.get('output', 0)):>7} calls={int(total.get('calls', 0))}"
         )
 
@@ -348,7 +395,6 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
     _print_token_usage(final_state)
     rounds = final_state.get("optimization_rounds") or []
     if len(rounds) > 1 or final_state.get("loop_optimize"):
-        graph = _graph_module()
         best = next((item for item in reversed(rounds) if item.get("improved")), None)
         best_round = (best or {}).get("round")
         final_round = rounds[-1].get("round") if rounds else None
@@ -361,8 +407,8 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
                 marker = " (not improved)"
             print(
                 f"    round {entry.get('round')}: {entry.get('target')} "
-                + graph._round_metrics_text(entry)
-                + graph._metric_deltas(entry, graph._previous_measured(rounds, index))
+                + flow_optimize._round_metrics_text(entry)
+                + flow_optimize._metric_deltas(entry, flow_optimize._previous_measured(rounds, index))
                 + marker
             )
         if (

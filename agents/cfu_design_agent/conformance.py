@@ -23,26 +23,33 @@ Anti-self-grading rules:
   file; the harness never guesses.
 * Missing reference/verify/setup/cases is a coverage FAIL, never a silent skip.
 * Lazy oracles are rejected: ``reference``/``verify`` must actually observe the
-  command's effect, so constant/tautological expressions and ``cfu_*``
-  self-references fail validation (a reference that calls the DUT proves
-  nothing), as does an ``a``/``b`` reference for a role the command never
-  declared (the class behind a ``'b' undeclared`` build failure).
+  command's effect, so constant expressions and ``cfu_*`` self-references fail
+  validation (a reference that calls the DUT proves nothing), as does an
+  ``a``/``b`` reference for a role the command never declared (the class behind
+  a ``'b' undeclared`` build failure).
+* An expression that *looks* observational is still rejected when it decides its
+  own outcome: ``a == a`` (an operand compared with itself), a ``verify`` built
+  only from the case arguments (an acknowledgement command returns nothing, so
+  its own inputs cannot prove anything), and a comparison against a value the
+  same oracle's ``setup``/``helpers`` assigned a literal to (run
+  20261003-090854: ``verify: "probe_marker == 1u"`` where setup wrote
+  ``probe_marker = 1u``, and a readback ``reference`` that returned the reset IV
+  table, both passed a 9-case conformance rung while the benchmark result was
+  wrong).
+* Every case argument must not be zero: an all-zero case set exercises only the
+  zero boundary and says nothing about a real address, slot or count.
 * Oracle ``helpers`` blocks must define each C symbol once; a helper needed by
   several commands must live in one entry (the class behind a generated-test
   ``redefinition of 'ref_rol32'`` build failure).
-* For rd-writing commands the harness appends a bounded set of deterministic
-  extra differential cases (edge values plus fixed-seed pseudo-random inputs
-  derived from the command name) after the model's own cases, so the model's
-  ``reference`` is exercised on inputs the model did not pick itself. An entry
-  whose reference cannot model arbitrary inputs (address-taking or stateful
-  commands) opts out with ``edge_cases: false``; the resulting weaker coverage
-  is an accepted trade-off over wrong comparisons.
+* The model chooses all case data and workload sizes. The harness executes
+  exactly the declared cases, with no hidden edge/random inputs: full-width
+  numbers may represent counts, lengths or loop bounds rather than cheap data.
+  Prompts require small, representative quick tests; independent references
+  and non-empty coverage remain mandatory.
 """
 
 from __future__ import annotations
 
-import hashlib
-import random
 import re
 from typing import Any
 
@@ -63,12 +70,6 @@ DETAIL_RE = re.compile(r"^CFU_CONFORMANCE_(?:MISSING|CASE)\b.*$", re.MULTILINE)
 
 # Oracle `cases[].args` are bound to these C names in rs1/rs2 order.
 ROLE_NAMES = {"rs1": "a", "rs2": "b"}
-
-# Harness-side extra differential cases for rd-writing commands: edge values
-# swept across the roles plus fixed-seed pseudo-random inputs, bounded.
-EDGE_CASE_VALUES = (0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF)
-MAX_EXTRA_CASES = 5
-
 
 def _commands(isa: Any) -> list[dict[str, Any]]:
     if not isinstance(isa, dict):
@@ -262,6 +263,71 @@ def _expression_is_constant(expression: str) -> bool:
     return _C_IDENTIFIER_RE.search(text) is None
 
 
+#: An operand compared with itself, e.g. ``a == a``. The purest tautology that
+#: still contains an identifier, so the constant check above cannot see it.
+_IDENTITY_COMPARISON_RE = re.compile(
+    r"([A-Za-z_]\w*(?:\[[^\[\]]*\])?)\s*(?:==|!=)\s*\1(?![A-Za-z0-9_])"
+)
+#: ``NAME = <literal>;`` inside this entry's own helpers/setup. Such a NAME is a
+#: value the oracle wrote next to the check, never a DUT observation.
+_LITERAL_ASSIGNMENT_RE = re.compile(
+    r"(?<![.\w])([A-Za-z_]\w*)\s*=\s*(?:\([^()]*\)\s*)?"
+    r"(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)[uUlL]*\s*;"
+)
+
+
+def _identifiers(expression: str) -> set[str]:
+    """Identifiers referenced by one C expression, comments/literals removed.
+
+    Numeric literals go too: without that step the ``u`` suffix of ``0u`` is an
+    identifier, which would hide an argument-only ``verify`` from the lint below.
+    """
+    text = _C_NUMBER_RE.sub(" ", _strip_c_comments_and_literals(expression))
+    return set(_C_IDENTIFIER_RE.findall(text))
+
+
+def _comparison_is_identity(expression: str) -> bool:
+    """True for ``a == a`` / ``b != b`` (parentheses around an operand ignored)."""
+    text = _strip_c_comments_and_literals(expression).replace("(", " ").replace(")", " ")
+    return _IDENTITY_COMPARISON_RE.search(text) is not None
+
+
+def _literal_decision_names(entry: dict[str, Any]) -> set[str]:
+    """Names this entry's own helpers/setup assign a plain literal to.
+
+    A comparison against one of them is decided by the oracle itself: the same C
+    block wrote the value and then asserts it, so the harness would pass even if
+    the command did nothing. Pointer assignments are excluded because they
+    publish an address (``p = (uint32_t *)0x80000000u``), and reading through
+    ``p`` is a real observation.
+    """
+    text = _strip_c_comments_and_literals(
+        "\n".join(str(entry.get(field) or "") for field in ("helpers", "setup")))
+    names: set[str] = set()
+    for match in _LITERAL_ASSIGNMENT_RE.finditer(text):
+        # A pointer assignment publishes an address, not a data constant:
+        # `uint32_t *p = ...`, `*p = ...`, or `p = (uint32_t *)0x80000000u`.
+        # Reading through p afterwards is a real observation.
+        if text[:match.start()].rstrip().endswith("*"):
+            continue
+        if "*" in match.group(0).split("=", 1)[1]:
+            continue
+        names.add(match.group(1))
+    return names
+
+
+def _argument_int(value: Any) -> int | None:
+    """The integer an oracle case argument denotes, or ``None`` when unusable."""
+    if _int_ok(value):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 0)
+        except ValueError:
+            return None
+    return None
+
+
 _C_KEYWORDS = frozenset("if else for while switch return do sizeof".split())
 _HELPER_DEF_RE = re.compile(
     r"\b(?:static\s+|inline\s+|extern\s+|const\s+|unsigned\s+|signed\s+|volatile\s+)*"
@@ -281,54 +347,90 @@ def _helper_definitions(helpers_text: str) -> list[str]:
     return [m.group(1) for m in _HELPER_DEF_RE.finditer(text) if m.group(1) not in _C_KEYWORDS]
 
 
-def _extra_cases(command: dict[str, Any], entry: dict[str, Any]) -> list[list[int]]:
-    """Harness-side deterministic extra differential cases (bounded).
+def _helper_dependencies(entries: Any) -> dict[str, set[str]]:
+    """Conservative symbol graph, shared across oracle entries like the C unit.
 
-    Appended after the model's own cases for rd-writing commands only, so the
-    model's ``reference`` is exercised against edge and fixed-seed pseudo-random
-    inputs the model did not pick. The seed derives from the command name via
-    sha256, so the vectors are reproducible across runs and machines.
-
-    Trade-off (accepted, see tests): ``reference`` must model these arbitrary
-    inputs. A command whose reference cannot (address-taking or stateful
-    commands) opts out with ``edge_cases: false`` in its oracle entry, keeping
-    only the model's own cases — weaker coverage instead of wrong comparisons.
+    Brace matching covers ordinary helper bodies; logical-line scanning covers
+    function/object macros. Identifier edges also catch taking a DUT/helper's
+    address, callbacks and simple pointer aliases (not just direct calls).
+    This is not a C parser/preprocessor: token pasting, external definitions and
+    computed pointers are outside its scope; identifier edges may over-reject.
     """
-    if entry.get("edge_cases") is False:
-        return []
-    if not writes_cpu_rd(command):
-        return []  # verify expressions may not model arbitrary inputs
-    roles = cpu_value_roles(command)
-    if not roles:
-        return []
-    seed = int.from_bytes(hashlib.sha256(str(command.get("name", "")).encode("utf-8")).digest(), "big")
-    rng = random.Random(seed)
-    extras: list[list[int]] = []
-    for offset in (0, 3):  # two edge sweeps over EDGE_CASE_VALUES
-        extras.append([EDGE_CASE_VALUES[(offset + i) % len(EDGE_CASE_VALUES)] for i in range(len(roles))])
-    for _ in range(3):  # three seeded pseudo-random pairs
-        extras.append([rng.getrandbits(32) for _ in roles])
-    return extras[:MAX_EXTRA_CASES]
+    graph: dict[str, set[str]] = {}
+    for entry in entries:
+        text = _strip_c_comments_and_literals(str(entry.get("helpers") or ""))
+        text = re.sub(r"\\\r?\n", " ", text)
+        for match in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\b([^\n]*)", text, re.M):
+            graph.setdefault(match[1], set()).update(_C_IDENTIFIER_RE.findall(match[2]))
+        spans: list[tuple[int, int]] = []
+        for match in _HELPER_DEF_RE.finditer(text):
+            start, depth, end = match.end(), 1, match.end()
+            while end < len(text) and depth:
+                depth += (text[end] == "{") - (text[end] == "}")
+                end += 1
+            graph.setdefault(match[1], set()).update(_C_IDENTIFIER_RE.findall(text[start:end]))
+            spans.append((match.start(), end))
+        # Global aliases and aliases assigned in setup. Local helper aliases are
+        # already covered by identifiers in the containing body. Do not make
+        # setup calls graph roots: setup-only DUT operations remain legal.
+        for start, end in reversed(spans):
+            text = text[:start] + " " + text[end:]
+        text += "\n" + _strip_c_comments_and_literals(str(entry.get("setup") or ""))
+        aliases = re.finditer(
+            r"\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\([^;=]*\)\s*=\s*([^;]+);"
+            r"|\b([A-Za-z_]\w*)\s*=\s*([^;]+);", text,
+        )
+        for match in aliases:
+            name, value = (match[1], match[2]) if match[1] else (match[3], match[4])
+            graph.setdefault(name, set()).update(_C_IDENTIFIER_RE.findall(value))
+    return graph
 
 
-def _expression_problems(command: dict[str, Any], entry: dict[str, Any]) -> list[str]:
+def _dut_dependency(expression: str, graph: dict[str, set[str]]) -> list[str]:
+    """Find one DUT dependency path; visit each symbol at most once (cycles safe)."""
+    pending = [(name, [name]) for name in sorted(set(_C_IDENTIFIER_RE.findall(
+        _strip_c_comments_and_literals(expression)
+    )), reverse=True)]
+    visited: set[str] = set()
+    while pending:
+        name, path = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        if name.startswith("cfu_"):
+            return path
+        pending.extend((child, path + [child]) for child in sorted(graph.get(name, ()), reverse=True))
+    return []
+
+
+def _expression_problems(
+    command: dict[str, Any], entry: dict[str, Any], dependencies: dict[str, set[str]] | None = None,
+) -> list[str]:
     """Lazy-oracle lints on the oracle C expressions (reference/verify).
 
-    Regression class (2026-09-28): ``verify: "1"``, ``reference: "0"`` and a
-    self-referential ``reference: "cfu_compute(a, b)"`` all validated clean, so
-    a design could pass hw_conformance on a tautology and then fail the
-    benchmark (run 20260928-103622: conformance 2/2, Embench verify failed).
+    Two regression classes drive these rules.
+
+    2026-09-28 (run 20260928-103622): ``verify: "1"``, ``reference: "0"`` and a
+    self-referential ``reference: "cfu_compute(a, b)"`` all validated clean, so a
+    design could pass hw_conformance on a constant and then fail the benchmark
+    (conformance 2/2, Embench verify failed).
+
+    2026-10-03 (run 20261003-090854): the expression *looked* observational but
+    decided its own outcome — ``a == a``, a ``verify`` built only from the case
+    arguments, and a comparison against a value the same oracle's setup had
+    written. Nine cases passed while the digest was wrong.
     """
     problems: list[str] = []
     for field in ("reference", "verify"):
         text = str(entry.get(field) or "").strip()
         if not text:
             continue  # emptiness is reported by the required-field checks
-        calls = sorted(set(re.findall(r"\b(cfu_[A-Za-z0-9_]*)\s*\(", text)))
-        if calls:
+        path = _dut_dependency(text, dependencies or _helper_dependencies([entry]))
+        if path:
             problems.append(
-                f"{field} calls the cfu_* intrinsic {calls[0]}: reference/verify must not call "
-                "cfu_* intrinsics: the reference must be an independent scalar C expression"
+                f"{field} depends on the cfu_* intrinsic {' -> '.join(path)}: reference/verify "
+                "must not call cfu_* intrinsics, directly or through helpers/macros/aliases: "
+                "the reference must be an independent scalar C expression"
             )
         if _expression_is_constant(text):
             problems.append(
@@ -345,10 +447,37 @@ def _expression_problems(command: dict[str, Any], entry: dict[str, Any]) -> list
                 f"declared CPU-value roles bind only {bound_names} (rs1->a, rs2->b); declare "
                 "the CPU read in `resources` or stop using that identifier"
             )
+        if _comparison_is_identity(text):
+            problems.append(
+                f"{field} compares an operand with itself ({text}): a tautology is decided "
+                "before the command runs and can never fail. Compare the value the command "
+                "produces against an independently computed expectation"
+            )
+        identifiers = _identifiers(text)
+        observed = identifiers - bound - _C_TYPE_TOKENS - _C_KEYWORDS
+        if field == "verify" and identifiers and identifiers <= bound:
+            problems.append(
+                "verify only references the case arguments (" + ", ".join(sorted(bound)) + "): "
+                "a command with no CPU result returns nothing, so a check built from its own "
+                "inputs proves nothing about the hardware. Observe state the command acts on "
+                "(memory/slot state your setup seeded, read back through a helper) or declare "
+                "a readback command with a CPU rd and compare that with `reference`"
+            )
+        decided = _literal_decision_names(entry)
+        if observed and observed <= decided:
+            problems.append(
+                f"{field} compares value(s) this oracle's own setup/helpers assigned a literal "
+                f"to ({', '.join(sorted(observed))}): the expression decides its own outcome, so "
+                "it would pass even if the command did nothing. Derive the expected value from "
+                "the workload's scalar code or from memory the DUT wrote"
+            )
     return problems
 
 
-def _coverage_problem_list(command: dict[str, Any], entry: dict[str, Any] | None) -> list[str]:
+def _coverage_problem_list(
+    command: dict[str, Any], entry: dict[str, Any] | None,
+    dependencies: dict[str, set[str]] | None = None,
+) -> list[str]:
     """Every reason this command cannot be verified, or [] when it can.
 
     The caller prefixes the command name, so messages here stay name-free.
@@ -379,8 +508,8 @@ def _coverage_problem_list(command: dict[str, Any], entry: dict[str, Any] | None
             "the harness does not guess how to seed it"
         )
     if "edge_cases" in entry and not isinstance(entry.get("edge_cases"), bool):
-        problems.append("edge_cases must be a boolean: false opts out of the harness extra cases")
-    problems.extend(_expression_problems(command, entry))
+        problems.append("edge_cases must be a boolean (legacy field; no automatic cases are added)")
+    problems.extend(_expression_problems(command, entry, dependencies))
     if isinstance(cases, list):
         roles = cpu_value_roles(command)
         for index, case in enumerate(cases):
@@ -410,13 +539,48 @@ def _coverage_problem_list(command: dict[str, Any], entry: dict[str, Any] | None
                         "value instead)"
                     )
                     break
+        roles = cpu_value_roles(command)
+        if roles:
+            known = [
+                value
+                for case in cases
+                if isinstance(case, dict) and isinstance(case.get("args"), list)
+                for raw in case["args"]
+                if (value := _argument_int(raw)) is not None
+            ]
+            if known and all(value == 0 for value in known):
+                problems.append(
+                    "every declared case binds only zero arguments: the test would exercise "
+                    "the all-zero boundary and nothing else, so a real address, slot index or "
+                    "count is never touched. Give at least one case a representative non-zero "
+                    "literal value (a real aligned address such as 0x80000000 is allowed and "
+                    "must match the address your setup seeds)"
+                )
     return problems
 
 
-def _coverage_problem(command: dict[str, Any], entry: dict[str, Any] | None) -> str:
-    """First coverage problem, or "" when the command can be verified."""
-    problems = _coverage_problem_list(command, entry)
-    return problems[0] if problems else ""
+def _mapping(text: str) -> dict | None:
+    """The answer as one YAML mapping, or ``None`` when it is not one."""
+    import yaml
+
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def parse_oracle(text: str) -> tuple[dict, list[str]]:
+    """Parse one oracle YAML answer into ``(oracle, problems)``.
+
+    Lives with the harness because two callers need it and they must agree: the
+    conformance rung, and the Implement stage where the agent authors an oracle
+    for its own verification. A lazy oracle has to be refused identically by both.
+    """
+    data = _mapping(text)
+    if data is None:
+        return {}, ["the oracle must be exactly one YAML mapping with a commands list"]
+    return data, []
 
 
 def validate_oracle(isa: Any, oracle: Any) -> list[str]:
@@ -445,10 +609,12 @@ def validate_oracle(isa: Any, oracle: Any) -> list[str]:
         seen.add(name)
         if name not in {str(c.get("name", "")) for c in commands}:
             errors.append(f"oracle.commands[{index}] names unknown command {name!r}")
+    entries = _oracle_entries(oracle)
+    dependencies = _helper_dependencies(entries.values())
     for command in commands:
         name = str(command.get("name", ""))
-        entry = _oracle_entries(oracle).get(name)
-        for problem in _coverage_problem_list(command, entry):
+        entry = entries.get(name)
+        for problem in _coverage_problem_list(command, entry, dependencies):
             errors.append(f"{name}: {problem}")
         for issue in unknown_intrinsic_calls(entry or {}, isa):
             errors.append(f"{name}: {issue}")
@@ -471,8 +637,7 @@ def validate_oracle(isa: Any, oracle: Any) -> list[str]:
 def _render_case(command: dict[str, Any], entry: dict[str, Any]) -> str:
     """One case block: bind arguments, call the intrinsic and compare.
 
-    The model's own cases come first; harness extras (see ``_extra_cases``)
-    follow and count into ``g_cases`` like any other case. Both case-argument
+    Only the model's declared cases run and count into ``g_cases``. Both case-argument
     names are declared unconditionally at case scope — the undeclared-identifier
     class must never fail the C build even for a stale oracle (the validator
     lint rejects such references first, with a message that names them).
@@ -482,8 +647,7 @@ def _render_case(command: dict[str, Any], entry: dict[str, Any]) -> str:
     intrinsic = intrinsic_name(command)
     check = "reference" if writes_cpu_rd(command) else "verify"
     expression = str(entry.get(check) or "").strip()
-    model_cases = list(entry.get("cases") or [])
-    cases = model_cases + [{"args": args} for args in _extra_cases(command, entry)]
+    cases = list(entry.get("cases") or [])
     lines: list[str] = []
     for index, case in enumerate(cases):
         args = case.get("args") or []
@@ -527,6 +691,7 @@ def render_conformance(isa: Any, oracle: Any) -> str:
     """
     commands = enabled_commands(isa)
     entries = _oracle_entries(oracle)
+    dependencies = _helper_dependencies(entries.values())
     # Helper emission is collision-proof: identical blocks are emitted once, and
     # when two distinct blocks define the same symbol the first wins (the render
     # stays compilable; validate_oracle rejects the oracle with a rename hint).
@@ -547,7 +712,7 @@ def render_conformance(isa: Any, oracle: Any) -> str:
     for command in commands:
         name = str(command.get("name", ""))
         entry = entries.get(name, {})
-        problem = "; ".join(_coverage_problem_list(command, entries.get(name)))
+        problem = "; ".join(_coverage_problem_list(command, entries.get(name), dependencies))
         body.append(f"  /* ---- {name} ---- */")
         body.append("  {")
         if problem:

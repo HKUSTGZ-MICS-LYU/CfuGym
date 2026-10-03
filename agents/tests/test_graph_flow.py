@@ -1,62 +1,21 @@
-"""Deterministic dry-run flow and prompt visibility."""
+"""Prompt visibility, overlay command construction, and test hermeticity."""
 
 from __future__ import annotations
 
 import shutil
 import unittest
 
-from agents.cfu_design_agent.graph import run_agent_python
 from agents.cfu_design_agent.prompts import context_digest
-from agents.tests.common import REPO_ROOT
+from agents.cfu_design_agent import ir
+from agents.cfu_design_agent.runtime import llm_step
+from agents.tests.common import REPO_ROOT, offline_llm
+from agents.cfu_design_agent import ir as ir_mod
+from agents.cfu_design_agent.runtime import commands as commands_mod
+from agents.cfu_design_agent.stages import feedback as feedback_mod
+from agents.cfu_design_agent.stages import profile
 
 
-class GraphFlowTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.run_id = "flow-test-00000000-0000"
-        self.run_dir = REPO_ROOT / f"agents/generated/runs/{self.run_id}"
-
-    def tearDown(self) -> None:
-        shutil.rmtree(self.run_dir, ignore_errors=True)
-
-    def test_dry_run_plans_without_completing(self) -> None:
-        state = {
-            "workdir": str(REPO_ROOT),
-            "task": "Accelerate a uint8 weighted average kernel with a TileLink CFU.",
-            "input_mode": "natural_language",
-            "dry_run": True,
-            "run_commands": False,
-            "apply_patch": False,
-            "skip_sim": True,
-            "skip_yosys": True,
-            "max_iters": 1,
-            "run_id": self.run_id,
-        }
-        final = run_agent_python(state)
-        self.assertEqual(final["status"], "planned")  # forced by dry_run
-        self.assertTrue(final["final_report_path"])
-        self.assertTrue((REPO_ROOT / final["final_report_path"]).exists())
-        self.assertTrue((self.run_dir / "run.yaml").exists())
-
-    def test_ir_auto_dry_run_does_not_execute_and_does_not_block(self) -> None:
-        state = {
-            "workdir": str(REPO_ROOT),
-            "task": "Accelerate a uint8 weighted average kernel with a TileLink CFU.",
-            "input_mode": "natural_language",
-            "dry_run": True,
-            "run_commands": False,
-            "apply_patch": False,
-            "skip_sim": True,
-            "skip_yosys": True,
-            "ir_features": "auto",
-            "max_iters": 1,
-            "run_id": self.run_id,
-        }
-        final = run_agent_python(state)
-        self.assertEqual(final["status"], "planned")
-        self.assertEqual(final["ir_result"]["status"], "unavailable")
-        self.assertTrue(final["gates"]["ir"]["ok"])
-        self.assertTrue((self.run_dir / "07_analysis/ir_features.yaml").exists())
-
+class ContextDigestTest(unittest.TestCase):
     def test_context_digest_omits_sensitive_and_other_runs(self) -> None:
         context = {
             "files": {
@@ -73,11 +32,12 @@ class GraphFlowTest(unittest.TestCase):
         self.assertNotIn(".git/config", digest)
         self.assertNotIn("other run", digest)
 
+
 class OverlayCommandTest(unittest.TestCase):
     """The overlay command swaps sources without touching the repository."""
 
     def test_overlay_command_swaps_scaffolds_and_scopes_output(self) -> None:
-        from agents.cfu_design_agent.graph import agent_cfu_overlay_commands
+        from agents.cfu_design_agent.runtime.commands import agent_cfu_overlay_commands
         from agents.cfu_design_agent.runtime.policy import load_policy
 
         run_root = "agents/generated/runs/overlay-test"
@@ -105,35 +65,39 @@ class OverlayCommandTest(unittest.TestCase):
             "validation", "soc_generate_agent", argv, REPO_ROOT
         )
 
-    def test_dry_run_seeds_and_reports_design_workspace(self) -> None:
-        run_id = "flow-overlay-test-00000000"
-        run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
-        shutil.rmtree(run_dir, ignore_errors=True)
-        try:
-            final = run_agent_python({
-                "workdir": str(REPO_ROOT),
-                "task": "Accelerate a uint8 weighted average kernel with a TileLink CFU.",
-                "input_mode": "natural_language",
-                "dry_run": True,
-                "run_commands": False,
-                "apply_patch": False,
-                "skip_sim": True,
-                "skip_yosys": True,
-                "max_iters": 1,
-                "run_id": run_id,
-            })
-            design = final.get("design_workspace", {})
-            self.assertTrue(design.get("root", "").endswith("workspace/design"))
-            self.assertEqual(len(final.get("design_files", [])), 2)
-        finally:
-            shutil.rmtree(run_dir, ignore_errors=True)
+class TestHermeticityTest(unittest.TestCase):
+    """Tests must never dial a real model endpoint (operator tokens)."""
+
+    def test_offline_client_is_unavailable_and_patches_the_graph_factory(self) -> None:
+        from agents.cfu_design_agent import graph
+        from agents.tests.common import OfflineLlm
+
+        self.assertFalse(OfflineLlm().available)
+        client = OfflineLlm()
+        result = client.complete("s", "u", fallback="FALLBACK")
+        self.assertFalse(result.used_llm)
+        self.assertEqual(result.text, "FALLBACK")
+        with offline_llm() as patched:
+            self.assertIs(llm_step._llm({}), patched)
+            self.assertFalse(llm_step._llm({}).available)
+
+    @unittest.skipIf(
+        __import__("os").environ.get("CFU_AGENT_TESTS_ALLOW_NETWORK", "").lower()
+        in {"1", "true", "yes", "on"},
+        "network explicitly allowed for this run",
+    )
+    def test_outbound_network_is_blocked(self) -> None:
+        import socket
+
+        with self.assertRaises(RuntimeError):
+            socket.create_connection(("example.com", 80), timeout=1)
 
 
 class RepairFeedbackTest(unittest.TestCase):
     """A hardware repair must see every failing rung's exact error log."""
 
     def test_hardware_repair_feedback_labels_each_source(self) -> None:
-        from agents.cfu_design_agent.graph import hardware_repair_feedback
+        from agents.cfu_design_agent.stages.feedback import hardware_repair_feedback
 
         state = {
             "validation_results": [
@@ -181,9 +145,107 @@ class RepairFeedbackTest(unittest.TestCase):
         self.assertNotIn("IGNORED_SUCCESS", feedback)
 
     def test_hardware_repair_feedback_is_empty_without_failures(self) -> None:
-        from agents.cfu_design_agent.graph import hardware_repair_feedback
+        from agents.cfu_design_agent.stages.feedback import hardware_repair_feedback
 
         self.assertEqual(hardware_repair_feedback({}), "")
+
+
+class IrFeatureXmlTest(unittest.TestCase):
+    """collect_ir_evidence writes feature XML best-effort beside the .ll files."""
+
+    def setUp(self) -> None:
+        import sys
+        import types
+        from unittest import mock
+
+        self.mock = mock
+        self.run_id = "flow-irfeat-000000-00"
+        self.run_dir = REPO_ROOT / f"agents/generated/runs/{self.run_id}"
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.run_dir, True)
+        self.fake_module = types.ModuleType("agents.cfu_design_agent.ir.features")
+        self.extract_calls: list[dict] = []
+        self.extract_error: Exception | None = None
+
+        def fake_extract(text, **kwargs):
+            self.extract_calls.append({**kwargs, "text_len": len(text)})
+            if self.extract_error is not None:
+                raise self.extract_error
+            return {"schema_version": "1", "source_file": kwargs.get("source_file", "")}, {}
+
+        self.fake_module.extract_ir_features = fake_extract
+        self.fake_module.render_features_xml = (
+            lambda features: '<ir_features schema_version="1"/>\n'
+        )
+        self.module_patch = self.mock.patch.dict(
+            sys.modules, {"agents.cfu_design_agent.ir.features": self.fake_module}
+        )
+        self.module_patch.start()
+        self.addCleanup(self.module_patch.stop)
+
+    def _state(self, **overrides) -> dict:
+        state = {
+            "workdir": str(REPO_ROOT),
+            "run_id": self.run_id,
+            "run_root": f"agents/generated/runs/{self.run_id}",
+            "benchmark_project": {"kind": "embench_benchmark", "benchmark": "crc32"},
+            "ir_features": "auto",
+            "run_commands": True,
+            "dry_run": False,
+            "workload_spec": {
+                "hot_loop": {"file": "crc_32.c", "function": "crc32pseudo", "line": 158},
+            },
+            "gates": {},
+        }
+        state.update(overrides)
+        return state
+
+    def test_feature_xml_written_with_hotspot_focus(self) -> None:
+        from agents.cfu_design_agent.stages.profile import collect_ir_evidence
+
+        summary = {"schema_version": "1", "status": "ok", "reason": "",
+                   "toolchain": {"target_match": True}}
+        files = {"07_analysis/ir/crc_32.ll": "define void @f() {\n  ret void\n}\n",
+                 "07_analysis/ir/other.ll": "define void @g() {\n  ret void\n}\n"}
+        with self.mock.patch(
+            "agents.cfu_design_agent.ir.export_embench_ir",
+            return_value=(summary, files),
+        ):
+            result = collect_ir_evidence(self._state())
+        ir = result["ir_result"]
+        self.assertEqual(ir["feature_extraction"], {"status": "ok"})
+        self.assertEqual(len(ir["feature_files"]), 2)
+        for path in ir["feature_files"]:
+            self.assertTrue((REPO_ROOT / path).exists(), path)
+        self.assertTrue((self.run_dir / "07_analysis/ir/crc_32.features.xml").exists())
+        self.assertEqual(len(self.extract_calls), 2)
+        focused = [c for c in self.extract_calls if c["function"] == "crc32pseudo"]
+        self.assertEqual(len(focused), 1)
+        self.assertEqual(focused[0]["hotspot_line"], 158)
+        self.assertEqual(focused[0]["source_file"], "crc_32.c")
+        unfocused = [c for c in self.extract_calls if c["function"] == ""]
+        self.assertEqual(len(unfocused), 1)
+        self.assertIsNone(unfocused[0]["hotspot_line"])
+        self.assertEqual(unfocused[0]["source_file"], "other.c")
+
+    def test_feature_extraction_failure_does_not_block_ir_evidence(self) -> None:
+        from agents.cfu_design_agent.stages.profile import collect_ir_evidence
+
+        self.extract_error = RuntimeError("opt exploded")
+        summary = {"schema_version": "1", "status": "ok", "reason": "",
+                   "toolchain": {"target_match": True}}
+        files = {"07_analysis/ir/crc_32.ll": "define void @f() {\n  ret void\n}\n"}
+        with self.mock.patch(
+            "agents.cfu_design_agent.ir.export_embench_ir",
+            return_value=(summary, files),
+        ):
+            result = collect_ir_evidence(self._state())
+        ir = result["ir_result"]
+        self.assertEqual(ir["status"], "ok")
+        self.assertEqual(len(ir["ir_files"]), 1)
+        self.assertEqual(ir["feature_extraction"]["status"], "unavailable")
+        self.assertIn("opt exploded", ir["feature_extraction"]["errors"][0])
+        self.assertTrue(result["gates"]["ir"]["ok"])
 
 
 if __name__ == "__main__":

@@ -8,7 +8,10 @@ import io
 import unittest
 
 from agents.cfu_design_agent import cli
-from agents.cfu_design_agent.runtime.llm import LlmResult
+from agents.cfu_design_agent.runtime.llm import (
+    DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
+    DEFAULT_MAX_TOOL_ROUNDS, LlmResult,
+)
 from agents.tests.common import REPO_ROOT
 
 
@@ -50,7 +53,43 @@ def _args(**overrides):
     return argparse.Namespace(**base)
 
 
-class ApiTest(unittest.TestCase):
+class V2OptionsTest(unittest.TestCase):
+    def test_tool_budget_defaults_are_shared_and_overridable(self) -> None:
+        args = cli.build_parser().parse_args([])
+        self.assertEqual((DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
+                          DEFAULT_MAX_TOOL_CALLS), (20, 4, 96))
+        self.assertEqual((args.max_tool_rounds, args.max_tool_calls), (20, 96))
+        explicit = cli.build_parser().parse_args([
+            "--max-tool-rounds", "3", "--max-tool-calls", "7",
+        ])
+        self.assertEqual((explicit.max_tool_rounds, explicit.max_tool_calls), (3, 7))
+
+    def test_resume_and_eval_budget_options(self) -> None:
+        args = cli.build_parser().parse_args(["--resume", "abc", "--max-evals", "2"])
+        self.assertEqual(args.resume, "abc")
+        self.assertEqual(args.max_evals, 2)
+
+    def test_max_output_tokens_is_optional_and_validated(self) -> None:
+        # The completion budget defaults to the config / env value; an explicit
+        # flag is the run-level escape hatch for a reasoning model whose
+        # thinking tokens share the same budget.
+        parser = cli.build_parser()
+        self.assertEqual(parser.parse_args(["--task", "x"]).max_output_tokens, 0)
+        self.assertEqual(
+            parser.parse_args(["--task", "x", "--max-output-tokens", "65536"]).max_output_tokens,
+            65536,
+        )
+        with self.assertRaisesRegex(SystemExit, "zero or positive"):
+            cli.main(["--task", "offline test", "--max-output-tokens", "-1"])
+
+    def test_checkpoint_without_run_id_is_rejected_before_any_execution(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "requires --run-id"):
+            cli.main(["--checkpoint", "--task", "offline test"])
+
+    def test_resume_refuses_new_workload_without_touching_run(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "not a new workload"):
+            cli.main(["--resume", "old-run", "--task", "new task"])
+
     def test_success_branch(self) -> None:
         original = cli.OpenAiTextClient
         cli.OpenAiTextClient = _FakeClient
@@ -225,12 +264,59 @@ class StreamFlagTest(unittest.TestCase):
             self.assertIs(cli.build_parser().parse_args(["--task", "x"]).stream_llm, True)
 
 
+class EffectFlagTest(unittest.TestCase):
+    """Patch application and command execution are the default; --dry-run opts out."""
+
+    def _run(self, *argv: str) -> dict:
+        from unittest import mock
+
+        captured: dict = {}
+
+        def _fake_run(state, **kwargs):
+            captured.update(state)
+            return {"status": "planned"}
+
+        with mock.patch.object(cli, "run_agent", _fake_run), \
+                mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
+                mock.patch.object(cli, "enable_progress", lambda: None):
+            cli.main(["--task", "x", *argv])
+        return captured
+
+    def test_effects_are_enabled_by_default(self) -> None:
+        captured = self._run()
+        self.assertFalse(captured["dry_run"])
+        self.assertTrue(captured["apply_patch"])
+        self.assertTrue(captured["run_commands"])
+        self.assertEqual(captured["mode"], "autonomous")
+
+    def test_dry_run_forces_read_only(self) -> None:
+        captured = self._run("--dry-run")
+        self.assertTrue(captured["dry_run"])
+        self.assertFalse(captured["apply_patch"])
+        self.assertFalse(captured["run_commands"])
+        self.assertEqual(captured["mode"], "dry-run")
+
+    def test_effects_can_be_disabled_individually(self) -> None:
+        captured = self._run("--no-apply-patch")
+        self.assertFalse(captured["apply_patch"])
+        self.assertTrue(captured["run_commands"])
+        captured = self._run("--no-run-commands")
+        self.assertTrue(captured["apply_patch"])
+        self.assertFalse(captured["run_commands"])
+
+    def test_legacy_effect_flags_and_no_dry_run_are_accepted_no_ops(self) -> None:
+        captured = self._run("--apply-patch", "--run-commands", "--no-dry-run")
+        self.assertFalse(captured["dry_run"])
+        self.assertTrue(captured["apply_patch"])
+        self.assertTrue(captured["run_commands"])
+
+
 class IrFeaturesFlagTest(unittest.TestCase):
     def test_ir_evidence_is_opt_in_and_passed_to_state(self) -> None:
         from unittest import mock
 
         parser = cli.build_parser()
-        self.assertEqual(parser.parse_args(["--task", "x"]).ir_features, "off")
+        self.assertEqual(parser.parse_args(["--task", "x"]).ir_features, "auto")
         self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "auto"]).ir_features, "auto")
         self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "require"]).ir_features, "require")
         self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "approx"]).ir_features, "approx")
@@ -245,74 +331,6 @@ class IrFeaturesFlagTest(unittest.TestCase):
                 mock.patch.object(cli, "enable_progress", lambda: None):
             cli.main(["--task", "x", "--ir-features", "auto"])
         self.assertEqual(captured.get("ir_features"), "auto")
-
-
-class RepairRoutingFlagTest(unittest.TestCase):
-    def test_default_is_auto_and_can_be_pinned(self) -> None:
-        import os
-        from unittest import mock
-
-        parser = cli.build_parser()
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CFU_AGENT_REPAIR_ROUTING", None)
-            self.assertEqual(parser.parse_args(["--task", "x"]).repair_routing, "auto")
-        with mock.patch.dict(os.environ, {"CFU_AGENT_REPAIR_ROUTING": "fixed"}):
-            self.assertEqual(
-                cli.build_parser().parse_args(["--task", "x"]).repair_routing, "fixed"
-            )
-        self.assertEqual(
-            parser.parse_args(["--task", "x", "--repair-routing", "fixed"]).repair_routing,
-            "fixed",
-        )
-
-    def test_main_passes_the_choice_into_the_state(self) -> None:
-        from unittest import mock
-
-        captured: dict = {}
-
-        def _fake_run(state, **kwargs):
-            captured.update(state)
-            return {"status": "planned"}
-
-        with mock.patch.object(cli, "run_agent", _fake_run), \
-                mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
-                mock.patch.object(cli, "enable_progress", lambda: None):
-            cli.main(["--task", "x", "--repair-routing", "fixed"])
-        self.assertEqual(captured.get("repair_routing"), "fixed")
-
-
-class SoftwareChangeFlagTest(unittest.TestCase):
-    def test_default_is_auto_and_can_be_pinned(self) -> None:
-        import os
-        from unittest import mock
-
-        parser = cli.build_parser()
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CFU_AGENT_SOFTWARE_CHANGE", None)
-            self.assertEqual(parser.parse_args(["--task", "x"]).software_change, "auto")
-        with mock.patch.dict(os.environ, {"CFU_AGENT_SOFTWARE_CHANGE": "always"}):
-            self.assertEqual(
-                cli.build_parser().parse_args(["--task", "x"]).software_change, "always"
-            )
-        self.assertEqual(
-            parser.parse_args(["--task", "x", "--software-change", "always"]).software_change,
-            "always",
-        )
-
-    def test_main_passes_the_choice_into_the_state(self) -> None:
-        from unittest import mock
-
-        captured: dict = {}
-
-        def _fake_run(state, **kwargs):
-            captured.update(state)
-            return {"status": "planned"}
-
-        with mock.patch.object(cli, "run_agent", _fake_run), \
-                mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
-                mock.patch.object(cli, "enable_progress", lambda: None):
-            cli.main(["--task", "x", "--software-change", "always"])
-        self.assertEqual(captured.get("software_change"), "always")
 
 
 class LoopFlagTest(unittest.TestCase):

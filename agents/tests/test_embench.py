@@ -16,6 +16,8 @@ from agents.cfu_design_agent.runtime.policy import PolicyError, load_policy
 from agents.cfu_design_agent.spec import normalize_workload_spec, validate_workload_spec
 from agents.cfu_design_agent.runtime.tools import RepoToolbox, infer_command_id
 from agents.tests.common import REPO_ROOT
+from agents.cfu_design_agent.runtime import stage_services as services
+from agents.cfu_design_agent.stages import profile
 
 
 FIXTURE = """#include <stdio.h>
@@ -342,7 +344,7 @@ class EmbenchPolicyTest(unittest.TestCase):
 
     def test_embench_tree_is_readable_but_not_writable(self) -> None:
         src = "benchmarks/embench-iot/src/crc32/crc_32.c"
-        self.assertTrue(self.policy.can_read("prepare_benchmark", src))
+        self.assertTrue(self.policy.can_read(src))
         for stage in ("implementation", "profile", "validation"):
             self.assertFalse(self.policy.can_write(stage, src), stage)
 
@@ -473,8 +475,8 @@ class EmbenchHotspotTest(unittest.TestCase):
                                                         "function": "Multiply", "file": "matmult-int.c",
                                                         "line": 153, "ordinal": 3, "loop_kind": "for"}},
                   "benchmark_project": {"candidate_hotspots": ["Multiply"]}, "gates": {}}
-        with mock.patch.object(graph, "_write_hotspot_artifact"):
-            updated = graph.extract_hotspot(source)
+        with mock.patch.object(services, "_write_hotspot_artifact"):
+            updated = profile.extract_hotspot(source)
         self.assertEqual(updated["workload_spec"]["kernel_function"], "Multiply")
         self.assertEqual(updated["workload_spec"]["hot_loop"]["line"], 153)
         self.assertEqual(updated["workload_spec"]["hot_spot"], "obs_loop_x_Multiply_3")
@@ -487,7 +489,7 @@ class EmbenchHotspotTest(unittest.TestCase):
             "reference": {"crc32": {"cycles": 100}},
             "profile": {"crc32": {"cycles": 100}, "crc32pseudo": {"cycles": 90, "calls": 2}},
         }
-        instrumented = graph.embench_instrumented_profile(profiles)
+        instrumented = profile.embench_instrumented_profile(profiles)
         self.assertIn("crc32pseudo", instrumented)
         self.assertEqual(
             embench.hotspot_from_profile(instrumented, exclude=("crc32",)), "crc32pseudo"
@@ -497,7 +499,7 @@ class EmbenchHotspotTest(unittest.TestCase):
         from agents.cfu_design_agent import graph
 
         self.assertEqual(
-            graph.embench_instrumented_profile({"reference": {"crc32": {"cycles": 1}}}),
+            profile.embench_instrumented_profile({"reference": {"crc32": {"cycles": 1}}}),
             {"crc32": {"cycles": 1}},
         )
 

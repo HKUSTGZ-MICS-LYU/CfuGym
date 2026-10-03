@@ -18,9 +18,9 @@ bash agents/examples/run_c_project_llm.sh
 
 This points the agent at `c_project_u8_wavg/`, copies the project into `agents/generated/workspaces/`, instruments the copied `main`, and uses the copied project for later profiling.
 
-Both runners default to `--dry-run --skip-sim --skip-yosys`, so the agent only plans: it writes run artifacts under `agents/generated/runs/<run_id>/` but never mutates CFU source or launches long hardware flows.
+The framework default is autonomous (patch application and allowlisted commands are enabled), but both runners pass `--dry-run --skip-sim --skip-yosys` themselves, so the agent only plans: it writes run artifacts under `agents/generated/runs/<run_id>/` but never mutates CFU source or launches long hardware flows.
 
-Read-only behavior is the framework default. To let the same example apply a patch or run hardware commands, pass capability flags:
+To let the same example apply a patch or run hardware commands, pass capability flags (each effect that is not requested stays disabled):
 
 ```bash
 CFU_AGENT_APPLY_PATCH=1 bash agents/examples/run_natural_language_llm.sh

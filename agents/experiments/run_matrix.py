@@ -433,8 +433,6 @@ def agent_script_args(
     run_name: str,
     max_iters: int,
     visibility: str,
-    repair_routing: str,
-    software_change: str,
     profile_cache: str,
 ) -> list[str]:
     return [
@@ -443,10 +441,7 @@ def agent_script_args(
         "--llm-config", str(config_name),
         "--run-id", str(run_name),
         "--max-iters", str(int(max_iters)),
-        "--apply-patch", "--run-commands",
         "--visibility", str(visibility),
-        "--repair-routing", str(repair_routing),
-        "--software-change", str(software_change),
         "--profile-cache", str(profile_cache),
     ]
 
@@ -481,13 +476,11 @@ def build_argv(
     run_name: str,
     max_iters: int,
     visibility: str,
-    repair_routing: str,
-    software_change: str,
     profile_cache: str,
 ) -> list[str]:
     python_cmd = shlex.split(python) + agent_script_args(
         config_name, benchmark, run_name, max_iters,
-        visibility, repair_routing, software_change, profile_cache,
+        visibility, profile_cache,
     )
     return launcher_argv(python_cmd, conda_env, shim_dir)
 
@@ -1275,8 +1268,7 @@ def execute_one(job: dict, opts: argparse.Namespace, exp_dir: Path, configs: dic
         config_name = configs[job["model"]]["config"]
         argv = build_argv(
             opts.python, opts.conda_env, shim_dir, config_name, job["benchmark"], run_name,
-            opts.max_iters, opts.visibility, opts.repair_routing, opts.software_change,
-            opts.profile_cache,
+            opts.max_iters, opts.visibility, opts.profile_cache,
         )
         (run_dir / "cmd.txt").write_text(shlex.join(argv) + "\n")
 
@@ -1358,8 +1350,6 @@ def materialize_experiment(opts: argparse.Namespace) -> dict:
         "conda_env": opts.conda_env,
         "python": opts.python,
         "visibility": opts.visibility,
-        "repair_routing": opts.repair_routing,
-        "software_change": opts.software_change,
         "profile_cache": opts.profile_cache,
         "jobs": opts.jobs,
         "timeout": opts.timeout,
@@ -1372,8 +1362,7 @@ def materialize_experiment(opts: argparse.Namespace) -> dict:
         },
         "argv_template": build_argv(
             opts.python, opts.conda_env, None, "<config>", "<benchmark>", "<run_name>",
-            opts.max_iters, opts.visibility, opts.repair_routing, opts.software_change,
-            opts.profile_cache,
+            opts.max_iters, opts.visibility, opts.profile_cache,
         ),
     }
     meta.update(git_info(opts.workdir))
@@ -1410,8 +1399,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=10800, help="Per-run wall-clock timeout in seconds (default: 3h).")
     parser.add_argument("--seed", type=int, default=20260212, help="Scheduling shuffle seed.")
     parser.add_argument("--visibility", default="standard", choices=("basic", "standard", "extended"))
-    parser.add_argument("--repair-routing", default="auto", choices=("auto", "fixed"))
-    parser.add_argument("--software-change", default="auto", choices=("auto", "always"))
     parser.add_argument("--profile-cache", default="on", choices=("on", "off", "refresh"))
     parser.add_argument("--infra-retries", type=int, default=2, help="Harness retries for infrastructure failures only (default: 2).")
     parser.add_argument("--sbt-lock", dest="sbt_lock", action="store_true", default=True,
@@ -1532,8 +1519,8 @@ def main(argv: list[str] | None = None) -> int:
             name = make_run_name(opts.exp_id, job["model"], job["benchmark"], job["repeat"], opts.max_iters)
             argv_list = build_argv(
                 opts.python, opts.conda_env, shim_dir, configs[job["model"]]["config"],
-                job["benchmark"], name, opts.max_iters, opts.visibility, opts.repair_routing,
-                opts.software_change, opts.profile_cache,
+                job["benchmark"], name, opts.max_iters, opts.visibility,
+                opts.profile_cache,
             )
             print(f"[dry ] {name}: {shlex.join(argv_list)}")
         print(f"[dry ] experiment.yaml -> {exp_dir / 'experiment.yaml'} ({len(jobs)} runs scheduled)")

@@ -592,6 +592,14 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         val uopId = hart.microOpRetirePtr
         val uop = hart.microOp(uopId)
         if (uop.spawned) {
+          // Diagnostic only: an untracked fetch/decode context used to die as a
+          // bare ArrayIndexOutOfBoundsException here. Fail with the context a
+          // reader needs instead; the lookup itself is unchanged.
+          if (uop.fetchId < 0 || uop.decodeId < 0) {
+            simFailure(f"VexiiRiscvProbe lost the pipeline context of retiring uop 0x$uopId%X " +
+              f"(fetchId=${uop.fetchId}, decodeId=${uop.decodeId}, cycle=$cycle): " +
+              "the probe bookkeeping desynchronized from the pipeline")
+          }
           val fetch = hart.fetch(uop.fetchId)
           val decode = hart.decode(uop.decodeId)
 

@@ -21,7 +21,12 @@ class PolicyError(ValueError):
 
 @dataclass(frozen=True)
 class StagePolicy:
-    read: tuple[str, ...]
+    """What one stage may WRITE and RUN.
+
+    Reads are deliberately absent: a run's knowledge is shared, so the whole
+    flow sees one tree while only the write/command authority is stage-scoped.
+    """
+
     write: tuple[str, ...]
     commands: tuple[str, ...]
 
@@ -47,6 +52,9 @@ class AccessPolicy:
     write_roots: tuple[str, ...]
     stages: dict[str, StagePolicy]
     commands: dict[str, CommandPolicy]
+    # One shared read tree for the whole flow. Every stage sees the same paths;
+    # `is_current_run_path` still scopes run artifacts to the executing run.
+    read: tuple[str, ...] = ()
     # Visibility tiers are an ordered ladder (lowest first). A path matched by
     # ``visibility_gated[level]`` may only be read at that level or above.
     visibility: str = DEFAULT_VISIBILITY
@@ -67,12 +75,22 @@ class AccessPolicy:
         if not isinstance(raw_stages, dict) or not isinstance(raw_commands, dict):
             raise PolicyError("access policy stages and commands must be mappings")
 
+        read = _string_tuple(data.get("read", []), "read")
+        if not read:
+            raise PolicyError("access policy needs a top-level `read` list")
+
         stages: dict[str, StagePolicy] = {}
         for name, raw in raw_stages.items():
             if not isinstance(name, str) or not isinstance(raw, dict):
                 raise PolicyError(f"invalid stage policy: {name!r}")
+            if "read" in raw:
+                # Reads are shared by the whole flow; a stage-scoped read list
+                # would silently narrow what a stage sees, so refuse it.
+                raise PolicyError(
+                    f"stage {name!r} declares `read`; reads are declared once at "
+                    "the top level and shared by every stage"
+                )
             stages[name] = StagePolicy(
-                read=_string_tuple(raw.get("read", []), f"{name}.read"),
                 write=_string_tuple(raw.get("write", []), f"{name}.write"),
                 commands=_string_tuple(raw.get("commands", []), f"{name}.commands"),
             )
@@ -103,6 +121,7 @@ class AccessPolicy:
             write_roots=_string_tuple(data.get("write_roots", []), "write_roots"),
             stages=stages,
             commands=commands,
+            read=read,
             visibility=_resolve_visibility(visibility or default_level, levels),
             visibility_levels=levels,
             visibility_gated=gated,
@@ -118,10 +137,21 @@ class AccessPolicy:
             ) from exc
 
     def required_visibility(self, rel_path: str) -> str:
-        """The lowest level allowed to read ``rel_path`` ("" when ungated)."""
+        """The lowest level allowed to read ``rel_path`` or anything below it.
+
+        A gate is usually declared as a subtree (``ext/SpinalHDL/**``), so the
+        directory that roots it must report the same level as its contents:
+        otherwise a walk matches nothing on the directory and descends into a
+        tree that can never yield a readable file.
+        """
         required = ""
         for level, patterns in self.visibility_gated.items():
-            if self._matches(rel_path, patterns):
+            hit = self._matches(rel_path, patterns) or any(
+                _under_root(rel_path, root)
+                for root in map(_subtree_root, patterns)
+                if root
+            )
+            if hit:
                 # Several levels may match; the strictest wins.
                 if not required or self.level_index(level) > self.level_index(required):
                     required = level
@@ -146,30 +176,107 @@ class AccessPolicy:
     def is_denied(self, rel_path: str) -> bool:
         return self._matches(rel_path, self.deny)
 
-    def can_read(self, stage: str, rel_path: str) -> bool:
-        stage_policy = self.stage(stage)
-        if self.is_denied(rel_path) or not self._matches(rel_path, stage_policy.read):
+    def is_denied_subtree(self, rel_path: str) -> bool:
+        """True when ``rel_path`` or everything below it is denied.
+
+        ``is_denied`` alone misses a directory that only *contains* a denied
+        tree (``target`` against ``**/target/**``), so a walk would descend into
+        it and spend its enumeration budget on paths it can never return.
+        """
+        if self.is_denied(rel_path) or self.is_denied(rel_path + "/"):
+            return True
+        return any(
+            _under_root(rel_path, root)
+            for root in map(_subtree_root, self.deny)
+            if root
+        )
+
+    def can_read(self, rel_path: str) -> bool:
+        if self.is_denied(rel_path) or not self._matches(rel_path, self.read):
             return False
         return not self.visibility_block(rel_path)
+
+    def _pattern_is_gated_here(self, pattern: str) -> bool:
+        """True when the whole ``pattern`` is unreadable at the current level."""
+        root = _subtree_root(pattern) or _literal_prefix(pattern)
+        if not root:
+            return False
+        required = self.required_visibility(root)
+        return bool(required) and self.level_index(required) > self.level_index(self.visibility)
+
+    def may_contain_readable(self, rel_path: str) -> bool:
+        """True when a readable path may exist at or below ``rel_path``.
+
+        Navigation needs this: a directory is never itself in the read
+        allowlist, so filtering directories through ``can_read`` hides every
+        directory-only tree behind a misleading "nothing here".
+        """
+        rel = (rel_path or "").strip("/")
+        if not rel:
+            return True
+        if self.visibility_block(rel):
+            # The directory roots a gated subtree: nothing below it is readable.
+            return False
+        if self.can_read(rel):
+            return True
+        for pattern in self.read:
+            if self._pattern_is_gated_here(pattern):
+                continue
+            prefix = _literal_prefix(pattern)
+            if not prefix or _under_root(rel, prefix) or _under_root(prefix, rel):
+                return True
+        return False
+
+    def _blocked_gate_below(self, rel_path: str) -> str:
+        """The strictest gate above the current level that roots a subtree here.
+
+        A directory that only leads to gated content (``skills`` at ``basic``)
+        is unreadable *because of the tier*, and saying so is what tells the
+        model that rephrasing cannot help.
+        """
+        blocked = ""
+        for level, patterns in self.visibility_gated.items():
+            if self.level_index(level) <= self.level_index(self.visibility):
+                continue
+            for pattern in patterns:
+                root = _subtree_root(pattern)
+                if root and _under_root(root, rel_path):
+                    if not blocked or self.level_index(level) > self.level_index(blocked):
+                        blocked = level
+        return blocked
+
+    def subtree_exclusion(self, rel_path: str) -> str:
+        """Why nothing at or below ``rel_path`` can be read, or "" when it may."""
+        if self.may_contain_readable(rel_path):
+            return ""
+        rel = (rel_path or "").strip("/")
+        if self.is_denied_subtree(rel):
+            return "denied by deny rule"
+        blocked = self.visibility_block(rel) or (
+            self._blocked_gate_below(rel) if rel else ""
+        )
+        if blocked:
+            return f"requires visibility level {blocked!r} (current: {self.visibility})"
+        return "outside the shared read allowlist"
 
     def can_write(self, stage: str, rel_path: str) -> bool:
         stage_policy = self.stage(stage)
         return not self.is_denied(rel_path) and self._matches(rel_path, stage_policy.write)
 
-    def check_read(self, stage: str, rel_path: str) -> None:
-        if self.can_read(stage, rel_path):
+    def check_read(self, rel_path: str) -> None:
+        if self.can_read(rel_path):
             return
         if self.is_denied(rel_path):
             reason = "denied by deny rule"
-        elif not self._matches(rel_path, self.stage(stage).read):
-            reason = "not allowlisted for stage"
+        elif not self._matches(rel_path, self.read):
+            reason = "not in the shared read allowlist"
         else:
             blocked = self.visibility_block(rel_path)
             reason = (
                 f"requires visibility level {blocked!r} "
                 f"(current: {self.visibility})"
             )
-        raise PolicyError(f"read path is {reason}: {stage}: {rel_path}")
+        raise PolicyError(f"read path is {reason}: {rel_path}")
 
     def check_write(self, stage: str, rel_path: str) -> None:
         if not self.can_write(stage, rel_path):
@@ -288,6 +395,38 @@ def _glob_matches(path: str, pattern: str) -> bool:
     if pattern.startswith("**/") and fnmatchcase(path, pattern[3:]):
         return True
     return False
+
+
+def _has_wildcard(text: str) -> bool:
+    return any(ch in text for ch in "*?[")
+
+
+def _literal_prefix(pattern: str) -> str:
+    """The longest leading path a pattern cannot match outside of.
+
+    ``src/main/**/*.scala`` -> ``src/main``, ``sw/tests/**`` -> ``sw/tests``.
+    An empty result means the pattern may match anywhere.
+    """
+    parts: list[str] = []
+    for part in pattern.split("/"):
+        if _has_wildcard(part):
+            break
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _subtree_root(pattern: str) -> str:
+    """The literal directory a subtree pattern covers (``X/**`` -> ``X``).
+
+    Returns "" for patterns that name files or carry a wildcard in the
+    directory part, because those cannot prune a whole subtree.
+    """
+    body = pattern[3:] if pattern.startswith("**/") else pattern
+    for suffix in ("/**", "/*", "/"):
+        if body.endswith(suffix):
+            root = body[: -len(suffix)]
+            return root if root and not _has_wildcard(root) else ""
+    return ""
 
 
 def _under_root(path: str, root: str) -> bool:

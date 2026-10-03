@@ -269,7 +269,6 @@ def validate_workload_spec(spec: WorkloadSpec, *, strict: bool = False) -> list[
 
 
 def unknown_high_impact_fields(operation: str | None, spec: WorkloadSpec) -> bool:
-    op = operation or spec.get("operation", "")
     return bool(
         any(unknown in {"operation", "element_type", "signedness", "overflow_policy"} for unknown in spec.get("unknowns", []))
     )
