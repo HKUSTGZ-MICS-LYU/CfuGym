@@ -257,7 +257,16 @@ class ImplementationToolset:
             delivery, problems = self.conformance_session.write(args["oracle"])
             if problems:
                 return "error: oracle delivery rejected: " + "; ".join(problems)
-            return "conformance oracle delivered and source rendered; no simulation. " + delivery["source_path"]
+            # Host-owned compile preflight: a delivered test that cannot even be
+            # parsed must not reach the ladder (run 20261003-130005 spent the
+            # last answer-repair round on `redefinition of 'md5_oracle_mem'`).
+            # Rejecting here keeps the previous delivery and hands the compiler
+            # error straight back to the model.
+            syntax = self._conformance_syntax_problems()
+            if syntax:
+                self.conformance_session.revert_pending()
+                return "error: oracle delivery rejected: the delivered C does not compile: " + syntax
+            return "conformance oracle delivered and source compiled (syntax only); no simulation. " + delivery["source_path"]
         if name == "check_conformance_syntax" and self.check_conformance_syntax is not None:
             if args:
                 return "usage error: check_conformance_syntax takes no arguments"
@@ -340,6 +349,29 @@ class ImplementationToolset:
             return "edit rejected: " + str(result.get("stderr_tail", ""))[:2000]
         self.edits_used[kind] += 1
         return str(result.get("stdout_tail", "") or "edits applied atomically")[:6000]
+
+    def _conformance_syntax_problems(self) -> str:
+        """Compiler diagnostics for the just-delivered test, or "" when it compiles.
+
+        The parent owns the command; this only consumes its result. A negative
+        status (policy denial, missing toolchain, timeout) is *not* a delivery
+        rejection -- the model cannot fix that, and the final ``hw_conformance``
+        rung still owns the verdict -- so only a real compiler error (positive
+        return code) blocks the delivery.
+        """
+        if self.check_conformance_syntax is None:
+            return ""
+        try:
+            result = self.check_conformance_syntax()
+        except Exception:
+            return ""
+        if not isinstance(result, dict):
+            return ""
+        returncode = result.get("returncode")
+        if returncode is None or not isinstance(returncode, int) or returncode <= 0:
+            return ""
+        text = str(result.get("stderr_tail") or result.get("stdout_tail") or "").strip()
+        return " ".join(text.split())[-1200:]
 
     def _check(self, args: dict[str, Any], kind: str, callback: Callable[[], dict[str, Any]],
                session: CodingSession, budget: int, label: str, gate: str) -> str:

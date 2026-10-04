@@ -57,7 +57,7 @@ def _software_targets(state: CfuDesignState, toolbox: RepoToolbox) -> list[tuple
     """[(writable path, current text)] the software rung may rewrite."""
     spec = state.get("workload_spec", {})
     project = state.get("benchmark_project", {})
-    run_root = state.get("run_root", "")
+    run_root = str(state.get("run_root", "") or "")
     workdir = Path(state.get("workdir", ".")).resolve()
     kind = str(project.get("kind", ""))
 
@@ -67,14 +67,29 @@ def _software_targets(state: CfuDesignState, toolbox: RepoToolbox) -> list[tuple
         for source in embench.benchmark_source_files(workdir, name) if name else []:
             path = embench.embench_cfu_rel(run_root, name, Path(source).name)
             targets.append((path, toolbox.read_text(path, limit=1_000_000)))
-        return targets
-    if kind == "generated_benchmark":
+    elif kind == "generated_benchmark":
         source = str(project.get("source_path", ""))
-        return [(source, toolbox.read_text(source, limit=1_000_000))] if source else []
-    if kind == "instrumented_copy":
+        targets = [(source, toolbox.read_text(source, limit=1_000_000))] if source else []
+    elif kind == "instrumented_copy":
         source = str(project.get("source_path", ""))
-        return [(source, toolbox.read_text(source, limit=1_000_000))] if source else []
-    return []
+        targets = [(source, toolbox.read_text(source, limit=1_000_000))] if source else []
+    else:
+        targets = []
+    if run_root and not state.get("isa_contract", True):
+        # Ablation (--no-isa-contract): the intrinsics header is agent-authored,
+        # so it is an ordinary editable software target alongside the kernel.
+        from ..stages.implement.intrinsics import intrinsics_header_path
+
+        header = intrinsics_header_path(state)
+        if header and all(path != header for path, _ in targets):
+            try:
+                text = toolbox.read_text(header, limit=1_000_000)
+            except (OSError, policy_mod.PolicyError):
+                # Not seeded yet; _write_intrinsics_header seeds it from the
+                # intrinsic template before any edit round.
+                text = ""
+            targets.append((header, text))
+    return targets
 
 
 def _toolbox_for_stage(state: CfuDesignState, stage: str) -> RepoToolbox:

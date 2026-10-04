@@ -19,6 +19,21 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
     a missing or stale answer returns to Implement under the answer budget.
     """
     rung = "hw_conformance"
+    if not state.get("require_conformance", True):
+        # Ablation (--no-conformance): the rung is out of scope, not skipped for
+        # want of execution. It is recorded as disabled (never verified) and the
+        # gate machinery excludes it from the completeness requirement.
+        reason = "disabled by --no-conformance (ablation)"
+        result = stage_services._skipped_result("make cfu_conformance + MiCoSocSim", state, reason)
+        result["rung"] = rung
+        stage_services._write_ladder_artifact(state, rung, [result], "disabled", reason)
+        return {
+            "validation_results": [result],
+            "stage_jobs": "validation",
+            **outcome.stage_result(state, rung=rung, ok=False, skipped=True,
+                                   disabled="no-conformance", reason=reason,
+                                   history="Hardware conformance disabled (--no-conformance); never validated."),
+        }
     reason = stage_services._profile_reason(state)
     if reason:
         result = stage_services._skipped_result("make cfu_conformance + MiCoSocSim", state, reason)

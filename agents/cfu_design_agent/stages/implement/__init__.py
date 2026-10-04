@@ -68,10 +68,11 @@ def implement(state: CfuDesignState) -> CfuDesignState:
             update = outcome.merge_updates(update, sw_update)
             if _rejected(sw_update, "implementation_sw", state):
                 return _rollback(update, state, transaction)
-        oracle_update = oracle_author.write_conformance(outcome.merge_updates(state, update))
-        update = outcome.merge_updates(update, oracle_update)
-        if oracle_update.get("errors"):
-            return _rollback(update, state, transaction)
+        if state.get("require_conformance", True):
+            oracle_update = oracle_author.write_conformance(outcome.merge_updates(state, update))
+            update = outcome.merge_updates(update, oracle_update)
+            if oracle_update.get("errors"):
+                return _rollback(update, state, transaction)
         return update
     except Exception:
         if transaction is not None:

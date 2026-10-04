@@ -99,6 +99,9 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                                        timeout=1800, mutate=True) for argv in commands]
         return (next((item for item in results if item.get("returncode") != 0), results[-1]))
 
+    # Ablation (--no-conformance): no oracle session, no write_conformance /
+    # check_conformance_syntax tools, no oracle requirement in the verdict.
+    conformance_on = bool(state.get("require_conformance", True))
     # Oracle/C stay editable in every round. A verification contract that cannot
     # observe the real failure has to be repairable, not frozen: run
     # 20261003-090854-136683-d98e5be9 spent its whole design-repair budget against
@@ -106,11 +109,15 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
     # attempt to strengthen it was refused. Strengthening is expected; weakening
     # is not — the validator rejects a lazy oracle, and a repair must still submit
     # its structured diagnosis before the first oracle edit.
-    _prior_delivery, _delivery_problems = conformance_delivery.inspect_delivery(state, toolbox)
-    oracle_session = conformance_delivery.ConformanceDelivery(
-        state, toolbox, header_path, editable=True, diagnosis_required=bool(feedback))
+    oracle_session = None
+    if conformance_on:
+        _prior_delivery, _delivery_problems = conformance_delivery.inspect_delivery(state, toolbox)
+        oracle_session = conformance_delivery.ConformanceDelivery(
+            state, toolbox, header_path, editable=True, diagnosis_required=bool(feedback))
 
     def check_conformance_syntax() -> dict[str, Any]:
+        if oracle_session is None:
+            return {"returncode": 1, "stderr_tail": "conformance is disabled (--no-conformance)"}
         _delivery, problems = oracle_session.current()
         if problems:
             return {"returncode": 1, "stderr_tail": "; ".join(problems)}
@@ -131,13 +138,14 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         if not delivery.strip() or not toolsets:
             return False, "the delivery was empty"
         tools = toolsets[-1]
+        oracle_changed = bool(oracle_session is not None and oracle_session.changed)
         if state.get("repair_scope") == "conformance":
-            need_change = bool(need_hw or need_sw or oracle_session.changed)
+            need_change = bool(need_hw or need_sw or oracle_changed)
         else:
             need_change = True
         hw_changed = repair_scope.changed_paths(toolbox, tools.hardware_session).intersection(hardware_targets)
         sw_changed = repair_scope.changed_paths(toolbox, tools.software_session).intersection(software_targets)
-        if need_change and not hw_changed and not sw_changed and not oracle_session.changed:
+        if need_change and not hw_changed and not sw_changed and not oracle_changed:
             return False, (
                 "no hardware target was edited and no software target was edited, so "
                 "nothing is applied: call edit_hardware/edit_software on the approved "
@@ -155,9 +163,10 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                 f"call edit_software on {', '.join(sorted(software_targets))}, "
                 "then submit a summary"
             )
-        _delivery, delivery_errors = oracle_session.current()
-        if delivery_errors:
-            return False, "conformance oracle is missing/stale/invalid: call write_conformance; " + "; ".join(delivery_errors)
+        if oracle_session is not None:
+            _delivery, delivery_errors = oracle_session.current()
+            if delivery_errors:
+                return False, "conformance oracle is missing/stale/invalid: call write_conformance; " + "; ".join(delivery_errors)
         if any(not (toolbox.workdir / path).is_file() for path in (*hw_changed, *sw_changed)):
             return False, "an edited target is missing from the run workspace"
         try:
@@ -189,24 +198,49 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         tool_names.append("submit_repair_diagnosis")
     tool_names.extend([
         "edit_hardware", "edit_software", "check_hardware_elaboration",
-        "check_software_compile", "build_soc", "build_software",
-        "write_conformance", "check_conformance_syntax", "submit_stage",
+        "check_software_compile", "build_soc", "build_software", "submit_stage",
     ])
+    if conformance_on:
+        tool_names.extend(["write_conformance", "check_conformance_syntax"])
     artifact_paths: list[tuple[str, str]] = []
     if run_root:
-        artifact_paths = stage_services.existing_evidence(state, [
-            (f"{run_root}/07_analysis/workload_analysis.yaml", "workload analysis"),
-            (f"{run_root}/08_isa/cfu_isa.yaml", "frozen ISA contract (read it before using an encoding)"),
-        ])
+        evidence = [(f"{run_root}/07_analysis/workload_analysis.yaml", "workload analysis")]
+        if state.get("isa_contract", True):
+            evidence.append(
+                (f"{run_root}/08_isa/cfu_isa.yaml", "frozen ISA contract (read it before using an encoding)")
+            )
+        artifact_paths = stage_services.existing_evidence(state, evidence)
+    conformance_step = (
+        "3. Keep the conformance oracle honest with `write_conformance(oracle)`; "
+        "the host renders C. Optionally check `check_conformance_syntax`; do not simulate "
+        "in Implement. The oracle stays editable in every round: when a build or "
+        "simulation failure shows the current checks are blind, strengthen them (add the "
+        "case that would have caught it). Never weaken an oracle to make a failing design "
+        "pass; a tautological or self-decided check is rejected.\n"
+        if conformance_on else ""
+    )
+    submit_number = 4 if conformance_on else 3
+    contract_free = not state.get("isa_contract", True)
+    step_one = (
+        "1. Read the scaffold/platform before writing, "
+        "skipping only what the run memory already covers with matching hashes "
+        "(re-read anything changed or needed for exact SEARCH text). "
+        "There is NO ISA contract in this run: you design the instructions yourself. "
+        "Write `cfu_intrinsics.h` from the intrinsic template below with `edit_software` "
+        "(it is a normal software target): pick the encodings freely (custom0 opcode 0x0B, "
+        "funct3 0..7, funct7 0..127) and keep the RTL encodings consistent with the header.\n"
+        if contract_free else
+        "1. Read the frozen ISA contract and the scaffold/platform before writing, "
+        "skipping only what the run memory already covers with matching hashes "
+        "(re-read anything changed or needed for exact SEARCH text).\n"
+    )
     brief = prompts.stage_brief(
         "implementation (hardware + software)",
         deliverable=(
             "Apply the change to the workspace files with the editing tools, then call "
             "`submit_stage` with a short summary.\n"
-            "1. Read the frozen ISA contract and the scaffold/platform before writing, "
-            "skipping only what the run memory already covers with matching hashes "
-            "(re-read anything changed or needed for exact SEARCH text).\n"
-            "2. Write the design with `edit_hardware` and the accelerated kernel with "
+            + step_one
+            + "2. Write the design with `edit_hardware` and the accelerated kernel with "
             "`edit_software` (exact SEARCH/REPLACE edits). First delivery requires actual "
             "changes in both domains. A repair may reuse unchanged healthy sources "
             "only with a hash-checked prior implementation gate and real CFU software; "
@@ -214,13 +248,8 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
             "Before you submit, apply required changes; a delivery that pastes file "
             "content or a patch is not applied "
             "anywhere and will be rejected.\n"
-            "3. Keep the conformance oracle honest with `write_conformance(oracle)`; "
-            "the host renders C. Optionally check `check_conformance_syntax`; do not simulate "
-            "in Implement. The oracle stays editable in every round: when a build or "
-            "simulation failure shows the current checks are blind, strengthen them (add the "
-            "case that would have caught it). Never weaken an oracle to make a failing design "
-            "pass; a tautological or self-decided check is rejected.\n"
-            "4. `submit_stage(delivery)`: `delivery` is a summary of what you changed, "
+            + conformance_step
+            + f"{submit_number}. `submit_stage(delivery)`: `delivery` is a summary of what you changed, "
             "which evidence you ran, and what remains unknown — not the change itself. "
             "The gate rejects a submission that reports no applied change to a hardware "
             "and a software target on first delivery; repairs require applied changes "
@@ -234,6 +263,30 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         agent_tools=True,
         artifact_paths=artifact_paths,
     )
+    schedule_line = (
+        "\nYou schedule the work: read/search, edit_hardware, edit_software, "
+        "check_hardware_elaboration, check_software_compile, build_soc, build_software, "
+        + ("write_conformance and check_conformance_syntax " if conformance_on else "")
+        + "may be used while budget remains. "
+        + ("All simulation belongs to Verify, which consumes your committed oracle. "
+           "Use independent reference and small bounded cases; never weaken the oracle to "
+           "make a failing design pass, and strengthen it when the failure evidence shows "
+           "the current checks could not see the defect."
+           if conformance_on else
+           "All simulation belongs to Verify; run no simulation in Implement.")
+    )
+    conformance_block = (
+        ("\n\nConformance oracle authoring contract:\n"
+         + prompts.conformance_prompt(state["task"], state.get("isa_spec") or {}, state.get("workload_spec") or {},
+                                     agent_tools=True, workdir=str(toolbox.workdir), run_root=run_root)
+         + "\nIn this tool session apply the oracle with write_conformance(oracle), not as your final response.")
+        if conformance_on else ""
+    )
+    template_block = (
+        ("\n\nIntrinsic template (starting point for `cfu_intrinsics.h`; adapt it freely):\n"
+         "```c\n" + intrinsics.intrinsics_template_text(str(toolbox.workdir)) + "\n```")
+        if contract_free else ""
+    )
     stage_user = (
         f"Task:\n{state['task']}\n\n"
         + brief
@@ -241,20 +294,12 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         + ", ".join(sorted(hardware_targets))
         + "\nSoftware targets (edit with `edit_software`): "
         + ", ".join(sorted(software_targets))
-        + "\nYou schedule the work: read/search, edit_hardware, edit_software, "
-        "check_hardware_elaboration, check_software_compile, build_soc, build_software, "
-        "write_conformance and check_conformance_syntax may be used while budget remains. "
-        "All simulation belongs to Verify, which consumes your committed oracle. "
-        "Use independent reference and small bounded cases; never weaken the oracle to "
-        "make a failing design pass, and strengthen it when the failure evidence shows "
-        "the current checks could not see the defect."
+        + schedule_line
         + "\nCurrent failure evidence:\n" + feedback
         + ("\nCONFORMANCE-ONLY REPAIR: repair oracle/test authoring; reuse healthy HW/SW without dummy edits."
            if state.get("repair_scope") == "conformance" else "")
-        + "\n\nConformance oracle authoring contract:\n"
-        + prompts.conformance_prompt(state["task"], state.get("isa_spec") or {}, state.get("workload_spec") or {},
-                                    agent_tools=True, workdir=str(toolbox.workdir), run_root=run_root)
-        + "\nIn this tool session apply the oracle with write_conformance(oracle), not as your final response."
+        + conformance_block
+        + template_block
     )
     try:
         result, raw, calls = llm_step._run_agent_step(
@@ -304,7 +349,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                                 "applied": True, "proposed": True, "errors": []}, feedback)
         stage_services._write_software_artifact(state, result.text, {"patch": "", "files": software_changed,
                                 "applied": True, "proposed": True, "errors": []}, [], feedback)
-        delivery, _ = oracle_session.current()
+        delivery, _ = oracle_session.current() if oracle_session is not None else ({}, [])
         tools.commit()
     except Exception:
         if toolsets and not toolsets[-1].hardware_session.committed:

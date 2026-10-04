@@ -51,7 +51,9 @@ def _hardware_evidence_paths(state: CfuDesignState) -> list[tuple[str, str]]:
         return []
     return stage_services.existing_evidence(state, [
         (f"{run_root}/07_analysis/workload_analysis.yaml", "workload analysis"),
-        (f"{run_root}/08_isa/cfu_isa.yaml", "frozen ISA contract"),
+        (f"{run_root}/08_isa/cfu_isa.yaml",
+         "frozen ISA contract" if state.get("isa_contract", True)
+         else "contract stage marker (disabled by ablation)"),
         (f"{run_root}/09_implementation/hw_plan.md", "previous hardware plan (if any)"),
         (f"{run_root}/09_implementation/hw_changed_files.yaml", "previous hardware change record"),
         (f"{run_root}/workspace/design/", "this run's hardware overlay (your edit target lives here)"),
@@ -151,6 +153,7 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         resolved_failure_ids=resolved_failure_ids,
         coding_tools=bool(toolset_kwargs),
         diagnosis_required=bool(feedback),
+        contract_free=not state.get("isa_contract", True),
         artifact_paths=_hardware_evidence_paths(state),
     )
     fallback = fallbacks.deterministic_hardware_plan(state["task"], state.get("design_contract", ""))

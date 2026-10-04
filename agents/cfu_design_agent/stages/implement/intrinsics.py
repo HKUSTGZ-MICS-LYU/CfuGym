@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from ... import isa, prompts
@@ -116,6 +117,11 @@ def _cfu_call_sites(
                if isinstance(c, dict) and isa.command_kind(c) == "control"}
     sites: list[dict[str, Any]] = []
     for path, _ in targets:
+        if Path(path).name == "cfu_intrinsics.h":
+            # The header *defines* the intrinsics (agent-authored under
+            # --no-isa-contract): its own macro/call syntax is not datapath
+            # evidence, only calls from the workload sources are.
+            continue
         try:
             text = toolbox.read_text(path, limit=2_000_000)
         except PolicyError:
@@ -140,7 +146,10 @@ def _cfu_call_sites(
 
 def _cfu_missing_intrinsic_message(state: CfuDesignState) -> str:
     expected = isa.intrinsic_symbols(state.get("isa_spec", {}) or {})
-    wanted = ", ".join(expected) or "a generated cfu_<command>() intrinsic"
+    if not state.get("isa_contract", True):
+        wanted = "the cfu_* intrinsics you define in cfu_intrinsics.h"
+    else:
+        wanted = ", ".join(expected) or "a generated cfu_<command>() intrinsic"
     return (
         f"the CFU build does not call any CFU datapath intrinsic (expected {wanted}); "
         "an #ifdef USE_AGENT_CFU branch that only calls cfu_enable() and then runs the "
@@ -181,10 +190,19 @@ def _write_intrinsics_header(state: CfuDesignState, toolbox: RepoToolbox) -> str
         # rung cannot apply a kernel either, so do not leave a half-generated
         # workspace behind.
         return ""
-    text = isa.render_cfu_intrinsics(state.get("isa_spec", {}) or {})
     path = intrinsics_header_path(state)
     if not path:
         return ""
+    if not state.get("isa_contract", True):
+        # Ablation (--no-isa-contract): the header is agent-authored. Seed it
+        # once from the tracked intrinsic template so it exists as an editable
+        # software target, but never overwrite the agent's bytes on a later
+        # round: its encodings are its own contract with the hardware.
+        if (toolbox.workdir / path).is_file():
+            return path
+        toolbox.write_text(path, intrinsics_template_text(str(toolbox.workdir)))
+        return path
+    text = isa.render_cfu_intrinsics(state.get("isa_spec", {}) or {})
     toolbox.write_text(path, text)
     return path
 
@@ -206,3 +224,19 @@ def intrinsics_header_path(state: CfuDesignState) -> str:
             return ""
         path = f"{workspace}/cfu_intrinsics.h"
     return path
+
+
+INTRINSICS_TEMPLATE_REL = "skills/cfu-designer/assets/templates/cfu_intrinsics.h"
+
+
+def intrinsics_template_text(workdir: str) -> str:
+    """The tracked intrinsic skeleton the agent authors from under --no-isa-contract.
+
+    Read at seed/prompt time and inlined into the prompt: the skills tree is
+    hidden at --visibility basic, and the template must stay visible there.
+    """
+    try:
+        return (Path(workdir) / INTRINSICS_TEMPLATE_REL).read_text()
+    except OSError:
+        return ("// cfu_intrinsics.h — write the CFU intrinsics yourself "
+                "(custom0 opcode 0x0B; pick funct3/funct7 freely).")

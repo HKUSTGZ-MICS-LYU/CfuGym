@@ -236,13 +236,31 @@ class ReadOnlyToolset:
     # search; those lines are skipped and reported instead.
     max_line_chars: int = 20000
     max_file_bytes: int = 400_000
+    # Ablation (--no-llvm-ir): the observation tool keeps only asm/summary; the
+    # ir/features views and their schema are removed with the IR evidence.
+    ir_views: bool = True
     calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def _observation_schema(self) -> dict[str, Any]:
+        if self.ir_views:
+            return OBSERVATION_SCHEMA
+        schema = {**OBSERVATION_SCHEMA, "function": dict(OBSERVATION_SCHEMA["function"])}
+        function = schema["function"]
+        function["description"] = (
+            "Inspect a measured Embench observation ID: reference-build "
+            "function-level ASM candidates or the summary provenance. "
+            "Returns confidence/ambiguity and never estimates cycles from static code."
+        )
+        properties = dict(function["parameters"]["properties"])
+        properties["view"] = {**properties["view"], "enum": ["summary", "asm"]}
+        function["parameters"] = {**function["parameters"], "properties": properties}
+        return schema
 
     def schemas(self) -> list[dict[str, Any]]:
         # Deep-ish copy so callers cannot mutate the module-level schemas.
         offered = list(READ_ONLY_TOOL_SCHEMAS)
         if self.toolbox.stage == "analysis" and (self.observation_index or {}).get("observations"):
-            offered.append(OBSERVATION_SCHEMA)
+            offered.append(self._observation_schema())
         if self.toolbox.stage == "implementation" and (self.failure_index or {}).get("failures"):
             offered.append(FAILURE_SCHEMA)
         return [
@@ -348,7 +366,7 @@ class ReadOnlyToolset:
         return inspect_observation(
             self.observation_index, self.toolbox,
             str(args.get("id", "") or ""), str(args.get("view", "summary") or "summary"),
-            args.get("max_lines", 60),
+            args.get("max_lines", 60), allow_ir=self.ir_views,
         )
 
     def _inspect_failure(self, args: dict[str, Any]) -> str:

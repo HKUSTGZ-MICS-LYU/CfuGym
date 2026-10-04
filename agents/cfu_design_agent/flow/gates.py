@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..runtime import dependencies
 from ..state import CfuDesignState
 
@@ -54,6 +56,37 @@ REQUIRED_GATES = (
 )
 
 
+def disabled_gate(gate: Any) -> bool:
+    """True when an ablation switch turned this rung off instead of validating it.
+
+    A ``disabled`` gate is recorded (``ok: False``: it was never verified) but is
+    out of scope for this run, so it neither fails the run nor forces the
+    ``skipped => planned`` honesty rule. Real skips (``--dry-run``, ``--skip-sim``,
+    execution disabled) keep that rule and can never produce ``complete``.
+    """
+    return isinstance(gate, dict) and bool(gate.get("disabled"))
+
+
+def required_gates(state: CfuDesignState) -> tuple[str, ...]:
+    """REQUIRED_GATES minus the rungs an ablation switch disabled."""
+    gates = state.get("gates", {}) or {}
+
+    def gate(rung: str) -> Any:
+        value = gates.get(rung)
+        return value if isinstance(value, dict) else None
+
+    required = []
+    for rung in REQUIRED_GATES:
+        if disabled_gate(gate(rung)):
+            continue
+        if rung == "isa" and not state.get("isa_contract", True):
+            continue
+        if rung == "hw_conformance" and not state.get("require_conformance", True):
+            continue
+        required.append(rung)
+    return tuple(required)
+
+
 def max_repairs(state: CfuDesignState) -> int:
     """Repair rounds the global ``--max-iters`` budget still allows.
 
@@ -104,19 +137,20 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
     if state.get("dry_run", False):
         # Dry-run is a planning pass: never claims a measured or complete result.
         return "final_report", "planned"
-    if gates.get("isa", {}).get("abstain"):
+    if gates.get("isa", {}).get("abstain") and not disabled_gate(gates.get("isa")):
         return "final_report", "blocked"
     if not gates.get("workload_spec", {}).get("ok", False):
         return "final_report", "blocked"
     if isinstance(gates.get("analysis"), dict) and not gates["analysis"].get("ok", False):
         return "final_report", "blocked"
-    if not gates.get("isa", {}).get("ok", False):
+    if not gates.get("isa", {}).get("ok", False) and not disabled_gate(gates.get("isa")):
         return "final_report", "blocked"
     if (state.get("ir_features", "off") == "require"
             and not gates.get("ir", {}).get("ok", False)):
         # Explicit IR experiments have their own failure, never an HW/LLM one.
         return "final_report", "failed"
-    present = [rung for rung in LADDER_RUNGS if isinstance(gates.get(rung), dict)]
+    present = [rung for rung in LADDER_RUNGS if isinstance(gates.get(rung), dict)
+               and not disabled_gate(gates.get(rung))]
     executed = [rung for rung in present if not gates[rung].get("skipped")]
     skipped = [rung for rung in present if gates[rung].get("skipped")]
     # A terminal rung failure always reports failed, even when a later rung was
@@ -127,7 +161,7 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
         return "final_report", "planned"
     if skipped:
         return "final_report", "planned"
-    if not all(gates.get(key, {}).get("ok", False) for key in REQUIRED_GATES):
+    if not all(gates.get(key, {}).get("ok", False) for key in required_gates(state)):
         return "final_report", "blocked"
     if state.get("input_fingerprints"):
         try:
@@ -139,7 +173,7 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
 
 def _is_complete(state: CfuDesignState) -> bool:
     gates = state.get("gates", {})
-    if not all(gates.get(key, {}).get("ok", False) for key in REQUIRED_GATES):
+    if not all(gates.get(key, {}).get("ok", False) for key in required_gates(state)):
         return False
     if state.get("ir_features", "off") == "require" and not gates.get("ir", {}).get("ok", False):
         return False

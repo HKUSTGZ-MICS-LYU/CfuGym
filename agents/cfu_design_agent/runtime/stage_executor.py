@@ -449,11 +449,9 @@ def _native_stage_loop(
                 try:
                     observation = toolset.run(name, arguments)
                     # `usage error:` is a fixable argument problem, not an
-                    # answer: the toolset renders it distinctly for exactly this
-                    # check, so a failed call must not be journaled as ok.
-                    ok = not observation.startswith((
-                        "error:", "tool error:", "denied by", "skipped:", "usage error:",
-                    ))
+                    # answer, and a rendered "check failed" is a real failure:
+                    # neither may be journaled as ok.
+                    ok = tools_mod.tool_result_ok(observation)
                 except Exception as exc:
                     observation = f"tool error: {type(exc).__name__}: {exc}"
                     ok = False

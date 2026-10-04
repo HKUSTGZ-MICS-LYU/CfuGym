@@ -21,7 +21,9 @@ def render_ladder(state: CfuDesignState) -> str:
         if not isinstance(gate, dict):
             lines.append(f"- {rung}: not reached")
             continue
-        if gate.get("skipped"):
+        if gate.get("disabled"):
+            status = f"DISABLED by ablation ({gate.get('reason') or gate.get('disabled')})"
+        elif gate.get("skipped"):
             status = f"skipped ({gate.get('reason', '')})"
         else:
             status = "pass" if gate.get("ok") else "FAIL"
@@ -36,6 +38,31 @@ def render_ladder(state: CfuDesignState) -> str:
         f"(iteration={state.get('iteration', 0)})"
     )
     return "\n".join(lines)
+
+
+def ablation_lines(state: CfuDesignState) -> list[str]:
+    """The ablation switches this run enabled and what each one removed.
+
+    An ablated capability is never silently absent: the report and the CLI
+    summary both say which flag disabled which check or evidence source.
+    """
+    active: list[str] = []
+    if not state.get("llvm_ir", True):
+        active.append(
+            "- `--no-llvm-ir`: LLVM IR content removed (ir_features forced off; "
+            "inspect_observation keeps only asm/summary views)"
+        )
+    if not state.get("require_conformance", True):
+        active.append(
+            "- `--no-conformance`: conformance requirement dropped (hw_conformance "
+            "rung recorded as disabled, never validated)"
+        )
+    if not state.get("isa_contract", True):
+        active.append(
+            "- `--no-isa-contract`: ISA contract stage skipped; the agent authored "
+            "`cfu_intrinsics.h` itself from the intrinsic template (encodings free)"
+        )
+    return active
 
 
 def render_report(state: CfuDesignState) -> str:
@@ -73,6 +100,11 @@ def render_report(state: CfuDesignState) -> str:
         if withheld:
             lines.append("- withheld from the agent at this level:")
             lines.extend(f"  - {item}" for item in withheld)
+        lines.append("")
+    ablation = ablation_lines(state)
+    if ablation:
+        lines.append("## Ablation")
+        lines.extend(ablation)
         lines.append("")
     lines.append("## Gates")
     for key, value in (state.get("gates") or {}).items():
@@ -135,7 +167,7 @@ def render_report(state: CfuDesignState) -> str:
     lines.append("")
     lines.append("## Workload Analysis")
     lines.append(str(state.get("workload_analysis", "")))
-    if state.get("ir_features", "off") != "off":
+    if state.get("ir_features", "off") != "off" and state.get("llvm_ir", True):
         ir = state.get("ir_result") or {}
         lines.append("\n### LLVM IR evidence (static, optional)")
         lines.append(f"- status: {ir.get('status', 'unavailable')}")
@@ -146,7 +178,13 @@ def render_report(state: CfuDesignState) -> str:
         lines.extend(f"- features: {path}" for path in ir.get("feature_files", []))
     lines.append("")
     lines.append("## CFU ISA Spec")
-    if state.get("isa_spec"):
+    if not state.get("isa_contract", True):
+        lines.append(
+            "Disabled by `--no-isa-contract`: no contract was authored. The agent wrote "
+            "`cfu_intrinsics.h` itself from the intrinsic template (free encodings); the "
+            "header is the instruction interface."
+        )
+    elif state.get("isa_spec"):
         import yaml as _yaml
         lines.append("```yaml")
         lines.append(_yaml.safe_dump(state["isa_spec"], sort_keys=False).strip())

@@ -82,6 +82,22 @@ class ToolsTest(unittest.TestCase):
         )
         self.assertEqual(virtualize_run_paths("no run path here", run_root), "no run path here")
 
+    def test_failed_check_results_are_not_ok(self) -> None:
+        # Run 20261003-130005: a real "check failed" was journaled ok while the
+        # budget-refusal (error:) was the only thing marked ERROR.
+        from agents.cfu_design_agent.runtime.tools import tool_result_ok
+
+        self.assertFalse(tool_result_ok("isolated hardware elaboration check failed\nfailure: x"))
+        self.assertFalse(tool_result_ok("error: hardware check budget exhausted"))
+        self.assertFalse(tool_result_ok("denied by access policy: nope"))
+        self.assertFalse(tool_result_ok("usage error: limit must be an integer"))
+        self.assertTrue(tool_result_ok(
+            "isolated software compile check passed (evidence only)\nfull log: x"))
+        self.assertTrue(tool_result_ok("edits applied atomically"))
+        self.assertTrue(tool_result_ok(""))
+        # Only the first line decides: a log excerpt may mention a failure.
+        self.assertTrue(tool_result_ok("Failure fail_sim_1\nsummary:\ncheck failed at boot"))
+
     def test_command_allowed_matches_policy(self) -> None:
         # Command authority is per stage: load_context may run nothing, while the
         # profile stage may run the allowlisted embench build.

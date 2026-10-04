@@ -43,6 +43,10 @@ class RunConfig(TypedDict, total=False):
     visibility: Visibility
     skip_sim: bool
     skip_yosys: bool
+    # Ablation switches (all default True; the --no-* CLI flags set False).
+    llvm_ir: bool
+    require_conformance: bool
+    isa_contract: bool
     max_iters: int
     run_id: str
     run_root: str

@@ -333,18 +333,42 @@ _HELPER_DEF_RE = re.compile(
     r"\b(?:static\s+|inline\s+|extern\s+|const\s+|unsigned\s+|signed\s+|volatile\s+)*"
     r"(?:[A-Za-z_]\w*(?:\s*\*\s*|\s+))+([A-Za-z_]\w*)\s*\([^;()]*\)\s*\{"
 )
+#: A file-scope object with an initializer, e.g. the shared scratch pointer an
+#: oracle seeds in two different entries. Local variables are excluded by the
+#: brace-depth check below, not by the pattern.
+_HELPER_OBJECT_RE = re.compile(
+    r"\b(?:static\s+|extern\s+|volatile\s+|const\s+|unsigned\s+|signed\s+)*"
+    r"(?:[A-Za-z_]\w*(?:\s*\*+\s*|\s+))+([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*=\s*[^;=]*;"
+)
+_HELPER_MACRO_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)", re.M)
+
+
+def _brace_depth(text: str, index: int) -> int:
+    """Brace nesting depth at ``index`` (comments/literals already stripped)."""
+    return text.count("{", 0, index) - text.count("}", 0, index)
 
 
 def _helper_definitions(helpers_text: str) -> list[str]:
-    """Top-level C function definition names in an oracle ``helpers`` block.
+    """File-scope symbols one oracle ``helpers`` block defines.
 
-    Conservative: only a parenthesised signature immediately followed by a body
-    brace counts, so call statements and prototypes are never mistaken for
-    definitions. Source order, duplicates preserved (duplicates are themselves
-    redefinitions).
+    Functions, objects with an initializer and object/function macros all count,
+    because any two entries defining the same name make the harness-owned C
+    fail to compile ("redefinition of ...", run 20261003-130005: two entries
+    both defined ``md5_oracle_mem`` and the rung died on the build). Conservative
+    extraction: a parenthesised signature followed by a body brace is a function,
+    an initialised declarator at brace depth zero is an object, and a
+    ``#define`` is a macro; call statements, prototypes and function-local
+    variables are never reported. Source order, duplicates preserved.
     """
     text = _strip_c_comments_and_literals(helpers_text)
-    return [m.group(1) for m in _HELPER_DEF_RE.finditer(text) if m.group(1) not in _C_KEYWORDS]
+    symbols = [m.group(1) for m in _HELPER_DEF_RE.finditer(text) if m.group(1) not in _C_KEYWORDS]
+    for match in _HELPER_OBJECT_RE.finditer(text):
+        if match.group(1) in _C_KEYWORDS:
+            continue
+        if _brace_depth(text, match.start()) == 0:
+            symbols.append(match.group(1))
+    symbols.extend(_HELPER_MACRO_RE.findall(text))
+    return symbols
 
 
 def _helper_dependencies(entries: Any) -> dict[str, set[str]]:

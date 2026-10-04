@@ -731,6 +731,44 @@ class HelperCollisionTest(unittest.TestCase):
         self.assertEqual(text.count("static uint32_t ref_rol32"), 1)
         self.assertNotIn("other_h", text)
 
+    def test_duplicate_file_scope_object_rejected(self) -> None:
+        """Run 20261003-130005: a variable counted as a redefinition too.
+
+        Both entries defined ``md5_oracle_mem``; the function-only symbol scan
+        accepted the oracle, and the delivered C then failed to compile with
+        ``redefinition of 'md5_oracle_mem'`` in the hw_conformance rung.
+        """
+        pointer = ("static volatile uint32_t *const md5_oracle_mem = "
+                   "(volatile uint32_t *)0x80000000u;")
+        oracle = {
+            "commands": [
+                {"name": "compute", "cases": [{"args": [1, 2]}], "reference": "a + b",
+                 "helpers": pointer},
+                {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                 "verify": "md5_oracle_mem[0] != 0u",
+                 "helpers": pointer + "\nstatic uint32_t extra(uint32_t a) { return a; }"},
+            ]
+        }
+        problems = validate_oracle(isa(CPU_COMMAND, VECTOR_COMMAND), oracle)
+        message = next((p for p in problems if "md5_oracle_mem" in p), None)
+        self.assertIsNotNone(message, problems)
+        self.assertIn("defined by more than one command", message)
+
+    def test_function_local_variables_are_not_symbols(self) -> None:
+        """Only file-scope objects count; locals in a body must never collide."""
+        first = ("static uint32_t ref_a(uint32_t a) { uint32_t scratch = a; return scratch; }")
+        second = ("static uint32_t ref_b(uint32_t a) { uint32_t scratch = a + 1u; "
+                  "return scratch; }")
+        oracle = {
+            "commands": [
+                {"name": "compute", "cases": [{"args": [1, 2]}], "reference": "ref_a(a)",
+                 "helpers": first},
+                {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                 "verify": "ref_b(a) != 0u", "helpers": second},
+            ]
+        }
+        self.assertEqual(validate_oracle(isa(CPU_COMMAND, VECTOR_COMMAND), oracle), [])
+
     def test_distinct_helper_symbols_are_all_emitted(self) -> None:
         distinct = "static uint32_t other_h(uint32_t a) { return a; }"
         text = render_conformance(isa(CPU_COMMAND, VECTOR_COMMAND), self.oracle(distinct))

@@ -311,6 +311,53 @@ class EffectFlagTest(unittest.TestCase):
         self.assertTrue(captured["run_commands"])
 
 
+class AblationFlagTest(unittest.TestCase):
+    """--no-llvm-ir / --no-conformance / --no-isa-contract threading and conflicts."""
+
+    def _run(self, *argv: str) -> dict:
+        from unittest import mock
+
+        captured: dict = {}
+
+        def _fake_run(state, **kwargs):
+            captured.update(state)
+            return {"status": "planned"}
+
+        with mock.patch.object(cli, "run_agent", _fake_run), \
+                mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
+                mock.patch.object(cli, "enable_progress", lambda: None):
+            cli.main(["--task", "x", *argv])
+        return captured
+
+    def test_ablation_switches_default_off(self) -> None:
+        captured = self._run()
+        self.assertTrue(captured["llvm_ir"])
+        self.assertTrue(captured["require_conformance"])
+        self.assertTrue(captured["isa_contract"])
+        self.assertEqual(captured["ir_features"], "auto")
+
+    def test_no_llvm_ir_forces_ir_features_off(self) -> None:
+        captured = self._run("--no-llvm-ir")
+        self.assertFalse(captured["llvm_ir"])
+        self.assertEqual(captured["ir_features"], "off")
+
+    def test_no_llvm_ir_conflicts_with_explicit_ir_evidence(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "--no-llvm-ir conflicts"):
+            cli.main(["--task", "x", "--no-llvm-ir", "--ir-features", "require"])
+        with self.assertRaisesRegex(SystemExit, "--no-llvm-ir conflicts"):
+            cli.main(["--task", "x", "--no-llvm-ir", "--ir-features", "approx"])
+
+    def test_no_conformance_is_independent(self) -> None:
+        captured = self._run("--no-conformance")
+        self.assertFalse(captured["require_conformance"])
+        self.assertTrue(captured["isa_contract"])
+
+    def test_no_isa_contract_implies_no_conformance(self) -> None:
+        captured = self._run("--no-isa-contract")
+        self.assertFalse(captured["isa_contract"])
+        self.assertFalse(captured["require_conformance"])
+
+
 class IrFeaturesFlagTest(unittest.TestCase):
     def test_ir_evidence_is_opt_in_and_passed_to_state(self) -> None:
         from unittest import mock

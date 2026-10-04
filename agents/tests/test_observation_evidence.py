@@ -255,6 +255,23 @@ class ObservationEvidenceTest(unittest.TestCase):
         self.assertEqual(inspect_observation(self.index(), Denied(), "obs_loop_crc").splitlines()[0],
                          "Observation obs_loop_crc: loop crc_32.c:12 function=crc_32 ordinal=1")
 
+    def test_ir_views_and_lines_removed_under_ablation(self):
+        # --no-llvm-ir (allow_ir=False): the ir/features views are gone and the
+        # summary carries no IR content; asm/summary evidence stays.
+        index = self.index(ir_result={"ir_files": [IR], "feature_files": [FEATURES]})
+        toolbox = ReadOnlyToolbox({FEATURES: "<ir_features>", IR: self.ir_text, ASM: self.asm_text})
+        for view in ("ir", "features"):
+            output = inspect_observation(index, toolbox, "obs_loop_crc", view, allow_ir=False)
+            self.assertIn("IR views are disabled", output)
+        self.assertEqual(toolbox.reads, [])
+        summary = inspect_observation(index, toolbox, "obs_loop_crc", allow_ir=False)
+        self.assertNotIn("LLVM IR", summary)
+        self.assertNotIn("Feature XML", summary)
+        self.assertNotIn("not recorded", summary)
+        self.assertIn("ASM reference candidate", summary)
+        asm = inspect_observation(index, toolbox, "obs_loop_crc", "asm", allow_ir=False)
+        self.assertIn("ASM symbols", asm)
+
     def test_no_cycle_data_duplicate_ids_and_limits(self):
         blank = self.index(profiles={"profile": {"obs_loop_crc": {"cycles": -1, "calls": "12"}}})
         result = inspect_observation(blank, ReadOnlyToolbox(), "obs_loop_crc")

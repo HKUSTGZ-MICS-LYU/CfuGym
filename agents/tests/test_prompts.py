@@ -572,3 +572,66 @@ class PathsDigestTest(unittest.TestCase):
         self.assertEqual(paths_digest({"files": {}}), "")
 
 
+class AblationPromptTest(unittest.TestCase):
+    """--no-llvm-ir / --no-isa-contract keep the prompt surface consistent."""
+
+    def setUp(self) -> None:
+        self.spec = {"name": "w", "operation": "dot_product", "pattern": "vector_to_scalar",
+                     "unknowns": []}
+        self.context = {"files": {}, "run_root": "agents/generated/runs/ablation-prompt",
+                        "visibility": "standard"}
+        self.index = {"observations": {
+            "obs_loop_hot": {"cycles": 1200, "calls": 6, "kind": "loop"},
+        }}
+
+    def test_workload_prompt_hides_ir_views_and_ir_text(self) -> None:
+        prompt = workload_prompt("accelerate", self.spec, self.context, agent_tools=True,
+                                 observation_index=self.index, ir_views=False)
+        self.assertIn("view='asm'", prompt)
+        self.assertNotIn("view='ir'", prompt)
+        self.assertNotIn("view='features'", prompt)
+        self.assertNotIn("LLVM IR", prompt)
+        self.assertNotIn("Feature XML", prompt)
+        kept = workload_prompt("accelerate", self.spec, self.context, agent_tools=True,
+                               observation_index=self.index, ir_views=True)
+        self.assertIn("view='asm' or 'ir'", kept)
+
+    def test_contract_free_hardware_prompt_has_no_contract(self) -> None:
+        prompt = hardware_prompt("accelerate it", self.spec, "analysis",
+                                 "contract", self.context, contract_free=True)
+        self.assertNotIn("cfu_isa.yaml", prompt)
+        self.assertNotIn("Contract:", prompt)
+        self.assertNotIn("the workload, contract, and current scaffold", prompt)
+        tools_prompt = hardware_prompt("accelerate it", self.spec, "analysis", "contract",
+                                       self.context, contract_free=True, agent_tools=True)
+        self.assertIn("There is NO frozen ISA contract", tools_prompt)
+        self.assertNotIn("cfu_isa.yaml", tools_prompt)
+        default = hardware_prompt("accelerate it", self.spec, "analysis", "contract",
+                                  self.context, agent_tools=True)
+        self.assertIn("cfu_isa.yaml", default)
+
+    def test_contract_free_software_prompt_offers_the_template(self) -> None:
+        prompt = software_prompt("accelerate it", self.spec, "analysis", "contract",
+                                 self.context, intrinsics="#define cfu_op() TEMPLATE_MARK",
+                                 contract_free=True,
+                                 targets=[("agents/generated/runs/ablation-prompt/main.c", "")])
+        self.assertIn("There is NO ISA contract", prompt)
+        self.assertIn("TEMPLATE_MARK", prompt)
+        self.assertIn("Intrinsic template", prompt)
+        self.assertNotIn("frozen command contract", prompt)
+        self.assertNotIn("cfu_isa.yaml", prompt)
+        default = software_prompt("accelerate it", self.spec, "analysis", "contract",
+                                  self.context, intrinsics="#define cfu_op() {}",
+                                  targets=[("agents/generated/runs/ablation-prompt/main.c", "")])
+        self.assertIn("frozen command contract", default)
+
+    def test_contract_free_optization_prompt_drops_extend_isa(self) -> None:
+        prompt = optimization_prompt("t", self.spec, "score", "none", {}, "hw", "sw", 1,
+                                     "performance", contract_free=True)
+        self.assertNotIn("extend_isa", prompt)
+        self.assertIn('"target": "implement"', prompt)
+        default = optimization_prompt("t", self.spec, "score", "none", {}, "hw", "sw", 1,
+                                      "performance")
+        self.assertIn("extend_isa", default)
+
+

@@ -10,7 +10,7 @@ from unittest import mock
 
 import yaml
 
-from agents.cfu_design_agent.runtime import conformance_delivery, llm_step, stage_services, tools
+from agents.cfu_design_agent.runtime import conformance_delivery, effects, llm_step, stage_services, tools
 from agents.cfu_design_agent.runtime.policy import AccessPolicy, PolicyError, StagePolicy
 from agents.cfu_design_agent.stages import implement
 from agents.cfu_design_agent.stages.implement import conformance, delivery, intrinsics
@@ -48,6 +48,10 @@ class DeliveryModeTest(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
         mock.patch.object(stage_services, "_toolbox_for_stage", return_value=self.box).start()
         mock.patch.object(llm_step, "_llm", return_value=SimpleNamespace(available=False)).start()
+        # Oracle delivery preflights the rendered C with a host command; these
+        # tests exercise the oracle contract, not a compiler.
+        mock.patch.object(effects, "run_command", return_value={
+            "returncode": 0, "stdout_tail": "", "stderr_tail": ""}).start()
 
     def bytes(self):
         return {path: (self.root / path).read_bytes() if (self.root / path).is_file() else None
@@ -232,6 +236,22 @@ class DeliveryModeTest(unittest.TestCase):
         paths = conformance_delivery.delivery_paths(self.state)
         self.assertNotEqual((self.root / paths["oracle_path"]).read_bytes(),
                             yaml.safe_dump(record).encode("utf-8"))
+
+    def test_a_delivered_test_that_does_not_compile_is_not_committed(self) -> None:
+        """Delivery mode preflights the same way (run 20261003-130005 class)."""
+        self.approved()
+        before = self.bytes()
+        self.state["repair_scope"] = "conformance"
+        failure = {"returncode": 1,
+                   "stderr_tail": "cfu_conformance.c:19:1: error: redefinition of 'md5_oracle_mem'"}
+        with mock.patch.object(implement.hardware, "implement_hw", side_effect=self.hardware_update), \
+                mock.patch.object(implement.software, "implement_sw", side_effect=self.software_update), \
+                mock.patch.object(llm_step, "_complete_llm", return_value=(
+                    SimpleNamespace(text=yaml.safe_dump(self.oracle)), "raw")), \
+                mock.patch.object(effects, "run_command", return_value=failure):
+            result = implement.implement(self.state)
+        self.assertTrue(any("does not compile" in str(item) for item in result["errors"]), result)
+        self.assertEqual(self.bytes(), before, "a rejected preflight must not change the pair")
 
     def test_rejected_revision_keeps_the_approved_oracle_and_the_repair(self):
         """A bad revision must not fail the design repair it was offered for."""

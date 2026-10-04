@@ -63,6 +63,26 @@ def load_isa_spec(path: str | Path) -> dict[str, Any]:
     return data
 
 
+def _describe(value: Any) -> str:
+    """What the model actually returned, for an actionable shape lint.
+
+    "assumptions must be a mapping" cost run 20261003-130005 ten answer-repair
+    rounds: the model kept sending a list of strings and the message never said
+    what had been received.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, dict):
+        return f"a mapping with {len(value)} key(s)"
+    if isinstance(value, list):
+        return f"a list of {len(value)} item(s)"
+    if isinstance(value, str):
+        return "an empty string" if not value else f"a string ({len(value)} chars)"
+    if isinstance(value, bool):
+        return f"a boolean ({value})"
+    return f"a {type(value).__name__}"
+
+
 def validate_cfu_resources(resources: Any, datapath: Any = None, prefix: str = "resources") -> list[str]:
     """Validate explicit resource declarations; absence is handled by the caller.
 
@@ -152,7 +172,7 @@ def validate_isa_spec(data: dict[str, Any]) -> list[str]:
     identity = data.get("identity") or {}
     function_id_width: int | None = None
     if not isinstance(identity, dict):
-        errors.append("identity must be a mapping")
+        errors.append(f"identity must be a mapping (received {_describe(identity)})")
     else:
         for key in ("name", "opcode", "function_id_width"):
             if not identity.get(key):
@@ -196,7 +216,7 @@ def validate_isa_spec(data: dict[str, Any]) -> list[str]:
         for index, command in enumerate(commands):
             prefix = f"commands[{index}]"
             if not isinstance(command, dict):
-                errors.append(f"{prefix} must be a mapping")
+                errors.append(f"{prefix} must be a mapping (received {_describe(command)})")
                 continue
             func = command.get("function_id")
             if func is None:
@@ -250,9 +270,12 @@ def validate_isa_spec(data: dict[str, Any]) -> list[str]:
 
     datapath = data.get("datapath")
     if datapath is not None and not isinstance(datapath, dict):
-        errors.append("datapath must be a mapping when provided")
+        errors.append("datapath must be a mapping when provided"
+                      f" (received {_describe(datapath)})")
     if isinstance(datapath, dict) and "implementation" in datapath and not isinstance(datapath["implementation"], dict):
-        errors.append("datapath.implementation must be a mapping when provided")
+        implementation = datapath["implementation"]
+        errors.append("datapath.implementation must be a mapping when provided"
+                      f" (received {_describe(implementation)})")
     # Legacy flat algorithm-specific metadata remains readable; new templates
     # deliberately put optional implementation choices in a namespaced mapping.
     # Datapath dimensions are independent, optional design metadata. A direct
@@ -264,7 +287,7 @@ def validate_isa_spec(data: dict[str, Any]) -> list[str]:
         errors.append("integration is required")
     software = data.get("software")
     if not isinstance(software, dict):
-        errors.append("software is required and must be a mapping")
+        errors.append(f"software is required and must be a mapping (received {_describe(software)})")
         software = {}
     if not software.get("intrinsics_header"):
         errors.append("software.intrinsics_header is required")
@@ -273,7 +296,7 @@ def validate_isa_spec(data: dict[str, Any]) -> list[str]:
 
     validation = data.get("validation") or {}
     if not isinstance(validation, dict):
-        errors.append("validation must be a mapping")
+        errors.append(f"validation must be a mapping (received {_describe(validation)})")
     else:
         requirements = validation.get("requirements", [])
         if not isinstance(requirements, list):
@@ -283,10 +306,14 @@ def validate_isa_spec(data: dict[str, Any]) -> list[str]:
         if validation.get("status") in ("implemented", "validated") and not issues:
             errors.append("validation.requirements cannot be empty for implemented/validated status")
 
-    if not isinstance(data.get("assumptions", {}), dict):
-        errors.append("assumptions must be a mapping")
-    if not isinstance(data.get("unknowns", []), list):
-        errors.append("unknowns must be a list")
+    assumptions = data.get("assumptions", {})
+    if not isinstance(assumptions, dict):
+        errors.append("assumptions must be a mapping of name: text"
+                      f" (received {_describe(assumptions)})")
+    unknowns = data.get("unknowns", [])
+    if not isinstance(unknowns, list):
+        errors.append("unknowns must be a list of strings"
+                      f" (received {_describe(unknowns)})")
 
     return sorted(errors)
 

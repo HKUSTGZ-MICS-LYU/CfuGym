@@ -138,7 +138,10 @@ def _conformance_syntax_command(state: CfuDesignState, header_path: str) -> list
     return [
         "riscv64-unknown-elf-gcc",
         "-fsyntax-only",
-        "-std=c99",
+        # GNU C: the framework's own generated intrinsics header binds operand
+        # registers with `register uint32_t r1 asm("a1")`, which -std=c99 rejects
+        # in the header before the test body is ever parsed.
+        "-std=gnu99",
         "-Werror=implicit-function-declaration",
         "-march=rv32imc_zicsr_zifencei",
         "-mabi=ilp32",

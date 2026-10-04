@@ -197,8 +197,8 @@ commands:
   # Implementation-only preflight; no make, assembly, link, SoC or simulation.
   conformance_syntax:
     executable: riscv64-unknown-elf-gcc
-    argv_prefix: [riscv64-unknown-elf-gcc, -fsyntax-only, -std=c99, -Werror=implicit-function-declaration, -march=rv32imc_zicsr_zifencei, -mabi=ilp32]
-    required_tokens: [-fsyntax-only, -std=c99, -Werror=implicit-function-declaration, -march=rv32imc_zicsr_zifencei, -mabi=ilp32]
+    argv_prefix: [riscv64-unknown-elf-gcc, -fsyntax-only, -std=gnu99, -Werror=implicit-function-declaration, -march=rv32imc_zicsr_zifencei, -mabi=ilp32]
+    required_tokens: [-fsyntax-only, -std=gnu99, -Werror=implicit-function-declaration, -march=rv32imc_zicsr_zifencei, -mabi=ilp32]
     required_substring: "cfu_conformance.c"
     priority: 20
   # Hardware conformance micro-test build: the same make shape as a benchmark build,

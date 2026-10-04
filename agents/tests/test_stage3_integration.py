@@ -14,6 +14,7 @@ from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.runtime.tools import RepoToolbox, design_workspace_paths
 from agents.cfu_design_agent.flow import ladder
 from agents.cfu_design_agent.runtime import checks
+from agents.cfu_design_agent.runtime import effects
 from agents.cfu_design_agent.runtime import conformance_delivery
 from agents.tests.test_conformance import CPU_COMMAND, isa
 from agents.cfu_design_agent.runtime import commands
@@ -72,6 +73,12 @@ class _BatchClient(_RoundClient):
 
 class Stage3IntegrationTest(unittest.TestCase):
     def setUp(self):
+        # The delivered oracle is preflighted with a host compiler command; these
+        # tests script the model, so stub the command instead of a toolchain.
+        preflight = mock.patch.object(effects, "run_command", return_value={
+            "returncode": 0, "stdout_tail": "", "stderr_tail": ""})
+        preflight.start()
+        self.addCleanup(preflight.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)

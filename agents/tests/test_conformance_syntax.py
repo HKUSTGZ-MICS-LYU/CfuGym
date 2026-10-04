@@ -43,7 +43,7 @@ class ConformanceSyntaxTest(unittest.TestCase):
         self.assertEqual(argv, [
             "riscv64-unknown-elf-gcc",
             "-fsyntax-only",
-            "-std=c99",
+            "-std=gnu99",
             "-Werror=implicit-function-declaration",
             "-march=rv32imc_zicsr_zifencei",
             "-mabi=ilp32",
@@ -84,8 +84,8 @@ class ConformanceSyntaxTest(unittest.TestCase):
 
     def test_policy_rejects_arbitrary_compilers_and_compile_link_commands(self) -> None:
         invalid = [
-            ["gcc", "-fsyntax-only", "-std=c99", self.source],
-            ["clang", "-fsyntax-only", "-std=c99", self.source],
+            ["gcc", "-fsyntax-only", "-std=gnu99", self.source],
+            ["clang", "-fsyntax-only", "-std=gnu99", self.source],
             ["riscv64-unknown-elf-gcc", "-c", self.source, "-o", "test.o"],
             ["riscv64-unknown-elf-gcc", self.source, "-o", "test.elf"],
             ["sh", "-c", "riscv64-unknown-elf-gcc -fsyntax-only cfu_conformance.c"],

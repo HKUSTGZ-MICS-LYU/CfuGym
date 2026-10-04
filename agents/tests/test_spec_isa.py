@@ -166,7 +166,27 @@ class IsaValidationTest(unittest.TestCase):
             spec["datapath"] = {"implementation": parameters}
             self.assertEqual(validate_isa_spec(spec), [])
         spec["datapath"]["implementation"] = 32
-        self.assertIn("datapath.implementation must be a mapping when provided", validate_isa_spec(spec))
+        message = next(m for m in validate_isa_spec(spec)
+                       if m.startswith("datapath.implementation must be a mapping"))
+        # The message names what was received, so a repair can act on it.
+        self.assertIn("received a int", message)
+
+    def test_shape_lint_names_what_was_received(self) -> None:
+        """Run 20261003-130005: ten answer-repair rounds on one terse message.
+
+        The model kept returning ``assumptions`` as a sequence of strings, and
+        "assumptions must be a mapping" never said so.
+        """
+        from agents.cfu_design_agent.isa import validate_isa_spec
+        spec = _valid_isa()
+        spec["assumptions"] = ["one", "two"]
+        message = next(m for m in validate_isa_spec(spec) if m.startswith("assumptions"))
+        self.assertIn("a mapping of name: text", message)
+        self.assertIn("received a list of 2 item(s)", message)
+        spec["unknowns"] = {"not": "a list"}
+        self.assertTrue(any(m.startswith("unknowns must be a list of strings")
+                            and "received a mapping with 1 key(s)" in m
+                            for m in validate_isa_spec(spec)))
 
     def test_datapath_mapping_can_be_empty_for_scalar_cfu(self) -> None:
         from agents.cfu_design_agent.isa import validate_isa_spec

@@ -209,6 +209,7 @@ class ConformanceDelivery:
         self.paths = delivery_paths(state)
         self.snapshots = _snapshot(toolbox, self.paths, write=editable)
         self._pending: dict[str, Any] | None = None
+        self._before_write: dict[str, bytes | None] | None = None
         self.committed = False
         self.rolled_back = False
 
@@ -278,7 +279,23 @@ class ConformanceDelivery:
             _restore(self.toolbox, before)
             raise
         self._pending = deepcopy(record)
+        self._before_write = before
         return self.current()
+
+    def revert_pending(self) -> None:
+        """Undo the last accepted write, keeping the transaction open.
+
+        The parent may reject a pending pair *after* ``write`` accepted it, for
+        example when the host-owned compile preflight finds a redefinition in
+        the rendered C. That is not a failed stage: the model has to be able to
+        deliver a corrected oracle, so the transaction stays open while the
+        previously approved pair (or the empty state) returns to disk.
+        """
+        if self.committed or self.rolled_back or self._pending is None:
+            return
+        _restore(self.toolbox, self._before_write or self.snapshots)
+        self._pending = None
+        self._before_write = None
 
     def commit(self) -> None:
         if self.rolled_back:

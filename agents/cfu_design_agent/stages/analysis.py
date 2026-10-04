@@ -68,6 +68,7 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
             # Evidence lookup is advisory; malformed/unavailable profile data
             # must not turn workload analysis into a new mandatory failure.
             observation_index = None
+    ir_views = bool(state.get("llvm_ir", True))
     user = prompts.workload_prompt(
         task,
         state.get("workload_spec", {}),
@@ -77,6 +78,7 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
         tool_rounds=int(state.get("max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS) or DEFAULT_MAX_TOOL_ROUNDS),
         ir_evidence=state.get("ir_result"),
         observation_index=observation_index,
+        ir_views=ir_views,
         artifact_paths=_evidence_paths(state),
         feedback=_repair_feedback(state),
     )
@@ -93,6 +95,7 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
         client=client,
         deliverable_hint="the final YAML analysis mapping with the required Roofline fields",
         observation_index=observation_index,
+        toolset_kwargs={"ir_views": ir_views},
     )
     parsed = parsing.parse_yaml_mapping(result.text)
     if isinstance(client, OpenAiTextClient) and not result.used_llm and not state.get("dry_run", False):

@@ -265,14 +265,20 @@ def _features_excerpt(text: str, function: str, source_line: int | None,
 
 
 def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
-                        view: str = "summary", max_lines: int = 60) -> str:
+                        view: str = "summary", max_lines: int = 60,
+                        *, allow_ir: bool = True) -> str:
     """Read only approved artifact paths through ``toolbox.read_text``.
 
     Results are capped to 8..100 output lines and 12,000 characters. ASM
     symbols and LLVM debug locations are candidate evidence, not loop identity.
+    ``allow_ir=False`` (ablation ``--no-llvm-ir``) removes the ir/features views
+    and the LLVM IR lines of the summary; asm/summary stay.
     """
     if view not in ("summary", "asm", "ir", "features"):
         raise ValueError("view must be summary, asm, ir or features")
+    if view in ("ir", "features") and not allow_ir:
+        return ("IR views are disabled in this run (--no-llvm-ir); "
+                "use view='summary' or view='asm'")
     if not isinstance(index, dict) or not _safe(observation_id, _IDENT):
         raise ValueError("unknown observation ID")
     records = index.get("observations")
@@ -330,13 +336,16 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
               f"ASM reference candidate: {asm} — " +
               (f"{len(sections)} function symbol(s); {'ambiguous clones' if len(sections) > 1 else 'function-level only'}"
                if sections else _asm_absence(asm_state)) +
-              (" [bounded scan truncated; further symbols may exist]" if asm_cut else ""),
-              f"LLVM IR candidate: {ir_path or 'not recorded'} — " +
-              (ir_mapping if ir_lines else ir_state) + f" [{target_note}]" +
-              (" [bounded scan truncated; mapping incomplete]" if ir_cut else ""),
-              f"Feature XML: {features_path or 'not recorded'} — " +
-              ("available (view='features')" if features_path and view != "features" else feature_state),
-              "Caution: static reference candidates are not measured loop addresses or cycle estimates."]
+              (" [bounded scan truncated; further symbols may exist]" if asm_cut else "")]
+    if allow_ir:
+        output.extend([
+            f"LLVM IR candidate: {ir_path or 'not recorded'} — " +
+            (ir_mapping if ir_lines else ir_state) + f" [{target_note}]" +
+            (" [bounded scan truncated; mapping incomplete]" if ir_cut else ""),
+            f"Feature XML: {features_path or 'not recorded'} — " +
+            ("available (view='features')" if features_path and view != "features" else feature_state),
+        ])
+    output.append("Caution: static reference candidates are not measured loop addresses or cycle estimates.")
     if view == "asm" and sections:
         output.append("ASM symbols (function-level only; no source-line link):")
         for symbol, physical, excerpt in sections[:4]:

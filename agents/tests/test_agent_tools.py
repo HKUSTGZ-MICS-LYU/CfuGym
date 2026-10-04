@@ -384,6 +384,25 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         ])
         self.assertIn("unknown tool", tools.run("inspect_observation", {"id": "obs_loop_x"}))
 
+    def test_ir_views_schema_is_narrowed_for_ablation(self) -> None:
+        # --no-llvm-ir removes the ir/features views from the offered schema;
+        # asm/summary stay, and the default schema is untouched.
+        index = {"observations": {"obs_loop_x": {"id": "obs_loop_x"}}}
+        toolbox = RepoToolbox(REPO_ROOT, dry_run=True, stage="analysis")
+
+        def view_enum(toolset):
+            schema = next(item for item in toolset.schemas()
+                          if item["function"]["name"] == "inspect_observation")
+            return (schema["function"]["parameters"]["properties"]["view"]["enum"],
+                    schema["function"]["description"])
+
+        enum, description = view_enum(ReadOnlyToolset(toolbox, observation_index=index, ir_views=False))
+        self.assertEqual(enum, ["summary", "asm"])
+        self.assertNotIn("LLVM IR", description)
+        enum, description = view_enum(ReadOnlyToolset(toolbox, observation_index=index))
+        self.assertEqual(enum, ["summary", "asm", "ir", "features"])
+        self.assertIn("LLVM IR", description)
+
     def test_read_file_numbers_lines_and_slices(self) -> None:
         whole = self.toolset.run("read_file", {"path": self.target})
         self.assertIn("int main(void)", whole)

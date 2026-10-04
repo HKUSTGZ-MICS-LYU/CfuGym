@@ -1,8 +1,33 @@
 """Oracle authoring inside Implement for the no-tool delivery mode."""
 from ... import prompts
-from ...runtime import conformance_delivery, llm_step, stage_services
+from ...runtime import commands as commands_mod, conformance_delivery, effects, llm_step, stage_services
 from ...state import CfuDesignState
 from . import intrinsics
+
+
+def _delivered_test_errors(state: CfuDesignState, toolbox, header_path: str) -> list[str]:
+    """Host-owned compile preflight of the pair just written, before commit.
+
+    A delivered test that cannot compile must not reach ``hw_conformance`` (run
+    20261003-130005 spent its last answer-repair round on a `redefinition` in the
+    generated C). Only a real compiler error (positive return code) is reported:
+    a policy denial, a missing toolchain or a timeout is left to the final gate,
+    because the model cannot fix it.
+    """
+    if not str(header_path or "").strip():
+        return []
+    try:
+        argv = commands_mod._conformance_syntax_command(state, header_path)
+    except ValueError:
+        return []
+    result = effects.run_command(state, toolbox, argv, stage="implementation",
+                                 rung="conformance_syntax", command_id="conformance_syntax",
+                                 timeout=120, mutate=True)
+    returncode = result.get("returncode")
+    if not isinstance(returncode, int) or returncode <= 0:
+        return []
+    text = " ".join(str(result.get("stderr_tail") or result.get("stdout_tail") or "").split())
+    return [f"the delivered test does not compile: {text[-1200:]}"]
 
 
 def write_conformance(state: CfuDesignState) -> dict:
@@ -32,6 +57,8 @@ def write_conformance(state: CfuDesignState) -> dict:
         header = intrinsics._write_intrinsics_header(state, toolbox)
         session = conformance_delivery.ConformanceDelivery(state, toolbox, header)
         delivery, errors = session.write(result.text)
+        if not errors:
+            errors = _delivered_test_errors(state, toolbox, header)
         if errors:
             session.rollback()
             conformance_delivery._restore(toolbox, snapshot)

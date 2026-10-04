@@ -65,7 +65,38 @@ def _isa_step(state, client, tools_enabled, stage, label, prompt, fallback):
     )
 
 
+def _contract_disabled(state: CfuDesignState, node: str) -> CfuDesignState | None:
+    """Ablation (--no-isa-contract): no contract is ever authored here.
+
+    The graph shape is unchanged (this node still runs and stamps the ``isa``
+    gate), but the gate is recorded as disabled instead of validated, so the
+    completeness machinery excludes it. Implement owns everything instead: the
+    agent writes ``cfu_intrinsics.h`` itself from the intrinsic template.
+    """
+    if state.get("isa_contract", True):
+        return None
+    artifacts = stage_services._artifacts_for_stage(state, "isa")
+    artifacts.write_yaml("isa", "08_isa/cfu_isa.yaml",
+                         {"disabled": "no-isa-contract",
+                          "note": "contract stage skipped by ablation; the agent authors cfu_intrinsics.h"},
+                         status="disabled")
+    artifacts.write_yaml("isa", "08_isa/validation.yaml", {"status": "disabled", "problems": []})
+    return {
+        "isa_spec": {}, "isa_spec_text": "", "design_contract": "",
+        "isa_spec_errors": [], "isa_revision": 0, "stage_jobs": "implementation",
+        **outcome.stage_result(
+            state, rung="isa", ok=False, skipped=True, disabled="no-isa-contract",
+            reason="disabled by --no-isa-contract (ablation)", next="implement",
+            history=f"{node} skipped (--no-isa-contract): the agent authors "
+                    "cfu_intrinsics.h itself from the intrinsic template.",
+        ),
+    }
+
+
 def design_contract(state: CfuDesignState) -> CfuDesignState:
+    disabled = _contract_disabled(state, "The ISA contract stage")
+    if disabled is not None:
+        return disabled
     spec = state.get("workload_spec", {})
     fallback = _isa_from_template(state.get("isa_spec_text", ""), spec, state.get("workload_analysis", ""))
     fallback_text = json.dumps(fallback, ensure_ascii=True, indent=2)
@@ -132,6 +163,9 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
 
 def extend_isa(state: CfuDesignState) -> CfuDesignState:
     """Append commands without replacing the incumbent contract on rejection."""
+    disabled = _contract_disabled(state, "The ISA extension round")
+    if disabled is not None:
+        return disabled
     previous = state.get("isa_extension_base") or state.get("isa_spec", {})
     feedback = feedback_mod.isa_repair_feedback(state)
     client = llm_step._llm(state)

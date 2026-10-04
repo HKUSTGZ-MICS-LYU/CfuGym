@@ -12,6 +12,7 @@ from .runtime.llm import (
 )
 from .runtime.llm_config import LlmConfigError, effective_config, list_configs
 from .flow import optimize as flow_optimize
+from .stages.review import report as report_mod
 from .state import CfuDesignState
 
 
@@ -112,6 +113,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-dry-run", action="store_true",
                         help="Deprecated no-op: mutation and command execution are the default "
                         "(use --dry-run or the --no-* effect flags to restrict).")
+    parser.add_argument(
+        "--no-llvm-ir",
+        action="store_true",
+        help="Ablation: remove LLVM IR content from the agent (forces --ir-features off and "
+        "drops the inspect_observation ir/features views; asm/summary evidence stays).",
+    )
+    parser.add_argument(
+        "--no-conformance",
+        action="store_true",
+        help="Ablation: drop the conformance requirement (no oracle delivery; the hw_conformance "
+        "rung is recorded as disabled instead of validated).",
+    )
+    parser.add_argument(
+        "--no-isa-contract",
+        action="store_true",
+        help="Ablation: skip the ISA contract stage; the agent writes cfu_intrinsics.h itself "
+        "from the intrinsic template with free encodings. Implies --no-conformance.",
+    )
     parser.add_argument("--skip-sim", action="store_true", help="Skip SBT generation/simulation.")
     parser.add_argument("--skip-yosys", action="store_true", help="Skip Yosys cost estimation.")
     parser.add_argument(
@@ -230,6 +249,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--checkpoint requires --run-id for safe recovery")
     if args.max_evals < 0:
         raise SystemExit("--max-evals must be zero or positive")
+    if args.no_llvm_ir and args.ir_features in ("require", "approx"):
+        raise SystemExit(
+            "--no-llvm-ir conflicts with --ir-features require/approx: "
+            "explicit IR evidence cannot be requested without IR content"
+        )
     if args.max_output_tokens < 0:
         raise SystemExit("--max-output-tokens must be zero or positive")
     if args.resume and any((args.task, args.embench, args.project_root, args.kernel_file,
@@ -238,6 +262,9 @@ def main(argv: list[str] | None = None) -> int:
     input_mode = infer_input_mode(args)
     task = args.task or ("" if args.resume else default_task(args))
     dry_run = bool(args.dry_run)
+    if args.no_isa_contract and not args.no_conformance:
+        print("note: --no-isa-contract implies --no-conformance "
+              "(conformance consumes the ISA contract)")
     state: CfuDesignState = {
         "task": task,
         "input_kind": input_mode,
@@ -258,7 +285,10 @@ def main(argv: list[str] | None = None) -> int:
         "max_tool_rounds": args.max_tool_rounds,
         "max_tool_calls": args.max_tool_calls,
         "profile_cache": args.profile_cache,
-        "ir_features": args.ir_features,
+        "ir_features": "off" if args.no_llvm_ir else args.ir_features,
+        "llvm_ir": not args.no_llvm_ir,
+        "require_conformance": not (args.no_conformance or args.no_isa_contract),
+        "isa_contract": not args.no_isa_contract,
         "loop_optimize": args.loop_optimize,
         "loop_policy": args.loop_policy,
         "loop_patience": max(1, args.loop_patience),
@@ -370,6 +400,11 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
 
     print()
     print("summary:")
+    ablation = report_mod.ablation_lines(final_state)
+    if ablation:
+        print("  ablation:")
+        for line in ablation:
+            print(f"    {line.removeprefix('- ')}")
     if reference and cfu:
         print(f"  cycles_before = {reference}")
         print(f"  cycles_after  = {cfu}")

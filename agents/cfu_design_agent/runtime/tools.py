@@ -45,6 +45,26 @@ def expand_run_dir(value: str, run_root: str) -> str:
     return text
 
 
+#: Result prefixes a toolset uses for a rejected call rather than an outcome.
+_TOOL_FAILURE_PREFIXES = ("error:", "tool error:", "denied by", "skipped:", "usage error:")
+
+
+def tool_result_ok(text: str) -> bool:
+    """Whether one tool result is an accepted outcome, for the run ledger.
+
+    A *failed* isolated check renders as prose (``isolated hardware elaboration
+    check failed``), so a prefix-only test journaled it as ``ok`` and the
+    transcript, the live CLI line and the report all claimed the agent's checks
+    had passed (run 20261003-130005). Only the first line is inspected, so a log
+    excerpt that merely mentions a failure cannot flip a real result.
+    """
+    value = str(text or "").lstrip()
+    if value.startswith(_TOOL_FAILURE_PREFIXES):
+        return False
+    head = value.splitlines()[0] if value.strip() else ""
+    return "check failed" not in head
+
+
 def virtualize_run_paths(text: str, run_root: str) -> str:
     """Render this run's root as ``{{run-dir}}`` in text shown to the model."""
     root = str(run_root or "").strip("/")

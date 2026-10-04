@@ -223,6 +223,33 @@ class StageWiringTest(unittest.TestCase):
         self.assertIn("+class AgentCfu { int changed; }", applied)
         self.assertEqual(target.read_text(), "class AgentCfu { int changed; }\n")
 
+    def test_oracle_delivery_is_preflighted_and_keeps_the_session_open(self) -> None:
+        """A delivered test that cannot compile is rejected at delivery time.
+
+        Regression (run 20261003-130005): the oracle passed validation, the
+        ladder's hw_conformance build then died on ``redefinition of
+        'md5_oracle_mem'`` with no answer-repair budget left.
+        """
+        from unittest import mock
+
+        from agents.cfu_design_agent.runtime import effects
+
+        captured = self._capture()
+        tool = self._tool(captured)
+        session = captured["toolset_kwargs"]["conformance_session"]
+        oracle = ("commands:\n  - name: compute\n    reference: a + b\n"
+                  "    cases:\n      - args: [1, 2]\n")
+        failure = {"returncode": 1,
+                   "stderr_tail": "cfu_conformance.c:19:1: error: redefinition of 'md5_oracle_mem'"}
+        with mock.patch.object(effects, "run_command", return_value=failure):
+            rejected = tool.run("write_conformance", {"oracle": oracle})
+        self.assertIn("does not compile", rejected)
+        self.assertIn("redefinition", rejected)
+        self.assertFalse(session.changed, "a rejected preflight must not keep the pair on disk")
+        # The transaction stays open so the model can deliver a corrected oracle.
+        with mock.patch.object(effects, "run_command", return_value={"returncode": 0}):
+            self.assertIn("delivered", tool.run("write_conformance", {"oracle": oracle}))
+
     def test_conformance_session_refuses_an_undeclared_command_without_executing(self) -> None:
         from unittest import mock
         from agents.cfu_design_agent.runtime import effects

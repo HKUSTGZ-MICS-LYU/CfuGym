@@ -213,9 +213,11 @@ def tool_list_block(
     *,
     failure_ids: list[str] | None = None,
     resolved_failure_ids: list[str] | None = None,
+    tool_usage: dict[str, str] | None = None,
 ) -> str:
     """One-line-per-tool description plus the budget and delivery obligation."""
-    names = [name for name in tool_names if name in READ_TOOL_USAGE]
+    usage = tool_usage or READ_TOOL_USAGE
+    names = [name for name in tool_names if name in usage]
     if not names:
         return ""
     budget = (
@@ -252,7 +254,7 @@ def tool_list_block(
         )
     return (
         "## Tools (policy-checked; a denied path returns a policy error)\n"
-        + "\n".join(f"- {READ_TOOL_USAGE[name]}" for name in names)
+        + "\n".join(f"- {usage[name]}" for name in names)
         + f"\n{budget}{note}{logs} Read only what you need; the key paths below are where to "
         "start. When the budget runs out the tools are withdrawn: your next reply must "
         "be exactly the deliverable under ## Deliverable. Never answer with only a "
@@ -436,6 +438,7 @@ def stage_brief(
     resolved_failure_ids: list[str] | None = None,
     tools_note: str = "",
     shared: str = "",
+    tool_usage: dict[str, str] | None = None,
 ) -> str:
     """The stage brief, ordered stable-first so the provider can cache the head.
 
@@ -472,6 +475,7 @@ def stage_brief(
             tool_rounds,
             failure_ids=failure_ids,
             resolved_failure_ids=resolved_failure_ids,
+            tool_usage=tool_usage,
         )
         if tools:
             parts.append(tools)
@@ -593,6 +597,7 @@ def workload_prompt(
     tool_rounds: int = 0,
     ir_evidence: dict | None = None,
     observation_index: dict | None = None,
+    ir_views: bool = True,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
     feedback: str = "",
 ) -> str:
@@ -625,18 +630,25 @@ def workload_prompt(
             tool_names.append("inspect_observation")
             evidence_note = (
                 "\nMeasured observation IDs (descending inclusive profile cycles): " + ids + ".\n"
-                "Call inspect_observation with an ID above and view='asm' or 'ir' "
-                "for the top measured loop before proposing the CFU shape; view='features' "
-                "returns its static feature XML (data movement, typed op counts, "
-                "dependencies); use view='summary' for provenance. If the returned "
+                "Call inspect_observation with an ID above and "
+                + ("view='asm' or 'ir' "
+                   "for the top measured loop before proposing the CFU shape; view='features' "
+                   "returns its static feature XML (data movement, typed op counts, "
+                   "dependencies); use view='summary' for provenance. "
+                   if ir_views else
+                   "view='asm' "
+                   "for the top measured loop before proposing the CFU shape; use "
+                   "view='summary' for provenance. ")
+                + "If the returned "
                 "evidence is unavailable, continue from the measured profile and source "
                 "without guessing. "
                 "ASM is at most a reference-build function candidate, not a proven loop-address match; "
-                "LLVM IR is static Clang evidence, possibly approximate, and never measured cycles. "
-                "Unavailable or ambiguous evidence must remain unknown.\n"
+                + ("LLVM IR is static Clang evidence, possibly approximate, and never measured cycles. "
+                   if ir_views else "")
+                + "Unavailable or ambiguous evidence must remain unknown.\n"
             )
     ir_note = ""
-    if ir_evidence and ir_evidence.get("mode") != "off":
+    if ir_views and ir_evidence and ir_evidence.get("mode") != "off":
         ir_note = (
             "\nLLVM IR export (static analysis only; do not infer loop counts, cycles, "
             "memory bytes, or source-loop matches from this P0 artifact):\n"
@@ -658,6 +670,11 @@ def workload_prompt(
         agent_tools=agent_tools,
         artifact_paths=artifact_paths,
         shared=workload_digest_block(spec, profile),
+        tool_usage=(
+            None if ir_views else
+            {**READ_TOOL_USAGE,
+             "inspect_observation": "`inspect_observation(id, view=summary|asm)` — measured observation evidence."}
+        ),
     )
     return f"""Task:
 {task}
@@ -741,6 +758,8 @@ the JSON object must have exactly the top-level keys listed below.
 The YAML must contain these top-level keys:
 `spec_version`, `identity`, `commands`, `operations_contract`, `state`, `memory`, `datapath`,
 `software`, `integration`, `validation`, `assumptions`, `unknowns`, and `roofline`.
+`assumptions` is a MAPPING of `name: text` (never a list of strings); `unknowns` is a
+LIST of strings.
 Copy the Roofline conclusion into `roofline`, including the selected boundary, intensity,
 ceiling provenance, bottleneck, and the architecture rationale used by the contract.
 Include ISA function IDs, operand/result semantics, and the datapath parameters when they
@@ -978,6 +997,7 @@ def hardware_prompt(
     resolved_failure_ids: list[str] | None = None,
     coding_tools: bool = False,
     diagnosis_required: bool = False,
+    contract_free: bool = False,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
 ) -> str:
     """Prompt for the hardware rung: AgentCfu.scala / AgentCfuFiber.scala only."""
@@ -1111,7 +1131,19 @@ def hardware_prompt(
                 "so ext/SpinalHDL/** cannot be read here; rely on the visible AgentCfu "
                 "scaffold and standard SpinalHDL idioms.\n"
             )
-    if agent_tools:
+    if contract_free:
+        if agent_tools:
+            analysis_ref = (
+                "Prior analysis (read it). There is NO frozen ISA contract in this run: "
+                "you design the instruction encodings yourself (custom0 opcode 0x0B; "
+                "funct3 0..7; funct7 0..127) and the software side calls them through the "
+                "`cfu_intrinsics.h` it writes — keep the RTL decodable for exactly those "
+                "encodings:\n"
+                f"- {run_root}/07_analysis/workload_analysis.yaml"
+            )
+        else:
+            analysis_ref = "Analysis:\n" + analysis
+    elif agent_tools:
         analysis_ref = (
             "Prior analysis and contract (read them; the ISA contract is the frozen interface):\n"
             f"- {run_root}/07_analysis/workload_analysis.yaml\n"
@@ -1143,7 +1175,8 @@ def hardware_prompt(
     else:
         feedback_block = (
             "\nThis is the first hardware attempt. Do not present a repair diagnosis; design "
-            "from the workload, contract, and current scaffold.\n"
+            + ("from the workload and current scaffold.\n" if contract_free
+               else "from the workload, contract, and current scaffold.\n")
         )
     optimization_block = _optimization_block(optimization)
     targets = "\n".join(f"   - {path}" for path in HARDWARE_TARGETS)
@@ -1206,6 +1239,7 @@ def optimization_prompt(
     tool_rounds: int = 0,
     workdir: str = "",
     run_root: str = "",
+    contract_free: bool = False,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
 ) -> str:
     """Ask whether another round should improve speed or hardware cost (PPA).
@@ -1218,8 +1252,8 @@ def optimization_prompt(
     if agent_tools:
         design_block = (
             "Current design (read what you need before deciding):\n"
-            f"- ISA contract: {run_root}/08_isa/cfu_isa.yaml\n"
-            f"- Hardware plan: {run_root}/09_implementation/hw_plan.md\n"
+            + ("" if contract_free else f"- ISA contract: {run_root}/08_isa/cfu_isa.yaml\n")
+            + f"- Hardware plan: {run_root}/09_implementation/hw_plan.md\n"
             f"- Software plan: {run_root}/09_implementation/sw_plan.md"
         )
     else:
@@ -1241,6 +1275,19 @@ def optimization_prompt(
         agent_tools=agent_tools,
         artifact_paths=artifact_paths,
     )
+    extend_bullet = (
+        ""
+        if contract_free else
+        "- `extend_isa` appends new compute/control instructions, including different\n"
+        "  subfunction_id values under the same function_id. Keep every old encoding,\n"
+        "  operand/result semantic, shared state/memory/datapath/assumptions contract and\n"
+        "  integration/software ABI unchanged (intrinsic_names may be appended).\n"
+        "  It re-enters ISA validation, hardware build and software adaptation before any\n"
+        "  measurement. Name the new operation and how software will use it; adding an\n"
+        "  unused instruction is not an optimization. Do not assume the ISA is frozen\n"
+        "  when considering this target.\n"
+    )
+    target_enum = '"implement"' if contract_free else '"implement" or "extend_isa"'
     return f"""Task:
 {task}
 
@@ -1267,15 +1314,7 @@ Decide whether another round is worth spending budget on, and where.
   usage) and/or the accelerated kernel (packing, blocking, loop structure,
   intrinsic granularity, residual scalar work, fences). The whole ladder then
   reruns, so name the concrete change rather than the side.
-- `extend_isa` appends new compute/control instructions, including different
-  subfunction_id values under the same function_id. Keep every old encoding,
-  operand/result semantic, shared state/memory/datapath/assumptions contract and
-  integration/software ABI unchanged (intrinsic_names may be appended).
-  It re-enters ISA validation, hardware build and software adaptation before any
-  measurement. Name the new operation and how software will use it; adding an
-  unused instruction is not an optimization. Do not assume the ISA is frozen
-  when considering this target.
-Prefer `{focus}` unless the evidence clearly points at the other side.
+{extend_bullet}Prefer `{focus}` unless the evidence clearly points at the other side.
 
 Answer `continue: true` only when you can name a concrete change that should beat
 the current numbers and keep every gate passing (the correctness oracle, the
@@ -1291,7 +1330,7 @@ the framework owns the budget and may ask you to reconsider this recommendation.
 
 Return exactly one JSON object and nothing else:
 {{"continue": true or false,
-  "target": "implement" or "extend_isa",
+  "target": {target_enum},
   "focus": "performance" or "cost",
   "reason": "<the concrete change you would make, or why you stop>"}}"""
 
@@ -1327,6 +1366,7 @@ def software_prompt(
     coding_tools: bool = False,
     diagnosis_required: bool = False,
     intrinsics_path: str = "",
+    contract_free: bool = False,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
 ) -> str:
     """Prompt for the software rung: the accelerated kernel using the intrinsics.
@@ -1339,13 +1379,21 @@ def software_prompt(
     run_root = str((context or {}).get("run_root", "") or "").rstrip("/")
     if agent_tools and intrinsics_path:
         intrinsics_block = (
-            "\nGenerated CFU intrinsics (read the exact signatures before calling them):\n"
-            f"- {intrinsics_path}\n"
+            "\n"
+            + ("Agent-authored CFU intrinsics header (yours to edit with the software "
+               "target edits; keep its signatures and the RTL encodings consistent):\n"
+               if contract_free else
+               "Generated CFU intrinsics (read the exact signatures before calling them):\n")
+            + f"- {intrinsics_path}\n"
         )
     elif intrinsics:
         intrinsics_block = (
-            "\nGenerated CFU intrinsics (call these from the accelerated kernel):\n"
-            "```c\n"
+            "\n"
+            + ("Intrinsic template — write `cfu_intrinsics.h` from it (adapt it freely) and "
+               "call your own intrinsics from the accelerated kernel:\n"
+               if contract_free else
+               "Generated CFU intrinsics (call these from the accelerated kernel):\n")
+            + "```c\n"
             + intrinsics
             + "\n```\n"
         )
@@ -1374,7 +1422,10 @@ def software_prompt(
     else:
         feedback_block = (
             "\nThis is the first software attempt. Do not present a repair diagnosis; "
-            "implement the kernel from the contract and intrinsics.\n"
+            + ("design the instructions (`cfu_intrinsics.h`) and the kernel together — "
+               "there is no ISA contract in this run.\n"
+               if contract_free else
+               "implement the kernel from the contract and intrinsics.\n")
             if not optimization
             else "\nThe kernel is already written and passing; improve it as described above.\n"
         )
@@ -1415,7 +1466,17 @@ def software_prompt(
         tools_note=tools_note,
         shared=workload_digest_block(spec, profile),
     )
-    if agent_tools:
+    if contract_free:
+        if agent_tools:
+            context_ref = (
+                "Prior analysis (read it). There is NO ISA contract in this run: the "
+                "`cfu_intrinsics.h` you write IS the instruction interface — design it from "
+                "the intrinsic template and keep it consistent with the hardware:\n"
+                f"- {run_root}/07_analysis/workload_analysis.yaml"
+            )
+        else:
+            context_ref = "Analysis:\n" + analysis
+    elif agent_tools:
         context_ref = (
             "Prior analysis and contract (read them; the ISA contract is the frozen interface):\n"
             f"- {run_root}/07_analysis/workload_analysis.yaml\n"
@@ -1435,6 +1496,32 @@ def software_prompt(
         )
     target_list = "\n".join(f"   - {path}" for path in target_paths)
     optimization_block = _optimization_block(optimization)
+    if contract_free:
+        abi_block = (
+            "There is NO ISA contract in this run: you define the instruction interface "
+            "yourself in `cfu_intrinsics.h` (custom0 opcode 0x0B; funct3 0..7; funct7 0..127). "
+            "Whatever encodings and operand conventions you pick, the header and the hardware "
+            "must agree on them exactly: CPU rs1/rs2 arguments are values (or vector slot "
+            "indices), CPU rd writes return uint32_t, and a void-returning operation must not "
+            "fabricate a C return value."
+        )
+        intrinsic_rule = (
+            "The CFU build (#ifdef USE_AGENT_CFU) must call your cfu_* intrinsic(s)"
+        )
+    else:
+        abi_block = (
+            "Follow each command's CfuResource/resources declarations and the exact generated\n"
+            "intrinsic signature. CPU rs1/rs2 arguments are values, or vector slot indices when\n"
+            "selected by a cpu_value index resource; never pass a physical register number in\n"
+            "place of a slot value. CPU rd writes return uint32_t; vector writes and ack-only\n"
+            "commands return void and encode rd=x0. Vector-only operations must feed a later\n"
+            "vector read/store or another useful operation; their lack of a C return value is\n"
+            "not grounds for fabricating one. Omitted resources denote the legacy two-argument\n"
+            "ABI; do not silently change legacy encodings or the frozen command contract."
+        )
+        intrinsic_rule = (
+            "The CFU build (#ifdef USE_AGENT_CFU) must call the generated CFU intrinsic(s)"
+        )
     return f"""Task:
 {task}
 
@@ -1444,16 +1531,9 @@ def software_prompt(
 {intrinsics_block}
 This is the SOFTWARE rung only. The hardware design is already fixed and
 already passed SoC generation; do not propose hardware changes here.
-Follow each command's CfuResource/resources declarations and the exact generated
-intrinsic signature. CPU rs1/rs2 arguments are values, or vector slot indices when
-selected by a cpu_value index resource; never pass a physical register number in
-place of a slot value. CPU rd writes return uint32_t; vector writes and ack-only
-commands return void and encode rd=x0. Vector-only operations must feed a later
-vector read/store or another useful operation; their lack of a C return value is
-not grounds for fabricating one. Omitted resources denote the legacy two-argument
-ABI; do not silently change legacy encodings or the frozen command contract.
+{abi_block}
 {ROOFLINE_DECISION_RULE}
-The CFU build (#ifdef USE_AGENT_CFU) must call the generated CFU intrinsic(s)
+{intrinsic_rule}
 for the hot operation and derive its result from them. A branch that only calls
 cfu_enable() and then computes with the scalar loop, or that calls an intrinsic
 and ignores both its CPU result and any declared vector/memory effects, is

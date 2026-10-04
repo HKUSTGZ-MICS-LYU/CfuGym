@@ -16,7 +16,7 @@ from dataclasses import dataclass, is_dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from . import context_budget, request_audit
+from . import context_budget, request_audit, tools as tools_mod
 
 DEFAULT_MODEL = "gpt-5"
 # Reasoning/thinking is OFF unless a config opts in. ``reasoning_effort`` values
@@ -985,10 +985,8 @@ class OpenAiTextClient:
                     try:
                         observation = tool_runner(name, arguments)
                         # Keep the string runner API, but do not count error text
-                        # as a successful tool observation.
-                        ok = not observation.startswith((
-                            "error:", "tool error:", "denied by access policy:", "skipped:",
-                        ))
+                        # or a rendered "check failed" as a successful observation.
+                        ok = tools_mod.tool_result_ok(observation)
                     except Exception as exc:  # pragma: no cover - tools report their own errors
                         observation = f"tool error: {type(exc).__name__}: {exc}"
                         ok = False

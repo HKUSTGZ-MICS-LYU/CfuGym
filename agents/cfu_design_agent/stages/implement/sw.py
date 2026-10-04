@@ -22,12 +22,16 @@ def _software_evidence_paths(state: CfuDesignState, intrinsics_path: str) -> lis
     if run_root:
         paths.extend(stage_services.existing_evidence(state, [
             (f"{run_root}/07_analysis/workload_analysis.yaml", "workload analysis"),
-            (f"{run_root}/08_isa/cfu_isa.yaml", "frozen ISA contract"),
+            (f"{run_root}/08_isa/cfu_isa.yaml",
+             "frozen ISA contract" if state.get("isa_contract", True)
+             else "contract stage marker (disabled by ablation)"),
             (f"{run_root}/09_implementation/sw_plan.md", "previous software plan (if any)"),
             (f"{run_root}/09_implementation/sw_changed_files.yaml", "previous software change record"),
         ]))
     if intrinsics_path:
-        paths.append((intrinsics_path, "generated CFU intrinsics header"))
+        paths.append((intrinsics_path,
+                      "generated CFU intrinsics header" if state.get("isa_contract", True)
+                      else "agent-authored CFU intrinsics header (editable software target)"))
     return paths
 
 
@@ -136,9 +140,11 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
             state.get("design_contract", ""),
             state.get("context", {}),
             profile=state.get("embench_profiles"),
-            intrinsics=isa.render_cfu_intrinsics(isa_spec),
+            intrinsics=(isa.render_cfu_intrinsics(isa_spec) if state.get("isa_contract", True)
+                        else intrinsics.intrinsics_template_text(str(state.get("workdir", ".")))),
             intrinsics_path=intrinsics_path,
             targets=targets,
+            contract_free=not state.get("isa_contract", True),
             feedback=feedback,
             optimization=feedback_mod.optimization_directive(state),
             agent_tools=tools_enabled,

@@ -167,6 +167,7 @@ def _choose_optimization(
                 tool_rounds=int(state.get("max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS) or DEFAULT_MAX_TOOL_ROUNDS),
                 workdir=workdir,
                 run_root=run_root,
+                contract_free=not state.get("isa_contract", True),
                 artifact_paths=artifact_paths,
             ),
             fallback,
@@ -211,6 +212,7 @@ def _choose_optimization(
                     tool_rounds=int(state.get("max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS) or DEFAULT_MAX_TOOL_ROUNDS),
                     workdir=workdir,
                     run_root=run_root,
+                    contract_free=not state.get("isa_contract", True),
                     artifact_paths=artifact_paths,
                 ) + "\n=== RECONSIDER EARLY STOP ===\n"
                 + f"Previous recommendation: {result.text}\n"
@@ -239,7 +241,11 @@ def _choose_optimization(
     reason = str(parsed.get("reason", "") or "").strip()
     focus = str(parsed.get("focus", "") or focus)
     if parsing._as_bool(parsed.get("continue")):
-        if target in OPTIMIZATION_TARGETS and reason:
+        # --no-isa-contract removes extend_isa from the design space: with no
+        # contract to extend, only the implementation round remains.
+        allowed = [name for name in OPTIMIZATION_TARGETS
+                   if name != "extend_isa" or state.get("isa_contract", True)]
+        if target in allowed and reason:
             return target, {
                 "continue": True,
                 "target": target,
