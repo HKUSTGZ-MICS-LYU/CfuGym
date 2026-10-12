@@ -105,6 +105,55 @@ class ModeDispatchTest(unittest.TestCase):
         self.assertIn("implement", graph.python_nodes())
 
 
+class ConformanceRepairBudgetTest(unittest.TestCase):
+    """A conformance-scope round that only revised the oracle is answer work.
+
+    The ladder charges the design budget before anyone knows which side of the
+    differential test was wrong. Refund it when the delivered change was the
+    oracle alone, bounded by the answer pool (run 20261005-073745 spent its last
+    design repair on an oracle whose MD5 K table held 63 of 64 entries).
+    """
+
+    def state(self, **overrides) -> dict:
+        return {"repair_scope": "conformance", "repairs_used": 3,
+                "answer_repairs_used": 0, "max_answer_repairs": 2, **overrides}
+
+    def update(self, **overrides) -> dict:
+        return {"changed_design_files": [], "changed_sw_files": [],
+                "conformance_delivery": {"oracle_sha": "new"},
+                "iteration_history": ["Stage 3 agent submitted HW/SW for independent validation."],
+                **overrides}
+
+    def test_oracle_only_round_is_refunded_to_the_answer_pool(self) -> None:
+        result = implement_stage._reattribute_conformance_round(self.state(), self.update())
+        self.assertEqual(result["repairs_used"], 2)
+        self.assertEqual(result["answer_repairs_used"], 1)
+        self.assertTrue(any("answer-repair budget" in line for line in result["iteration_history"]))
+
+    def test_design_change_keeps_the_design_charge(self) -> None:
+        result = implement_stage._reattribute_conformance_round(
+            self.state(), self.update(changed_design_files=["AgentCfu.scala"]))
+        self.assertNotIn("repairs_used", result)
+        self.assertNotIn("answer_repairs_used", result)
+
+    def test_unchanged_oracle_keeps_the_design_charge(self) -> None:
+        state = self.state(conformance_delivery={"oracle_sha": "same"})
+        result = implement_stage._reattribute_conformance_round(
+            state, self.update(conformance_delivery={"oracle_sha": "same"}))
+        self.assertNotIn("repairs_used", result)
+
+    def test_exhausted_answer_pool_keeps_the_design_charge(self) -> None:
+        result = implement_stage._reattribute_conformance_round(
+            self.state(answer_repairs_used=2), self.update())
+        self.assertNotIn("repairs_used", result)
+        self.assertNotIn("answer_repairs_used", result)
+
+    def test_design_scope_round_is_untouched(self) -> None:
+        result = implement_stage._reattribute_conformance_round(
+            self.state(repair_scope="design"), self.update())
+        self.assertNotIn("repairs_used", result)
+
+
 class TwoGateNodeTest(unittest.TestCase):
     """`implement` writes both implementation gates; both must stay fresh."""
 

@@ -22,13 +22,13 @@ _NODE_LAYOUT: tuple[tuple[str, str | None, str | None, tuple[str, ...]], ...] = 
      ("instrument_and_profile", "review_and_route")),
     ("prepare_embench_benchmark", None, "_route_after_prepare",
      ("profile_embench", "review_and_route")),
-    ("profile_embench", "extract_hotspot", None, ()),
-    ("instrument_and_profile", "extract_hotspot", None, ()),
+    ("profile_embench", None, "_route_after_profile", ("extract_hotspot", "review_and_route")),
+    ("instrument_and_profile", None, "_route_after_profile", ("extract_hotspot", "review_and_route")),
     ("extract_hotspot", "collect_ir_evidence", None, ()),
     ("collect_ir_evidence", "analyze_workload", None, ()),
-    # A workload analysis that is not a parseable mapping is an answer error:
-    # repair it from the answer pool or stop, but never hand the empty mapping
-    # to every later stage.
+    # The analysis artifact is advisory context, not a downstream generator
+    # contract: non-empty prose is normalized into a summary mapping. Only an
+    # empty response is repaired or stopped; never hand an empty answer onward.
     ("analyze_workload", None, "_route_after_analysis",
      ("analyze_workload", "design_contract", "review_and_route")),
     # One implementation stage; every repair below routes back into it.
@@ -36,7 +36,8 @@ _NODE_LAYOUT: tuple[tuple[str, str | None, str | None, tuple[str, ...]], ...] = 
      ("design_contract", "implement", "review_and_route")),
     ("extend_isa", None, "_route_after_isa",
      ("extend_isa", "implement", "review_and_route")),
-    ("implement", "generate_soc", None, ()),
+    ("implement", None, "_route_after_implement",
+     ("generate_soc", "analyze_workload", "design_contract", "review_and_route")),
     ("generate_soc", None, "_route_after_hw_build",
      ("check_conformance", "implement", "review_and_route")),
     ("check_conformance", None, "_route_after_hw_conformance",

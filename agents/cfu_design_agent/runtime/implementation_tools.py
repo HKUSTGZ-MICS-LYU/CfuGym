@@ -16,6 +16,7 @@ from typing import Any, Callable
 from . import observations
 from .agent_tools import FAILURE_SCHEMA, READ_ONLY_TOOL_SCHEMAS, ReadOnlyToolset
 from .coding_session import CodingSession
+from . import coding_tools
 from .coding_tools import DIAGNOSIS_SCHEMA, render_check_result
 from .hardware_tools import EDIT_HARDWARE_SCHEMA, CHECK_HARDWARE_SCHEMA
 from .software_tools import EDIT_SOFTWARE_SCHEMA, CHECK_SOFTWARE_SCHEMA
@@ -92,14 +93,17 @@ class ImplementationToolset:
     verifications: tuple[Verification, ...] = ()
     failure_index: dict[str, Any] | None = None
     diagnosis_required: bool = False
+    repair_route: dict[str, Any] | None = None
     #: Per-domain budgets bound one stage's thrash, not its work: a correct
     #: delivery commonly needs an include guard, the kernel body and a boundary
     #: fix. `2` (the original value) rejected the third edit of a legitimate
     #: patch in run-0003 and left no way to answer the gate.
     max_hardware_edits: int = 6
     max_software_edits: int = 6
-    max_hardware_checks: int = 2
-    max_software_checks: int = 2
+    # Cheap post-edit checks are unlimited by default; the stage tool-call/round
+    # budgets still bound total work. A finite override remains available to tests.
+    max_hardware_checks: int | None = None
+    max_software_checks: int | None = None
     max_edit_chars: int = 100_000
     edits_used: dict[str, int] = field(default_factory=lambda: {"hardware": 0, "software": 0})
     checks_used: dict[str, int] = field(default_factory=lambda: {"hardware": 0, "software": 0})
@@ -126,8 +130,10 @@ class ImplementationToolset:
                              ("hardware checks", self.max_hardware_checks),
                              ("software checks", self.max_software_checks),
                              ("edit characters", self.max_edit_chars)):
+            if budget is None:
+                continue
             if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
-                raise ValueError(f"{name} budget must be a non-negative integer")
+                raise ValueError(f"{name} budget must be a non-negative integer or None")
         groups = (self.hardware_targets, self.software_targets)
         if sum(map(len, groups)) != len(set().union(*groups)):
             raise ValueError("Stage 3 target groups must not overlap")
@@ -141,7 +147,7 @@ class ImplementationToolset:
             raise ValueError("verification names must be unique")
         reserved = {"edit_hardware", "edit_software",
                     "check_hardware_elaboration", "check_software_compile",
-                    "submit_repair_diagnosis", "submit_stage", "write_conformance", "check_conformance_syntax"}
+                    "submit_repair_diagnosis", "request_repair_route", "submit_stage", "write_conformance", "check_conformance_syntax"}
         clash = reserved.intersection(names)
         if clash:
             raise ValueError(f"verification name shadows a reserved tool: {sorted(clash)}")
@@ -209,13 +215,16 @@ class ImplementationToolset:
                     "Optional syntax-only compiler check of the delivered test. No link, ELF or simulation."))
         if self.diagnosis_required:
             schemas.append(DIAGNOSIS_SCHEMA)
+            schemas.append(coding_tools.REPAIR_ROUTE_SCHEMA)
         if self.hardware_targets:
             schemas.append(EDIT_HARDWARE_SCHEMA)
         if self.software_targets:
             schemas.append(EDIT_SOFTWARE_SCHEMA)
-        if self.check_elaboration is not None and self.max_hardware_checks > 0:
+        if (self.check_elaboration is not None
+                and (self.max_hardware_checks is None or self.max_hardware_checks > 0)):
             schemas.append(CHECK_HARDWARE_SCHEMA)
-        if self.check_compile is not None and self.max_software_checks > 0:
+        if (self.check_compile is not None
+                and (self.max_software_checks is None or self.max_software_checks > 0)):
             schemas.append(CHECK_SOFTWARE_SCHEMA)
         for verification in self.verifications:
             if self.verifications_used.get(verification.name, 0) < verification.budget:
@@ -242,6 +251,19 @@ class ImplementationToolset:
         args = arguments or {}
         if any(session.committed or session.rolled_back for session in self.sessions):
             return "error: Stage 3 coding transaction is closed"
+        if name == "request_repair_route":
+            try:
+                route = coding_tools.validate_repair_route(
+                    args, diagnosis=self.hardware_session.diagnosis,
+                    failure_index=self.failure_index, repair_mode=self.diagnosis_required)
+            except ValueError as exc:
+                return "repair route rejected: " + str(exc)
+            if route["target"] != "implement":
+                self.rollback()
+            self.repair_route = route
+            return ("repair route accepted: " + route["target"] +
+                    ("; transaction rolled back; call submit_stage to leave the frozen contract"
+                     if route["target"] != "implement" else "; continue editing and submit actual changes in this round"))
         if name == "submit_repair_diagnosis" and self.diagnosis_required:
             answer = self.hardware_session.submit_diagnosis(args)
             if answer.startswith("diagnosis accepted"):
@@ -279,10 +301,12 @@ class ImplementationToolset:
             return self._edit_hardware(args)
         if name == "edit_software" and self.software_targets:
             return self._edit_software(args)
-        if name == "check_hardware_elaboration" and self.check_elaboration is not None and self.max_hardware_checks > 0:
+        if (name == "check_hardware_elaboration" and self.check_elaboration is not None
+                and (self.max_hardware_checks is None or self.max_hardware_checks > 0)):
             return self._check(args, "hardware", self.check_elaboration, self.hardware_session,
                                self.max_hardware_checks, "hardware elaboration", "hw_build")
-        if name == "check_software_compile" and self.check_compile is not None and self.max_software_checks > 0:
+        if (name == "check_software_compile" and self.check_compile is not None
+                and (self.max_software_checks is None or self.max_software_checks > 0)):
             return self._check(args, "software", self.check_compile, self.software_session,
                                self.max_software_checks, "software compile", "sw_build")
         for verification in self.verifications:
@@ -374,11 +398,11 @@ class ImplementationToolset:
         return " ".join(text.split())[-1200:]
 
     def _check(self, args: dict[str, Any], kind: str, callback: Callable[[], dict[str, Any]],
-               session: CodingSession, budget: int, label: str, gate: str) -> str:
+               session: CodingSession, budget: int | None, label: str, gate: str) -> str:
         if args:
             return f"usage error: check_{kind} accepts no arguments (no argv/cwd/gate)"
-        if self.checks_used[kind] >= budget:
-            return f"error: {kind} check budget exhausted"
+        if budget is not None and self.checks_used[kind] >= budget:
+            return f"error: {kind} check budget exhausted ({budget})"
         self.checks_used[kind] += 1
         try:
             result = callback()

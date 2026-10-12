@@ -8,7 +8,7 @@ from ..prompts import SYSTEM_PROMPT
 from ..runtime import llm_step, parsing, stage_services
 from ..runtime.llm import DEFAULT_MAX_TOOL_ROUNDS, OpenAiTextClient
 from ..flow import ladder, outcome
-from ..stages import fallbacks
+from ..stages import fallbacks, feedback as feedback_mod
 from ..state import CfuDesignState
 
 
@@ -35,9 +35,9 @@ def _repair_feedback(state: CfuDesignState) -> str:
         return ""
     return (
         "\n## Previous attempt rejected\n"
-        "The previous reply was not accepted as the YAML analysis mapping:\n"
+        "The previous reply did not contain usable workload-analysis content:\n"
         + "\n".join(f"- {item}" for item in problems)
-        + "\nReturn the corrected mapping as raw YAML, with no prose and no code fence.\n"
+        + "\nProvide a concise, substantive analysis; YAML is preferred but prose is acceptable.\n"
     )
 
 
@@ -80,7 +80,7 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
         observation_index=observation_index,
         ir_views=ir_views,
         artifact_paths=_evidence_paths(state),
-        feedback=_repair_feedback(state),
+        feedback=_repair_feedback(state) + feedback_mod.upstream_repair_feedback(state),
     )
     result, raw_output, tool_calls = llm_step._run_agent_step(
         state,
@@ -93,24 +93,32 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
         user=user,
         fallback=parsing._yaml_str(fallback),
         client=client,
-        deliverable_hint="the final YAML analysis mapping with the required Roofline fields",
+        deliverable_hint="concise workload analysis; YAML mapping preferred, prose is acceptable",
         observation_index=observation_index,
         toolset_kwargs={"ir_views": ir_views},
     )
+    raw_analysis = (result.text or "").strip()
     parsed = parsing.parse_yaml_mapping(result.text)
     if isinstance(client, OpenAiTextClient) and not result.used_llm and not state.get("dry_run", False):
         raise RuntimeError("workload analysis requires a model-authored response")
-    analysis = parsed if parsed is not None else (fallback if state.get("dry_run", False) else {})
-    analysis_errors = [] if parsed is not None or state.get("dry_run", False) else [
-        "analysis did not deliver a valid YAML mapping; no deterministic answer is accepted"
+    if state.get("dry_run", False) and parsed is None:
+        analysis = fallback
+    elif parsed:
+        analysis = parsed
+    elif raw_analysis:
+        # The analysis is advisory context, not a generator input schema. Keep
+        # useful prose or malformed-YAML content rather than blocking the design
+        # ladder on serialization; the persisted artifact is still valid YAML.
+        analysis = {"summary": raw_analysis}
+    else:
+        analysis = {}
+    if analysis and not isinstance(analysis.get("roofline"), dict):
+        analysis["roofline"] = fallback["roofline"]
+    analysis_errors = [] if analysis or state.get("dry_run", False) else [
+        "analysis response was empty; no workload-analysis content can be passed downstream"
     ]
     if analysis_errors:
-        # Hand the repair the reply's own opening lines: the failure is a shape
-        # problem (a fence, a preamble, a bad indent), and quoting it is what
-        # makes the second attempt different from the first.
-        excerpt = (result.text or "").strip()[:400]
-        if excerpt:
-            analysis_errors.append(f"the reply started with:\n{excerpt}")
+        analysis_errors.append("the model must provide substantive workload-analysis content")
     ir = state.get("ir_result") or {}
     if ir.get("mode") in {"auto", "require", "approx"}:
         # Preserve evidence provenance even if the LLM omits it; P0 does not

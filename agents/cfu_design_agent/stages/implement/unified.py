@@ -7,16 +7,17 @@ from typing import Any
 
 from ... import state as state_mod
 from ... import prompts
-from ...flow import outcome
+from ...flow import ladder, outcome
 from ...prompts import SYSTEM_PROMPT
 from ...runtime.llm import DEFAULT_MAX_TOOL_ROUNDS
-from ...runtime import conformance_delivery, effects, commands as commands_mod, llm_step, observations, stage_services, tools as tools_mod
+from ...runtime import coding_tools, conformance_delivery, effects, failures, commands as commands_mod, llm_step, observations, stage_services, tools as tools_mod
 from ...runtime.implementation_tools import ImplementationToolset, Verification
 from ...runtime.policy import PolicyError
 from ...stages import feedback as feedback_mod
 from ...stages.implement import header_transaction, intrinsics, repair_scope
 from ...state import CfuDesignState
 
+@coding_tools.delivery_failure_gate
 @header_transaction.atomic_header
 def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDesignState:
     """Let the agent interleave HW/SW/DEV tools before the independent ladder."""
@@ -37,16 +38,17 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
     if not header_path:
         raise ValueError("Stage 3 cannot generate the ISA intrinsics header")
     failure_info = observations.failure_index(state)
-    # One stage absorbs every repair, so it sees every failing rung at once.
     feedback = feedback_mod.all_failure_feedback(state)
 
-    # Freeze repair scope at entry; internal checks cannot relax first delivery.
     need_hw, need_sw = repair_scope.required_domains(state, toolbox, failure_info)
 
     hardware_check_index = 0
 
     def check_elaboration() -> dict[str, Any]:
         nonlocal hardware_check_index
+        problems = stage_services.hardware_integrity_problems(state, toolbox)
+        if problems:
+            return {"returncode": 1, "stderr_tail": "hardware integrity: " + "; ".join(problems)}
         hardware_check_index += 1
         commands = commands_mod.agent_cfu_check_commands(state, check_index=hardware_check_index)
         if not commands:
@@ -59,12 +61,13 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         result = next((item for item in results if item.get("returncode") != 0), results[-1])
         rtl = (Path(state.get("workdir", ".")).resolve()
                / commands_mod._agent_cfu_check_out_dir(state, hardware_check_index) / "AgentCfu.v")
-        if result.get("returncode") == 0 and (not rtl.is_file() or not rtl.stat().st_size):
-            return {**result, "returncode": 1, "stderr_tail": "isolated check produced no RTL"}
-        return result
+        return coding_tools.audit_hardware_result(state, check_toolbox, result, rtl)
 
     def check_compile() -> dict[str, Any]:
         check_toolbox = stage_services._toolbox_for_stage(state, "validation")
+        problems = stage_services.benchmark_integrity_problems(check_toolbox)
+        if problems:
+            return {"returncode": 1, "stderr_tail": "benchmark integrity: " + "; ".join(problems)}
         commands = commands_mod._isolated_software_check_commands(state, check_toolbox)
         if not commands:
             return {"returncode": 1, "stderr_tail": "no isolated software check command"}
@@ -75,21 +78,14 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         return (next((item for item in results if item.get("returncode") != 0), results[-1]))
 
     def build_soc() -> dict[str, Any]:
-        """Run the same SoC generation command the hw_build rung will rerun."""
-        check_toolbox = stage_services._toolbox_for_stage(state, "validation")
-        isa_spec = state.get("isa_spec", {}) or {}
-        commands = (commands_mod.agent_cfu_overlay_commands(state, isa_spec)
-                    or commands_mod._legacy_ladder_commands(state, check_toolbox)["generate"])
-        if not commands:
-            return {"returncode": 1, "stderr_tail": "no SoC generation command"}
-        results = [effects.run_command(state, check_toolbox, argv, stage="validation",
-                                       rung="hw_build", command_id="soc_generate_agent",
-                                       timeout=3600, mutate=True) for argv in commands]
-        return (next((item for item in results if item.get("returncode") != 0), results[-1]))
+        return coding_tools.build_soc_check(state, toolbox)
 
     def build_software() -> dict[str, Any]:
         """Compile the accelerated workload with the software build commands."""
         check_toolbox = stage_services._toolbox_for_stage(state, "validation")
+        problems = stage_services.benchmark_integrity_problems(check_toolbox)
+        if problems:
+            return {"returncode": 1, "stderr_tail": "benchmark integrity: " + "; ".join(problems)}
         commands = commands_mod._software_build_commands(state, check_toolbox)
         if not commands:
             return {"returncode": 1, "stderr_tail": "no software build command"}
@@ -99,16 +95,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                                        timeout=1800, mutate=True) for argv in commands]
         return (next((item for item in results if item.get("returncode") != 0), results[-1]))
 
-    # Ablation (--no-conformance): no oracle session, no write_conformance /
-    # check_conformance_syntax tools, no oracle requirement in the verdict.
     conformance_on = bool(state.get("require_conformance", True))
-    # Oracle/C stay editable in every round. A verification contract that cannot
-    # observe the real failure has to be repairable, not frozen: run
-    # 20261003-090854-136683-d98e5be9 spent its whole design-repair budget against
-    # a 9-case oracle that never checked a compression result, and the model's
-    # attempt to strengthen it was refused. Strengthening is expected; weakening
-    # is not — the validator rejects a lazy oracle, and a repair must still submit
-    # its structured diagnosis before the first oracle edit.
     oracle_session = None
     if conformance_on:
         _prior_delivery, _delivery_problems = conformance_delivery.inspect_delivery(state, toolbox)
@@ -126,7 +113,6 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                                    command_id="conformance_syntax", timeout=120, mutate=True)
 
     toolsets: list[ImplementationToolset] = []
-
     def factory(box, **kwargs):
         kwargs.pop("observation_index", None)
         toolset = ImplementationToolset(box, **kwargs)
@@ -138,6 +124,18 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         if not delivery.strip() or not toolsets:
             return False, "the delivery was empty"
         tools = toolsets[-1]
+        if tools.repair_route and tools.repair_route["target"] in ("analysis", "contract"):
+            return True, ""
+        problems = stage_services.benchmark_integrity_problems(toolbox)
+        if problems:
+            return False, "benchmark integrity: " + "; ".join(problems)
+        # Oracle staging may precede diagnosis; submitting a repair may not.
+        if tools.diagnosis_required and not tools.hardware_session.diagnosis:
+            return False, (
+                "a repair round must file submit_repair_diagnosis before it can be submitted: "
+                "state the observed failure, the root cause, the repair mapping and the "
+                "regression risks, then submit again"
+            )
         oracle_changed = bool(oracle_session is not None and oracle_session.changed)
         if state.get("repair_scope") == "conformance":
             need_change = bool(need_hw or need_sw or oracle_changed)
@@ -169,6 +167,9 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                 return False, "conformance oracle is missing/stale/invalid: call write_conformance; " + "; ".join(delivery_errors)
         if any(not (toolbox.workdir / path).is_file() for path in (*hw_changed, *sw_changed)):
             return False, "an edited target is missing from the run workspace"
+        problems = stage_services.hardware_integrity_problems(state, toolbox)
+        if problems:
+            return False, "hardware integrity: " + "; ".join(problems)
         try:
             exercises, why = intrinsics._software_exercises_cfu(
                 state, toolbox, stage_services._software_targets(state, toolbox)
@@ -180,12 +181,8 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         return True, ""
 
     def submit(delivery: str) -> tuple[bool, str]:
-        # Model choice controls when to submit, not the gate verdict. The
-        # formally validated ISA is frozen; self-tests cannot substitute for
-        # subsequent hw_build / hw_conformance / sw_build / sim gates.
-        # Every rejection states which condition failed, and re-opens the local
-        # edit/check budgets: the demanded change has to be possible, and the
-        # corrective round is already bounded by the loop's turn/call caps.
+        # Model choice controls submission, not verdicts. Reopen local correction
+        # budgets after rejection; the loop's turn/call caps remain authoritative.
         accepted, reason = verdict(delivery)
         if not accepted:
             for toolset in toolsets:
@@ -195,7 +192,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
     run_root = str(state.get("run_root", "") or "").rstrip("/")
     tool_names = ["read_file", "list_dir", "search_text", "list_command_logs", "inspect_failure"]
     if feedback:
-        tool_names.append("submit_repair_diagnosis")
+        tool_names.extend(["submit_repair_diagnosis", "request_repair_route"])
     tool_names.extend([
         "edit_hardware", "edit_software", "check_hardware_elaboration",
         "check_software_compile", "build_soc", "build_software", "submit_stage",
@@ -268,6 +265,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         "check_hardware_elaboration, check_software_compile, build_soc, build_software, "
         + ("write_conformance and check_conformance_syntax " if conformance_on else "")
         + "may be used while budget remains. "
+        + "Computational results must consume operand, vector or LSU payloads; never return fixed expected values. "
         + ("All simulation belongs to Verify, which consumes your committed oracle. "
            "Use independent reference and small bounded cases; never weaken the oracle to "
            "make a failing design pass, and strengthen it when the failure evidence shows "
@@ -278,7 +276,9 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
     conformance_block = (
         ("\n\nConformance oracle authoring contract:\n"
          + prompts.conformance_prompt(state["task"], state.get("isa_spec") or {}, state.get("workload_spec") or {},
-                                     agent_tools=True, workdir=str(toolbox.workdir), run_root=run_root)
+                                     agent_tools=True, workdir=str(toolbox.workdir), run_root=run_root,
+                                     scalar_sources=[Path(p).name for p in
+                                                     commands_mod.conformance_scalar_sources(state)])
          + "\nIn this tool session apply the oracle with write_conformance(oracle), not as your final response.")
         if conformance_on else ""
     )
@@ -287,6 +287,8 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
          "```c\n" + intrinsics.intrinsics_template_text(str(toolbox.workdir)) + "\n```")
         if contract_free else ""
     )
+    # Differential mismatches are unattributed: either oracle or design may be wrong.
+    scope_line = prompts.repair_scope_note(state)
     stage_user = (
         f"Task:\n{state['task']}\n\n"
         + brief
@@ -296,8 +298,8 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         + ", ".join(sorted(software_targets))
         + schedule_line
         + "\nCurrent failure evidence:\n" + feedback
-        + ("\nCONFORMANCE-ONLY REPAIR: repair oracle/test authoring; reuse healthy HW/SW without dummy edits."
-           if state.get("repair_scope") == "conformance" else "")
+        + scope_line
+        + (feedback_mod.repair_route_guidance(tool_mode=True) if feedback else "")
         + conformance_block
         + template_block
     )
@@ -339,7 +341,14 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         tools = toolsets[-1]
         accepted, reason = verdict(result.text)
         if not accepted:
-            raise RuntimeError("accepted Stage 3 submission failed final audit: " + reason)
+            raise failures.StageDeliveryFailure("accepted Stage 3 submission failed final audit: " + reason,
+                                                stage="implement", tool_calls=calls)
+        if tools.repair_route and tools.repair_route["target"] in ("analysis", "contract"):
+            tools.rollback()
+            update = ladder.repair_route_transition(state, tools.repair_route)
+            update.update(llm_raw_outputs=[raw],
+                          tool_calls=[llm_step._tool_call_summary(call) for call in calls])
+            return update
         touched = repair_scope.changed_paths(toolbox, tools.hardware_session) | repair_scope.changed_paths(toolbox, tools.software_session)
         hardware_changed = sorted(touched.intersection(hardware_targets))
         software_changed = sorted(touched.intersection(software_targets))
@@ -356,7 +365,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
             toolsets[-1].rollback()
         raise
     return {
-        "conformance_delivery": delivery, "repair_scope": "",
+        "conformance_delivery": delivery, "repair_scope": "", "repair_route": {},
         "hardware_plan": result.text, "software_plan": result.text,
         "implementation_hw_summary": "Unified Stage 3 submission; formal gates pending",
         "implementation_sw_summary": "Unified Stage 3 submission; formal gates pending",
@@ -364,6 +373,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         "llm_raw_outputs": [raw], "tool_calls": [llm_step._tool_call_summary(call) for call in calls],
         "stage_jobs": "validation",
         "gates": outcome.gates(state, {
+            "implementation_route": {"ok": True, "next": "generate_soc"},
             "implementation_hw": {"ok": True, "applied": True, "files": hardware_changed,
                                   "candidate_hash": hw_hash, "reused": not bool(hardware_changed)},
             "implementation_sw": {"ok": True, "applied": True, "files": software_changed,
@@ -372,6 +382,5 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         }),
         "iteration_history": state_mod.append_history(state, "Stage 3 agent submitted HW/SW for independent validation."),
     }
-
 
 implement_stage3 = implement_with_tools  # historical node alias

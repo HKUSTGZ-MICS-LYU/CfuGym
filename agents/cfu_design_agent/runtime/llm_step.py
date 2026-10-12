@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
 from ..flow import instrument
-from ..runtime import flow_memory, llm, llm_config, parsing, stage_services, tools as tools_mod
+from ..runtime import flow_memory, llm, llm_config, parsing, source_visibility, stage_services, tools as tools_mod
 from ..runtime.llm import LlmResult, OpenAiTextClient
 from ..runtime.stage_executor import StageExecutionRequest, StageExecutor
 from ..runtime.tools import RepoToolbox
@@ -182,6 +183,7 @@ def _record_llm_output(
 
 def _virtual_paths(state: CfuDesignState, system: str, user: str) -> tuple[str, str]:
     """Render this run's artifact root as ``{{run-dir}}`` in one request."""
+    system, user = source_visibility.mask_model_payload((system, user))
     root = str(state.get("run_root", "") or "")
     if not root:
         return system, user
@@ -240,17 +242,35 @@ def _short_value(value: Any, limit: int = _MAX_LOGGED_VALUE) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def _edit_summary(item: Any) -> str:
+    """One edit's log summary. A malformed element must never crash the CLI.
+
+    Observed 2026-10-04 (ablation matrix, run ...-l1-isa): the model sent
+    ``edits`` as a list of strings, ``item.get`` raised ``AttributeError`` in
+    this live-log path, and the run died with exit code 1 and no ``status=``
+    line -- the harness could only report "framework crash or launcher failure".
+    """
+    if not isinstance(item, dict):
+        return f"<{type(item).__name__}>"
+    path = str(item.get("path", "") or "").rsplit("/", 1)[-1]
+    search = str(item.get("search", "") or "")
+    replace = str(item.get("replace", "") or "")
+    return f"{path} search={len(search)} replace={len(replace)}"
+
+
 def _render_tool_arguments(name: str, arguments: dict[str, Any]) -> str:
-    """A short, single-line summary of one tool call for the CLI log."""
+    """A short, single-line summary of one tool call for the CLI log.
+
+    This is presentation only: a model that sends an unexpected argument shape
+    gets a plain placeholder, never an exception (the tool layer is what rejects
+    malformed arguments).
+    """
+    if not isinstance(arguments, dict):
+        return f"<{type(arguments).__name__}>"
     if name == "edit_hardware":
         edits = arguments.get("edits")
         if isinstance(edits, list):
-            parts = []
-            for item in edits[:3]:
-                path = str((item or {}).get("path", "") or "").rsplit("/", 1)[-1]
-                search = str((item or {}).get("search", "") or "")
-                replace = str((item or {}).get("replace", "") or "")
-                parts.append(f"{path} search={len(search)} replace={len(replace)}")
+            parts = [_edit_summary(item) for item in edits[:3]]
             if len(edits) > 3:
                 parts.append(f"+{len(edits) - 3} more")
             return f"edits=[{', '.join(parts)}]"
@@ -327,7 +347,7 @@ def _tools_enabled(state: CfuDesignState, client) -> bool:
 def _has_delivery_block(text: str) -> bool:
     """True when the response carries an edit, file block, or patch."""
     return bool(tools_mod.extract_edit_blocks(text) or tools_mod.extract_file_blocks(text)
-                or tools_mod.extract_patch(text))
+                or tools_mod.extract_patch(text) or re.search(r"(?m)^REPAIR_ROUTE\b", text))
 
 
 def _with_run_memory(state: CfuDesignState, toolbox: RepoToolbox, stage: str, user: str) -> str:

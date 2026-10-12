@@ -30,7 +30,12 @@ class HardwareCodingIntegrationTest(unittest.TestCase):
         for tracked, overlay in design_workspace_paths(self.state["run_root"]).items():
             target = REPO_ROOT / overlay
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text((REPO_ROOT / tracked).read_text())
+            text = (REPO_ROOT / tracked).read_text()
+            if tracked == DESIGN_SOURCE_FILES[0]:
+                text = text.replace(
+                    "start = ctx => ctx.reply(B(0, cfuParam.CFU_OUTPUT_DATA_W bits))),",
+                    "start = ctx => ctx.reply(ctx.read(RS1) ^ ctx.read(RS2))),", 1)
+            target.write_text(text)
 
     def test_hardware_tool_edit_and_check_commit_without_setting_hw_build(self):
         target = design_workspace_paths(self.state["run_root"])[DESIGN_SOURCE_FILES[0]]

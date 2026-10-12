@@ -126,6 +126,75 @@ def _conformance_workspace(state: CfuDesignState) -> str:
     return f"{state.get('run_root', '')}/{CONFORMANCE_SUBDIR}"
 
 
+def _conformance_scalar_benchmark(state: CfuDesignState) -> tuple[str, str]:
+    """(benchmark name, reference tree) for an Embench workload, else ("", "")."""
+    project = state.get("benchmark_project") or {}
+    name = str(project.get("benchmark") or "").strip()
+    run_root = str(state.get("run_root") or "").strip()
+    if not name or not run_root:
+        return "", ""
+    return name, embench.config_workspace(run_root, name, "reference")
+
+
+def conformance_scalar_sources(state: CfuDesignState) -> list[str]:
+    """Every workload scalar source the oracle may `#include`, repo-relative.
+
+    Verified end to end: the real build command links a conformance test that
+    includes ``beebsc.c`` and ``md5.c`` of the pristine reference tree
+    (``-ffunction-sections`` + ``--gc-sections`` drops ``benchmark_body``, so the
+    run's own ``main`` stays the only entry point).
+
+    A CFU's semantics are a transcription of the workload's scalar code, so the
+    conformance oracle may `#include` that code instead of copying its constant
+    tables by hand: run 20261005-073745 hand-copied md5.c's 64-entry K table,
+    dropped one entry, and the rung then failed *correct* hardware for three
+    consecutive rounds. Only the ``reference`` configuration is offered — the
+    harness-owned plain build that `embench.workspace_tampering` guards, never the
+    writable ``cfu`` copy whose CFU branch would make the test self-referential.
+    ``support/beebsc.c`` comes along because the Embench scalar sources allocate
+    their scratch message on the Beebs bump allocator; ``support/main.c`` is
+    deliberately excluded (it defines ``main``).
+    """
+    name, root = _conformance_scalar_benchmark(state)
+    if not name:
+        return []
+    workdir = Path(str(state.get("workdir") or "."))
+    sources = embench.config_sources(
+        workdir, str(state.get("run_root") or "").strip(), name, "reference")
+    if not sources:
+        return []
+    allocator = f"{root}/support/beebsc.c"
+    if (workdir / allocator).is_file():
+        sources.append(allocator)
+    return sources
+
+
+def _scalar_reference_root(state: CfuDesignState) -> str:
+    """The reference tree when it is actually present on disk, else ""."""
+    _name, root = _conformance_scalar_benchmark(state)
+    if not root:
+        return ""
+    return root if (Path(str(state.get("workdir") or ".")) / root).is_dir() else ""
+
+
+def conformance_scalar_includes(state: CfuDesignState) -> list[str]:
+    """Include dirs of that scalar tree, repo-relative (empty when unavailable)."""
+    root = _scalar_reference_root(state)
+    return [f"{root}/src", f"{root}/support", f"{root}/board"] if root else []
+
+
+def conformance_scalar_defines(state: CfuDesignState) -> list[str]:
+    """The benchmark's own defines, which its scalar source needs to compile.
+
+    ``md5.c`` only builds with the Embench ``-D`` set (``GLOBAL_SCALE_FACTOR`` and
+    friends). They are the same harness-owned defines ``embench.build_command``
+    passes for the reference configuration, so including the scalar source adds no
+    flag the benchmark build does not already use.
+    """
+    name, _root = _conformance_scalar_benchmark(state)
+    return embench.config_defines(name, "reference") if name and _scalar_reference_root(state) else []
+
+
 def _conformance_syntax_command(state: CfuDesignState, header_path: str) -> list[str]:
     """Check the harness-owned C without assembling, linking or running it.
 
@@ -135,20 +204,26 @@ def _conformance_syntax_command(state: CfuDesignState, header_path: str) -> list
     """
     if not str(header_path or "").strip():
         raise ValueError("conformance syntax check requires an intrinsics header path")
+    includes = ["-I", str(Path(header_path).parent), "-I", "sw/MiCo-Lib/targets/vexii_soc"]
+    scalar_dirs = conformance_scalar_includes(state)
+    for directory in scalar_dirs:
+        includes.extend(["-I", directory])
+    scalar_defines = conformance_scalar_defines(state)
+    includes.extend(scalar_defines)
+    # Embench scalar files may use pre-C23 `typedef uint8_t bool`; compile them
+    # under the same GNU C11 mode as reference/profile/CFU builds. Other oracle
+    # syntax checks keep their existing GNU C mode.
+    c_standard = embench.DEFAULT_C_STANDARD if scalar_dirs else "-std=gnu99"
     return [
         "riscv64-unknown-elf-gcc",
         "-fsyntax-only",
-        # GNU C: the framework's own generated intrinsics header binds operand
-        # registers with `register uint32_t r1 asm("a1")`, which -std=c99 rejects
-        # in the header before the test body is ever parsed.
-        "-std=gnu99",
+        # GNU C is required because generated intrinsics bind operand registers
+        # with `register uint32_t r1 asm(\"a1\")`.
+        c_standard,
         "-Werror=implicit-function-declaration",
         "-march=rv32imc_zicsr_zifencei",
         "-mabi=ilp32",
-        "-I",
-        str(Path(header_path).parent),
-        "-I",
-        "sw/MiCo-Lib/targets/vexii_soc",
+        *includes,
         f"{_conformance_workspace(state)}/{CONFORMANCE_SOURCE}",
     ]
 
@@ -166,6 +241,13 @@ def _conformance_build_command(state: CfuDesignState, header_path: str) -> tuple
     cfg = _conformance_workspace(state)
     rel = os.path.relpath(cfg, "sw")
     header_dir = os.path.relpath(os.path.dirname(header_path) or ".", "sw")
+    # The oracle may `#include` the workload's pristine scalar source (see
+    # `conformance_scalar_sources`), so the reference tree joins the include path.
+    include_dirs = [header_dir, *(
+        os.path.relpath(directory, "sw") for directory in conformance_scalar_includes(state)
+    )]
+    scalar_defines = conformance_scalar_defines(state)
+    defines = " ".join([embench.DEFAULT_C_STANDARD, *scalar_defines]) if scalar_defines else ""
     elf = f"{cfg}/{CONFORMANCE_BIN}.elf"
     return (
         [
@@ -176,7 +258,8 @@ def _conformance_build_command(state: CfuDesignState, header_path: str) -> tuple
             f"MARCH={DEFAULT_MARCH}",
             f"MAIN={rel}/{CONFORMANCE_BIN}",
             f"BUILD={rel}/build",
-            f"EXTRA_INCLUDES={header_dir}",
+            f"EXTRA_INCLUDES={' '.join(include_dirs)}",
+            *([f"EXTRA_CFLAGS={defines}"] if defines else []),
             "compile",
         ],
         elf,

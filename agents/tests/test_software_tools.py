@@ -81,6 +81,17 @@ class SoftwareCodingToolsetTest(unittest.TestCase):
         self.assertNotIn("gate", result.lower())
         self.assertEqual(len(self.checks), 1)
 
+    def test_compile_checks_are_unlimited_by_default(self) -> None:
+        self.assertIsNone(self.tools.max_checks)
+        previous = "int x = 1;\n"
+        for value in range(2, 5):
+            current = f"int x = {value};\n"
+            self.assertNotIn("rejected", self.tools.run("edit_software", {
+                "path": self.target, "search": previous, "replace": current}))
+            self.assertIn("failed", self.tools.run("check_software_compile", {}))
+            previous = current
+        self.assertEqual(len(self.checks), 3)
+
     def test_edit_and_check_budgets_are_enforced(self) -> None:
         self.tools.max_edits = 1
         self.tools.run(

@@ -425,14 +425,15 @@ class StageExecutorTest(unittest.TestCase):
         self.assertIn("only submit_stage is available", second)
 
     def test_the_corrective_round_fits_inside_the_turn_ceiling(self) -> None:
-        # Observed run-0003: the gate asked for a change, the corrective round
-        # was granted, and the run then died on
-        # "model-turn hard limit reached without submission" one turn later.
+        # A rejected delivery gets bounded repair turns, then a submit-only
+        # finalization turn rather than an open-ended correction mode.
         client = _RoundClient([
             ("", [("read_file", {"path": "one"})]),
             ("", [("submit_stage", {"delivery": "not applied"})]),
             ("", [("read_file", {"path": "two"})]),
             ("", [("read_file", {"path": "three"})]),
+            ("", [("read_file", {"path": "four"})]),
+            ("", [("read_file", {"path": "five"})]),
             ("", [("submit_stage", {"delivery": "applied"})]),
         ])
         executor, _ = self._executor()
@@ -450,6 +451,28 @@ class StageExecutorTest(unittest.TestCase):
             client=client,
         )
         self.assertEqual(output.result.text, "applied")
+        self.assertEqual(client.seen[-1][1], ["submit_stage"])
+        self.assertIn("Finalize this stage now", " ".join(
+            str(item.get("content", "")) for item in client.seen[-1][0]))
+
+    def test_finalize_only_retries_a_prose_response_with_submit_stage(self) -> None:
+        client = _RoundClient([
+            ("", [("read_file", {"path": "one"})]),
+            ("I am done and will submit", []),
+            ("", [("submit_stage", {"delivery": "done"})]),
+        ])
+        executor, _ = self._executor()
+        output = executor.execute(
+            {"max_tool_rounds": 1}, object(),
+            self._request(tools_enabled=True, native_tool_loop=True,
+                          submit_stage=lambda _delivery: True),
+            client=client,
+        )
+        self.assertEqual(output.result.text, "done")
+        self.assertEqual(client.seen[1][1], ["submit_stage"])
+        self.assertEqual(client.seen[2][1], ["submit_stage"])
+        follow_up = " ".join(str(item.get("content", "")) for item in client.seen[2][0])
+        self.assertIn("Only submit_stage is available", follow_up)
 
     def test_native_graph_rejects_checkpoint_thread_reuse(self) -> None:
         saver = InMemorySaver()

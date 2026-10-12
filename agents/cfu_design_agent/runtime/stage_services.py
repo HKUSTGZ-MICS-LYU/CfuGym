@@ -7,7 +7,7 @@ from typing import Iterable
 
 from .. import isa
 from ..benchmark import embench
-from ..runtime import policy as policy_mod
+from ..runtime import policy as policy_mod, source_visibility
 from ..runtime.artifacts import RunArtifacts
 from ..runtime.tools import RepoToolbox
 from ..state import CfuDesignState
@@ -51,6 +51,23 @@ def existing_evidence(
         if target.is_file() or target.is_dir():
             kept.append((path, note))
     return kept
+
+
+def model_source_text(toolbox: RepoToolbox, path: str, *, limit: int) -> str:
+    """Mask a source prefix before bounding a model-facing excerpt.
+
+    Host candidate/verification readers deliberately keep using raw read_text.
+    Cap parsing at 2M characters; an incomplete verifier body is masked to EOF.
+    """
+    read_limit = min(limit, 2_000_000)
+    try:
+        source = toolbox.resolve(path)
+        if isinstance(source, Path):
+            read_limit = min(2_000_000, max(limit, source.stat().st_size))
+    except (AttributeError, OSError):
+        pass  # Missing files and lightweight test doubles retain read semantics.
+    text = toolbox.read_text(path, limit=read_limit)
+    return source_visibility.mask_file_view(text, path)[:limit]
 
 
 def _software_targets(state: CfuDesignState, toolbox: RepoToolbox) -> list[tuple[str, str]]:
@@ -100,9 +117,88 @@ def _toolbox_for_stage(state: CfuDesignState, stage: str) -> RepoToolbox:
         policy=policy,
         stage=stage,
         run_root=state.get("run_root", ""),
-        embench_benchmark=str(state.get("benchmark_name", "") or ""),
+        embench_benchmark=str((state.get("benchmark_project") or {}).get("benchmark")
+                             or state.get("benchmark_name")
+                             or (state.get("workload_spec") or {}).get("benchmark_name") or ""),
         apply_patch=state.get("apply_patch", False),
+        enforce_embench_integrity=(
+            (state.get("benchmark_project") or {}).get("kind") == "embench_benchmark"
+            or (state.get("workload_spec") or {}).get("source_kind") == "embench"
+        ),
     )
+
+
+def benchmark_integrity_problems(toolbox: RepoToolbox) -> list[str]:
+    """Production Embench toolboxes enforce this; synthetic tool doubles do not."""
+    if getattr(toolbox, "enforce_embench_integrity", False) is not True:
+        return []
+    return toolbox.benchmark_integrity_problems()
+
+
+def hardware_integrity_problems(state: CfuDesignState, toolbox: RepoToolbox, *,
+                                evidence: dict | None = None, rtl_path: Path | None = None) -> list[str]:
+    """Same live-overlay/encoding guard for submit and build, even without conformance."""
+    from . import hardware_integrity, instruction_encoding, tools
+    from ..stages.implement import intrinsics
+
+    sources = {}
+    for path in tools.design_workspace_paths(state.get("run_root", "")).values():
+        try:
+            sources[path] = toolbox.read_text(path, limit=2_000_000)
+        except (OSError, policy_mod.PolicyError) as exc:
+            return [f"hardware integrity cannot read {path}: {exc}"]
+    spec = state.get("isa_spec") or {}
+    problems = hardware_integrity.validate_sources(sources, spec)
+    encoding = {"version": instruction_encoding.VERSION, "candidate_hash": intrinsics._hardware_candidate_hash(state, toolbox),
+                "isa_hash": instruction_encoding.digest(spec),
+                "config": instruction_encoding.configuration(spec)}
+    encoding["config_hash"] = instruction_encoding.digest(encoding["config"])
+    if state.get("isa_contract", True) and spec.get("commands"):
+        encoding["source"] = instruction_encoding.validate_sources(sources, spec)
+        problems.extend(encoding["source"]["problems"])
+        if rtl_path is not None:
+            try:
+                rtl = toolbox.read_text(str(rtl_path), limit=20_000_000)
+            except (OSError, policy_mod.PolicyError) as exc:
+                problems.append(f"hardware integrity cannot read generated RTL {rtl_path}: {exc}")
+            else:
+                encoding["rtl"] = instruction_encoding.validate_rtl(rtl, spec)
+                problems.extend(encoding["rtl"]["problems"])
+    else:
+        encoding["source"] = {"checked": False, "unchecked": ["no frozen ISA contract: encoding crosscheck disabled"], "problems": []}
+    encoding["checked"] = encoding.get("rtl", encoding["source"]).get("checked", False)
+    encoding["proof_scope"] = "bounded encoding/enable structure only, not semantic correctness"
+    if evidence is not None:
+        evidence.update(encoding)
+    return problems
+
+
+def gate_failure_result(state: CfuDesignState, rung: str, reason: str,
+                        errors: list[str], *, category: str = "") -> dict:
+    """A host check, not a fabricated exit code for an external command.
+
+    Publish an inspectable failure even when all commands succeeded (for example
+    result mismatch) or no command ran (fixed-result hardware preflight).
+    """
+    from . import observations
+
+    text = "\n".join(errors)
+    result = {"kind": "host_gate_check", "executed": False, "rung": rung, "returncode": 1,
+              "command": f"host gate check: {rung}/{reason}", "reason": reason,
+              "terminal_reason": reason, "stderr_tail": text, "stdout_tail": "",
+              "log_path": f"{state.get('run_root', '')}/10_validation/{rung}.yaml"}
+    item = observations.build_failure_observation(
+        rung, result, stderr=text, log_path=result["log_path"],
+        workdir=str(state.get("workdir", "")))
+    if item is not None:
+        item["summary"] = text[:2000]
+        item["category"] = category or reason
+        signature = observations.failure_signature(
+            rung, item["category"], result, text, workdir=str(state.get("workdir", "")))
+        item.update(signature=signature,
+                    id=f"fail_{rung}_{signature.removeprefix('failure-v1:')[:12]}")
+        result["failure_observation"] = item
+    return result
 
 
 def _artifacts_for_stage(state: CfuDesignState, stage: str) -> RunArtifacts:
@@ -204,12 +300,14 @@ def _write_software_artifact(
     )
 
 
-def _write_ladder_artifact(state: CfuDesignState, rung: str, results: list, status: str, reason: str) -> None:
+def _write_ladder_artifact(state: CfuDesignState, rung: str, results: list, status: str, reason: str,
+                           *, evidence: dict | None = None) -> None:
     artifacts = _artifacts_for_stage(state, "validation")
     artifacts.write_yaml(
         "validation",
         f"10_validation/{rung}.yaml",
-        {"rung": rung, "status": status, "reason": reason, "commands": [dict(item) for item in results]},
+        {"rung": rung, "status": status, "reason": reason, "commands": [dict(item) for item in results],
+         **(evidence or {})},
     )
 
 

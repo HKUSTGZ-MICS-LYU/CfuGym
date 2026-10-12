@@ -44,7 +44,7 @@ class RooflinePromptTest(unittest.TestCase):
   design_action: keep vectors resident
 """
 
-    def test_workload_prompt_requires_structured_roofline(self) -> None:
+    def test_workload_prompt_keeps_roofline_lightweight_and_optional(self) -> None:
         prompt = workload_prompt("accelerate it", self.spec, self.context)
         for field in (
             "hot_function",
@@ -59,22 +59,19 @@ class RooflinePromptTest(unittest.TestCase):
             "verification_metric",
         ):
             self.assertIn(field, prompt)
-        self.assertIn("Return exactly one YAML mapping", prompt)
-        self.assertIn("algorithmic", prompt)
+        self.assertIn("mapping is useful but optional", prompt)
+        self.assertIn("do not fill a schema for its own sake", prompt)
         contract = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
         self.assertIn("independent optional knobs", contract)
         self.assertIn("regDepth: 0", contract)
-        self.assertIn("achieved", prompt)
+        self.assertIn("Roofline fallback", prompt)
 
-    def test_analysis_prompt_states_the_raw_yaml_wire_format(self) -> None:
-        # Observed 2026-09-29 (twice): a prose preamble plus a ```yaml fence made
-        # the whole analysis unparseable. The prompt must say the reply is a raw
-        # YAML mapping and nothing else.
+    def test_analysis_prompt_allows_flexible_serialization(self) -> None:
         prompt = workload_prompt("accelerate it", self.spec, self.context)
-        self.assertIn("and nothing else", prompt)
-        self.assertIn("Markdown fences", prompt)
-        self.assertIn("YAML parser", prompt)
-        self.assertIn("not valid YAML", prompt)
+        self.assertIn("YAML mapping is preferred but not required", prompt)
+        self.assertIn("plain prose or Markdown is acceptable", prompt)
+        self.assertNotIn("Return exactly one YAML mapping", prompt)
+        self.assertNotIn("invalidates the entire analysis", prompt)
 
     def test_analysis_repair_prompt_quotes_the_previous_rejection(self) -> None:
         prompt = workload_prompt(

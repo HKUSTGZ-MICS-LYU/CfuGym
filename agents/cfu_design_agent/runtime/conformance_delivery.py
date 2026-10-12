@@ -241,8 +241,11 @@ class ConformanceDelivery:
             return {}, ["conformance delivery transaction is closed"]
         if not self.editable:
             return {}, ["conformance delivery is frozen; oracle edits are not allowed"]
-        if not self.unlocked:
-            return {}, ["submit a structured repair diagnosis before editing the oracle"]
+        # A diagnosis-locked session still accepts a *staged* revision: the model
+        # may author the corrected oracle first and file the structured diagnosis
+        # afterwards. Refusing the write outright burned a round in run
+        # 20261005-073745, where the already-correct oracle was rejected for
+        # ordering alone. ``commit`` keeps the hard gate.
         if not isinstance(oracle_text, str):
             return {}, ["oracle_text must be a string"]
         oracle, errors = conformance.parse_oracle(oracle_text)
@@ -300,6 +303,8 @@ class ConformanceDelivery:
     def commit(self) -> None:
         if self.rolled_back:
             raise RuntimeError("cannot commit a rolled-back conformance delivery")
+        if not self.unlocked:
+            raise ValueError("submit a structured repair diagnosis before committing the oracle")
         _, errors = self.current()
         if errors:
             raise ValueError("cannot commit invalid conformance delivery: " + "; ".join(errors))

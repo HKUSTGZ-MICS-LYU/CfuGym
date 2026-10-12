@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
-import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from agents.cfu_design_agent import graph, profile_cache
+from agents.cfu_design_agent.benchmark import embench_integrity
 from agents.cfu_design_agent.benchmark.embench_loops import loop_id
 from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
@@ -53,24 +55,25 @@ class _ScriptedProfile:
 
 class ProfileCacheTest(unittest.TestCase):
     def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.workdir = Path(temp.name)
+        policy_source = REPO_ROOT.joinpath("agents/specs/agent_access_policy.yaml")
+        policy = self.workdir / "agents/specs/agent_access_policy.yaml"
+        policy.parent.mkdir(parents=True)
+        policy.write_bytes(policy_source.read_bytes())
         self.run_id = f"profile-cache-{self._testMethodName}"[:60]
         self.run_root = f"agents/generated/runs/{self.run_id}"
-        self.run_dir = REPO_ROOT / self.run_root
-        shutil.rmtree(self.run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, self.run_dir, True)
+        self.run_dir = self.workdir / self.run_root
 
-        cache_dir = REPO_ROOT / profile_cache.CACHE_SUBDIR
-        pre_existing = set(cache_dir.glob("*.json")) if cache_dir.is_dir() else set()
-        self.addCleanup(self._remove_new_cache_files, pre_existing)
-
+        # These cache/transport tests seed tiny synthetic kernels, not the real
+        # adapter's guarded Embench scaffold. Keep the checker mock local to this
+        # fixture; real adapter/fairness tests exercise fail-closed enforcement.
+        integrity = mock.patch.object(embench_integrity, "validate_candidate", return_value=[])
+        integrity.start()
+        self.addCleanup(integrity.stop)
         self._seed_workspace()
         self._pin_fingerprints()
-
-    def _remove_new_cache_files(self, pre_existing: set) -> None:
-        cache_dir = REPO_ROOT / profile_cache.CACHE_SUBDIR
-        if cache_dir.is_dir():
-            for path in set(cache_dir.glob("*.json")) - pre_existing:
-                path.unlink(missing_ok=True)
 
     def _pin_fingerprints(self) -> None:
         # Tool versions and the git revision are environment-specific; pin them
@@ -91,13 +94,13 @@ class ProfileCacheTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _seed_run(self, run_root: str) -> None:
-        root = REPO_ROOT / run_root / "workspace" / "embench_depthconv"
+        root = self.workdir / run_root / "workspace" / "embench_depthconv"
         for config in ("reference", "profile"):
             (root / config / "src").mkdir(parents=True, exist_ok=True)
             (root / config / "src" / "depthconv.c").write_text(
                 "int hot(int x){for(int i=0;i<x;i++){x++;break;} return x+1;}\n"
             )
-        design = REPO_ROOT / run_root / "workspace" / "design"
+        design = self.workdir / run_root / "workspace" / "design"
         design.mkdir(parents=True, exist_ok=True)
         (design / "AgentCfu.scala").write_text("// scaffold\n")
         (design / "AgentCfuFiber.scala").write_text("// fiber\n")
@@ -108,7 +111,7 @@ class ProfileCacheTest(unittest.TestCase):
     def _state(self, mode: str = "on", run_root: str = "") -> dict:
         run_root = run_root or self.run_root
         return {
-            "workdir": str(REPO_ROOT),
+            "workdir": str(self.workdir),
             "run_root": run_root,
             "run_id": run_root.rsplit("/", 1)[-1],
             "benchmark_name": "depthconv",
@@ -136,8 +139,6 @@ class ProfileCacheTest(unittest.TestCase):
         self.assertEqual(first["gates"]["profile"]["profile_cache"]["status"], "miss")
 
         other_root = f"agents/generated/runs/{self.run_id}-other"
-        shutil.rmtree(REPO_ROOT / other_root, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, REPO_ROOT / other_root, True)
         self._seed_run(other_root)
 
         second, scripted = self._run("on", run_root=other_root)
@@ -172,7 +173,7 @@ class ProfileCacheTest(unittest.TestCase):
         self.assertIn("profile_cache:", artifact.read_text())
 
     def test_off_never_reads_or_writes_the_cache(self) -> None:
-        cache_dir = REPO_ROOT / profile_cache.CACHE_SUBDIR
+        cache_dir = self.workdir / profile_cache.CACHE_SUBDIR
         before = set(cache_dir.glob("*.json")) if cache_dir.is_dir() else set()
         out, scripted = self._run("off")
         report = out["gates"]["profile"]["profile_cache"]
@@ -214,7 +215,7 @@ class ProfileCacheTest(unittest.TestCase):
     def test_key_changes_with_cpu_flags_and_with_the_design_overlay(self) -> None:
         def key() -> str:
             return profile_cache.build_key(
-                REPO_ROOT,
+                self.workdir,
                 run_root=self.run_root,
                 benchmark="depthconv",
                 configs=["reference", "profile"],
@@ -226,7 +227,7 @@ class ProfileCacheTest(unittest.TestCase):
         base = key()
         self.assertEqual(base, key(), "identical inputs must hash identically")
         changed_flags = profile_cache.build_key(
-            REPO_ROOT,
+            self.workdir,
             run_root=self.run_root,
             benchmark="depthconv",
             configs=["reference", "profile"],
@@ -242,32 +243,32 @@ class ProfileCacheTest(unittest.TestCase):
     def test_the_reference_disassembly_travels_with_the_cache_entry(self) -> None:
         # The disassembly is a build output, so a reused measurement has none and
         # the analysis could not read the ASM candidate (observed 2026-09-30).
-        toolbox = RepoToolbox(REPO_ROOT, dry_run=False, stage="profile",
+        toolbox = RepoToolbox(self.workdir, dry_run=False, stage="profile",
                               run_root=self.run_root)
         asm = profile._reference_disassembly_rel(self.run_root, "depthconv")
-        cached = REPO_ROOT / profile_cache.artifact_relpath(
+        cached = self.workdir / profile_cache.artifact_relpath(
             "a" * 64, profile_cache.DISASSEMBLY_NAME
         )
         self.addCleanup(cached.unlink, missing_ok=True)
-        (REPO_ROOT / asm).parent.mkdir(parents=True, exist_ok=True)
-        (REPO_ROOT / asm).write_text("0000 <hot>:\n  ret\n")
+        (self.workdir / asm).parent.mkdir(parents=True, exist_ok=True)
+        (self.workdir / asm).write_text("0000 <hot>:\n  ret\n")
         profile._store_reference_disassembly(toolbox, self.run_root, "depthconv", "a" * 64, "on")
         self.assertIn("hot", cached.read_text())
         # A cache hit restores it into the workspace...
-        (REPO_ROOT / asm).unlink()
+        (self.workdir / asm).unlink()
         profile._restore_reference_disassembly(toolbox, self.run_root, "depthconv", "a" * 64, "on")
-        self.assertIn("hot", (REPO_ROOT / asm).read_text())
+        self.assertIn("hot", (self.workdir / asm).read_text())
         # ...never overwriting a build that did happen...
-        (REPO_ROOT / asm).write_text("newer\n")
+        (self.workdir / asm).write_text("newer\n")
         profile._restore_reference_disassembly(toolbox, self.run_root, "depthconv", "a" * 64, "on")
-        self.assertEqual((REPO_ROOT / asm).read_text(), "newer\n")
+        self.assertEqual((self.workdir / asm).read_text(), "newer\n")
         # ...and staying out of the way when the cache is off.
-        (REPO_ROOT / asm).unlink()
+        (self.workdir / asm).unlink()
         profile._restore_reference_disassembly(toolbox, self.run_root, "depthconv", "a" * 64, "off")
-        self.assertFalse((REPO_ROOT / asm).exists())
+        self.assertFalse((self.workdir / asm).exists())
         profile._store_reference_disassembly(toolbox, self.run_root, "depthconv", "b" * 64, "off")
         self.assertFalse(
-            (REPO_ROOT / profile_cache.artifact_relpath(
+            (self.workdir / profile_cache.artifact_relpath(
                 "b" * 64, profile_cache.DISASSEMBLY_NAME)).exists()
         )
 
@@ -294,6 +295,70 @@ class ProfileCacheTest(unittest.TestCase):
         self.assertIsNone(profile_cache.parse(text, "other-key"))
         self.assertIsNone(profile_cache.parse("{not json", "k"))
         self.assertIsNone(profile_cache.parse('{"key": "k", "profiles": {}}', "k"))
+
+
+class ProfileCacheProtocolTest(unittest.TestCase):
+    """Protocol key regressions using only disposable source trees."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.workdir = Path(temp.name)
+        self.run_root = "runs/fixture"
+        reference = self.workdir / self.run_root / "workspace/embench_crc32/reference"
+        (reference / "src").mkdir(parents=True)
+        self.kernel = reference / "src/crc32.c"
+        self.kernel.write_text("int benchmark_body(void) { return 1; }\n")
+        (reference / "support").mkdir()
+        self.preparation = reference / "support/beebsc.c"
+        self.preparation.write_text("void initialise_benchmark(void) {}\n")
+        for name in ("toolchain_fingerprint", "repo_fingerprint"):
+            patcher = mock.patch.object(profile_cache, name, return_value={"fixture": "fixed"})
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _key(self, **kwargs) -> dict:
+        return profile_cache.build_key(
+            self.workdir, run_root=self.run_root, benchmark="crc32",
+            configs=["reference", "profile"],
+            build_commands={"reference": ["make"], "profile": ["make"]},
+            cpu_flags=["--mico-agent-cfu"], observation_plan=None, **kwargs,
+        )
+
+    def test_protocol_is_explicit_and_default_keeps_existing_api(self) -> None:
+        from agents.cfu_design_agent.benchmark import embench
+
+        with mock.patch.object(embench, "MEASUREMENT_PROTOCOL", "cold_single_invocation_v1", create=True):
+            default = self._key()
+        explicit = self._key(measurement_protocol="cold_single_invocation_v1")
+        self.assertEqual(default, explicit)
+        self.assertEqual(default["inputs"]["key_version"], "7")
+        self.assertEqual(default["inputs"]["measurement_protocol"], "cold_single_invocation_v1")
+        self.assertNotEqual(default["key"], self._key(measurement_protocol="legacy")["key"])
+        self.assertNotEqual(default["key"], self._key(measurement_protocol="future_v2")["key"])
+
+    def test_pristine_kernel_and_preparation_sources_still_invalidate_key(self) -> None:
+        base = self._key(measurement_protocol="cold_single_invocation_v1")
+        self.kernel.write_text("int benchmark_body(void) { return 2; }\n")
+        changed = self._key(measurement_protocol="cold_single_invocation_v1")
+        self.assertNotEqual(base["key"], changed["key"])
+        self.preparation.write_text("void initialise_benchmark(void) { prepare(); }\n")
+        self.assertNotEqual(changed["key"], self._key(measurement_protocol="cold_single_invocation_v1")["key"])
+
+    def test_version_six_entry_cannot_match_current_key(self) -> None:
+        import hashlib
+        import json
+
+        current = self._key(measurement_protocol="cold_single_invocation_v1")
+        old_inputs = dict(current["inputs"], key_version="6")
+        old_inputs.pop("measurement_protocol")
+        canonical = json.dumps(old_inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        old_key = hashlib.sha256(canonical.encode()).hexdigest()
+        old_entry = profile_cache.serialize(
+            old_key, benchmark="crc32", configs=["reference"],
+            profiles={"reference": {"crc32": {"cycles": 100}}}, observation={}, inputs=old_inputs,
+        )
+        self.assertIsNone(profile_cache.parse(old_entry, current["key"]))
 
 
 if __name__ == "__main__":

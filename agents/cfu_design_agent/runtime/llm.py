@@ -16,7 +16,7 @@ from dataclasses import dataclass, is_dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from . import context_budget, request_audit, tools as tools_mod
+from . import context_budget, request_audit, source_visibility, tools as tools_mod
 
 DEFAULT_MODEL = "gpt-5"
 # Reasoning/thinking is OFF unless a config opts in. ``reasoning_effort`` values
@@ -1194,6 +1194,7 @@ class OpenAiTextClient:
 
     def _sdk_request(self, sdk, endpoint: str, body: dict[str, Any], *, budget=None):
         from urllib.parse import urlsplit
+        body = source_visibility.mask_model_payload(body)
         metadata = {"stage": current_stage(), "endpoint": endpoint,
                     "base_url_host": urlsplit(self.base_url or "").hostname or "", "model": self.model}
         self._request_attempt += 1
@@ -1261,7 +1262,7 @@ class OpenAiTextClient:
         elif response_format is not None:
             kwargs["response_format"] = response_format
         messages, budget = self._budget_messages(
-            messages, tools=kwargs.get("tools"), response_config={k: v for k, v in kwargs.items()
+            source_visibility.mask_model_payload(messages), tools=kwargs.get("tools"), response_config={k: v for k, v in kwargs.items()
             if k not in {"tools", "timeout"}}, sdk=client)
         self._prepared_messages = messages
         if not self.stream:

@@ -7,10 +7,11 @@ writeback mistake is found before any workload software is written.
 
 Division of ownership:
 
-* The **harness** owns the C test (``render_conformance``). It is never a model
-  write target, so a hardware repair cannot weaken it.
+* The **harness** owns the C test (``render_conformance``) and the test **data**
+  (``conformance_data``): byte blocks, boundary values and deterministic random
+  vectors. It is never a model write target, so a hardware repair cannot weaken it.
 * The **model** owns only the oracle YAML: the scalar reference expression, the
-  optional setup statements and the boundary cases.
+  optional setup statements and the *shape* of the input space.
 
 Anti-self-grading rules:
 
@@ -21,7 +22,8 @@ Anti-self-grading rules:
   model attesting its own hardware) and is documented as such.
 * A command with any vector resource must supply ``setup`` to seed the register
   file; the harness never guesses.
-* Missing reference/verify/setup/cases is a coverage FAIL, never a silent skip.
+* Missing reference/verify/setup, or an unusable ``data`` block, is a coverage
+  FAIL, never a silent skip.
 * Lazy oracles are rejected: ``reference``/``verify`` must actually observe the
   command's effect, so constant expressions and ``cfu_*`` self-references fail
   validation (a reference that calls the DUT proves nothing), as does an
@@ -36,16 +38,13 @@ Anti-self-grading rules:
   ``probe_marker = 1u``, and a readback ``reference`` that returned the reset IV
   table, both passed a 9-case conformance rung while the benchmark result was
   wrong).
-* Every case argument must not be zero: an all-zero case set exercises only the
-  zero boundary and says nothing about a real address, slot or count.
 * Oracle ``helpers`` blocks must define each C symbol once; a helper needed by
   several commands must live in one entry (the class behind a generated-test
   ``redefinition of 'ref_rol32'`` build failure).
-* The model chooses all case data and workload sizes. The harness executes
-  exactly the declared cases, with no hidden edge/random inputs: full-width
-  numbers may represent counts, lengths or loop bounds rather than cheap data.
-  Prompts require small, representative quick tests; independent references
-  and non-empty coverage remain mandatory.
+* No case argument is model-authored. Run 20261005-073745 declared one
+  zero-length case, so the rung never transferred a source byte; the generated
+  sweep now covers 0, 1, the half and the full block plus deterministic random
+  lengths, and the model cannot shrink `data.buffer` to dodge the transfer.
 """
 
 from __future__ import annotations
@@ -53,6 +52,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from . import conformance_data
 from .isa import MAX_FUNCTION_ID, MAX_SUBFUNCTION_ID, command_symbol
 
 STATUS_SENTINEL = "CFU_CONFORMANCE"
@@ -68,7 +68,7 @@ STATUS_RE = re.compile(
 )
 DETAIL_RE = re.compile(r"^CFU_CONFORMANCE_(?:MISSING|CASE)\b.*$", re.MULTILINE)
 
-# Oracle `cases[].args` are bound to these C names in rs1/rs2 order.
+# Generated case arguments are bound to these C names in rs1/rs2 order.
 ROLE_NAMES = {"rs1": "a", "rs2": "b"}
 
 def _commands(isa: Any) -> list[dict[str, Any]]:
@@ -206,18 +206,33 @@ def _oracle_entries(oracle: Any) -> dict[str, dict[str, Any]]:
     return entries
 
 
-def _c_literal(value: Any) -> str:
-    """Render an oracle argument as a uint32 C literal, or "" when unusable."""
-    if _int_ok(value):
-        return f"(uint32_t){int(value) & 0xFFFFFFFF}u"
-    if isinstance(value, str):
-        text = value.strip()
-        try:
-            parsed = int(text, 0)
-        except ValueError:
-            return ""
-        return f"(uint32_t){parsed & 0xFFFFFFFF}u"
-    return ""
+def data_plans(isa: Any, oracle: Any) -> tuple[dict[str, conformance_data.DataPlan],
+                                               dict[str, list[str]]]:
+    """The harness-owned data for every declared command, and why one has none.
+
+    A command with CPU-value roles must declare ``data``; a command with none gets
+    a single invocation unless it declares a block of its own (a vector command
+    may still seed from a harness block in ``setup``). The plan is computed once
+    and shared by validation and rendering, so the two cannot disagree about what
+    the test will run.
+    """
+    entries = _oracle_entries(oracle)
+    plans: dict[str, conformance_data.DataPlan] = {}
+    problems: dict[str, list[str]] = {}
+    for command in enabled_commands(isa):
+        name = str(command.get("name", ""))
+        entry = entries.get(name)
+        if entry is None:
+            continue
+        roles = len(cpu_value_roles(command))
+        spec = entry.get("data")
+        if spec is None and not roles:
+            spec = {"count": 1}
+        plan, issues = conformance_data.plan(name, spec, roles)
+        problems[name] = issues
+        if plan is not None:
+            plans[name] = plan
+    return plans, problems
 
 
 _C_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
@@ -314,18 +329,6 @@ def _literal_decision_names(entry: dict[str, Any]) -> set[str]:
             continue
         names.add(match.group(1))
     return names
-
-
-def _argument_int(value: Any) -> int | None:
-    """The integer an oracle case argument denotes, or ``None`` when unusable."""
-    if _int_ok(value):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value.strip(), 0)
-        except ValueError:
-            return None
-    return None
 
 
 _C_KEYWORDS = frozenset("if else for while switch return do sizeof".split())
@@ -501,6 +504,7 @@ def _expression_problems(
 def _coverage_problem_list(
     command: dict[str, Any], entry: dict[str, Any] | None,
     dependencies: dict[str, set[str]] | None = None,
+    data_problems: list[str] | None = None,
 ) -> list[str]:
     """Every reason this command cannot be verified, or [] when it can.
 
@@ -511,9 +515,13 @@ def _coverage_problem_list(
     if entry is None:
         return ["no oracle entry"]
     problems: list[str] = []
-    cases = entry.get("cases")
-    if not isinstance(cases, list) or not cases:
-        problems.append("cases must be a non-empty list")
+    if entry.get("cases") is not None:
+        problems.append(
+            "cases is no longer accepted: the harness generates the test data. Replace it "
+            "with a data block — data.buffer for the byte block the DUT reads and "
+            "data.roles for the input space (kind address/length/index/value)"
+        )
+    problems.extend(data_problems or [])
     if writes_cpu_rd(command):
         if not str(entry.get("reference") or "").strip():
             problems.append(
@@ -531,55 +539,12 @@ def _coverage_problem_list(
             "setup is required because the command uses the vector register file; "
             "the harness does not guess how to seed it"
         )
-    if "edge_cases" in entry and not isinstance(entry.get("edge_cases"), bool):
-        problems.append("edge_cases must be a boolean (legacy field; no automatic cases are added)")
+    if "edge_cases" in entry:
+        problems.append(
+            "edge_cases is no longer accepted: boundary coverage comes from the harness "
+            "data generator, not from a boolean on the oracle"
+        )
     problems.extend(_expression_problems(command, entry, dependencies))
-    if isinstance(cases, list):
-        roles = cpu_value_roles(command)
-        for index, case in enumerate(cases):
-            if not isinstance(case, dict):
-                problems.append(f"cases[{index}] must be a mapping with an args list")
-                continue
-            args = case.get("args")
-            if not isinstance(args, list):
-                problems.append(f"cases[{index}].args must be a list")
-                continue
-            if len(args) != len(roles):
-                problems.append(
-                    f"cases[{index}].args has {len(args)} value(s) but the command takes "
-                    f"{len(roles)} CPU value argument(s) ({', '.join(roles) or 'none'}): "
-                    f"give exactly one literal per role, in rs1/rs2 order, and move any "
-                    f"data/address preparation into `setup`"
-                )
-                continue
-            for position, value in enumerate(args):
-                if not _c_literal(value):
-                    problems.append(
-                        f"cases[{index}].args[{position}] = {value!r} must be an integer or "
-                        "a C-style integer string such as 0xFFFFFFFF; casts, addresses, "
-                        "identifiers and expressions are rejected because the harness embeds "
-                        "each arg as a compile-time constant into the generated intrinsic call "
-                        "(move the address/data preparation into `setup` and pass a literal "
-                        "value instead)"
-                    )
-                    break
-        roles = cpu_value_roles(command)
-        if roles:
-            known = [
-                value
-                for case in cases
-                if isinstance(case, dict) and isinstance(case.get("args"), list)
-                for raw in case["args"]
-                if (value := _argument_int(raw)) is not None
-            ]
-            if known and all(value == 0 for value in known):
-                problems.append(
-                    "every declared case binds only zero arguments: the test would exercise "
-                    "the all-zero boundary and nothing else, so a real address, slot index or "
-                    "count is never touched. Give at least one case a representative non-zero "
-                    "literal value (a real aligned address such as 0x80000000 is allowed and "
-                    "must match the address your setup seeds)"
-                )
     return problems
 
 
@@ -635,10 +600,12 @@ def validate_oracle(isa: Any, oracle: Any) -> list[str]:
             errors.append(f"oracle.commands[{index}] names unknown command {name!r}")
     entries = _oracle_entries(oracle)
     dependencies = _helper_dependencies(entries.values())
+    _plans, plan_problems = data_plans(isa, oracle)
     for command in commands:
         name = str(command.get("name", ""))
         entry = entries.get(name)
-        for problem in _coverage_problem_list(command, entry, dependencies):
+        for problem in _coverage_problem_list(command, entry, dependencies,
+                                              plan_problems.get(name)):
             errors.append(f"{name}: {problem}")
         for issue in unknown_intrinsic_calls(entry or {}, isa):
             errors.append(f"{name}: {issue}")
@@ -658,28 +625,28 @@ def validate_oracle(isa: Any, oracle: Any) -> list[str]:
     return errors
 
 
-def _render_case(command: dict[str, Any], entry: dict[str, Any]) -> str:
-    """One case block: bind arguments, call the intrinsic and compare.
+def _render_case(command: dict[str, Any], entry: dict[str, Any],
+                 plan: conformance_data.DataPlan) -> str:
+    """One case block: bind the harness arguments, call the intrinsic and compare.
 
-    Only the model's declared cases run and count into ``g_cases``. Both case-argument
-    names are declared unconditionally at case scope — the undeclared-identifier
-    class must never fail the C build even for a stale oracle (the validator
-    lint rejects such references first, with a message that names them).
+    The arguments come from the plan, never from the oracle, so the model cannot
+    choose the data it is graded on. Both case-argument names are declared
+    unconditionally at case scope — the undeclared-identifier class must never
+    fail the C build even for a stale oracle (the validator lint rejects such
+    references first, with a message that names them).
     """
     name = str(command.get("name", ""))
     roles = cpu_value_roles(command)
     intrinsic = intrinsic_name(command)
     check = "reference" if writes_cpu_rd(command) else "verify"
     expression = str(entry.get(check) or "").strip()
-    cases = list(entry.get("cases") or [])
     lines: list[str] = []
-    for index, case in enumerate(cases):
-        args = case.get("args") or []
+    for index, args in enumerate(plan.cases):
         lines.append("    {")
         lines.append("      uint32_t a = 0;")
         lines.append("      uint32_t b = 0;")
         for role, value in zip(roles, args):
-            lines.append(f"      {ROLE_NAMES[role]} = {_c_literal(value)};")
+            lines.append(f"      {ROLE_NAMES[role]} = (uint32_t)({value});")
         lines.append("      (void)a; (void)b;")
         call = f"{intrinsic}({', '.join(ROLE_NAMES[r] for r in roles)})"
         if writes_cpu_rd(command):
@@ -716,6 +683,7 @@ def render_conformance(isa: Any, oracle: Any) -> str:
     commands = enabled_commands(isa)
     entries = _oracle_entries(oracle)
     dependencies = _helper_dependencies(entries.values())
+    plans, plan_problems = data_plans(isa, oracle)
     # Helper emission is collision-proof: identical blocks are emitted once, and
     # when two distinct blocks define the same symbol the first wins (the render
     # stays compilable; validate_oracle rejects the oracle with a rename hint).
@@ -736,30 +704,42 @@ def render_conformance(isa: Any, oracle: Any) -> str:
     for command in commands:
         name = str(command.get("name", ""))
         entry = entries.get(name, {})
-        problem = "; ".join(_coverage_problem_list(command, entries.get(name), dependencies))
+        plan = plans.get(name)
+        problem = "; ".join(_coverage_problem_list(
+            command, entries.get(name), dependencies, plan_problems.get(name)))
         body.append(f"  /* ---- {name} ---- */")
         body.append("  {")
-        if problem:
+        if problem or plan is None:
             body.append("    int cmd_ok = 0;")
             body.append(
-                f'    printf("CFU_CONFORMANCE_MISSING {name}: {problem}\\n");'
+                f'    printf("CFU_CONFORMANCE_MISSING {name}: {problem or "no data plan"}\\n");'
             )
         else:
             body.append("    int cmd_ok = 1;")
+            if plan.has_buffer:
+                # The block is harness-owned, so the harness also owns the fence
+                # that makes it visible to the DUT's TileLink reads.
+                body.append("    /* harness-owned data: order CPU writes before the DUT reads */")
+                body.append("    cfu_memory_fence();")
             setup = str(entry.get("setup") or "").strip()
             if setup:
                 body.append("    /* oracle setup */")
                 body.extend(f"    {line}" if line.strip() else "" for line in setup.splitlines())
-            body.append(_render_case(command, entry))
+            body.append(_render_case(command, entry, plan))
         body.append(f'    if (cmd_ok) g_commands_ok++; else conf_fail("{name}");')
         body.append("  }")
         body.append("")
     rendered_helpers = "\n\n".join(helper_blocks)
+    rendered_data = "\n\n".join(
+        block for block in (conformance_data.render_data(plans[name])
+                            for name in (str(c.get("name", "")) for c in commands) if name in plans)
+        if block
+    )
     return f"""/* Generated by CfuGym for the hw_conformance rung. Do not edit by hand.
  *
- * The model owns only the oracle YAML; this test is harness-owned, so a hardware
- * repair cannot weaken it. `main()` returns non-zero on the first mismatch and the
- * linker-provided `fail` symbol then stops the simulation.
+ * The model owns the oracle's semantics; the harness owns this test and its data.
+ * `main()` returns non-zero on the first mismatch and the linker-provided `fail`
+ * symbol then stops the simulation.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -768,6 +748,9 @@ def render_conformance(isa: Any, oracle: Any) -> str:
 #include "cfu_intrinsics.h"
 
 #define CONF_COMMANDS {len(commands)}
+
+/* ---- harness-owned test data ---- */
+{rendered_data}
 
 /* ---- oracle helpers ---- */
 {rendered_helpers}

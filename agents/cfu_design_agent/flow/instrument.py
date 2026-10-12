@@ -11,7 +11,7 @@ from typing import Any
 
 from contextlib import nullcontext
 
-from ..runtime import dependencies, effects, flow_memory, llm, progress as progress_mod, request_audit
+from ..runtime import dependencies, effects, failures, flow_memory, llm, progress as progress_mod, request_audit
 from ..runtime.persistence import RunPersistence
 from ..runtime.progress import StageProgress
 
@@ -197,11 +197,15 @@ def _wrap_node(fn):
             # commands as LangGraph tasks without checkpointing a toolbox. The
             # same context carries the node's exact tool transcripts (for the
             # run memory) and the run-scoped request audit for every model call.
-            audit = _audit_context(state)
-            with effects.use_state(state), flow_memory.collect_tool_transcripts() as transcript, audit:
-                update = fn(state)
-            update = apply_fingerprints(update)
-            return _with_flow_memory(state, update, transcript, name)
+            try:
+                audit = _audit_context(state)
+                with effects.use_state(state), flow_memory.collect_tool_transcripts() as transcript, audit:
+                    update = fn(state)
+                update = apply_fingerprints(update)
+                return _with_flow_memory(state, update, transcript, name)
+            except Exception as exc:
+                failures.attach_partial_state(exc, state, source="node_entry", stage=name)
+                raise
 
         def invoke():
             persisted = _ACTIVE_PERSISTENCE.get()

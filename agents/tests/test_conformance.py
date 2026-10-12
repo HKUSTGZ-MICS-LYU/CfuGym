@@ -1,11 +1,18 @@
-"""Harness-owned differential micro-test: rendering, oracle lint and verdict parsing."""
+"""Harness-owned differential micro-test: data generator, rendering, oracle lint.
+
+The model owns the oracle's *semantics*. The harness owns the *data*: the
+``data.buffer``/``data.roles`` spec selects the shape of the input space and
+``conformance_data`` generates the boundary sweep and the random draws from a
+fixed seed. These tests pin both halves, and every rejection message they assert
+has to name the fix, not just the format.
+"""
 
 from __future__ import annotations
 
 import unittest
 
+from agents.cfu_design_agent import conformance_data
 from agents.cfu_design_agent.conformance import (
-    _c_literal,
     cpu_value_roles,
     parse_conformance,
     render_conformance,
@@ -76,6 +83,16 @@ def isa(*commands: dict) -> dict:
     return {"spec_version": "1", "commands": [dict(c) for c in commands]}
 
 
+def data_for(command: dict, *, buffer: int = 0, max_value: int = 255) -> dict:
+    """The input-space spec the harness generator needs for one command."""
+    spec: dict = {
+        "roles": [{"kind": "value", "max": max_value} for _ in cpu_value_roles(command)]
+    }
+    if buffer:
+        spec["buffer"] = buffer
+    return spec
+
+
 class ResourceShapeTest(unittest.TestCase):
     def test_cpu_value_roles_follow_the_generated_intrinsic(self) -> None:
         self.assertEqual(cpu_value_roles(CPU_COMMAND), ["rs1", "rs2"])
@@ -101,7 +118,7 @@ class ResourceShapeTest(unittest.TestCase):
 
 class RenderTest(unittest.TestCase):
     def oracle(self, command: dict, **fields) -> dict:
-        entry = {"name": command["name"], "cases": [{"args": [1, 2]}], **fields}
+        entry = {"name": command["name"], "data": data_for(command), **fields}
         return {"commands": [entry]}
 
     def test_cpu_command_compares_intrinsic_against_reference(self) -> None:
@@ -164,9 +181,175 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("int cmd_ok = 1;", text)
 
 
+class HarnessDataTest(unittest.TestCase):
+    """The harness generates the data; the oracle only declares its shape.
+
+    Regression class (run 20261005-073745): the oracle declared one zero-length
+    case, so the rung never transferred a source byte and a wrong scalar table
+    could not be told apart from wrong hardware.
+    """
+
+    def plan(self, data: dict, roles: int = 2, name: str = "hash"):
+        plan, problems = conformance_data.plan(name, data, roles)
+        self.assertEqual(problems, [], problems)
+        self.assertIsNotNone(plan)
+        return plan
+
+    def test_boundary_sweep_covers_zero_half_and_full_block(self) -> None:
+        plan = self.plan({"buffer": 64,
+                          "roles": [{"kind": "address"}, {"kind": "length", "max": 64}]})
+        lengths = {case[1] for case in plan.cases}
+        self.assertIn("0", lengths)
+        self.assertIn("64", lengths)
+        self.assertIn("32", lengths)
+        self.assertGreater(len(plan.cases), 2)
+        self.assertTrue(all(case[0] == plan.base_macro for case in plan.cases))
+
+    def test_data_is_deterministic_and_not_model_chosen(self) -> None:
+        spec = {"buffer": 64, "roles": [{"kind": "address"}, {"kind": "length", "max": 64}]}
+        first = self.plan(spec)
+        second = self.plan(spec)
+        self.assertEqual(first.cases, second.cases)
+        self.assertEqual(first.buffer, second.buffer)
+        self.assertEqual(len(first.buffer), 64)
+        self.assertNotEqual(first.buffer, bytes(64), "a zero block would hide transfer bugs")
+
+    def test_random_draws_add_to_the_boundary_sweep(self) -> None:
+        spec = {"count": 4, "roles": [{"kind": "value", "max": 0xFFFFFFFF}]}
+        plan = self.plan(spec, roles=1)
+        self.assertEqual(len(plan.cases), 4 + 4)  # four boundaries plus four draws
+        self.assertIn(("4294967295",), plan.cases)
+        self.assertIn(("0",), plan.cases)
+
+    def test_buffer_renders_as_owned_block_with_a_fence(self) -> None:
+        oracle = {"commands": [{
+            "name": "hash",
+            "reference": "ref_hash(a, b)",
+            "helpers": "static uint32_t ref_hash(uint32_t p, uint32_t n) { return p + n; }",
+            "data": {"buffer": 16, "roles": [{"kind": "address"}, {"kind": "length", "max": 16}]},
+        }]}
+        command = dict(CPU_COMMAND, name="hash")
+        text = render_conformance(isa(command), oracle)
+        self.assertIn("CFU_CONFORMANCE", text)
+        self.assertIn("static uint8_t cfu_conf_data_hash[16]", text)
+        self.assertIn("#define HASH_CONF_DATA_BASE", text)
+        self.assertIn("#define HASH_CONF_DATA_BYTES ((uint32_t)16u)", text)
+        # Harness-owned data means the harness also owns the ordering fence.
+        self.assertIn("cfu_memory_fence();", text)
+        # The rendered argument is the owned block, never a model literal address.
+        self.assertIn("a = (uint32_t)(HASH_CONF_DATA_BASE);", text)
+
+    def test_legacy_cases_field_is_rejected_with_the_migration(self) -> None:
+        oracle = {"commands": [{"name": "compute", "cases": [{"args": [1, 2]}],
+                                "reference": "a + b"}]}
+        problems = validate_oracle(isa(CPU_COMMAND), oracle)
+        message = next((p for p in problems if "cases is no longer accepted" in p), None)
+        self.assertIsNotNone(message, problems)
+        self.assertIn("data.buffer", message)
+        self.assertIn("data.roles", message)
+
+    def test_model_supplied_seed_is_rejected(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
+            "name": "compute", "reference": "a + b",
+            "data": {"seed": 1, **data_for(CPU_COMMAND)}}]})
+        self.assertTrue(any("seed is not allowed" in p for p in problems), problems)
+
+    def test_legacy_edge_flag_is_rejected(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
+            {"name": "compute", "reference": "a + b", "data": data_for(CPU_COMMAND),
+             "edge_cases": True}]})
+        self.assertTrue(any("edge_cases is no longer accepted" in p for p in problems), problems)
+
+    def test_role_count_must_match_the_command(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
+            "name": "compute", "reference": "a + b",
+            "data": {"roles": [{"kind": "value"}]}}]})
+        message = next((p for p in problems if "data.roles has 1 entry" in p), None)
+        self.assertIsNotNone(message, problems)
+        self.assertIn("rs1/rs2 order", message)
+
+    def test_missing_data_block_names_the_replacement(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND),
+                                   {"commands": [{"name": "compute", "reference": "a + b"}]})
+        message = next((p for p in problems if "data must be a mapping" in p), None)
+        self.assertIsNotNone(message, problems)
+        self.assertIn("cases", message)
+
+    def test_address_role_requires_a_buffer(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
+            "name": "compute", "reference": "a + b",
+            "data": {"roles": [{"kind": "address"}, {"kind": "value"}]}}]})
+        self.assertTrue(any("data.buffer is missing" in p for p in problems), problems)
+
+    def test_length_bound_may_not_exceed_the_owned_block(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
+            "name": "compute", "reference": "a + b",
+            "data": {"buffer": 64,
+                     "roles": [{"kind": "address"}, {"kind": "length", "max": 128}]}}]})
+        self.assertTrue(any("bounds the transferred length" in p for p in problems), problems)
+
+    def test_buffer_size_and_count_are_bounded(self) -> None:
+        cases = [
+            ({"buffer": 6, "roles": [{"kind": "value"}, {"kind": "value"}]}, "multiple of 4"),
+            ({"buffer": 4096, "roles": [{"kind": "value"}, {"kind": "value"}]}, "between 4 and 1024"),
+            ({"count": 99, **data_for(CPU_COMMAND)}, "data.count must be an integer between"),
+        ]
+        for data, needle in cases:
+            with self.subTest(data=data):
+                problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
+                    {"name": "compute", "reference": "a + b", "data": data}]})
+                self.assertTrue(any(needle in p for p in problems), problems)
+
+    def test_unknown_role_kind_lists_the_vocabulary(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
+            "name": "compute", "reference": "a + b",
+            "data": {"roles": [{"kind": "banana"}, {"kind": "value"}]}}]})
+        message = next((p for p in problems if "kind must be one of" in p), None)
+        self.assertIsNotNone(message, problems)
+        for kind in conformance_data.ROLE_KINDS:
+            self.assertIn(kind, message)
+
+    def test_role_less_command_gets_one_invocation(self) -> None:
+        control = {"function_id": 3, "subfunction_id": 0, "name": "ctl",
+                   "kind": "control", "resources": []}
+        oracle = {"commands": [{
+            "name": "ctl", "verify": "ctl_seen()",
+            "helpers": "static uint32_t ctl_seen(void) { return 1u; }"}]}
+        self.assertEqual(validate_oracle(isa(control), oracle), [])
+        text = render_conformance(isa(control), oracle)
+        self.assertEqual(text.count("g_cases++;"), 1)
+
+    def test_byte_budget_keeps_the_full_block_and_drops_the_rest(self) -> None:
+        """A big buffer must not turn the rung into a mini-benchmark."""
+        plan = self.plan({"buffer": 1024, "count": 4,
+                          "roles": [{"kind": "address"}, {"kind": "length", "max": 1024}]})
+        self.assertLessEqual(plan.bytes_total, conformance_data.CASE_BYTE_BUDGET)
+        lengths = [case[1] for case in plan.cases]
+        self.assertIn("1024", lengths, "the full-block transfer is the case that matters")
+        self.assertIn("0", lengths)
+        self.assertNotIn("1023", lengths, "budget is spent before the near-full boundary")
+
+    def test_small_buffer_keeps_the_whole_sweep(self) -> None:
+        plan = self.plan({"buffer": 64,
+                          "roles": [{"kind": "address"}, {"kind": "length", "max": 64}]})
+        self.assertEqual(plan.bytes_total, 339)
+        self.assertEqual(len(plan.cases), 10)
+
+    def test_prompt_states_the_harness_owns_the_data(self) -> None:
+        from agents.cfu_design_agent.prompts import conformance_prompt
+
+        for tools in (True, False):
+            with self.subTest(tools=tools):
+                prompt = conformance_prompt("test", isa(CPU_COMMAND), {}, agent_tools=tools)
+                self.assertIn("YOU DO NOT CHOOSE THE TEST DATA", prompt)
+                self.assertIn("data.roles", prompt)
+                self.assertIn("data.buffer", prompt)
+                self.assertNotIn("cases:\n      - args:", prompt)
+
+
 class ValidateOracleTest(unittest.TestCase):
     def entry(self, **fields) -> dict:
-        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
+        return {"name": "compute", "data": data_for(CPU_COMMAND), **fields}
 
     def test_valid_oracle(self) -> None:
         self.assertEqual(
@@ -182,18 +365,9 @@ class ValidateOracleTest(unittest.TestCase):
         self.assertTrue(any("reference is required" in p for p in problems), problems)
 
     def test_missing_verify_for_command_without_cpu_result(self) -> None:
-        entry = {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();"}
+        entry = {"name": "vset", "data": data_for(VECTOR_COMMAND), "setup": "seed();"}
         problems = validate_oracle(isa(VECTOR_COMMAND), {"commands": [entry]})
         self.assertTrue(any("verify" in p for p in problems), problems)
-
-    def test_missing_cases_and_argument_mismatch(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{"name": "compute", "reference": "a"}]})
-        self.assertTrue(any("cases must be a non-empty list" in p for p in problems), problems)
-        problems = validate_oracle(
-            isa(CPU_COMMAND),
-            {"commands": [self.entry(reference="a", cases=[{"args": [1]}])]},
-        )
-        self.assertTrue(any("1 value(s)" in p for p in problems), problems)
 
     def test_unknown_and_duplicate_command_names(self) -> None:
         problems = validate_oracle(isa(CPU_COMMAND), {"commands": [self.entry(reference="a", name="nope")]})
@@ -256,8 +430,6 @@ class ParseVerdictTest(unittest.TestCase):
         # The sw Makefile links `$(OBJS) $(MAIN).c`, so passing the test in
         # EXTRA_SOURCES as well fails a real build with "multiple definition of
         # `main`". The generated source is the MAIN translation unit.
-        from agents.cfu_design_agent import graph
-
         state = {"run_root": "agents/generated/runs/x-00000000", "run_id": "x-00000000"}
         header = ("agents/generated/runs/x-00000000/workspace/embench_crc32/cfu/"
                   "include/cfu_intrinsics.h")
@@ -295,45 +467,35 @@ class ParseVerdictTest(unittest.TestCase):
         self.assertTrue(any("add[0]" in d for d in verdict["details"]), verdict)
 
 
-class ArgGuidanceTest(unittest.TestCase):
-    """Oracle-arg rejections must explain the fix, not just the format.
-
-    Regression (2026-09-26, matmult-int): the model oscillated three oracle
-    attempts between the arg-count and arg-literal errors because neither the
-    validator message nor the prompt said that args are compile-time constants
-    and addresses belong in `setup`.
-    """
+class DataSpecGuidanceTest(unittest.TestCase):
+    """A rejected data spec must explain the fix, not just the format."""
 
     def entry(self, **fields) -> dict:
-        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
+        return {"name": "compute", **fields}
 
-    def test_literal_error_names_value_and_setup_fix(self) -> None:
-        problems = validate_oracle(
-            isa(CPU_COMMAND),
-            {"commands": [self.entry(reference="a", cases=[{"args": ["(uintptr_t)probe", 2]}])]},
-        )
-        message = next(p for p in problems if "args[0]" in p)
-        self.assertIn("(uintptr_t)probe", message)  # the offending value
-        self.assertIn("setup", message)  # where the address belongs
-        self.assertIn("compile-time constant", message)
+    def test_missing_roles_error_says_one_descriptor_per_role(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
+            self.entry(reference="a + b", data={"buffer": 16})]})
+        message = next(p for p in problems if "data.roles has 0 entry" in p)
+        self.assertIn("rs1/rs2 order", message)
+        self.assertIn("omit data.roles when the command takes none", message)
 
-    def test_count_error_says_one_literal_per_role(self) -> None:
-        problems = validate_oracle(
-            isa(CPU_COMMAND),
-            {"commands": [self.entry(reference="a", cases=[{"args": ["0x80000000", 0, 3]}])]},
-        )
-        message = next(p for p in problems if "value(s)" in p)
-        self.assertIn("one literal per role", message)
-        self.assertIn("setup", message)
+    def test_index_role_requires_its_bound(self) -> None:
+        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
+            self.entry(reference="a + b", data={
+                "roles": [{"kind": "index"}, {"kind": "value"}]})]})
+        message = next(p for p in problems if "max is required" in p)
+        self.assertIn("bounds the index", message)
 
-    def test_prompt_documents_literal_args_and_repair_discipline(self) -> None:
+    def test_prompt_documents_the_data_block_and_repair_discipline(self) -> None:
         from agents.cfu_design_agent.prompts import conformance_prompt
 
         prompt = conformance_prompt("task", isa(CPU_COMMAND), {}, feedback="compute: problems")
-        self.assertIn("INTEGER LITERAL", prompt)
+        self.assertIn("data:", prompt)
+        self.assertIn("kind: address", prompt)
+        self.assertIn("kind: length", prompt)
         self.assertIn("ORACLE REPAIR MODE", prompt)
         self.assertIn("at once", prompt)
-        self.assertIn("setup", prompt)
         # The prompt names the generated intrinsics so setup/verify cannot
         # invent names like cfu_load (2026-09-26 link failure).
         self.assertIn("cfu_compute(", prompt)
@@ -345,7 +507,7 @@ class UnknownIntrinsicLintTest(unittest.TestCase):
 
     def test_invented_intrinsic_is_rejected_before_the_linker(self) -> None:
         entry = {
-            "name": "compute", "cases": [{"args": [1, 2]}], "reference": "a + b",
+            "name": "compute", "data": data_for(CPU_COMMAND), "reference": "a + b",
             "setup": "cfu_load((uintptr_t)buf, 0);",
         }
         problems = validate_oracle(isa(CPU_COMMAND), {"commands": [entry]})
@@ -357,7 +519,7 @@ class UnknownIntrinsicLintTest(unittest.TestCase):
     def test_suggests_the_generated_name(self) -> None:
         command = dict(CPU_COMMAND, name="vector_load_i32")
         entry = {
-            "name": "vector_load_i32", "cases": [{"args": [1, 2]}], "reference": "a + b",
+            "name": "vector_load_i32", "data": data_for(CPU_COMMAND), "reference": "a + b",
             "setup": "cfu_load(p, 0);",
         }
         problems = validate_oracle(isa(command), {"commands": [entry]})
@@ -366,7 +528,7 @@ class UnknownIntrinsicLintTest(unittest.TestCase):
 
     def test_generated_names_and_helpers_are_allowed(self) -> None:
         entry = {
-            "name": "compute", "cases": [{"args": [1, 2]}], "reference": "a + b",
+            "name": "compute", "data": data_for(CPU_COMMAND), "reference": "a + b",
             "setup": "cfu_enable(); cfu_memory_fence();",
         }
         problems = validate_oracle(isa(CPU_COMMAND), {"commands": [entry]})
@@ -384,7 +546,7 @@ class LazyOracleRejectionTest(unittest.TestCase):
     """
 
     def entry(self, **fields) -> dict:
-        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
+        return {"name": "compute", "data": data_for(CPU_COMMAND), **fields}
 
     def test_constant_reference_rejected(self) -> None:
         for constant in ("1", "0", "0x1234u", "(uint32_t)0", "(unsigned long)0"):
@@ -399,7 +561,8 @@ class LazyOracleRejectionTest(unittest.TestCase):
 
     def test_tautology_verify_rejected(self) -> None:
         # Non-rd command: verify is the operative expression.
-        entry = {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();", "verify": "1"}
+        entry = {"name": "vset", "data": data_for(VECTOR_COMMAND),
+                 "setup": "seed();", "verify": "1"}
         problems = validate_oracle(isa(VECTOR_COMMAND), {"commands": [entry]})
         message = next((p for p in problems if "verify" in p and "not a constant" in p), None)
         self.assertIsNotNone(message, problems)
@@ -415,7 +578,7 @@ class LazyOracleRejectionTest(unittest.TestCase):
 
     def test_self_referential_verify_rejected(self) -> None:
         entry = {
-            "name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+            "name": "vset", "data": data_for(VECTOR_COMMAND), "setup": "seed();",
             "verify": "cfu_vset(a, b)",
         }
         problems = validate_oracle(isa(VECTOR_COMMAND), {"commands": [entry]})
@@ -457,23 +620,23 @@ class InformativeOracleTest(unittest.TestCase):
     def test_operand_compared_with_itself_is_rejected(self) -> None:
         for expression in ("a == a", "(a) == a", "b != b"):
             with self.subTest(expression=expression):
-                entry = {"name": "vset", "cases": [{"args": [1, 2]}],
+                entry = {"name": "vset", "data": data_for(VECTOR_COMMAND),
                          "setup": "seed();", "verify": expression}
                 self.assert_message(self.problems(isa(VECTOR_COMMAND), entry),
                                     "compares an operand with itself")
 
     def test_argument_only_verify_is_rejected(self) -> None:
-        entry = {"name": "vset", "cases": [{"args": [1, 0]}],
+        entry = {"name": "vset", "data": data_for(VECTOR_COMMAND),
                  "setup": "seed();", "verify": "(a | b) == 0u"}
         self.assert_message(self.problems(isa(VECTOR_COMMAND), entry),
                             "verify only references the case arguments")
 
     def test_expression_comparing_its_own_value_is_rejected(self) -> None:
         """A value the oracle wrote next to the check cannot verify anything."""
-        marker = {"name": "vset", "cases": [{"args": [1, 2]}],
+        marker = {"name": "vset", "data": data_for(VECTOR_COMMAND),
                   "setup": "static volatile uint32_t marker = 1u; seed(); marker = 1u;",
                   "verify": "marker == 1u"}
-        helper = {"name": "compute", "cases": [{"args": [1, 2]}],
+        helper = {"name": "compute", "data": data_for(CPU_COMMAND),
                   "helpers": "static uint32_t expected;\n"
                              "static void set_expected(void) { expected = 4u; }",
                   "setup": "set_expected();", "reference": "expected"}
@@ -481,40 +644,31 @@ class InformativeOracleTest(unittest.TestCase):
             with self.subTest(expression=entry.get("verify") or entry["reference"]):
                 self.assert_message(self.problems(contract, entry), "assigned a literal to")
 
-    def test_all_zero_case_arguments_are_rejected(self) -> None:
-        entry = {"name": "compute", "cases": [{"args": [0, 0]}], "reference": "a + b"}
-        self.assert_message(self.problems(isa(CPU_COMMAND), entry),
-                            "only zero arguments")
-        # One representative non-zero case is enough.
-        entry = {"name": "compute", "cases": [{"args": [0, 0]}, {"args": [3, 4]}],
-                 "reference": "a + b"}
-        self.assertEqual(self.problems(isa(CPU_COMMAND), entry), [])
-
     def test_genuine_observations_still_validate(self) -> None:
         """No false positives: seed it in setup, read it back, and it is evidence."""
         control = {"function_id": 3, "subfunction_id": 0, "name": "ctl",
                    "kind": "control", "resources": []}
         cases = [
             # A no-role command whose verify reads memory a helper seeded.
-            (isa(control), {"name": "ctl", "cases": [{"args": []}],
-                       "helpers": "static void seed_memory(void) { volatile uint32_t *p = "
-                                  "(volatile uint32_t *)0x80000000u; p[0] = 4u; }\n"
-                                  "static uint32_t ctl_seen(void) { volatile uint32_t *p = "
-                                  "(volatile uint32_t *)0x80000000u; return p[0] == 4u; }",
-                       "setup": "seed_memory();", "verify": "ctl_seen()"}),
-            (isa(CPU_COMMAND), {"name": "compute", "cases": [{"args": [4, 2]}],
-                           "helpers": "static uint32_t w[8];",
-                           "setup": "w[0] = 0x80000000u;", "reference": "w[0] >> 4"}),
-            (isa(VECTOR_COMMAND), {"name": "vset", "cases": [{"args": [4, 2]}],
-                              "helpers": "static uint32_t check_loaded(void) { "
-                                         "volatile uint32_t *p = (volatile uint32_t *)0x80000000u; "
-                                         "return p[0] == 4u; }",
-                              "setup": "seed();", "verify": "check_loaded()"}),
+            (isa(control), {"name": "ctl", "data": {"count": 1},
+                            "helpers": "static void seed_memory(void) { volatile uint32_t *p = "
+                                       "(volatile uint32_t *)0x80000000u; p[0] = 4u; }\n"
+                                       "static uint32_t ctl_seen(void) { volatile uint32_t *p = "
+                                       "(volatile uint32_t *)0x80000000u; return p[0] == 4u; }",
+                            "setup": "seed_memory();", "verify": "ctl_seen()"}),
+            (isa(CPU_COMMAND), {"name": "compute", "data": data_for(CPU_COMMAND),
+                                "helpers": "static uint32_t w[8];",
+                                "setup": "w[0] = 0x80000000u;", "reference": "w[0] >> 4"}),
+            (isa(VECTOR_COMMAND), {"name": "vset", "data": data_for(VECTOR_COMMAND),
+                                   "helpers": "static uint32_t check_loaded(void) { "
+                                              "volatile uint32_t *p = (volatile uint32_t *)0x80000000u; "
+                                              "return p[0] == 4u; }",
+                                   "setup": "seed();", "verify": "check_loaded()"}),
             # `p = (T *)addr` publishes an address; reading through p is the observation.
-            (isa(CPU_COMMAND), {"name": "compute", "cases": [{"args": [4, 2]}],
-                           "helpers": "static volatile uint32_t *p;",
-                           "setup": "p = (volatile uint32_t *)0x80000000u;",
-                           "reference": "p[a]"}),
+            (isa(CPU_COMMAND), {"name": "compute", "data": data_for(CPU_COMMAND),
+                                "helpers": "static volatile uint32_t *p;",
+                                "setup": "p = (volatile uint32_t *)0x80000000u;",
+                                "reference": "p[a]"}),
         ]
         for contract, entry in cases:
             with self.subTest(expression=entry.get("verify") or entry["reference"]):
@@ -525,7 +679,7 @@ class HelperOracleIndependenceTest(unittest.TestCase):
     """Oracle expressions cannot hide DUT evaluation in shared C helpers."""
 
     def entry(self, **fields) -> dict:
-        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
+        return {"name": "compute", "data": data_for(CPU_COMMAND), **fields}
 
     def assert_rejected(self, contract: dict, oracle: dict, name: str, *symbols: str) -> None:
         problems = validate_oracle(contract, oracle)
@@ -559,7 +713,7 @@ class HelperOracleIndependenceTest(unittest.TestCase):
                              "ref_sum", "middle", "leaf", "cfu_compute")
 
     def test_verify_helper_calls_dut(self) -> None:
-        entry = {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+        entry = {"name": "vset", "data": data_for(VECTOR_COMMAND), "setup": "seed();",
                  "helpers": "static int observe(uint32_t x, uint32_t y) { cfu_vset(x, y); return x; }",
                  "verify": "observe(a, b)"}
         self.assert_rejected(isa(VECTOR_COMMAND), {"commands": [entry]}, "vset", "observe", "cfu_vset")
@@ -572,7 +726,7 @@ class HelperOracleIndependenceTest(unittest.TestCase):
             with self.subTest(helpers=helpers):
                 oracle = {"commands": [
                     self.entry(reference="shared(a, b)"),
-                    {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                    {"name": "vset", "data": data_for(VECTOR_COMMAND), "setup": "seed();",
                      "helpers": helpers, "verify": "shared(a, b)"},
                 ]}
                 for name in ("compute", "vset"):
@@ -622,7 +776,8 @@ class HelperOracleIndependenceTest(unittest.TestCase):
                   if (x) { return add(x, y); } return y;
                 }
                 """),
-            {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();", "verify": "REF(a, b)"},
+            {"name": "vset", "data": data_for(VECTOR_COMMAND), "setup": "seed();",
+             "verify": "REF(a, b)"},
         ]}
         self.assertEqual(validate_oracle(isa(CPU_COMMAND, VECTOR_COMMAND), oracle), [])
         self.assertNotIn("CFU_CONFORMANCE_MISSING", render_conformance(isa(CPU_COMMAND, VECTOR_COMMAND), oracle))
@@ -665,8 +820,8 @@ class UndeclaredArgumentLintTest(unittest.TestCase):
 
     def test_verify_referencing_undeclared_role_rejected(self) -> None:
         entry = {
-            "name": "vslot0", "cases": [{"args": [7]}], "setup": "seed();",
-            "verify": "slot_at(b) == 0",
+            "name": "vslot0", "data": data_for(CONST_INDEX_COMMAND, max_value=7),
+            "setup": "seed();", "verify": "slot_at(b) == 0",
         }
         problems = validate_oracle(isa(CONST_INDEX_COMMAND), {"commands": [entry]})
         message = next((p for p in problems if "undeclared identifier" in p), None)
@@ -676,15 +831,25 @@ class UndeclaredArgumentLintTest(unittest.TestCase):
         self.assertIn("rs1->a, rs2->b", message)
 
     def test_reference_referencing_undeclared_role_rejected(self) -> None:
-        entry = {"name": "onesel", "cases": [{"args": [3]}], "reference": "a + b"}
+        entry = {"name": "onesel", "data": data_for(ONE_ARG_COMMAND), "reference": "a + b"}
         problems = validate_oracle(isa(ONE_ARG_COMMAND), {"commands": [entry]})
         self.assertTrue(
             any("'b'" in p and "undeclared identifier" in p for p in problems), problems
         )
 
     def test_declared_roles_may_be_referenced(self) -> None:
-        entry = {"name": "onesel", "cases": [{"args": [3]}], "reference": "a * 2u + 1u"}
+        entry = {"name": "onesel", "data": data_for(ONE_ARG_COMMAND), "reference": "a * 2u + 1u"}
         self.assertEqual(validate_oracle(isa(ONE_ARG_COMMAND), {"commands": [entry]}), [])
+
+    def test_case_scope_binds_a_and_b_unconditionally(self) -> None:
+        # Render backstop for stale oracles: undeclared identifiers must never
+        # fail the C build; the validator lint rejects them first with a fix.
+        entry = {"name": "onesel", "data": data_for(ONE_ARG_COMMAND), "reference": "a"}
+        text = render_conformance(isa(ONE_ARG_COMMAND), {"commands": [entry]})
+        self.assertIn("uint32_t a = 0;", text)
+        self.assertIn("uint32_t b = 0;", text)
+        self.assertIn("(void)a; (void)b;", text)
+        self.assertNotIn("b = (uint32_t)(", text)  # undeclared role stays 0
 
 
 class HelperCollisionTest(unittest.TestCase):
@@ -701,11 +866,11 @@ class HelperCollisionTest(unittest.TestCase):
         return {
             "commands": [
                 {
-                    "name": "compute", "cases": [{"args": [1, 2]}],
+                    "name": "compute", "data": data_for(CPU_COMMAND),
                     "reference": "ref_rol32(a, b)", "helpers": self.HELPER,
                 },
                 {
-                    "name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                    "name": "vset", "data": data_for(VECTOR_COMMAND), "setup": "seed();",
                     "verify": "ref_rol32(a, b)", "helpers": second_helper,
                 },
             ]
@@ -742,9 +907,9 @@ class HelperCollisionTest(unittest.TestCase):
                    "(volatile uint32_t *)0x80000000u;")
         oracle = {
             "commands": [
-                {"name": "compute", "cases": [{"args": [1, 2]}], "reference": "a + b",
+                {"name": "compute", "data": data_for(CPU_COMMAND), "reference": "a + b",
                  "helpers": pointer},
-                {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                {"name": "vset", "data": data_for(VECTOR_COMMAND), "setup": "seed();",
                  "verify": "md5_oracle_mem[0] != 0u",
                  "helpers": pointer + "\nstatic uint32_t extra(uint32_t a) { return a; }"},
             ]
@@ -761,9 +926,9 @@ class HelperCollisionTest(unittest.TestCase):
                   "return scratch; }")
         oracle = {
             "commands": [
-                {"name": "compute", "cases": [{"args": [1, 2]}], "reference": "ref_a(a)",
+                {"name": "compute", "data": data_for(CPU_COMMAND), "reference": "ref_a(a)",
                  "helpers": first},
-                {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();",
+                {"name": "vset", "data": data_for(VECTOR_COMMAND), "setup": "seed();",
                  "verify": "ref_b(a) != 0u", "helpers": second},
             ]
         }
@@ -774,73 +939,6 @@ class HelperCollisionTest(unittest.TestCase):
         text = render_conformance(isa(CPU_COMMAND, VECTOR_COMMAND), self.oracle(distinct))
         self.assertIn("ref_rol32", text)
         self.assertIn("other_h", text)
-
-
-class ModelChosenCasesTest(unittest.TestCase):
-    """The model owns every input and size: no hidden random/edge expansion."""
-
-    def entry(self, **fields) -> dict:
-        return {"name": "compute", "cases": [{"args": [1, 2]}], **fields}
-
-    def test_only_declared_cases_are_rendered_in_order(self) -> None:
-        entry = self.entry(reference="a + b", cases=[{"args": [11, 2]}, {"args": [22, 8]}])
-        text = render_conformance(isa(CPU_COMMAND), {"commands": [entry]})
-        self.assertEqual(text.count("g_cases++;"), 2)
-        self.assertEqual(text.count("uint32_t got ="), 2)
-        self.assertLess(text.index("a = (uint32_t)11u"), text.index("a = (uint32_t)22u"))
-        self.assertNotIn("2147483648u", text)
-        self.assertNotIn("4294967295u", text)
-
-    def test_large_seed_does_not_invent_large_iteration_counts(self) -> None:
-        entry = self.entry(reference="a ^ b", cases=[
-            {"args": [0, 0]}, {"args": [0, 1]}, {"args": [4294967295, 8]},
-            {"args": [12345, 1024]},
-        ])
-        text = render_conformance(isa(CPU_COMMAND), {"commands": [entry]})
-        self.assertEqual(text.count("g_cases++;"), 4)
-        self.assertIn("a = (uint32_t)4294967295u", text)
-        self.assertNotIn("b = (uint32_t)4294967295u", text)
-        self.assertNotIn("b = (uint32_t)880296978u", text)
-
-    def test_legacy_edge_flag_never_adds_cases(self) -> None:
-        for flag in (True, False):
-            with self.subTest(flag=flag):
-                entry = self.entry(reference="a + b", edge_cases=flag)
-                self.assertEqual(validate_oracle(isa(CPU_COMMAND), {"commands": [entry]}), [])
-                text = render_conformance(isa(CPU_COMMAND), {"commands": [entry]})
-                self.assertEqual(text.count("g_cases++;"), 1)
-
-    def test_legacy_edge_flag_must_still_be_boolean(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
-            self.entry(reference="a + b", edge_cases="no")]})
-        self.assertTrue(any("edge_cases must be a boolean" in p for p in problems), problems)
-
-    def test_non_rd_cases_are_not_expanded(self) -> None:
-        entry = {"name": "vset", "cases": [{"args": [1, 2]}], "setup": "seed();", "verify": "slot_is(1)"}
-        text = render_conformance(isa(VECTOR_COMMAND), {"commands": [entry]})
-        self.assertEqual(text.count("g_cases++;"), 1)
-
-    def test_prompt_requires_model_chosen_small_quick_tests(self) -> None:
-        from agents.cfu_design_agent.prompts import conformance_prompt
-        for tools in (True, False):
-            with self.subTest(tools=tools):
-                prompt = conformance_prompt("test", isa(CPU_COMMAND), {}, agent_tools=tools)
-                self.assertIn("You choose ALL test inputs and data sizes", prompt)
-                self.assertIn("SMALL DATA", prompt)
-                self.assertIn("32000 cycles", prompt)
-                self.assertIn("never appends hidden edge or random inputs", prompt)
-                self.assertIn("do NOT use 0xFFFFFFFF", prompt)
-
-    def test_case_scope_binds_a_and_b_unconditionally(self) -> None:
-        # Render backstop for stale oracles: undeclared identifiers must never
-        # fail the C build; the validator lint rejects them first with a fix.
-        entry = {"name": "onesel", "cases": [{"args": [3]}], "reference": "a"}
-        text = render_conformance(isa(ONE_ARG_COMMAND), {"commands": [entry]})
-        self.assertIn("uint32_t a = 0;", text)
-        self.assertIn("uint32_t b = 0;", text)
-        self.assertIn("(void)a; (void)b;", text)
-        self.assertIn("a = (uint32_t)3u;", text)
-        self.assertNotIn("b = (uint32_t)", text)  # undeclared role stays 0
 
 
 if __name__ == "__main__":

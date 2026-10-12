@@ -67,7 +67,7 @@ _HARNESS_FRAME_RE = re.compile(r"(?:vexiiriscv\.test\.|spinal\.sim\.|spinal\.cor
 
 # Failure categories that a design repair cannot act on: the command produced
 # no verdict and no design-local diagnostic.
-HARNESS_FAILURE_CATEGORIES = frozenset({"sim_harness_crash", "environment", "policy"})
+HARNESS_FAILURE_CATEGORIES = frozenset({"sim_harness_crash", "environment", "policy", "cfu_status_missing"})
 
 
 def failure_is_design_actionable(category: str) -> bool:
@@ -319,15 +319,16 @@ def failure_index(state: dict[str, Any]) -> dict[str, Any]:
     """
     observations: dict[str, dict[str, Any]] = {}
     status: dict[str, str] = {}
+    epoch = state.get("repair_evidence_epoch") or {}
     for key in ("validation_results", "cost_results"):
-        for result in state.get(key) or []:
+        for position, result in enumerate(state.get(key) or []):
             if not isinstance(result, dict):
                 continue
             item = result.get("failure_observation")
             if isinstance(item, dict) and item.get("id"):
                 ident = str(item["id"])
                 observations[ident] = dict(item)
-                status[ident] = "current"
+                status[ident] = "stale" if position < int(epoch.get(key, 0)) else "current"
                 continue
             rung = str(result.get("rung") or "")
             if rung and result.get("returncode") == 0 and not result.get("skipped"):

@@ -15,6 +15,17 @@ from ..runtime.policy import PolicyError
 from ..state import CfuDesignState
 
 
+def _profile_verdict(state: CfuDesignState, *, ok: bool, skipped: bool, **evidence) -> dict:
+    failed = not ok and not skipped
+    update = outcome.stage_result(state, rung="profile", ok=ok, skipped=skipped,
+        next="review_and_route" if failed else "extract_hotspot",
+        terminal_reason="profile_precondition" if failed else "",
+        failure_kind="precondition_failure" if failed else "", **evidence)
+    if failed:
+        update.update(stopped_at="profile", stage_jobs="review")
+    return update
+
+
 def profile_embench(state: CfuDesignState) -> CfuDesignState:
     """Build and simulate the reference/profile(/cfu) configurations.
 
@@ -50,11 +61,26 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
             "embench_profiles": {},
             "observation_report": {},
             "stage_jobs": "hotspot",
-            **outcome.stage_result(state, rung="profile", ok=False, skipped=True, reason=reason,
+            **_profile_verdict(state, ok=False, skipped=True, reason=reason,
                                    history=f"Skipped embench profiling ({reason})."),
         }
 
     toolbox = stage_services._toolbox_for_stage(state, "profile")
+    integrity_problems = stage_services.benchmark_integrity_problems(toolbox)
+    if integrity_problems:
+        message = "benchmark integrity: " + "; ".join(integrity_problems)
+        _write_embench_profile_artifact(state, name, {}, [], message,
+            benchmark_integrity={"version": 1, "ok": False, "problems": integrity_problems})
+        return {
+            "profile_result": {"status": "failed", "command_results": [], "regions": [], "summary": message},
+            "embench_profiles": {}, "observation_report": {}, "errors": integrity_problems,
+            "stage_jobs": "hotspot",
+            **_profile_verdict(state, ok=False, skipped=False,
+                measurement=dict(project.get("measurement") or {}),
+                measurement_protocol=(project.get("measurement") or {}).get("protocol", "legacy"),
+                benchmark_integrity={"version": 1, "ok": False, "problems": integrity_problems},
+                history="Rejected benchmark preparation before cache lookup or profiling."),
+        }
 
     # The reference/profile configurations are scalar and are simulated on the
     # seeded scaffold (profiling runs before any hardware edit), so the
@@ -84,6 +110,7 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
         },
         cpu_flags=commands_mod.agent_cfu_gen_flags(state.get("isa_spec", {}) or {}),
         observation_plan=planned_observation,
+        measurement_protocol=(project.get("measurement") or {}).get("protocol"),
     )
     cache_key = str(cache_info["key"])
     cache_rel = profile_cache.cache_relpath(cache_key)
@@ -127,7 +154,7 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
             results.append(build)
             if build.get("returncode") not in (0, None):
                 errors.append(f"embench {config} build failed")
-                continue
+                break
             elf = embench.elf_path(run_root, name, config)
             sim_commands = commands_mod.agent_cfu_sim_commands(state, state.get("isa_spec", {}) or {}, elf=elf)
             for sim_command in sim_commands:
@@ -142,10 +169,20 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
                     (sim.get("parsed") or {}).get("embench_profile")
                     or embench.parse_profile(text)
                 )
+                verify = (sim.get("parsed") or {}).get("verify") or {}
+                if verify.get("status") == "fail":
+                    errors.append(f"embench {config} baseline verification failed")
+                if config == "reference":
+                    errors.extend(_baseline_problems(profiles[config], name))
                 if sim.get("returncode") not in (0, None):
                     errors.append(
                         f"embench {config} simulation failed (Embench verify did not pass)"
                     )
+                    break
+                if errors:
+                    break
+            if errors:
+                break
         # Keep the reference disassembly with the measurement it belongs to, so
         # a later run that reuses this entry still has the ASM evidence.
         _store_reference_disassembly(toolbox, run_root, name, cache_key, cache_mode)
@@ -173,11 +210,16 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
     expected_loops = [point for point in observation.get("points", [])
                       if isinstance(point, dict) and point.get("kind") == "loop"
                       and point.get("id") in applied_ids]
+    errors.extend(problem for problem in _baseline_problems(reference, name) if problem not in errors)
     ok = bool(reference) and bool(instrumented) and not errors
     if expected_loops and not loop_profiles:
         errors.append("no requested loop observation produced cycle/call evidence")
         ok = False
 
+    integrity_problems = stage_services.benchmark_integrity_problems(toolbox)
+    errors.extend(problem for problem in integrity_problems if problem not in errors)
+    if integrity_problems:
+        ok = False
     saved = False
     if ok and cache_mode in ("on", "refresh"):
         try:
@@ -226,7 +268,9 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
         "configs": sorted(profiles),
         "profile_cache": cache_report,
     }
-    _write_embench_profile_artifact(state, name, profiles, results, "", observation, cache_report)
+    _write_embench_profile_artifact(state, name, profiles, results, "", observation, cache_report,
+        benchmark_integrity={"version": 1, "ok": not integrity_problems, "problems": integrity_problems},
+        ok=ok, errors=errors)
     stage_services._artifacts_for_stage(state, "profile").set_manifest_metadata(
         "profile", "profile_cache", cache_report
     )
@@ -242,10 +286,24 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
         "observation_report": observation,
         "stage_jobs": "hotspot",
         "errors": errors,
-        **outcome.stage_result(state, rung="profile", ok=ok, skipped=False,
+        **_profile_verdict(state, ok=ok, skipped=False,
                                configs=sorted(profiles), profile_cache=cache_report,
+                               measurement=dict(project.get("measurement") or {}),
+                               measurement_protocol=(project.get("measurement") or {}).get("protocol", "legacy"),
+                               benchmark_integrity={"version": 1, "ok": not integrity_problems, "problems": integrity_problems},
                                history=history),
     }
+
+
+def _baseline_problems(reference: dict, name: str) -> list[str]:
+    record = reference.get(name) or {}
+    cycles = record.get("cycles") if isinstance(record, dict) else None
+    problems = []
+    if not isinstance(cycles, int) or isinstance(cycles, bool) or cycles <= 0:
+        problems.append("reference baseline has no positive benchmark cycle evidence")
+    if isinstance(record, dict) and record.get("verify") == 0:
+        problems.append("reference baseline verification failed")
+    return problems
 
 
 def embench_instrumented_profile(profiles: dict[str, dict]) -> dict:
@@ -322,6 +380,8 @@ def _write_embench_profile_artifact(
     reason: str,
     observation: dict | None = None,
     profile_cache: dict | None = None,
+    *, benchmark_integrity: dict | None = None, ok: bool | None = None,
+    errors: list[str] | None = None,
 ) -> None:
     artifacts = stage_services._artifacts_for_stage(state, "profile")
     artifacts.write_yaml(
@@ -329,13 +389,20 @@ def _write_embench_profile_artifact(
         "05_profile/embench.yaml",
         {
             "benchmark": name,
+            "measurement": dict((state.get("benchmark_project") or {}).get("measurement") or {}),
+            "measurement_protocol": ((state.get("benchmark_project") or {}).get("measurement") or {}).get("protocol", "legacy"),
+            "benchmark_integrity": benchmark_integrity or {},
+            "terminal_reason": "profile_precondition" if ok is False else "",
+            "failure_kind": "precondition_failure" if ok is False else "",
+            "errors": list(errors or []),
             "reason": reason,
             "profiles": profiles,
             "observation": observation or {},
             "profile_cache": profile_cache or {},
             "commands": [dict(item) for item in results],
         },
-        status="planned" if reason else "produced",
+        status=("failed" if ok is False or (benchmark_integrity and not benchmark_integrity.get("ok"))
+                else "planned" if reason else "produced"),
     )
 
 
@@ -374,7 +441,7 @@ def instrument_and_profile(state: CfuDesignState) -> CfuDesignState:
     return {
         "profile_result": profile,
         "stage_jobs": "hotspot",
-        **outcome.stage_result(state, rung="profile", ok=stage_services._profile_ok(profile) and not errors,
+        **_profile_verdict(state, ok=stage_services._profile_ok(profile) and not errors,
                                skipped=not execute, reason=reason,
                                history="Profiled the prepared workload."),
         "errors": errors,

@@ -25,7 +25,10 @@ This folder contains local agent frameworks for CfuGym workflows.
   `feedback.py` (repair/optimization prompt blocks and attempt ledgers),
   `fallbacks.py`, and the sub-packages `implement/` (`hw`, `sw`, `unified`,
   `delivery`, `intrinsics`), `verify/` (`soc`, `conformance`, `software`,
-  `cost`) and `review/` (`review_and_route`, `optimize`, `report`). A stage
+  `cost`) and `review/` (`review_and_route`, `optimize`, `report`); the
+  package root holds `conformance.py` (oracle validation, harness-owned C
+  rendering, verdict parsing) and `conformance_data.py` (the fixed-seed
+  boundary/random data generator). A stage
   module builds prompts, applies deliveries and reports gates; it never decides
   that a gate passed.
 - `runtime/`: low-level execution services — policy, repository tools,
@@ -119,6 +122,63 @@ immutable `versions/` copy, and the tool loop can enumerate them with
 record is written for successes as well as failures, so a repairable regression can
 be compared against the last passing run instead of guessed from a truncated tail.
 
+### Benchmark verifier visibility
+
+The Embench `verify_benchmark` interface remains visible, but its function body is
+hidden from the design agent in every stage. This is an **Agent-only source view**:
+original benchmark/reference files, Host hashes, compilation and actual verification
+remain unchanged. Read/search tools mask the complete readable source before line
+selection or matching; no-tool source/context prompts mask before bounding excerpts.
+Old hash-matched memory excerpts are rebuilt from the masked file view, including
+body-only reads. Tool diff/mismatch output, escaped source in JSON/YAML artifacts,
+verifier IR/ASM/features and Chat/Responses request payloads are covered as well.
+Hidden-body markers are not source bytes and must never be copied into an edit.
+
+This reduces direct verifier-code answer leakage, **not** all answer disclosure:
+contracts, scalar/reference outputs, failure diagnostics and constants outside the
+function body are not globally erased. It is not semantic verification or a replacement
+for conformance and the fixed-result hardware gate. Historical artifacts are not rewritten.
+
+### Encoding, execution status, and failure attribution
+
+Correctness means the frozen contract's valid input domain, not the observed answer.
+The shared system prompt prohibits benchmark answer folding, approximate semantics,
+and decorative reads, while allowing algorithm constants, exact lookup tables,
+declared fixed-shape specialization, conditional Boolean results and genuine zero
+success statuses. An incomplete implementation must report its limits and choose
+analysis/contract repair when appropriate; this guidance is not a correctness proof.
+
+The hardware integrity gate v2 checks literal/alias computational replies with
+bounded data-guard and memory-status context. Memory-status exemptions require
+explicit contract effects and a computed payload routed to a real LSU store;
+merely reading a pointer or asserting a store bit is insufficient. Encoding evidence
+crosschecks frozen funct3/funct7 against Scala declarations/configuration and, after
+generation, the actual RTL decoder. Software build crosschecks compiled custom0
+machine words against the contract and decoder and binds the artifact hashes.
+Unsupported syntax/coverage is explicitly `unchecked`, never certified equivalence.
+These Host checks still run with `--no-conformance`.
+
+Fresh Embench drivers bracket initialization and benchmark execution with Host-owned
+CFU sticky-status CSR diagnostics (`0x801`, `sticky_csr_801_v1`), outside the timed
+region. A nonzero status invalidates correctness/performance even if the original
+verifier accepts a zero result; a missing required diagnostic also fails closed.
+Protected drivers and versioned metadata prevent silently resuming an older driver.
+
+An executed reference/profile precondition failure routes directly to review/report,
+without analysis/contract model calls; explicit planning/skips remain advisory.
+Rejected native deliveries roll back and become typed gate failures using the
+existing retry budget, not missing-report exceptions. Unexpected/provider exceptions
+still fail loudly but the CLI persists a partial report, true recovered state, original
+exception type and available usage. Probe bookkeeping crashes are harness faults;
+commit watchdog stalls and HDL protocol assertions remain separate observations.
+
+Current performance requires matching candidate/ISA, source/configuration fingerprint,
+repair evidence epoch and known ELF/ASM/RTL product hashes. Historical valid measurements
+retain their snapshot/version/hash separately and never certify the final candidate.
+Experiment collection reconstructs request usage by request ID; failed requests without
+usage remain unknown, with known-token lower bounds and independent warnings. Historical
+artifacts are not rewritten. No new multi-case semantic adapter is implemented here.
+
 ### Run-wide memory, context budgets, and request debugging
 
 Every node shares a bounded `flow_memory` in LangGraph state. It contains accepted
@@ -197,7 +257,11 @@ read; denial messages list the legal target paths. Failure evidence is
 freshness-aware: every `FailureObservation` carries `status: current | resolved`
 (a later passing rung resolves it), repair prompts list only current IDs as
 valid, resolved IDs appear as context with a "do not re-fix" note, and
-`submit_repair_diagnosis` rejects resolved IDs. Sim/conformance failures are
+`submit_repair_diagnosis` rejects resolved IDs — accepting the failing **rung
+name** as an alias for its current id(s), listing the current ids when the model
+cites an unknown one, and naming only genuinely cited resolved ids as "do not
+re-fix" (run `20261005-073745` lost three rounds to a rejection that blamed an
+unrelated stale failure the model had never cited). Sim/conformance failures are
 classified (`fail_symbol`, `assertion`, `liveness_timeout`, `sim_harness_crash`,
 `timeout`, ...). A CPU commit-progress watchdog (`hasn't committed anything for
 too long`) is a repairable `liveness_timeout`: conformance routes back to
@@ -210,13 +274,16 @@ routed to `implement`. The category table and the 2026-09-29 case study (the
 are in [`docs/cfu_agent_failure_taxonomy.md`](../docs/cfu_agent_failure_taxonomy.md).
 
 Implement delivers the formal oracle through `write_conformance(oracle)`: the host
-parses/validates the independent small-case oracle and renders fixed C source. The
+parses/validates the oracle (independent scalar semantics plus the *shape* of the input
+space) and renders fixed C source **and its test data**. The
 oracle and source are a single rollback-capable transaction, approved by state hashes
 for ISA, oracle, generated C and generator version. First delivery requires HW, SW
 and oracle; later rounds keep the oracle **editable**: a design repair may strengthen
 (never weaken) it, because a verification contract that cannot observe the real
-failure has to be repairable. In repair mode the first oracle edit still requires a
-submitted `submit_repair_diagnosis`. In the no-tool delivery mode the oracle is
+failure has to be repairable. A repair round must submit a `submit_repair_diagnosis`
+before it can be **submitted**: the gate is enforced at the stage gate, not at the
+oracle write, so the model may author the corrected oracle first and file the diagnosis
+afterwards (tool ordering must not cost a round). In the no-tool delivery mode the oracle is
 re-authored on every repair round, and a revision the validator rejects keeps the
 approved pair instead of failing the design round. Optional
 `check_conformance_syntax()` invokes only `-fsyntax-only` (no ELF/link/simulation) with `-std=gnu99`, because the framework's own generated `cfu_intrinsics.h` binds operand registers with `register uint32_t r1 asm("a1")` and `-std=c99` rejected the header before the body was ever parsed. The same preflight is **host-owned and automatic**: every accepted `write_conformance` renders the pair and compiles it, and a compiler error (positive return code) rejects the delivery — the previous pair stays on disk and the session stays open so the model can deliver a corrected oracle in the same round. A negative status (policy denial, missing toolchain, timeout) is not a rejection: the model cannot fix that, and the `hw_conformance` rung still owns the verdict.
@@ -224,8 +291,16 @@ Implement exposes no `run_conformance` or `run_simulation` capability. Verify ma
 no model calls and never authors or rewrites oracle/C/header: it checks the approved
 bytes and builds/simulates that delivery. Missing/stale oracle or test compile errors
 return to Implement in conformance-only scope using the answer-repair budget;
-healthy HW/SW need no dummy edits. A design mismatch/watchdog uses the design-repair
-pool, and the oracle travels with it so a blind contract can be fixed in the same
+healthy HW/SW need no dummy edits. A **completed differential mismatch is
+unattributed**: the test ran to a verdict and disagreed with its own reference, so
+either side may be wrong (the model's scalar reference is not validated anywhere
+else). That round is recorded with `repair_scope: conformance` and
+`oracle_unattributed: true`, entered on the design-repair budget but **without**
+forcing a hardware edit; when the delivered change revised only the oracle,
+`implement` refunds the design slot and charges the answer pool instead — bounded by
+`--max-answer-repairs`, so oracle churn cannot buy unbounded free rounds. A
+watchdog/hang or a crash with no verdict stays design-scope, and the oracle travels
+with it so a blind contract can be fixed in the same
 round. Host/policy failures stop without reauthoring.
 A parsed PASS does not override a nonzero simulator exit or erase its diagnostics.
 Independent references must not reach CFU intrinsics through helper functions, macros
@@ -318,19 +393,21 @@ The design is checked by the tool that owns each artifact **immediately after it
 - Delivery parsing tolerates a terminator glued to the next token: a degenerate sampler occasionally restarts its answer template inside the same completion, so the response arrives twice with the second copy beginning at `EDIT_ENDREPAIR_DIAGNOSIS` instead of a newline. The parser splits that glue (only outside `identifier` continuations like `EDIT_END_foo`) and collapses byte-identical duplicate sections to the first copy, so a correct edit delivered in a doubled answer is applied once instead of rejected as "missing EDIT_END".
 - Prompts show a rung's own target files exactly once: with a tool loop they are listed as paths to read (`read_file` returns the live overlay bytes an edit targets), and without one they are inlined in full under "Exact current contents" and omitted from the truncated repo-context digest, so a truncated copy can never be mistaken for the text to copy. `DELIVERY_PROTOCOLS` also tells the model not to wrap long comment blocks in a SEARCH and to copy any included comment byte-for-byte.
 - **Every stage prompt is a stable-first brief**: the sections are ordered constant → variable so a provider's prefix cache can reuse the head, which is compared from the request's first byte. In order: `Task:`, `## Where you are` (repo root + run directory), the stage-independent key-path index plus access-tier paragraph, the shared digests every design stage renders byte-identically (`Normalized WorkloadSpec`, `Measured profile`, Embench delivery notes), and only then the stage block — `## Stage`, the tools the stage may call (with the tool budget), the deliverable, this stage's artifact paths and notes — followed by the per-call material (failure evidence, optimization state, the oracle contract). Repository file bodies are not inlined while a tool loop is available; the agent reads them by path. Only a run without that loop (`--no-agent-tools`, or no tool-capable endpoint) falls back to inlining the bodies the stage needs, after the deliverable, because a SEARCH/REPLACE delivery must be built from exact bytes. Regression guard: `agents/tests/test_prompts.py::PromptCacheLayoutTest` asserts everything before the first `## Stage:` is byte-identical across stages (run `20261003-090854` shared six characters; the real md5sum prompts now share 4,961). Every path that belongs to the current run is rendered with the virtual token `{{run-dir}}` instead of `agents/generated/runs/<run-id>`, so the task text is identical across runs as well: the tools accept the token (expanded to the real root *before* any access-policy check, so a token can never widen access) and tool results render it back, which means neither a prompt nor an observation ever shows a run id. The token works for reads, searches, listings, log lookups and edit targets; a misplaced or run-less token is a usage error, not a policy denial.
-- Before answering, the analysis, ISA-contract, implementation and optimization rungs may run a **bounded tool loop** (`--agent-tools`, on by default; `--no-agent-tools` disables it). The budget is `--max-tool-rounds N` (default 20, model turns that may use tools) plus `--max-tool-calls N` (default 96, cumulative calls across all rounds; `0` disables the cap) and at most 4 parallel calls per round. Common tools are policy-checked `read_file`, `list_dir`, `search_text` and `list_command_logs` (the run's persisted build/simulation/synthesis logs, newest first); analysis can additionally use `inspect_observation(id, view=summary|asm|ir)` for available Embench observation IDs, and implementation repair can use bounded `inspect_failure`. The first-attempt software capability described above is the only mutation/check exception. Observation inspection returns bounded, explicitly uncertain reference-function ASM/Clang IR snippets; a missing cached-build disassembly says so and points at `view='ir'`. Within one implementation stage the model may edit each domain up to 6 times and check twice; a stage-gate rejection re-opens those local budgets, because the gate just asked for a change and a corrective round is already bounded by the loop's turn/call caps. Every call is printed in the CLI log as one short line that reports edit/delivery payloads by size (see **Live progress** below) and written to the stage tool-call artifact (`07_analysis/analysis_tool_calls.yaml`, `08_isa/isa_tool_calls.yaml`, `09_implementation/{hw,sw,stage3}_tool_calls.yaml`, `12_review/optimize_tool_calls.yaml`), so model actions are auditable; the effective budget is recorded as `tool_policy` in `run.yaml`. If the endpoint rejects the tools payload, the step degrades to a one-shot prompt instead of failing.
+- Before answering, the analysis, ISA-contract, implementation and optimization rungs may run a **bounded tool loop** (`--agent-tools`, on by default; `--no-agent-tools` disables it). The budget is `--max-tool-rounds N` (default 20, model turns that may use tools) plus `--max-tool-calls N` (default 96, cumulative calls across all rounds; `0` disables the cap) and at most 4 parallel calls per round. Common tools are policy-checked `read_file`, `list_dir`, `search_text` and `list_command_logs` (the run's persisted build/simulation/synthesis logs, newest first); analysis can additionally use `inspect_observation(id, view=summary|asm|ir)` for available Embench observation IDs, and implementation repair can use bounded `inspect_failure`. The first-attempt software capability described above is the only mutation/check exception. Observation inspection returns bounded, explicitly uncertain reference-function ASM/Clang IR snippets; a missing cached-build disassembly says so and points at `view='ir'`. Within one implementation stage the model may edit each domain up to 6 times and check twice; a stage-gate rejection re-opens those local budgets, because the gate just asked for a change and a corrective round is already bounded by the loop's turn/call caps. Every call is printed in the CLI log as one short line that reports edit/delivery payloads by size (a malformed argument shape is rendered as a placeholder, never an exception: run 20261003/20261004 crashed the CLI in that renderer when the model sent `edits` as a list of strings) (see **Live progress** below) and written to the stage tool-call artifact (`07_analysis/analysis_tool_calls.yaml`, `08_isa/isa_tool_calls.yaml`, `09_implementation/{hw,sw,stage3}_tool_calls.yaml`, `12_review/optimize_tool_calls.yaml`), so model actions are auditable; the effective budget is recorded as `tool_policy` in `run.yaml`. If the endpoint rejects the tools payload, the step degrades to a one-shot prompt instead of failing.
 - When the budget is exhausted the tools are withdrawn and a reminder is injected that the next reply must be the final EDIT/FILE/PATCH deliverable. That reply is then parsed as the answer, and an answer with no delivery block fails `implementation_hw` with an explicit `no EDIT_BEGIN/FILE_BEGIN/PATCH_BEGIN deliverable` error (which the repair prompt carries) instead of failing silently and being misreported as a build failure downstream.
 - If the endpoint refuses the tools payload the request is retried once; if it still fails the step degrades to a plain completion that explicitly tells the model tools are unavailable, so it does not answer with an unexecutable "Let me read …" plan. The degradation is recorded (`degraded_reason` on the raw-output metadata, a `(tools unavailable)` entry in the tool-calls artifact, `tools_degraded` on the gate). Separately, any answer that only announces reading a file is detected and reported as a `tool-intent preamble` error, which the repair prompt carries, instead of being accepted as a finished design.
 - While tool budget remains, a reply that cannot be used gets **one corrective re-ask** before the step is finalized: either the model announced a read without calling a tool, or a rung that requires a delivery block returned none (plan-only answer). The re-ask states the requirement and keeps tools available, so a dropped or forgotten tool call does not burn a ladder repair.
 - The stages that own a workload also allowlist its source (`benchmarks/embench-iot/{src,support}/**`), so a file listed in the prompt's key-path index is never denied to the tool loop. The analysis rung additionally reads the profile build's disassembly (`workspace/**/*.asm`), so the hot loop can be analyzed from real instructions rather than inferred from C.
 - Hardware-target reads are redirected to the run-workspace overlay: `read_file`/`search_text` on `src/main/scala/vexiiriscv/soc/mico/AgentCfu*.scala` return the run's live copy (the same bytes the prompt shows and an edit targets), so a repair sees its own previous change instead of the pristine tracked scaffold. The redirect only applies where the stage may read the overlay, so the analysis rung still reads the tracked scaffold.
 - The build rungs are guarded by the implementation stage that feeds them: if `implementation_hw` applied nothing, `hw_build` fails without invoking `sbt` (the seeded scaffold would otherwise compile and "pass" while validating nothing) and repairs `implement`; if `implementation_sw` applied nothing, `sw_build` fails without invoking `make` and repairs `implement`.
-- A failed rung is repaired by the single implementation stage, which receives every failing rung's evidence at once (`feedback.all_failure_feedback`) and decides there what to change.
+- A failed rung enters the single implementation stage with current failure evidence. In that existing repair interaction the model may keep fixing `implement`, or, after an accepted `submit_repair_diagnosis`, use `request_repair_route(target, reason, failure_ids)` to return to `analysis` or `contract`. This adds no separate LLM routing call. Upstream selection rolls back the entire pending HW/SW/oracle transaction, invalidates the old ISA, conformance approval, downstream gates, reuse/fingerprints and selected candidate, and preserves old failure records as stale history. Routing remains bounded by the design-repair budget, not the contract answer-retry pool. Plain delivery supports the corresponding structured `REPAIR_ROUTE` JSON; a model cannot silently edit a frozen contract or certify a gate.
+- Hardware delivery and the independent `hw_build` preflight run a host-owned **bounded fixed-result lint**, even with `--no-conformance`: a compute/value instruction that returns a recognizable literal, constant alias/helper, or init-only fixed register is rejected as `hardware_integrity`. A dummy pointer read or waiting for `lsu.done` does not validate a constant answer. Configuration/status acknowledgements are not computational results. The guard is versioned in input fingerprints, so old hardware passes cannot be reused under a new rule. This is not a Scala compiler, full taint analysis, or arbitrary anti-cheat/semantic-equivalence proof; conformance and workload differential checks remain necessary.
+- Embench simulation records **current-round typed evidence** (`terminal_reason`, `correctness_ok`, `timing_ok`, `performance_valid`, reference/CFU result and cycle values) in the gate and validation artifacts. Execution/assertion failures and wrong/missing results take precedence over speedup thresholds. Missing cycle counts and invalid performance are `null`, never a fictitious zero-cycle measurement or a speedup for a wrong answer; a verified but slow design still records its measured ratio. The experiment collector/classifier consumes these reasons, with a conservative legacy fallback, rather than deriving the terminal failure from the entire accumulated error history.
 
 - The implementation stage writes both sides before the ladder runs, so `hw_build`, `hw_conformance`, `sw_build`, `sim` and `cost` always validate what the stage actually delivered. Whether the kernel was rewritten is the stage's own decision; the ladder compiles whatever is in the workspace and still enforces the correctness oracle and the speedup floor.
 
-- After Implement delivers hardware, software and the oracle, the `hw_conformance` rung runs the **smallest possible program** that exercises each declared instruction and compares it against an independent scalar reference, so a contract/encoding/writeback mistake is found before a kernel is written on top of it. The C test is **harness-owned** (`conformance.render_conformance`): the model supplies only an oracle YAML, so a hardware repair can never weaken the test. A command that writes CPU `rd` is compared case-by-case against an independent scalar `reference` expression; a command with no CPU result (a vector write or an acknowledgement) cannot be read back generically, so the oracle must supply a `verify` C expression instead — that is **weaker evidence** (the model attesting its own hardware) and is recorded as such. A command that uses the vector register file must supply `setup`; the harness never guesses how to seed it. A missing `reference`/`verify`/`setup`/`cases`, an unknown command name, or an argument-count mismatch is a **coverage failure**, and a missing `CFU_CONFORMANCE` line is a failure too: silence is never evidence. Lazy oracles are rejected by the validator: a `reference`/`verify` that is a compile-time constant (no identifier), that calls a `cfu_*` intrinsic (self-reference), that names an undeclared case argument, that compares an operand with itself (`a == a`), that (as `verify`) is built only from the case arguments, or that compares a value the same oracle's `setup`/`helpers` assigned a literal to fails with an actionable message, as does a `helpers` symbol defined by more than one command — **function, file-scope object or macro**, since any repeated name makes the harness-owned C fail to compile (run `20261003-130005`: two entries defined `md5_oracle_mem`) — and an all-zero case set. The model chooses all test inputs and sizes; the harness runs exactly the declared cases, without appending hidden edge/random inputs. Prompts require small-data, quick functional tests and warn against full-width random iteration counts or lengths. The legacy `edge_cases` boolean is accepted but no longer changes coverage. The harness always binds `a`/`b` at case scope, so a stale oracle cannot fail the generated C build. The rung is purely functional — it measures no cycles and asserts no performance; correctness is proved later by the `sim` rung and the workload's own oracle. A differential failure repairs `implement_hw`, while a malformed/unbuildable oracle repairs `check_conformance` from the separate answer-repair budget (see the repair-budget note above). The generated C, the oracle and the verdict are kept under `09_implementation/conformance/`.
-- Oracle `cases[i].args` values are compile-time constants in the generated C: the validator accepts only integer literals (exactly one per CPU-value role, rs1/rs2 order), and both the validator message and the prompt tell the model to move address/data preparation into `setup` (e.g. seed the vectors/memory there and give the argument the literal value it uses, such as `args: [0x80000000]`, never an all-zero case set). The oracle's C may call only the **generated intrinsics named in the prompt's command table** (plus `cfu_enable`/`cfu_memory_fence`); an invented name such as `cfu_load` is caught by a static lint before the build (`unknown intrinsic cfu_load (did you mean cfu_vector_load_i32?)`) instead of surfacing as a bare linker error. Conformance build/sim failures embed the compiler/linker diagnostics in the repair feedback (previously only the `make` command line reached the model, so it repaired blind), and a **recurring** rejection — validator failure or build failure — is flagged as a `REPEATED ORACLE REJECTION` with the correct shape pinned. `run.yaml` merges artifact refs across writer instances, so every oracle attempt's raw answer stays registered and numbered (`conformance_000/001/...`) instead of being dropped and overwritten.
+- After Implement delivers hardware, software and the oracle, the `hw_conformance` rung runs the **smallest possible program** that exercises each declared instruction and compares it against an independent scalar reference, so a contract/encoding/writeback mistake is found before a kernel is written on top of it. Ownership is split three ways. The **harness** owns the C test (`conformance.render_conformance`) **and the test data** (`conformance.conformance_data`): the oracle declares only the *shape* of the input space and the generator produces a fixed-seed boundary sweep — `length` gets 0, 1, the half block and the full block, `index` gets 1/half/max, `value` gets 0/1/0x7FFFFFFF/0xFFFFFFFF — followed by deterministic random draws (`data.count`, default 4). No case argument is model-authored, so a run cannot pass on a hand-picked degenerate input set (run `20261005-073745` declared a single zero-length message and never transferred a source byte) and "the expected value is whatever my table says" cannot be arranged by choosing easy inputs. The **model** owns the scalar semantics: `reference` for a command that writes CPU `rd`, or `verify` for a command with no CPU result (a vector write or an acknowledgement) — that is **weaker evidence** (the model attesting its own hardware) and is recorded as such. A command that uses the vector register file must supply `setup`; the harness never guesses how to seed it. A command with CPU-value roles must declare `data.roles` (one descriptor per argument, rs1/rs2 order) and, when a role is an `address`, a `data.buffer`; the harness defines `<NAME>_CONF_DATA_BASE`/`<NAME>_CONF_DATA_BYTES` and owns the `cfu_memory_fence()` that orders the block before the DUT reads it, so `setup`/`reference` read exactly the bytes the DUT read. A missing `reference`/`verify`/`setup`, an unusable `data` block, a legacy `cases`, an unknown command name or a role-count mismatch is a **coverage failure**, and a missing `CFU_CONFORMANCE` line is a failure too: silence is never evidence. Lazy oracles are rejected by the validator: a `reference`/`verify` that is a compile-time constant (no identifier), that calls a `cfu_*` intrinsic (self-reference), that names an undeclared case argument, that compares an operand with itself (`a == a`), that (as `verify`) is built only from the case arguments, or that compares a value the same oracle's `setup`/`helpers` assigned a literal to fails with an actionable message, as does a `helpers` symbol defined by more than one command — **function, file-scope object or macro**, since any repeated name makes the harness-owned C fail to compile (run `20261003-130005`: two entries defined `md5_oracle_mem`). `data.buffer` is capped at 1024 bytes, `data.count` at 16 and each command's generated cases at 2048 transferred bytes (`conformance_data.CASE_BYTE_BUDGET`, kept in priority order: the full-block case first, then the sweep, then the draws), so every case is still a quick functional check; the harness always binds `a`/`b` at case scope, so a stale oracle cannot fail the generated C build. The rung is purely functional — it measures no cycles and asserts no performance; correctness is proved later by the `sim` rung and the workload's own oracle. Because a model-authored reference is unvalidated ground truth, the oracle may instead `#include` the workload's own pristine scalar implementation: `commands.conformance_scalar_sources` puts `workspace/embench_<bench>/reference/{src,support}` (the harness-owned plain copy that `embench.workspace_tampering` guards — never the writable `cfu` copy) on both the syntax preflight's and the build's include path, with the benchmark's own `-D` set, so the expected value can come from code the model did not write. The include is a single translation unit: `-ffunction-sections` + `--gc-sections` drop the benchmark's `benchmark_body`/`workspace` code, so the run's `main` stays the only entry point (verified with a real `make -C sw … compile`). It is offered, not required — a config/reset/acknowledgement command has no workload counterpart and still needs its own independent expression. A **completed differential mismatch** is unattributed evidence: nothing validates the model's scalar reference, so a wrong reference makes correct hardware look broken (run `20261005-073745`: an oracle whose MD5 K table held 63 of 64 entries failed three consecutive rounds, and the last one reported a *correct* DUT). It therefore repairs `implement` in conformance scope with `oracle_unattributed: true` and no forced hardware edit, and an oracle-only delivery is charged to the separate answer-repair budget (see the repair-budget note above); a malformed/unbuildable oracle is an answer failure outright, and a watchdog/hang without a verdict stays design-scope. The generated C, the oracle and the verdict are kept under `09_implementation/conformance/`.
+- The oracle declares the input space, never the values: `data.buffer` (the harness-owned byte block the DUT reads), `data.count` (random draws on top of the boundary sweep) and `data.roles` (one `kind: address|length|index|value` descriptor per CPU-value argument, rs1/rs2 order, with `max` for `length`/`index`). The validator rejects a legacy `cases` block, a model-supplied `data.seed`, an `address` role without a buffer, a `length` bound larger than the buffer, a buffer that is not a ≤1024-byte multiple of 4, an out-of-range `count`, an unknown kind (listing the vocabulary) and a role-count mismatch, each naming the fix. The oracle's C may call only the **generated intrinsics named in the prompt's command table** (plus `cfu_enable`/`cfu_memory_fence`, and the harness `<NAME>_CONF_DATA_BASE`/`<NAME>_CONF_DATA_BYTES` macros); an invented name such as `cfu_load` is caught by a static lint before the build (`unknown intrinsic cfu_load (did you mean cfu_vector_load_i32?)`) instead of surfacing as a bare linker error. Conformance build/sim failures embed the compiler/linker diagnostics in the repair feedback (previously only the `make` command line reached the model, so it repaired blind), and a **recurring** rejection — validator failure or build failure — is flagged as a `REPEATED ORACLE REJECTION` with the correct shape pinned. `run.yaml` merges artifact refs across writer instances, so every oracle attempt's raw answer stays registered and numbered (`conformance_000/001/...`) instead of being dropped and overwritten.
 - With `--loop` a run does not have to stop when it succeeds (see **Multi-instruction ISA evolution** below for the current exploration and delivery rules). If every gate passes **and** the `--max-iters` budget still has room, the review node asks the agent (stage `optimize`, plus at most one stop reconsideration) whether another round is worth spending on: `{"continue": true|false, "target": "implement_hw"|"implement_sw"|"extend_isa", "focus": "performance"|"cost", "reason": ...}`. A round re-enters the normal ladder (`implement_hw` → `generate_soc` → software reuse-or-rewrite → `build_sw` → `simulate` → `estimate_cost` → review, or `implement_sw` → `build_sw` → …), so it can never skip verify, the 1.05x speedup floor, or a build rung. An optimization round is budgeted like a repair: `--max-iters N` stays the single bound on the whole run, and a round with no budget left, an unusable target, or a missing "concrete change" reason stops the loop deterministically; in default explore mode a `continue: false` is reconsidered once before the framework accepts it (no model answer can extend a run). The chosen rung receives an `=== OPTIMIZATION ROUND ===` block (not a `*_REPAIR MODE` block) with the current measured result, the focus, and the rule that the accepted ISA revision is frozen during implementation; only `extend_isa` may append compatible commands before re-entering hardware and software validation. Every round that produced its own measurement is recorded in `12_review/optimization_rounds.yaml` (speedup, reference/CFU cycles, Yosys cells/wires/memories), and `simulate`/`estimate_cost` stamp their gates with the round they ran in, so a round that failed before measuring is listed as `not measured` instead of repeating the previous round's numbers. The report's `## Optimization Rounds` section and the end-of-run CLI `summary:` each print one line per round with the change against the previous measured round — for example `round 1: implement_hw speedup=2.50x cells=1300 (+0.50x, +100 cells) (best)` — so the whole progression of speedup and cost is traceable; the first round is the initial ladder. A round counts as an improvement only when it is Pareto-better than the best round so far (not slower, not larger, better on at least one axis); a final measured round that regresses is reported with an explicit warning in the report and in the CLI summary. `--loop` is off by default (env `CFU_AGENT_LOOP`); without it, review stops as before.
 - The cost rung synthesizes the CFU **in isolation** rather than the whole SoC: `GenAgentCfu` (a tracked, non-agent-editable entry point) elaborates only the overlaid `AgentCfu` class into `11_cost/cfu_rtl/AgentCfu.v`, and Yosys runs `synth -top AgentCfu` on it. Cost numbers therefore track the agent's CFU design instead of the CPU/SoC, and the cost rung needs no CPU build. If the standalone generation produces no RTL, the cost rung fails and repairs `implement_hw`.
 - The simulation rung also fails when no design change was applied, so a benchmark whose cfu build is byte-identical to the reference cannot be reported as an accelerated result.
@@ -872,6 +949,20 @@ three configurations, each with its own source tree:
 | profile | `-DEMBENCH_OBS` | per-loop inclusive cycles/calls plus containing-function context |
 | cfu | `-DUSE_AGENT_CFU` | verify still passes + speedup vs reference |
 
+**Measurement protocol (future runs):** new Embench runs default to
+`cold_single_invocation_v1`: one cold invocation, no warmup, and both local and
+global scale factors fixed to 1. The timed invocation includes the original
+preparation, memory work and CFU configuration; it is **not pure math-kernel
+latency**. `benchmark_project.measurement` records `protocol`,
+`local_scale_factor: 1`, `global_scale_factor: 1`, and `warmup: false`; the sim gate
+and validation artifact retain this evidence. CLI/report summaries describe the
+scope, and experiment records/CSV preserve `measurement_protocol` and the metadata.
+Evidence without a protocol is labelled `legacy`. **New and old measurements are
+not comparable**: mixed-protocol complete runs suppress only the speedup median,
+with a warning; pass@k, effort and cost statistics are unchanged. Existing generated
+artifacts are not migrated. Legacy Embench checkpoints cannot resume under the
+new protocol: start a new run (with a new run ID).
+
 By default `embench_instrument.py` instruments complete `for`/`while`/`do` loop
 statements (not each iteration) and their containing functions, up to 24 total
 points per workload. Stable loop IDs map to source filename, function, ordinal,
@@ -906,15 +997,20 @@ own gate (for example the speedup floor) is reported. The Embench prompt block a
 documents these log semantics so a repair
 triages a wrong result instead of rewriting the build or the benchmark oracle.
 
-**Benchmark-oracle protection:** the correctness oracle and the cycle measurement live
-in the model-writable `workspace/embench_*/cfu/**` copy, so the `sim` rung refuses any
-result whose harness files differ from the untouched `reference` copy: `board/*`
-(boardsupport.c/h, embench_obs.h), `support/*`, the instrumented `embench_main.c`, and
-the `verify_benchmark()` body of every kernel source must stay byte-identical
-(`benchmark/embench.workspace_tampering`). Independently, the injected `EMBENCH_VERIFY`
-line is parsed on both sides: when the reference run and the cfu run report different
-`result=` values the gate fails on the mismatch itself, without trusting
-`verify_benchmark()` at all.
+**Protected benchmark scaffold:** the agent keeps the same tools and delivery
+flow, with no extra model-generation stage. It may optimize kernel functions and
+`benchmark_body`, but must preserve the workload's protected preparation, scaling,
+benchmark wrapper and oracle scaffold. Harness-owned `board/*`, `support/*`, and
+`embench_main.c` also remain protected. The host records guard metadata under
+`benchmark_project.integrity` and checks both pristine/reference evidence and the
+CFU copy; `benchmark_integrity: {version, ok, problems}` records the integrity gate
+verdict separately from simulation success. Independently, the injected
+`EMBENCH_VERIFY` line is parsed on both sides: different reference/CFU `result=`
+values fail the gate without trusting `verify_benchmark()` alone.
+These byte/scaffold checks and benchmark oracle results are **not proof of true
+operation equivalence**, nor an arbitrary semantic anti-cheat guarantee: a passing
+integrity gate does not establish that every possible input computes the same
+operation. CLI/reports distinguish the gate verdict from that stronger claim.
 A response whose `EDIT_BEGIN` section is not closed by a line equal to `EDIT_END` is
 reported as such ("was not closed"), and a trailing sampler token after `EDIT_END` is
 tolerated instead of discarding an otherwise valid edit.
@@ -929,9 +1025,11 @@ benchmark sources, both build commands (including their defines, with the run's 
 workspace path normalized to a placeholder so the key is **stable across runs**), the
 CPU/SoC flags, the seeded `workspace/design` overlay, the fixed
 `soc/mico`+`soc/cfu`+`execute/cfu` sources, the toolchain versions (`gcc`, `verilator`),
-the git revision/submodules, the normalized loop observation plan and the
-instrumenter/board-counter source hashes, so changed instrumentation, toolchain
-or scaffold invalidates it.
+the git revision/submodules, the normalized loop observation plan, the explicit
+measurement protocol (cache key version 7), and the instrumenter/board-counter source
+hashes, so changed protocol, instrumentation, toolchain or scaffold invalidates it.
+The already-hashed pristine reference sources include the workload preparation;
+old version-6 entries cannot supply a new-protocol baseline.
 Entries live in the git-ignored `agents/generated/cache/embench_profile/<key>.json` and
 are written only after a passing measurement. The same key also names a copy of the
 reference build's disassembly (`<key>.embench_main.asm`): it is a *build output*, so a
@@ -1000,6 +1098,13 @@ Run the agent and its tests from `conda run -n mico_env` (or an activated `mico_
 - `CFU_AGENT_LOOP`: optional default for `--loop` (`on`/`off`); otherwise off.
 
 ### Tests
+
+Regression tests never contact a real LLM. Test-package import blocks real OpenAI/Azure
+SDK construction, including localhost endpoints, and outbound network connections;
+there is no `CFU_AGENT_TESTS_ALLOW_NETWORK` opt-in. Inject a hand-written fake SDK/client
+or the deterministic offline client. Prompt, route, gate, transport and audit tests
+exercise local fixtures/mocks only; new cases must not launch live design runs, model
+requests, or another full-ladder integration scenario.
 
 ```bash
 # Use the project environment; tests patch model/network access and use unittest.

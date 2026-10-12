@@ -43,7 +43,8 @@ class DeliveryModeTest(unittest.TestCase):
         for index, path in enumerate(self.paths):
             self.box.write_text(path, f"entry-{index}\n")
         self.oracle = {"commands": [{"name": "add", "reference": "a + b",
-                                    "cases": [{"args": [1, 2]}]}]}
+                                    "data": {"roles": [{"kind": "value", "max": 255},
+                                                       {"kind": "value", "max": 255}]}}]}
         self.before = self.bytes()
         self.addCleanup(mock.patch.stopall)
         mock.patch.object(stage_services, "_toolbox_for_stage", return_value=self.box).start()
@@ -224,7 +225,9 @@ class DeliveryModeTest(unittest.TestCase):
         record = self.approved()
         self.state["repair_scope"] = "design"
         revised = {"commands": [{"name": "add", "reference": "a + b",
-                                 "cases": [{"args": [3, 4]}]}]}
+                                 "data": {"count": 8,
+                                          "roles": [{"kind": "value", "max": 255},
+                                                    {"kind": "value", "max": 255}]}}]}
         with mock.patch.object(implement.hardware, "implement_hw", side_effect=self.hardware_update), \
                 mock.patch.object(implement.software, "implement_sw", side_effect=self.software_update), \
                 mock.patch.object(llm_step, "_complete_llm", return_value=(
@@ -260,7 +263,8 @@ class DeliveryModeTest(unittest.TestCase):
         pair = {path: (self.root / path).read_bytes()
                 for path in conformance_delivery.delivery_paths(self.state).values()}
         blind = {"commands": [{"name": "add", "reference": "a == a",
-                               "cases": [{"args": [1, 2]}]}]}
+                               "data": {"roles": [{"kind": "value", "max": 255},
+                                                  {"kind": "value", "max": 255}]}}]}
         with mock.patch.object(implement.hardware, "implement_hw", side_effect=self.hardware_update), \
                 mock.patch.object(implement.software, "implement_sw", side_effect=self.software_update), \
                 mock.patch.object(llm_step, "_complete_llm", return_value=(

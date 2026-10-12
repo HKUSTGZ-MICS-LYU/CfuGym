@@ -143,6 +143,16 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
     )
     if repair_target is not None:
         repair_target = "implement"
+    # A test that ran to a verdict and disagreed with its own reference is
+    # *unattributed* evidence. The DUT may be wrong, but so may the model's
+    # scalar reference: nothing else validates that C (run 20261005-073745 — an
+    # oracle whose MD5 K table held 63 of 64 entries made correct hardware fail
+    # three consecutive rounds). Such a round may repair either side, so it must
+    # not force a hardware edit; the delivered change decides which budget pays.
+    unattributed_mismatch = (
+        not ok and not environment_failure and not oracle_failure
+        and repair_target is not None and verdict.get("status") == "fail"
+    )
     if oracle_failure and repair_target is not None:
         attempt = feedback._rejection_attempt(errors, "")
         if attempt:
@@ -174,7 +184,9 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
             repair_kind="answer" if oracle_failure else None,
         )
         if not ok and next_node == "implement":
-            extra["repair_scope"] = "conformance" if oracle_failure else "design"
+            extra["repair_scope"] = (
+                "conformance" if (oracle_failure or unattributed_mismatch) else "design"
+            )
     update = {
         "validation_results": results,
         "stage_jobs": "validation" if ok else "implementation",
@@ -185,7 +197,8 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
             state, rung=rung, ok=ok, next=next_node, errors=errors,
             details=verdict.get("details") or [], verdict=verdict.get("status"),
             cases=verdict.get("cases"), repair_target=repair_target,
-            oracle_failure=oracle_failure, repairable=repair_target is not None,
+            oracle_failure=oracle_failure, oracle_unattributed=unattributed_mismatch,
+            repairable=repair_target is not None,
             history=f"Hardware conformance {'passed' if ok else 'failed'} "
             f"({verdict.get('commands')}/{verdict.get('total')} commands, "
             f"{verdict.get('cases')} cases).",

@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from agents.cfu_design_agent import graph
+from agents.cfu_design_agent.benchmark import embench_integrity
 from agents.cfu_design_agent.runtime.llm import LlmResult
 from agents.cfu_design_agent.flow import gates
 from agents.cfu_design_agent.flow import instrument
@@ -42,7 +43,7 @@ GOOD_PATCH = """PATCH_BEGIN
  
  object AgentCfuFunction {
 -  val compute = 1
-+  val compute = 6
++  val compute = 1 // offline fixture v1
    val config = 2
    val load = 4
    val store = 5
@@ -166,6 +167,13 @@ class ImplementationGateTest(unittest.TestCase):
             stage="implementation",
             run_root=f"agents/generated/runs/{self.run_id}",
         ).seed_design_workspace()
+        # The delivery/apply tests need a valid input-dependent compute baseline,
+        # not the tracked placeholder or an ABI renumbering that hides it.
+        target = self.run_dir / "workspace/design/AgentCfu.scala"
+        text = target.read_text()
+        target.write_text(text.replace(
+            "start = ctx => ctx.reply(B(0, cfuParam.CFU_OUTPUT_DATA_W bits))),",
+            "start = ctx => ctx.reply(ctx.read(RS1) ^ ctx.read(RS2))),", 1))
 
     def _implement(self, patch: str, **overrides):
         self._seed()
@@ -254,12 +262,12 @@ class ImplementationGateTest(unittest.TestCase):
         self.assertTrue(first["gates"]["implementation_hw"]["applied"], first["implementation_hw_summary"])
 
         target = REPO_ROOT / f"agents/generated/runs/{self.run_id}/workspace/design/AgentCfu.scala"
-        self.assertIn("val compute = 6", target.read_text())
+        self.assertIn("val compute = 1 // offline fixture v1", target.read_text())
 
         # Second repair searches for the value written by the first attempt.
         second_patch = GOOD_PATCH.replace(
-            "-  val compute = 1", "-  val compute = 6"
-        ).replace("+  val compute = 6", "+  val compute = 7")
+            "-  val compute = 1", "-  val compute = 1 // offline fixture v1"
+        ).replace("+  val compute = 1 // offline fixture v1", "+  val compute = 1 // offline fixture v2")
         state2 = dict(state)
         state2.update(first)
         state2["iteration"] = 1
@@ -267,8 +275,8 @@ class ImplementationGateTest(unittest.TestCase):
             second = impl_hw.implement_hw(state2)
         self.assertTrue(second["gates"]["implementation_hw"]["applied"], second["implementation_hw_summary"])
         text = target.read_text()
-        self.assertIn("val compute = 7", text)
-        self.assertNotIn("val compute = 1", text)
+        self.assertIn("val compute = 1 // offline fixture v2", text)
+        self.assertNotIn("val compute = 1 // offline fixture v1", text)
         self.assertNotIn("Re-seeded", second["implementation_hw_summary"])
         self.assertNotIn("Could not re-seed", second["implementation_hw_summary"])
 
@@ -580,36 +588,39 @@ class AnalysisToolLoopTest(unittest.TestCase):
         self.assertTrue(result["gates"]["analysis"]["ok"])
         self.assertEqual(result["gates"]["analysis"]["next"], "design_contract")
 
-    def test_an_unparseable_analysis_is_repaired_not_handed_on_as_empty(self) -> None:
-        # The empty mapping used to reach every later stage as "{}".
+    def test_non_yaml_analysis_is_normalized_instead_of_repaired(self) -> None:
+        # Serialization is advisory: keep substantive prose and provide the
+        # conservative roofline needed by later contract prompts.
         state = _base_state(self.run_id, workload_spec={"name": "depthconv"})
-        llm = _ToolUsingLlm("I could not produce YAML this time.", "unused")
+        llm = _ToolUsingLlm("The measured kernel is depthconv; memory traffic is unknown.", "unused")
         with mock.patch.object(llm_step, "_llm", lambda state: llm):
             result = analysis.analyze_workload(state)
         gate = result["gates"]["analysis"]
-        self.assertFalse(gate["ok"])
-        self.assertEqual(gate["next"], "analyze_workload")
-        self.assertEqual(result["stage_jobs"], "analyze_workload")
-        self.assertEqual(result["answer_repairs_used"], 1)
-        self.assertIn("did not deliver a valid YAML mapping", " ".join(gate["problems"]))
-        # The repair feedback quotes what the model actually sent.
-        self.assertIn("could not produce YAML", " ".join(gate["problems"]))
-        self.assertEqual(result["workload_analysis"].strip(), "{}")
+        self.assertTrue(gate["ok"])
+        self.assertEqual(gate["next"], "design_contract")
+        import yaml
+
+        normalized = yaml.safe_load(result["workload_analysis"])
+        self.assertIn("measured kernel is depthconv", normalized["summary"])
+        self.assertEqual(normalized["roofline"]["memory_boundary"], "unknown")
+        artifact = self.run_dir / "07_analysis/workload_analysis.yaml"
+        self.assertEqual(yaml.safe_load(artifact.read_text()), normalized)
         self.assertEqual(
             graph._route_after_analysis({**state, "gates": result["gates"]}),
-            "analyze_workload",
+            "design_contract",
         )
 
-    def test_an_unparseable_analysis_blocks_the_run_when_repairs_are_spent(self) -> None:
+    def test_empty_analysis_still_blocks_when_repairs_are_spent(self) -> None:
         state = _base_state(self.run_id, workload_spec={"name": "depthconv"},
                             max_answer_repairs=0)
-        llm = _ToolUsingLlm("still not YAML", "unused")
+        llm = _ToolUsingLlm("", "unused")
         with mock.patch.object(llm_step, "_llm", lambda state: llm):
             result = analysis.analyze_workload(state)
         gate = result["gates"]["analysis"]
         self.assertFalse(gate["ok"])
         self.assertEqual(gate["next"], "review_and_route")
         self.assertEqual(result["stopped_at"], "analysis")
+        self.assertIn("response was empty", " ".join(gate["problems"]))
         self.assertEqual(
             graph._route_after_analysis({**state, "gates": result["gates"]}),
             "review_and_route",
@@ -703,6 +714,12 @@ class SoftwareRetryBreakerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.run_id = "gate-sw-retry-00000000"
         self.run_dir = REPO_ROOT / f"agents/generated/runs/{self.run_id}"
+        # Transport/repair fixtures contain only a synthetic kernel, not an
+        # adapter-created Embench manifest. Fairness is covered independently
+        # by the real adapter/checker tests; do not bypass production enforcement.
+        integrity = mock.patch.object(embench_integrity, "validate_candidate", return_value=[])
+        integrity.start()
+        self.addCleanup(integrity.stop)
         shutil.rmtree(self.run_dir, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.run_dir, True)
 

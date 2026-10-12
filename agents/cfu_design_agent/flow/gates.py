@@ -137,6 +137,9 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
     if state.get("dry_run", False):
         # Dry-run is a planning pass: never claims a measured or complete result.
         return "final_report", "planned"
+    profile = gates.get("profile") or {}
+    if profile and profile.get("ok") is False and not profile.get("skipped"):
+        return "final_report", "failed"
     if gates.get("isa", {}).get("abstain") and not disabled_gate(gates.get("isa")):
         return "final_report", "blocked"
     if not gates.get("workload_spec", {}).get("ok", False):
@@ -173,6 +176,9 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
 
 def _is_complete(state: CfuDesignState) -> bool:
     gates = state.get("gates", {})
+    profile = gates.get("profile") or {}
+    if profile and profile.get("ok") is False and not profile.get("skipped"):
+        return False
     if not all(gates.get(key, {}).get("ok", False) for key in required_gates(state)):
         return False
     if state.get("ir_features", "off") == "require" and not gates.get("ir", {}).get("ok", False):

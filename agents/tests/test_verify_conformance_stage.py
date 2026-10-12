@@ -233,13 +233,28 @@ class VerifyConformanceStageTest(unittest.TestCase):
         self.assertNotIn("answer_repairs_used", update)
         self.assertTrue(any("commit-progress watchdog" in error for error in update["errors"]))
 
-    def test_completed_differential_failure_routes_to_design_repair(self):
+    def test_completed_differential_failure_is_unattributed_conformance_repair(self):
         verdict = {**self.pass_verdict, "ok": False, "status": "fail", "failed": ["compute"]}
         update, execute, _, _, _ = self.run_stage(verdict=verdict)
         self.assertEqual(execute.call_count, 2)
-        self.assertEqual(update["gates"]["hw_conformance"]["next"], "implement")
-        self.assertFalse(update["gates"]["hw_conformance"]["oracle_failure"])
+        gate = update["gates"]["hw_conformance"]
+        self.assertEqual(gate["next"], "implement")
+        self.assertFalse(gate["oracle_failure"])
+        self.assertTrue(gate["oracle_unattributed"])
         self.assertEqual(update["repairs_used"], 1)
+        # Unattributed: either side may be wrong, so Implement may repair the
+        # oracle without a dummy hardware edit (the delivered change decides the
+        # budget; see test_delivery_mode_conformance).
+        self.assertEqual(update["repair_scope"], "conformance")
+
+    def test_missing_verdict_is_not_an_unattributed_mismatch(self):
+        simulation = {"returncode": 1, "rung": "hw_conformance", "command": "sim test.elf",
+                      "stdout_tail": "no verdict line was printed", "failure_observation": None}
+        update, execute, _, _, _ = self.run_stage(simulation=simulation)
+        self.assertEqual(execute.call_count, 2)
+        gate = update["gates"]["hw_conformance"]
+        self.assertFalse(gate["oracle_failure"])
+        self.assertFalse(gate["oracle_unattributed"])
         self.assertEqual(update["repair_scope"], "design")
 
     def test_exhausted_answer_budget_stops_without_using_design_budget(self):

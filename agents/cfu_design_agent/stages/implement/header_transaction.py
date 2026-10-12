@@ -17,7 +17,10 @@ def atomic_header(function):
         session = coding_session.CodingSession(toolbox, frozenset({path}))
         try:
             update = function(state, *args, **kwargs)
-            session.commit()
+            if (update.get("repair_route") or {}).get("target") in ("analysis", "contract"):
+                session.rollback()
+            else:
+                session.commit()
             return update
         except Exception:
             session.rollback()

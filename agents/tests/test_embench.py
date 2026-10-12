@@ -20,6 +20,21 @@ from agents.cfu_design_agent.runtime import stage_services as services
 from agents.cfu_design_agent.stages import profile
 
 
+def temporary_embench_repo(test: unittest.TestCase) -> Path:
+    """Real source fixtures copied into disposable storage; never run artifacts."""
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    root = Path(directory.name)
+    for subdir in ("src", "support"):
+        shutil.copytree(REPO_ROOT / embench.EMBENCH_ROOT / subdir,
+                        root / embench.EMBENCH_ROOT / subdir)
+    board = root / embench.BOARD_ROOT
+    board.mkdir(parents=True)
+    for fname in embench.BOARD_FILES:
+        shutil.copyfile(REPO_ROOT / embench.BOARD_ROOT / fname, board / fname)
+    return root
+
+
 FIXTURE = """#include <stdio.h>
 
 static int helper(int x);
@@ -206,11 +221,19 @@ class EmbenchDiscoveryTest(unittest.TestCase):
         self.assertIn("EXTRA_SOURCES=", joined)
         self.assertIn("EXTRA_INCLUDES=", joined)
         self.assertIn("-DEMBENCH_OBS", joined)
+        self.assertIn("-std=gnu11", joined)
         # Each configuration owns its source tree so objects never collide.
         self.assertIn("/profile/embench_main", joined)
         self.assertIn("/profile/src/*.c", joined)
         for token in cmd:
             self.assertFalse(token.startswith("/"), token)
+
+    def test_all_build_configs_pin_gnu11(self) -> None:
+        for config in embench.CONFIGS:
+            with self.subTest(config=config):
+                cmd = embench.build_command("agents/generated/runs/r1", "wikisort", config)
+                extra_cflags = next(item for item in cmd if item.startswith("EXTRA_CFLAGS="))
+                self.assertIn("-std=gnu11", extra_cflags)
 
     def test_config_defines(self) -> None:
         self.assertNotIn("-DEMBENCH_OBS", embench.config_defines("crc32", "reference"))
@@ -407,13 +430,13 @@ class IntrinsicsRenderTest(unittest.TestCase):
 class PrepareWorkspaceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.run_id = "embench-prep-00000000"
-        self.run_dir = REPO_ROOT / f"agents/generated/runs/{self.run_id}"
-        shutil.rmtree(self.run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, self.run_dir, True)
+        self.workdir = temporary_embench_repo(self)
+        self.run_dir = self.workdir / f"agents/generated/runs/{self.run_id}"
 
     def test_prepare_copies_benchmark_support_and_board(self) -> None:
         toolbox = RepoToolbox(
-            REPO_ROOT,
+            self.workdir,
+            policy=load_policy(REPO_ROOT),
             dry_run=False,
             stage="prepare_benchmark",
             run_root=f"agents/generated/runs/{self.run_id}",
@@ -421,7 +444,7 @@ class PrepareWorkspaceTest(unittest.TestCase):
         project = embench.prepare_embench_benchmark(
             toolbox, {"benchmark_name": "crc32"}
         )
-        ws = REPO_ROOT / project["workspace"]
+        ws = self.workdir / project["workspace"]
         for config in ("reference", "profile", "cfu"):
             self.assertTrue((ws / config / "src/crc_32.c").exists(), config)
             self.assertTrue((ws / config / "support/main.c").exists(), config)
@@ -432,13 +455,14 @@ class PrepareWorkspaceTest(unittest.TestCase):
 
     def test_generated_main_c_carries_the_verify_diagnostic(self) -> None:
         toolbox = RepoToolbox(
-            REPO_ROOT,
+            self.workdir,
+            policy=load_policy(REPO_ROOT),
             dry_run=False,
             stage="prepare_benchmark",
             run_root=f"agents/generated/runs/{self.run_id}",
         )
         project = embench.prepare_embench_benchmark(toolbox, {"benchmark_name": "crc32"})
-        main = (REPO_ROOT / project["workspace"] / "reference/embench_main.c").read_text()
+        main = (self.workdir / project["workspace"] / "reference/embench_main.c").read_text()
         self.assertIn("EMBENCH_VERIFY_", main)
         self.assertIn("EMBENCH_STRINGIFY", main)
         # Embench verify_benchmark() returns non-zero when correct, so a PASS is
@@ -456,7 +480,8 @@ class PrepareWorkspaceTest(unittest.TestCase):
 
     def test_unknown_benchmark_rejected(self) -> None:
         toolbox = RepoToolbox(
-            REPO_ROOT,
+            self.workdir,
+            policy=load_policy(REPO_ROOT),
             dry_run=False,
             stage="prepare_benchmark",
             run_root=f"agents/generated/runs/{self.run_id}",
@@ -545,19 +570,18 @@ class EmbenchPatchRedirectTest(unittest.TestCase):
         from agents.cfu_design_agent.runtime.tools import RepoToolbox
 
         run_id = "embench-cfu-patch-0001"
-        run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
-        shutil.rmtree(run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, run_dir, True)
+        workdir = temporary_embench_repo(self)
         prep = RepoToolbox(
-            REPO_ROOT,
+            workdir,
+            policy=load_policy(REPO_ROOT),
             dry_run=False,
             stage="prepare_benchmark",
             run_root=f"agents/generated/runs/{run_id}",
         )
         embench.prepare_embench_benchmark(prep, {"benchmark_name": "crc32"})
-        cfu = REPO_ROOT / f"agents/generated/runs/{run_id}/workspace/embench_crc32/cfu/src/crc_32.c"
+        cfu = workdir / f"agents/generated/runs/{run_id}/workspace/embench_crc32/cfu/src/crc_32.c"
         original_text = cfu.read_text()
-        target = "#define LOCAL_SCALE_FACTOR 170"
+        target = "#define LOCAL_SCALE_FACTOR 1"
         self.assertIn(target, original_text)
         idx = original_text.splitlines().index(target)
         context = original_text.splitlines()[idx - 1 : idx + 2]
@@ -574,7 +598,8 @@ class EmbenchPatchRedirectTest(unittest.TestCase):
             ]
         )
         toolbox = RepoToolbox(
-            REPO_ROOT,
+            workdir,
+            policy=load_policy(REPO_ROOT),
             dry_run=False,
             stage="implementation",
             run_root=f"agents/generated/runs/{run_id}",
@@ -601,15 +626,15 @@ class FileBlockProtocolTest(unittest.TestCase):
         from agents.cfu_design_agent.runtime.tools import RepoToolbox
 
         run_id = "embench-fileblock-0001"
-        run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
-        shutil.rmtree(run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, run_dir, True)
+        workdir = temporary_embench_repo(self)
         prep = RepoToolbox(
-            REPO_ROOT, dry_run=False, stage="prepare_benchmark", run_root=f"agents/generated/runs/{run_id}"
+            workdir, policy=load_policy(REPO_ROOT), dry_run=False,
+            stage="prepare_benchmark", run_root=f"agents/generated/runs/{run_id}"
         )
         embench.prepare_embench_benchmark(prep, {"benchmark_name": "crc32"})
         toolbox = RepoToolbox(
-            REPO_ROOT,
+            workdir,
+            policy=load_policy(REPO_ROOT),
             dry_run=False,
             stage="implementation",
             run_root=f"agents/generated/runs/{run_id}",

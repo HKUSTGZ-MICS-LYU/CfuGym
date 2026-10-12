@@ -15,9 +15,9 @@ from typing import Any
 
 from .flow import instrument, policies, wiring
 from .flow.instrument import STAGE_ORDER, disable_progress, enable_progress, progress
-from .flow.ladder import _route_after_analysis, _route_after_cost, _route_after_hw_build, _route_after_hw_conformance, _route_after_isa, _route_after_prepare, _route_after_review, _route_after_sim, _route_after_sw_build, _route_input_target
+from .flow.ladder import _route_after_analysis, _route_after_cost, _route_after_hw_build, _route_after_hw_conformance, _route_after_implement, _route_after_isa, _route_after_prepare, _route_after_profile, _route_after_review, _route_after_sim, _route_after_sw_build, _route_input_target
 from .flow.wiring import NODE_NAMES, ROUTER_NAMES, ROUTE_TARGETS, SUCCESSORS as FLOW_SUCCESSORS
-from .runtime import dependencies, llm, persistence, tools
+from .runtime import dependencies, failures, llm, persistence, tools
 from .runtime.llm import LlmResult
 from .runtime.persistence import PersistenceRiskError
 from .runtime.policy import PolicyError
@@ -105,7 +105,7 @@ def run_agent(
                         "manual reconciliation is required before resume"
                     )
                 try:
-                    dependencies.completed_gate_inputs(previous)
+                    dependencies.completed_gate_inputs(previous, resume=True)
                 except ValueError as exc:
                     raise PersistenceRiskError(str(exc)) from exc
                 graph_input = None
@@ -130,16 +130,31 @@ def run_agent(
 
 
 def _invoke_agent_graph(app: Any, graph_input: CfuDesignState | None, config: dict[str, Any], *, stream: bool) -> CfuDesignState:
-    if not stream:
-        final = app.invoke(graph_input, config=config, **({"durability": "sync"} if app.checkpointer else {}))
-        return _finalize(final)
-    final_state: CfuDesignState = {}
+    final_state: CfuDesignState = dict(graph_input or {})
     snapshots = 0
-    for snapshot in app.stream(graph_input, config=config, stream_mode="values",
-                               **({"durability": "sync"} if app.checkpointer else {})):
-        if isinstance(snapshot, dict):
-            snapshots += 1
-            final_state = snapshot
+    try:
+        if not stream:
+            final = app.invoke(graph_input, config=config, **({"durability": "sync"} if app.checkpointer else {}))
+            return _finalize(final)
+        for snapshot in app.stream(graph_input, config=config, stream_mode="values",
+                                   **({"durability": "sync"} if app.checkpointer else {})):
+            if isinstance(snapshot, dict):
+                snapshots += 1
+                final_state = snapshot
+    except Exception as exc:
+        observed = getattr(exc, "partial_state", None) or final_state
+        source = getattr(exc, "partial_state_source", "") or ("stream_snapshot" if snapshots else "graph_input")
+        if app.checkpointer:
+            try:
+                snapshot = app.get_state(config)
+                if snapshot and isinstance(snapshot.values, dict) and snapshot.values:
+                    observed = snapshot.values
+                    source = "native_checkpoint"
+            except Exception as recovery_exc:
+                # State recovery must never replace the original error/traceback.
+                exc.add_note(f"checkpoint state recovery failed: {type(recovery_exc).__name__}: {recovery_exc}")
+        failures.attach_partial_state(exc, _finalize(dict(observed)), source=source)
+        raise
     if snapshots:
         final_state = dict(final_state)
         final_state["graph_events"] = [f"streamed {snapshots} state snapshots"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 from ...flow import gates as gates_mod, ladder, outcome
-from ...runtime import effects, commands as commands_mod, stage_services
+from ...runtime import effects, commands as commands_mod, hardware_integrity, stage_services
 from ...runtime.tools import SOC_WORKSPACE_SUBDIR
 from ...stages.implement import intrinsics
 from ...state import CfuDesignState
@@ -34,6 +34,8 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
     isa_spec = state.get("isa_spec", {}) or {}
     commands = commands_mod.agent_cfu_overlay_commands(state, isa_spec) or commands_mod._legacy_ladder_commands(state, toolbox)["generate"]
     results: list[dict] = []
+    integrity_checked = False
+    encoding_evidence: dict = {}
     impl_gate = gates_mod._rung_gate(state, "implementation_hw")
     if impl_gate and not impl_gate.get("ok", False):
         # The hardware rung produced no applied design, so the workspace still
@@ -53,9 +55,12 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
         errors = commands_mod._missing_design_files(state)
         if errors:
             errors = [f"hardware design file is missing or empty: {', '.join(errors)}"]
-        elif not commands:
-            errors.append("no SoC generation command is available for this run")
         else:
+            integrity_checked = True
+            errors = stage_services.hardware_integrity_problems(state, toolbox, evidence=encoding_evidence)
+        if not errors and not commands:
+            errors.append("no SoC generation command is available for this run")
+        if not errors:
             for command in commands:
                 result = effects.run_command(
                     state,
@@ -72,8 +77,25 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
     if not errors and rtl is not None and not rtl.is_file():
         errors.append(f"SoC generation produced no RTL at {state.get('run_root')}/{SOC_WORKSPACE_SUBDIR}/MiCoSoc.v")
 
+    if not errors and rtl is not None and all(r.get("returncode") == 0 for r in results):
+        before = encoding_evidence.get("candidate_hash")
+        errors.extend(stage_services.hardware_integrity_problems(state, toolbox,
+                      evidence=encoding_evidence, rtl_path=rtl))
+        if before and before != encoding_evidence.get("candidate_hash"):
+            errors.append("hardware_integrity/stale_candidate: candidate changed during SoC generation")
     ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
-    stage_services._write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
+    integrity_failed = any("hardware_integrity/" in error or "hardware integrity" in error for error in errors)
+    evidence = {"errors": errors, "terminal_reason": "hardware_integrity" if integrity_failed else "",
+                "candidate_hash": encoding_evidence.get("candidate_hash", ""),
+                "instruction_encoding": encoding_evidence,
+                "hardware_integrity": {"version": hardware_integrity.VERSION, "checked": integrity_checked,
+                                       "ok": not integrity_failed if integrity_checked else None,
+                                       "scope": "bounded fixed-result lint and encoding crosscheck, not semantic equivalence"}}
+    if integrity_failed:
+        results.append(stage_services.gate_failure_result(
+            state, rung, "hardware_integrity", errors))
+    stage_services._write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "",
+                                          evidence=evidence)
 
     retry = ladder._delivery_retry_transition(
         state, rung, "implement", ok,
@@ -95,7 +117,8 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
         rung: {
             "ok": ok,
             "skipped": False,
-            "commands": len(results),
+            "commands": sum(item.get("kind") != "host_gate_check" for item in results),
+            **evidence,
             "next": next_node,
         },
     }

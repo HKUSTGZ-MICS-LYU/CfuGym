@@ -10,7 +10,6 @@ instead of a silent API call.
 from __future__ import annotations
 
 import contextlib
-import os
 import socket
 from pathlib import Path
 from typing import Iterator
@@ -21,9 +20,6 @@ from agents.cfu_design_agent.runtime import llm_step
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-
-# Escape hatch for a test that genuinely needs the network (none should).
-ALLOW_NETWORK_ENV = "CFU_AGENT_TESTS_ALLOW_NETWORK"
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", ""}
 
@@ -107,8 +103,27 @@ def offline_llm() -> Iterator[OfflineLlm]:
         yield client
 
 
-def _network_allowed() -> bool:
-    return os.environ.get(ALLOW_NETWORK_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+def block_real_llm_clients() -> None:
+    """Fail before SDK setup/retries, even for localhost model endpoints.
+
+    Transport/protocol tests must inject a fake SDK with mock.patch. There is
+    deliberately no environment escape hatch in the regression suite.
+    """
+    if getattr(block_real_llm_clients, "_installed", False):
+        return
+    try:
+        import openai
+    except ImportError:
+        return
+
+    def refused(*args, **kwargs):
+        raise AssertionError("real LLM SDK client blocked in regression tests; inject a fake client")
+
+    for name in ("OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI"):
+        cls = getattr(openai, name, None)
+        if isinstance(cls, type):
+            cls.__init__ = refused
+    block_real_llm_clients._installed = True
 
 
 def block_outbound_network() -> None:
@@ -117,7 +132,8 @@ def block_outbound_network() -> None:
     Applied at import of the shared test helpers. Local sockets (and child
     processes, which get their own interpreter) are unaffected.
     """
-    if _network_allowed() or getattr(block_outbound_network, "_installed", False):
+    block_real_llm_clients()
+    if getattr(block_outbound_network, "_installed", False):
         return
     block_outbound_network._installed = True  # type: ignore[attr-defined]
     real_connect = socket.socket.connect
@@ -132,7 +148,7 @@ def block_outbound_network() -> None:
         if not _local(address):
             raise RuntimeError(
                 f"outbound network blocked in tests (tried {address!r}); "
-                f"patch the LLM client or set {ALLOW_NETWORK_ENV}=1 intentionally"
+                "inject a fake LLM client; regression tests never permit real model calls"
             )
         return real_connect(self, address)
 

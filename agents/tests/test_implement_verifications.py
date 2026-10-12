@@ -238,7 +238,7 @@ class StageWiringTest(unittest.TestCase):
         tool = self._tool(captured)
         session = captured["toolset_kwargs"]["conformance_session"]
         oracle = ("commands:\n  - name: compute\n    reference: a + b\n"
-                  "    cases:\n      - args: [1, 2]\n")
+                  "    data:\n      roles:\n        - kind: value\n          max: 255\n        - kind: value\n          max: 255\n")
         failure = {"returncode": 1,
                    "stderr_tail": "cfu_conformance.c:19:1: error: redefinition of 'md5_oracle_mem'"}
         with mock.patch.object(effects, "run_command", return_value=failure):
@@ -259,7 +259,7 @@ class StageWiringTest(unittest.TestCase):
         with mock.patch.object(effects, "run_command") as execute:
             delivery, problems = session.write(
                 "commands:\n  - name: not_a_command\n    reference: a + b\n"
-                "    cases:\n      - args: [1, 2]\n")
+                "    data:\n      roles:\n        - kind: value\n          max: 255\n        - kind: value\n          max: 255\n")
             self.assertEqual(delivery, {})
             self.assertTrue(problems)
             self.assertIn("not_a_command", " ".join(problems))
@@ -281,7 +281,7 @@ class StageWiringTest(unittest.TestCase):
             execute.assert_not_called()
             delivery, problems = session.write(
                 "commands:\n  - name: compute\n    reference: a + b\n"
-                "    cases:\n      - args: [1, 2]\n")
+                "    data:\n      roles:\n        - kind: value\n          max: 255\n        - kind: value\n          max: 255\n")
             self.assertEqual(problems, [])
             self.assertTrue(delivery["source_path"].endswith("cfu_conformance.c"))
             execute.assert_not_called()

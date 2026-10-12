@@ -145,12 +145,36 @@ class ObservationEvidenceTest(unittest.TestCase):
         toolbox = ReadOnlyToolbox({IR: self.ir_text})
         summary = inspect_observation(self.index(), toolbox, "obs_loop_crc")
         self.assertIn("cycles=125 calls=4", summary)
-        self.assertIn("ASM reference candidate: " + ASM + " — not inspected in this view", summary)
+        self.assertIn("ASM reference candidate: " + ASM + " — no reference disassembly", summary)
+        self.assertIn("Hot-spot ASM instruction counts: no reference disassembly", summary)
         self.assertIn("LLVM IR candidate: " + IR + " — not inspected in this view", summary)
-        self.assertEqual(toolbox.reads, [])
+        self.assertEqual([p for p, _ in toolbox.reads], [ASM])
+        toolbox.reads.clear()
         ir_view = inspect_observation(self.index(), toolbox, "obs_loop_crc", "ir")
         self.assertIn("2 candidate instruction", ir_view)
         self.assertEqual([p for p, _ in toolbox.reads], [IR])
+
+    def test_summary_counts_hotspot_riscv_mnemonics_per_function_candidate(self):
+        asm = (
+            "00000000 <crc_32>:\n"
+            "  00000000: 00550513 addi a0,a0,5\n"
+            "  00000004: 00052583 lw a1,0(a0)\n"
+            "  00000008: 00b52023 sw a1,0(a0)\n"
+            "  0000000c: fea594e3 bne a1,a0,0x0\n"
+            "  00000010: 00008067 ret\n"
+            "00000014 <crc_32.constprop.0>:\n"
+            "  00150513 addi a0,a0,1\n"
+            "  c.addi a0,1\n"
+            "0000001c <other>:\n"
+            "  add a0,a1,a2\n"
+        )
+        toolbox = ReadOnlyToolbox({ASM: asm})
+        summary = inspect_observation(self.index(), toolbox, "obs_loop_crc")
+        self.assertIn("crc_32: total=5 (addi=1, bne=1, lw=1, ret=1, sw=1)", summary)
+        self.assertIn("crc_32.constprop.0: total=2 (addi=1, c.addi=1)", summary)
+        self.assertNotIn("other:", summary)
+        self.assertIn("not exact loop addresses", summary)
+        self.assertEqual([p for p, _ in toolbox.reads], [ASM])
 
     def test_asm_clone_ambiguity_no_loop_address_and_physical_lines(self):
         output = inspect_observation(self.index(), ReadOnlyToolbox({ASM: self.asm_text}),
@@ -250,9 +274,10 @@ class ObservationEvidenceTest(unittest.TestCase):
             def read_text(self, path, *, limit):
                 raise PolicyError("analysis read forbidden")
 
-        with self.assertRaisesRegex(PolicyError, "read forbidden"):
-            inspect_observation(self.index(), Denied(), "obs_loop_crc", "asm")
-        self.assertEqual(inspect_observation(self.index(), Denied(), "obs_loop_crc").splitlines()[0],
+        for view in ("asm", "summary", "ir"):
+            with self.subTest(view=view), self.assertRaisesRegex(PolicyError, "read forbidden"):
+                inspect_observation(self.index(), Denied(), "obs_loop_crc", view)
+        self.assertEqual(inspect_observation(self.index(), Denied(), "obs_loop_crc", "features").splitlines()[0],
                          "Observation obs_loop_crc: loop crc_32.c:12 function=crc_32 ordinal=1")
 
     def test_ir_views_and_lines_removed_under_ablation(self):

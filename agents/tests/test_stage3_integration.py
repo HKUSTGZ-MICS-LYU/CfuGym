@@ -94,8 +94,10 @@ class Stage3IntegrationTest(unittest.TestCase):
             dest = self.root / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content)
-        self.oracle = json.dumps({"commands": [{"name": "compute", "reference": "a + b",
-                                               "cases": [{"args": [1, 2]}]}]})
+        self.oracle = json.dumps({"commands": [
+            {"name": "compute", "reference": "a + b",
+             "data": {"roles": [{"kind": "value", "max": 255},
+                                {"kind": "value", "max": 255}]}}]})
         self.state = {
             "workdir": str(self.root), "run_id": "disposable-stage3", "run_root": self.run_root,
             "task": "accelerate", "isa_spec": isa(CPU_COMMAND), "isa_spec_text": "accepted ISA",
@@ -172,8 +174,10 @@ class Stage3IntegrationTest(unittest.TestCase):
                      mock.patch.object(checks, "_run_check", return_value={
                          "returncode": 1, "stderr_tail": "error: first internal failure"}), \
                      mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-                    with self.assertRaisesRegex(RuntimeError, f"no {missing_domain} target was edited"):
-                        unified.implement_stage3(self.state)
+                    update = unified.implement_stage3(self.state)
+                    self.assertFalse(update["gates"]["implementation_hw"]["ok"])
+                    self.assertFalse(update["gates"]["implementation_sw"]["ok"])
+                    self.assertIn(f"no {missing_domain} target was edited", " ".join(update["errors"]))
                 self.assertEqual(client.turns, [])
                 self.assertIn("inspect_failure", client.seen[0])
                 self.assertEqual((self.root / self.hw).read_text(), "class AgentCfu {}\n")
@@ -302,7 +306,7 @@ class Stage3IntegrationTest(unittest.TestCase):
         state, diagnosis = self._hardware_repair_state()
         before = self._conformance_bytes()
         revised = json.loads(self.oracle)
-        revised["commands"][0]["cases"].append({"args": [3, 4]})
+        revised["commands"][0]["data"]["count"] = 8
         turns = self._hardware_repair_turns(diagnosis)
         turns.insert(1, ("write_conformance", {"oracle": json.dumps(revised)}))
         client = _RoundClient(turns)
@@ -318,6 +322,38 @@ class Stage3IntegrationTest(unittest.TestCase):
             conformance.render_conformance(state["isa_spec"], revised),
         )
 
+    def test_repair_round_cannot_submit_without_a_diagnosis(self):
+        """The oracle may be staged first; the repair still has to justify itself.
+
+        Regression class (run 20261005-073745): the already-correct oracle was
+        refused because the diagnosis had not been filed yet, so the round was
+        spent on tool ordering. Staging is allowed now, but the stage gate keeps
+        the hard requirement.
+        """
+        state, _diagnosis = self._hardware_repair_state()
+        state["validation_results"] = [{
+            "rung": "hw_build", "returncode": 1, "command": "sbt GenAgentCfu",
+            "stderr_tail": "WIDTH MISMATCH",
+            "failure_observation": observations.build_failure_observation(
+                "hw_build", {"returncode": 1}, stderr="WIDTH MISMATCH"),
+        }]
+        before = self._conformance_bytes()
+        revised = json.loads(self.oracle)
+        revised["commands"][0]["data"]["count"] = 8
+        client = _RoundClient([
+            ("write_conformance", {"oracle": json.dumps(revised)}),
+            ("submit_stage", {"delivery": "revised oracle; no diagnosis filed"}),
+            ("submit_stage", {"delivery": "still no diagnosis"}),
+        ])
+        with mock.patch.object(llm_step, "_llm", return_value=client), \
+             mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
+             mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
+            update = unified.implement_stage3(state)
+            self.assertFalse(update["gates"]["implementation_hw"]["ok"])
+            self.assertIn("submit_repair_diagnosis", " ".join(update["errors"]))
+        self.assertEqual(client.turns, [])
+        self.assertEqual(self._conformance_bytes(), before)
+
     def test_oracle_only_repair_reuses_healthy_hw_and_sw_without_dummy_edits(self):
         state, diagnosis = self._hardware_repair_state()
         state["repair_scope"] = "conformance"
@@ -330,7 +366,7 @@ class Stage3IntegrationTest(unittest.TestCase):
                      "repair_mapping": ["add a bounded independent oracle case"]}
         before = {path: (self.root / path).read_bytes() for path in (self.hw, self.sw)}
         revised = json.loads(self.oracle)
-        revised["commands"][0]["cases"].append({"args": [3, 4]})
+        revised["commands"][0]["data"]["count"] = 8
         client = _RoundClient([
             ("submit_repair_diagnosis", diagnosis),
             ("write_conformance", {"oracle": json.dumps(revised)}),
@@ -367,8 +403,9 @@ class Stage3IntegrationTest(unittest.TestCase):
                 ])
                 with mock.patch.object(llm_step, "_llm", return_value=client), \
                      mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-                    with self.assertRaisesRegex(RuntimeError, "no software target was edited"):
-                        unified.implement_stage3(state)
+                    update = unified.implement_stage3(state)
+                    self.assertFalse(update["gates"]["implementation_sw"]["ok"])
+                    self.assertIn("no software target was edited", " ".join(update["errors"]))
                 self.assertEqual(client.turns, [])
                 self.assertEqual((self.root / self.sw).read_bytes(), original_sw)
                 self.assertEqual((self.root / self.hw).read_text(), "class AgentCfu {}\n")
@@ -383,8 +420,9 @@ class Stage3IntegrationTest(unittest.TestCase):
                 ])
                 with mock.patch.object(llm_step, "_llm", return_value=client), \
                      mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-                    with self.assertRaisesRegex(RuntimeError, "does not exercise the CFU"):
-                        unified.implement_stage3(state)
+                    update = unified.implement_stage3(state)
+                    self.assertFalse(update["gates"]["implementation_sw"]["ok"])
+                    self.assertIn("does not exercise the CFU", " ".join(update["errors"]))
                 self.assertEqual((self.root / self.sw).read_text(), software)
                 self.assertEqual((self.root / self.hw).read_text(), "class AgentCfu {}\n")
 
@@ -421,8 +459,10 @@ class Stage3IntegrationTest(unittest.TestCase):
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(False, "no intrinsic")), \
              mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            with self.assertRaisesRegex(RuntimeError, "gate rejected"):
-                unified.implement_stage3(self.state)
+            update = unified.implement_stage3(self.state)
+            self.assertFalse(update["gates"]["implementation_hw"]["ok"])
+            self.assertFalse(update["gates"]["implementation_sw"]["ok"])
+            self.assertIn("gate rejected", " ".join(update["errors"]))
         self.assertEqual((self.root / self.hw).read_text(), "class AgentCfu {}\n")
         self.assertEqual((self.root / self.sw).read_text(), "int kernel(void) { return 1; }\n")
         self.assertTrue(all(data is None for data in self._conformance_bytes().values()))
@@ -544,8 +584,9 @@ class Stage3IntegrationTest(unittest.TestCase):
              mock.patch.object(unified.ImplementationToolset, "grant_correction",
                                autospec=True) as grant, \
              mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            with self.assertRaisesRegex(RuntimeError, "no hardware target was edited"):
-                unified.implement_stage3(self.state)
+            update = unified.implement_stage3(self.state)
+            self.assertFalse(update["gates"]["implementation_hw"]["ok"])
+            self.assertIn("no hardware target was edited", " ".join(update["errors"]))
         self.assertEqual(grant.call_count, 2)
 
     def test_a_cfu_usage_rejection_is_answerable_in_the_corrective_round(self):
@@ -590,8 +631,9 @@ class Stage3IntegrationTest(unittest.TestCase):
         ])
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            with self.assertRaisesRegex(RuntimeError, "no hardware target was edited"):
-                unified.implement_stage3(self.state)
+            update = unified.implement_stage3(self.state)
+            self.assertFalse(update["gates"]["implementation_hw"]["ok"])
+            self.assertIn("no hardware target was edited", " ".join(update["errors"]))
         self.assertEqual((self.root / self.hw).read_text(), "class AgentCfu {}\n")
 
 

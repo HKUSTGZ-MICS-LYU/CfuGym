@@ -89,6 +89,14 @@ def _route_after_prepare(state: CfuDesignState) -> str:
     return str(gate.get("next") or "review_and_route")
 
 
+def _route_after_profile(state: CfuDesignState) -> str:
+    """Executed preconditions fail closed; explicit planning remains advisory."""
+    gate = (state.get("gates") or {}).get("profile") or {}
+    if gate and not gate.get("ok") and not gate.get("skipped"):
+        return "review_and_route"
+    return "extract_hotspot"
+
+
 def _route_after_review(state: CfuDesignState) -> str:
     return gates._rung_next(state, "review", "final_report")
 
@@ -120,6 +128,8 @@ def _delivery_retry_transition(
         "delivery_retries": retries + 1,
         "iteration": int(state.get("iteration", 0) or 0) + 1,
         "stage_jobs": target,
+        "repair_entry": {"kind": "delivery", "target": target,
+                         "iteration": int(state.get("iteration", 0) or 0) + 1, "route_used": False},
         "errors": [note],
         "iteration_history": state_mod.append_history(state, note),
     }, target
@@ -167,6 +177,8 @@ def _ladder_transition(
             "iteration": int(state.get("iteration", 0) or 0) + 1,
             "last_repair_target": target,
             "stage_jobs": target,
+            "repair_entry": {"kind": "answer" if answer_repair else "design", "target": target,
+                             "iteration": int(state.get("iteration", 0) or 0) + 1, "route_used": False},
             "errors": [note],
             "iteration_history": state_mod.append_history(state, note),
         }, target
@@ -203,6 +215,60 @@ def _route_after_analysis(state: CfuDesignState) -> str:
 
 def _route_after_isa(state: CfuDesignState) -> str:
     return gates._rung_next(state, "isa", "implement")
+
+
+def _route_after_implement(state: CfuDesignState) -> str:
+    return gates._rung_next(state, "implementation_route", "generate_soc")
+
+
+def repair_route_transition(state: CfuDesignState, route: dict) -> dict:
+    """One bounded upstream rewind; never use the answer-retry pool for routing."""
+    target = {"analysis": "analyze_workload", "contract": "design_contract"}.get(route.get("target"))
+    if target is None:
+        raise ValueError("only analysis/contract cause an upstream rewind")
+    entry = state.get("repair_entry") or {}
+    paid_entry = (entry.get("kind") == "design" and entry.get("target") == "implement"
+                  and entry.get("iteration") == int(state.get("iteration", 0) or 0)
+                  and not entry.get("route_used"))
+    if paid_entry:
+        note = f"Implementation repair selects {target} using its already-paid design-repair slot."
+        extra, next_node = {
+            "last_repair_target": target, "stage_jobs": target,
+            "iteration_history": state_mod.append_history(state, note),
+        }, target
+    else:
+        extra, next_node = _ladder_transition(
+            state, "implementation_route", ok=False, default="generate_soc",
+            repair_target=target, repair_kind="design")
+    update = {"repair_route": dict(route), **extra}
+    if next_node == target:
+        update["repair_entry"] = {"kind": "design", "target": target, "route_used": True,
+                                  "iteration": extra.get("iteration", state.get("iteration", 0))}
+        preserved = {"load_context", "workload_spec", "prepare_benchmark", "profile", "hotspot", "ir"}
+        if route["target"] == "contract":
+            preserved.add("analysis")
+        update.update({
+            "gates": {key: value for key, value in (state.get("gates") or {}).items()
+                      if key in preserved},
+            "isa_spec": {}, "isa_spec_text": "", "isa_spec_errors": [], "design_contract": "",
+            "isa_extension_base": {}, "isa_added_symbols": [], "conformance_delivery": {},
+            "hardware_plan": "", "software_plan": "", "hardware_patch": "", "software_patch": "",
+            "implementation_hw_summary": "", "implementation_sw_summary": "",
+            "changed_design_files": [], "changed_sw_files": [], "repair_scope": "",
+            "input_fingerprints": {}, "best_candidate": {}, "optimization_plan": {}, "delivered_round": 0,
+            "flow_memory": {}, "stopped_at": "",
+            "repair_evidence_epoch": {key: len(state.get(key) or [])
+                                      for key in ("validation_results", "cost_results", "hw_attempts",
+                                                  "sw_attempts", "conformance_attempts")},
+        })
+        if route["target"] == "analysis":
+            update["workload_analysis"] = ""
+    current = {**state, **update}
+    update["gates"] = outcome.gate(
+        current, "implementation_route", ok=False,
+        rewind=outcome.Rewind(next_node, route["reason"], tuple(route["failure_ids"])),
+        repair_target=route["target"], repair_diagnosis=route["diagnosis"], rolled_back=True)
+    return update
 
 
 def _route_after_hw_build(state: CfuDesignState) -> str:

@@ -24,7 +24,7 @@ from ...runtime import llm_step, observations, stage_services
 from ...state import CfuDesignState
 from . import conformance as oracle_author, delivery, hw as hardware, intrinsics, repair_scope, sw as software, unified
 
-from ...flow import outcome
+from ...flow import gates, ladder, outcome
 
 
 def implement(state: CfuDesignState) -> CfuDesignState:
@@ -34,10 +34,24 @@ def implement(state: CfuDesignState) -> CfuDesignState:
     without tools still has to be able to implement something, and a run with
     tools gets the free loop.
     """
+    # A previous rewind is historical, not this attempt's successor (including
+    # rejected deliveries). Removing it prevents a free replay of the old route.
+    if "implementation_route" in (state.get("gates") or {}):
+        state = {**state, "repair_route": {}, "gates": {
+            key: value for key, value in state["gates"].items() if key != "implementation_route"}}
+    # Legacy/prepared-source corruption is a host failure, not a model repair:
+    # refuse it before spending an implementation generation.
+    if ((state.get("benchmark_project") or {}).get("kind") == "embench_benchmark"
+            or (state.get("workload_spec") or {}).get("source_kind") == "embench"):
+        integrity_box = stage_services._toolbox_for_stage(state, "implementation")
+        integrity_problems = stage_services.benchmark_integrity_problems(integrity_box)
+        if integrity_problems:
+            raise ValueError("benchmark integrity: " + "; ".join(integrity_problems))
     client = llm_step._llm(state)
     if (llm_step._tools_enabled(state, client) and not state.get("dry_run")
             and state.get("apply_patch", False) and state.get("run_commands", False)):
-        return unified.implement_with_tools(state, client=client)
+        return _reattribute_conformance_round(
+            state, unified.implement_with_tools(state, client=client))
     # An outer transaction spans HW, SW, the host header, and fixed oracle/C;
     # per-source protocol atomicity alone cannot undo an accepted HW half when
     # the later SW/model/oracle delivery fails.
@@ -58,6 +72,8 @@ def implement(state: CfuDesignState) -> CfuDesignState:
                 need_sw = not exercises
         if need_hw:
             update = hardware.implement_hw({**state, "_implementation_domain": "hardware"})
+            if update.get("repair_route"):
+                return _rewind(state, update, transaction)
             if _rejected(update, "implementation_hw", state):
                 return _rollback(update, state, transaction)
         if need_sw:
@@ -66,18 +82,71 @@ def implement(state: CfuDesignState) -> CfuDesignState:
             current = outcome.merge_updates(state, update)
             sw_update = software.implement_sw({**current, "_implementation_domain": "software"})
             update = outcome.merge_updates(update, sw_update)
+            if sw_update.get("repair_route"):
+                return _rewind(state, update, transaction)
             if _rejected(sw_update, "implementation_sw", state):
+                return _rollback(update, state, transaction)
+        if toolbox is not None:
+            problems = stage_services.hardware_integrity_problems(state, toolbox)
+            if problems:
+                note = "hardware integrity: " + "; ".join(problems)
+                current = outcome.merge_updates(state, update)
+                update = outcome.merge_updates(update, {
+                    "errors": [note], "gates": outcome.gates(current, {
+                        "implementation_hw": {"ok": False, "applied": False, "errors": [note]},
+                    }),
+                })
                 return _rollback(update, state, transaction)
         if state.get("require_conformance", True):
             oracle_update = oracle_author.write_conformance(outcome.merge_updates(state, update))
             update = outcome.merge_updates(update, oracle_update)
             if oracle_update.get("errors"):
                 return _rollback(update, state, transaction)
-        return update
+        return _reattribute_conformance_round(state, update)
     except Exception:
         if transaction is not None:
             transaction.rollback()
         raise
+
+
+def _rewind(state, update, transaction):
+    if transaction is not None:
+        transaction.rollback()
+    transition = ladder.repair_route_transition(state, update["repair_route"])
+    return {**update, **transition}
+
+
+def _reattribute_conformance_round(state: CfuDesignState, update: dict) -> dict:
+    """Charge an oracle-only conformance round to the answer budget.
+
+    A conformance-scope round is entered before anyone knows which side is
+    wrong, so the ladder charges it to the design budget. When the delivered
+    change revised only the oracle, the round was answer work: refund the design
+    slot and charge the separate answer pool instead. Bounded by that pool, so
+    oracle churn never buys unbounded free rounds. Both implement modes funnel
+    through this one place, so they cannot disagree about what the round cost.
+    """
+    if state.get("repair_scope") != "conformance":
+        return update
+    if update.get("changed_design_files") or update.get("changed_sw_files"):
+        return update
+    if not update.get("conformance_delivery"):
+        return update
+    delivered = update.get("conformance_delivery") or {}
+    approved = state.get("conformance_delivery") or {}
+    if delivered.get("oracle_sha") == approved.get("oracle_sha"):
+        return update
+    used = int(state.get("answer_repairs_used", 0) or 0)
+    if used >= gates.answer_repairs_max(state):
+        return update
+    update = dict(update)
+    update["repairs_used"] = max(0, int(state.get("repairs_used", 0) or 0) - 1)
+    update["answer_repairs_used"] = used + 1
+    update["iteration_history"] = [
+        *(update.get("iteration_history") or []),
+        "Oracle-only repair charged to the answer-repair budget, not the design budget.",
+    ]
+    return update
 
 
 def _rejected(update, rung, state):

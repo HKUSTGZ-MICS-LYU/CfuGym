@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import tempfile
 import unittest
+from unittest import mock
 
 from agents.cfu_design_agent import cli
+from agents.cfu_design_agent.benchmark import embench
+from agents.cfu_design_agent.stages.review import report as report_mod
 from agents.cfu_design_agent.runtime.llm import (
     DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     DEFAULT_MAX_TOOL_ROUNDS, LlmResult,
@@ -239,6 +243,59 @@ class RunSummaryTest(unittest.TestCase):
             }
         )
         self.assertIn("profile_cache = hit (key 96b5fabf72de)", text)
+
+
+class MeasurementSummaryTest(unittest.TestCase):
+    """CLI and report use the same scope and integrity wording, no run execution."""
+
+    def _state(self, **sim) -> dict:
+        return {
+            "benchmark_name": "crc32",
+            "benchmark_project": {
+                "kind": "embench_benchmark",
+                "measurement": {"protocol": "cold_single_invocation_v1", "warmup": False,
+                                "local_scale_factor": 1, "global_scale_factor": 1},
+                "integrity": {"version": 1, "protected": ["benchmark", "verify_benchmark"]},
+            },
+            "gates": {"sim": {"ok": True, "benchmark_integrity": {"version": 1, "ok": True, "problems": []}, **sim}},
+        }
+
+    def test_cli_describes_cold_scope_and_separate_integrity_verdict(self) -> None:
+        with mock.patch.object(embench, "MEASUREMENT_PROTOCOL", "cold_single_invocation_v1", create=True):
+            text = RunSummaryTest()._capture(self._state())
+        for expected in ("measurement_protocol: cold_single_invocation_v1", "cold single invocation",
+                         "no warmup", "local_scale_factor=1", "global_scale_factor=1",
+                         "original preparation, memory and CFU configuration", "not pure math-kernel latency",
+                         "integrity gate status: pass", "not proof of true operation equivalence",
+                         "new and legacy Embench measurements are not comparable"):
+            self.assertIn(expected, text)
+
+    def test_report_keeps_guard_metadata_and_failed_integrity_distinct_from_sim(self) -> None:
+        state = self._state(benchmark_integrity={"version": 1, "ok": False, "problems": ["wrapper changed"]})
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(embench, "MEASUREMENT_PROTOCOL", "cold_single_invocation_v1", create=True):
+            state["run_root"] = tmp
+            text = report_mod.render_report(state)
+        self.assertIn("## Embench Measurement and Integrity", text)
+        self.assertIn("integrity gate status: FAIL", text)
+        self.assertIn("wrapper changed", text)
+        self.assertIn("integrity guard metadata:", text)
+        self.assertIn("not pure math-kernel latency", text)
+        self.assertIn("arbitrary semantic anti-cheat guarantee", text)
+
+    def test_legacy_summary_never_assumes_the_current_default(self) -> None:
+        state = {"benchmark_name": "crc32", "gates": {"sim": {"ok": True}}}
+        with mock.patch.object(embench, "MEASUREMENT_PROTOCOL", "cold_single_invocation_v1", create=True):
+            text = RunSummaryTest()._capture(state)
+        self.assertIn("measurement_protocol: legacy", text)
+        self.assertIn("protocol evidence absent", text)
+        self.assertIn("start a new run", text)
+        self.assertIn("integrity gate status: not recorded", text)
+        self.assertNotIn("integrity gate status: pass", text)
+        self.assertNotIn("measurement: cold single invocation", text)
+
+    def test_generic_workload_has_no_embench_protocol_claim(self) -> None:
+        self.assertEqual(report_mod.measurement_lines({"benchmark_project": {"kind": "c_project"}}), [])
 
 
 class StreamFlagTest(unittest.TestCase):

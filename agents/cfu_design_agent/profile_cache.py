@@ -27,7 +27,7 @@ from typing import Any
 CACHE_SUBDIR = "agents/generated/cache/embench_profile"
 SCHEMA_VERSION = "1"
 # Bump when the key composition changes so old entries cannot be reused.
-KEY_VERSION = "6"  # entries now also carry the reference disassembly (asm evidence)
+KEY_VERSION = "7"  # measurement protocol is explicit; old measurements cannot be reused
 # The reference build's disassembly, stored beside the entry under the same key:
 # a reused measurement has no build outputs of its own, and the analysis reads
 # this file as the ASM candidate for a measured loop.
@@ -160,10 +160,20 @@ def build_key(
     build_commands: dict[str, list[str]],
     cpu_flags: list[str],
     observation_plan: Any,
+    measurement_protocol: str | None = None,
 ) -> dict[str, Any]:
-    """Return ``{"key": <sha256>, "inputs": <auditable breakdown>}``."""
+    """Return ``{"key": <sha256>, "inputs": <auditable breakdown>}``.
+
+    Existing callers use the current Embench protocol; callers hashing older
+    evidence can supply its protocol explicitly without changing the API.
+    """
+    if measurement_protocol is None:
+        from .benchmark import embench
+
+        measurement_protocol = embench.MEASUREMENT_PROTOCOL
     inputs: dict[str, Any] = {
         "key_version": KEY_VERSION,
+        "measurement_protocol": measurement_protocol,
         "benchmark": benchmark,
         "configs": list(configs),
         # Normalized: the run root is a placeholder, so two runs of the same
@@ -179,6 +189,7 @@ def build_key(
             name: tree_hash(workdir / name) for name in (
                 "agents/cfu_design_agent/benchmark/generic.py",
                 "agents/cfu_design_agent/benchmark/embench.py",
+                "agents/cfu_design_agent/benchmark/cfu_execution.py",
                 "agents/cfu_design_agent/benchmark/embench_instrument.py",
                 "agents/cfu_design_agent/benchmark/embench_loops.py",
                 "sw/embench/boardsupport.c",

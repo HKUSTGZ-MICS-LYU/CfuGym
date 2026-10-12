@@ -44,7 +44,7 @@ def load_context(state: CfuDesignState) -> CfuDesignState:
             continue
         artifact_path = f"01_context/excerpt/{path.replace('/', '__')}.txt"
         try:
-            text = toolbox.read_text(path, limit=20000)
+            text = stage_services.model_source_text(toolbox, path, limit=20000)
         except PolicyError as exc:
             denied.append(f"{path}: {exc}")
             continue

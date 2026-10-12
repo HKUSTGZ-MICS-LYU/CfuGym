@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ...benchmark import embench
+from ...benchmark import cfu_execution, embench
 from ...flow import gates, ladder, outcome
 from ...flow.gates import MIN_EMBENCH_SPEEDUP_X100
-from ...runtime import effects, commands as commands_mod, stage_services
+from ...runtime import effects, commands as commands_mod, observations, provenance, software_encoding, stage_services
 from ...runtime.policy import PolicyError
 from ...stages import feedback
 from ...stages.implement import intrinsics
@@ -32,7 +32,9 @@ def build_sw(state: CfuDesignState) -> CfuDesignState:
     toolbox = stage_services._toolbox_for_stage(state, "validation")
     commands = commands_mod._software_build_commands(state, toolbox)
     results: list[dict] = []
-    errors: list[str] = []
+    measurement = dict((state.get("benchmark_project") or {}).get("measurement") or {})
+    integrity_errors = stage_services.benchmark_integrity_problems(toolbox)
+    errors: list[str] = list(integrity_errors)
     impl_gate = gates._rung_gate(state, "implementation_sw")
     if not impl_gate or not impl_gate.get("ok", False):
         # Fail closed: without an explicit successful implementation gate, a
@@ -43,7 +45,7 @@ def build_sw(state: CfuDesignState) -> CfuDesignState:
     else:
         if not commands:
             errors.append("no software build command is available for this workload")
-        for command in commands:
+        for command in (commands if not errors else []):
             result = effects.run_command(
                 state,
                 toolbox,
@@ -71,9 +73,26 @@ def build_sw(state: CfuDesignState) -> CfuDesignState:
     if not errors and elf and not (Path(state.get("workdir", ".")).resolve() / elf).is_file():
         errors.append(f"software build produced no ELF at {elf}")
 
+    encoding_evidence = (software_encoding.compiled_evidence(state, toolbox)
+                         if not errors and (state.get("isa_spec") or {}).get("commands") else {})
+    errors.extend(encoding_evidence.get("problems") or [])
+    integrity_errors = sorted(set(integrity_errors + stage_services.benchmark_integrity_problems(toolbox)))
+    errors.extend(problem for problem in integrity_errors if problem not in errors)
+    integrity_evidence = {"version": 1, "ok": not integrity_errors, "problems": integrity_errors}
+    measurement_evidence = ({"measurement": measurement,
+        "measurement_protocol": measurement.get("protocol", "legacy"),
+        "benchmark_integrity": integrity_evidence}
+        if (state.get("benchmark_project") or {}).get("kind") == "embench_benchmark" else {})
     ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
+    if encoding_evidence:
+        measurement_evidence["instruction_encoding"] = encoding_evidence
+        if encoding_evidence.get("problems"):
+            measurement_evidence["terminal_reason"] = "instruction_encoding"
+            results.append(stage_services.gate_failure_result(state, rung, "instruction_encoding",
+                encoding_evidence["problems"], category="instruction_encoding"))
     reused = bool(impl_gate.get("reused"))
-    stage_services._write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
+    stage_services._write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "",
+        evidence=measurement_evidence)
     retry = ladder._delivery_retry_transition(
         state, rung, "implement", ok,
         rejection=not (impl_gate and impl_gate.get("ok", False)),
@@ -93,12 +112,107 @@ def build_sw(state: CfuDesignState) -> CfuDesignState:
             state, rung=rung, ok=ok, skipped=False, next=next_node,
             commands=len(results), elf=elf, software_reused=reused,
             candidate_hash=candidate_hash,
+            **measurement_evidence,
             history="Compiled the reused software unchanged."
             if reused
             else "Compiled the accelerated software.",
         ),
     }
     return ladder._apply_transition(update, extra)
+
+
+def _cycle_count(value) -> int | None:
+    """Absent/invalid timing is unknown, never a fabricated zero measurement."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return count if not isinstance(value, bool) and count > 0 and count == value else None
+
+
+def _simulation_outcome(*, results: list[dict], name: str, reference: dict,
+                        profile: dict, verification: str, changed: bool,
+                        integrity_errors: list[str], cfu_status_expected: bool = False) -> dict:
+    """Current attempt only: execution/timing, correctness, then performance.
+
+    Old verify-only benchmarks are supported when *both* observable values are
+    absent. Once either side records a value, the other side must record it too.
+    """
+    ref_cycles = _cycle_count(reference.get("cycles"))
+    cfu_cycles = _cycle_count(profile.get("cycles"))
+    ref_result, cfu_result = reference.get("result"), profile.get("result")
+    verifies = [(r.get("parsed") or {}).get("verify") or {} for r in results]
+    categories = []
+    for result in results:
+        text = "\n".join(str(result.get(k) or "") for k in ("stdout_tail", "stderr_tail"))
+        category = str((result.get("failure_observation") or {}).get("category") or "")
+        if not category and (result.get("returncode") != 0 or result.get("timed_out")):
+            category = observations.classify_failure("sim", result, text)
+        categories.append(category)
+    status_evidence = cfu_execution.status_evidence(results, name, expected=cfu_status_expected)
+    verify_failed = (any(v.get("status") == "fail" for v in verifies)
+                     or profile.get("verify") == 0 or "fail_symbol" in categories)
+    verify_passed = (any(v.get("status") == "pass" and v.get("benchmark", name) == name
+                         for v in verifies) or profile.get("verify") == 1)
+    execution_reason = next((c for c in ("timeout", "liveness_timeout", "assertion",
+        "sim_harness_crash", "environment", "policy") if c in categories), "")
+    if not execution_reason and status_evidence.get("reason"):
+        execution_reason = status_evidence["reason"]
+    if not execution_reason and (not results or any(
+            r.get("returncode") != 0 and not (c == "fail_symbol" or verify_failed)
+            for r, c in zip(results, categories))):
+        execution_reason = "execution_error"
+    mismatch = ref_result is not None and cfu_result is not None and ref_result != cfu_result
+    missing_result = (ref_result is None) != (cfu_result is None)
+    correctness_ok = (not execution_reason and verification == "bench_verify"
+                      and verify_passed and not verify_failed and not mismatch
+                      and not missing_result and reference.get("verify", 1) == 1)
+    timing_ok = ref_cycles is not None and cfu_cycles is not None
+    performance_valid = bool(correctness_ok and timing_ok and changed and not integrity_errors)
+    speedup = ref_cycles * 100 // cfu_cycles if performance_valid else None
+    issues = []
+    if integrity_errors:
+        issues.append(("benchmark_integrity", "benchmark integrity validation failed"))
+    if execution_reason:
+        issues.append((execution_reason, status_evidence.get("error") or
+                       f"simulation execution failed ({execution_reason})"))
+    if verify_failed:
+        issues.append(("verify_failed", "Embench verify failed: the accelerated kernel produced a wrong result"))
+    if mismatch:
+        issues.append(("result_mismatch", f"the CFU build computed result={cfu_result} but the reference run computed "
+                       f"result={ref_result}: the accelerated kernel changes the benchmark's observable result"))
+    if not timing_ok:
+        issues.append(("no_timing", "no valid reference/CFU cycle count is available; acceleration cannot be verified"))
+    if missing_result:
+        issues.append(("result_missing", "reference/CFU observable result is missing on one side; correctness cannot be claimed"))
+    if verification != "bench_verify" or not verify_passed or reference.get("verify", 1) != 1:
+        issues.append(("no_verification", "benchmark provides no passing verification oracle; correctness cannot be claimed"))
+    if not changed:
+        issues.append(("no_design_change", "no design change was applied; the cfu build equals the reference configuration"))
+    if performance_valid and speedup < MIN_EMBENCH_SPEEDUP_X100:
+        issues.append(("speedup_floor", f"the CFU build is not meaningfully faster than the reference "
+                       f"({cfu_cycles} vs {ref_cycles} cycles, {speedup / 100:.2f}x); "
+                       "reverting to scalar inside the CFU build is not acceleration"))
+    return {"terminal_reason": issues[0][0] if issues else "passed",
+            "correctness_ok": bool(correctness_ok), "timing_ok": timing_ok,
+            "performance_valid": performance_valid, "reference_cycles": ref_cycles,
+            "cfu_cycles": cfu_cycles, "speedup_x100": speedup,
+            "reference_result": ref_result, "cfu_result": cfu_result,
+            "min_speedup_x100": MIN_EMBENCH_SPEEDUP_X100,
+            "cfu_execution": status_evidence,
+            "errors": [message for _, message in issues]}
+
+
+def _semantic_failure_result(state: CfuDesignState, evidence: dict, results: list[dict]) -> dict:
+    """An inspectable host verdict, explicitly not an external command exit."""
+    category = str(evidence["terminal_reason"])
+    check = stage_services.gate_failure_result(state, "sim", category,
+                                               evidence["errors"], category=category)
+    check["executed"] = False
+    check["source_log_paths"] = [str(r.get("full_log_path") or r.get("log_path"))
+                               for r in results if r.get("full_log_path") or r.get("log_path")]
+    check["parsed"] = {"sim_outcome": dict(evidence)}
+    return check
 
 
 def simulate(state: CfuDesignState) -> CfuDesignState:
@@ -124,12 +238,17 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
     is_embench = str(project.get("kind", "")) == "embench_benchmark"
     commands = commands_mod._software_sim_commands(state, toolbox)
     results: list[dict] = []
-    errors: list[str] = []
+    measurement = dict((state.get("benchmark_project") or {}).get("measurement") or {})
+    integrity_errors = stage_services.benchmark_integrity_problems(toolbox)
+    if is_embench:
+        tamper_workdir = getattr(toolbox, "workdir", None) or Path(state.get("workdir", "."))
+        integrity_errors.extend(embench.workspace_tampering(tamper_workdir, run_root, name))
+    errors: list[str] = list(integrity_errors)
     sim_text = ""
 
     if not commands:
         errors.append("no simulation command is available for this workload")
-    for command in commands:
+    for command in (commands if not errors else []):
         result = effects.run_command(
             state,
             toolbox,
@@ -143,66 +262,51 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
             break
 
     reference = state.get("embench_profiles", {}).get("reference", {})
-    ref_cycles = int(reference.get(name, {}).get("cycles", 0) or 0) if is_embench else 0
-    cfu_cycles = 0
-    speedup_x100 = 0
     verification = str(project.get("verification", "none"))
-
+    sim_evidence: dict = {}
     if is_embench:
-        # The correctness oracle and the cycle measurement live in the model's
-        # writable workspace copy: refuse results whose harness files differ
-        # from the untouched reference copy (hard-coded expected results or a
-        # faked rdcycle must never pass the gate). Test doubles without a real
-        # workdir simply skip the check (no reference copy exists there).
-        tamper_workdir = getattr(toolbox, "workdir", None) or Path(state.get("workdir", "."))
-        for problem in embench.workspace_tampering(tamper_workdir, run_root, name):
-            errors.append(problem)
         cfu_profile = (
             ((results[-1].get("parsed") or {}).get("embench_profile") if results else None)
             or embench.parse_profile(sim_text)
         )
-        cfu_cycles = int(cfu_profile.get(name, {}).get("cycles", 0) or 0)
-        speedup_x100 = (ref_cycles * 100 // cfu_cycles) if cfu_cycles else 0
-        if not cfu_profile:
-            errors.append("simulation produced no CFU profile; the accelerated kernel did not run")
-        if verification != "bench_verify":
-            errors.append("benchmark provides no verification oracle; correctness cannot be claimed")
-        # Harness-side independent check: the reference run and the cfu run must
-        # compute the same observable result value (parsed from the injected
-        # EMBENCH_VERIFY line, not from the model-writable verify_benchmark).
-        ref_result = (reference.get(name, {}) or {}).get("result")
-        cfu_result = (cfu_profile.get(name, {}) or {}).get("result")
-        if ref_result is not None and cfu_result is not None and int(ref_result) != int(cfu_result):
-            errors.append(
-                f"the CFU build computed result={cfu_result} but the reference run computed "
-                f"result={ref_result}: the accelerated kernel changes the benchmark's observable "
-                "result"
-            )
-        if not state.get("changed_design_files"):
-            # The cfu build is then identical to the reference configuration, so
-            # any speedup would come from the compiler, not the new CFU.
-            errors.append("no design change was applied; the cfu build equals the reference configuration")
-        if ref_cycles <= 0:
-            errors.append(
-                "no reference cycle count is available; acceleration cannot be verified"
-            )
-        elif cfu_cycles > 0 and speedup_x100 < MIN_EMBENCH_SPEEDUP_X100:
-            errors.append(
-                f"the CFU build is not meaningfully faster than the reference "
-                f"({cfu_cycles} vs {ref_cycles} cycles, {speedup_x100 / 100:.2f}x); "
-                "reverting to scalar inside the CFU build is not acceleration"
-            )
+        sim_evidence = _simulation_outcome(
+            results=results, name=name, reference=reference.get(name, {}) or {},
+            profile=cfu_profile.get(name, {}) or {}, verification=verification,
+            changed=bool(state.get("changed_design_files")), integrity_errors=integrity_errors,
+            cfu_status_expected=measurement.get("cfu_status_protocol") == cfu_execution.PROTOCOL,
+        )
+        errors.extend(sim_evidence["errors"])
     elif not state.get("changed_design_files"):
         # Without an applied design change the ELF exercises the scaffold, so
         # there is nothing to validate.
         errors.append("no design change was applied; the simulation runs the scaffold CFU")
 
+    integrity_errors = sorted(set(integrity_errors + stage_services.benchmark_integrity_problems(toolbox)))
+    errors.extend(problem for problem in integrity_errors if problem not in errors)
+    integrity_evidence = {"version": 1, "ok": not integrity_errors, "problems": integrity_errors}
+    measurement_evidence = ({"measurement": measurement,
+        "measurement_protocol": measurement.get("protocol", "legacy"),
+        "benchmark_integrity": integrity_evidence}
+        if (state.get("benchmark_project") or {}).get("kind") == "embench_benchmark" else {})
+    if is_embench:
+        measurement_evidence["performance_provenance"] = provenance.candidate_provenance(state)
     ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
-    # Attribute the failure from the log (verify code, fail symbol, timeout) so a
-    # repair prompt is not limited to "reached the fail symbol".
+    # Persist current terminal evidence, never the state's historical errors.
+    if is_embench and integrity_errors:
+        sim_evidence.update(terminal_reason="benchmark_integrity", performance_valid=False,
+                            speedup_x100=None)
     attribution = "" if ok else feedback.sim_attribution(results, sim_text)
-    if attribution:
+    if is_embench and not ok and sim_evidence.get("terminal_reason") != "speedup_floor":
+        attribution = sim_evidence["errors"][0] if sim_evidence["errors"] else attribution
+    if attribution and attribution not in errors:
         errors.append(attribution)
+    if is_embench:
+        sim_evidence["errors"] = list(errors)
+        sim_evidence["attribution"] = attribution
+        if not ok and all(r.get("returncode") == 0 for r in results):
+            check = _semantic_failure_result(state, sim_evidence, results)
+            results.append(check)
+            sim_evidence["failure_id"] = check["failure_observation"]["id"]
 
     if is_embench:
         artifacts = stage_services._artifacts_for_stage(state, "validation")
@@ -211,17 +315,18 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
             "10_validation/embench.yaml",
             {
                 "benchmark": name,
+                "measurement": measurement,
+                "measurement_protocol": measurement.get("protocol", "legacy"),
+                "benchmark_integrity": integrity_evidence,
                 "verification": verification,
-                "reference_cycles": ref_cycles,
-                "cfu_cycles": cfu_cycles,
-                "speedup_x100": speedup_x100,
-                "min_speedup_x100": MIN_EMBENCH_SPEEDUP_X100,
-                "attribution": attribution,
+                **measurement_evidence,
+                **sim_evidence,
                 "status": "passed" if ok else "failed",
             },
         )
 
-    stage_services._write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
+    stage_services._write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "",
+        evidence={**measurement_evidence, **sim_evidence})
 
     # One implementation stage owns both sides, so a failed simulation has a
     # single repair target: the agent decides inside the stage what to change.
@@ -238,8 +343,9 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
         **outcome.stage_result(
             state, rung=rung, ok=ok, skipped=False, next=next_node,
             round=int(state.get("optimization_round", 0) or 0),
-            reference_cycles=ref_cycles, cfu_cycles=cfu_cycles,
-            speedup_x100=speedup_x100, attribution=attribution,
+            **({**sim_evidence, **measurement_evidence} if is_embench else {
+                "reference_cycles": None, "cfu_cycles": None, "speedup_x100": None,
+                "attribution": attribution, "errors": errors}),
             history="Ran the SoC simulation.",
         ),
     }

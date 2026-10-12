@@ -94,6 +94,22 @@ class CodingSession:
             if not isinstance(item, dict) or item.get("status", "current") == "current"
         }
         resolved = set(failures) - known
+        # The model naturally cites the failing rung ("hw_conformance") rather
+        # than the opaque id the ledger minted for it. Expanding the rung name to
+        # its current failure ids keeps a correct diagnosis from bouncing on a
+        # naming technicality (run 20261005-073745 spent three rounds grepping
+        # for the id, and the rejection named an unrelated stale failure).
+        by_rung: dict[str, list[str]] = {}
+        for ident, item in failures.items():
+            rung = str(item.get("rung") or "") if isinstance(item, dict) else ""
+            if rung:
+                by_rung.setdefault(rung, []).append(ident)
+        expanded: list[str] = []
+        for ident in ids:
+            expanded.extend(sorted(by_rung[ident]) if ident in by_rung else [ident])
+        cited = list(dict.fromkeys(expanded))
+        unknown = [ident for ident in cited if ident not in known and ident not in resolved]
+        stale = [ident for ident in cited if ident in resolved]
         problems: list[str] = []
         if (
             not isinstance(observed, list)
@@ -115,18 +131,21 @@ class CodingSession:
             or any(not isinstance(item, str) or not item.strip() for item in risks)
         ):
             problems.append("regression_risks must be a non-empty array of non-empty strings (use 'none' explicitly)")
-        if known and (not ids or any(ident not in known for ident in ids)):
+        if (known and not cited) or unknown or stale:
             message = "failure_ids must cite only current failure IDs"
-            if resolved:
-                message += (
-                    "; these are already resolved and must not be re-fixed: "
-                    + ", ".join(sorted(resolved))
-                )
+            if known:
+                message += "; current failure IDs: " + ", ".join(sorted(known))
+            if unknown:
+                message += "; not a current failure ID (a rung name or the id itself is accepted): " \
+                           + ", ".join(unknown)
+            if stale:
+                message += "; these are already resolved and must not be re-fixed: " \
+                           + ", ".join(sorted(stale))
             problems.append(message)
         if problems:
             return "diagnosis rejected: " + "; ".join(problems)
         self.diagnosis = {
-            "failure_ids": ids,
+            "failure_ids": cited,
             "observed_errors": observed,
             "root_cause": root_cause,
             "repair_mapping": mapping,

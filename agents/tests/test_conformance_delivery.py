@@ -32,7 +32,8 @@ class ConformanceDeliveryTest(unittest.TestCase):
         self.paths = delivery_mod.delivery_paths(self.state)
         self.header = self.run + "/workspace/include/cfu_intrinsics.h"
         self.oracle = {"commands": [{"name": "add", "reference": "a + b",
-                                    "cases": [{"args": [1, 2]}]}]}
+                                    "data": {"roles": [{"kind": "value", "max": 255},
+                                                       {"kind": "value", "max": 255}]}}]}
         self.text = yaml.safe_dump(self.oracle)
 
     def session(self, **kwargs):
@@ -120,13 +121,19 @@ class ConformanceDeliveryTest(unittest.TestCase):
         frozen = self.session(editable=False)
         self.assertEqual(frozen.current()[1], [])
         self.assertIn("frozen", frozen.write(self.text)[1][0])
+        # A diagnosis-locked session may stage a revision, but it cannot apply it:
+        # the model can author the corrected oracle first and file the diagnosis
+        # afterwards instead of losing the round to tool ordering.
         locked = self.session(diagnosis_required=True)
         self.assertFalse(locked.unlocked)
-        self.assertIn("diagnosis", locked.write(self.text)[1][0])
-        self.assertEqual(self.bytes(), before)
+        self.assertEqual(locked.write(self.text)[1], [])
+        with self.assertRaisesRegex(ValueError, "diagnosis"):
+            locked.commit()
         locked.diagnosis = {"root_cause": "parent validated"}
         self.assertTrue(locked.unlocked)
         self.assertEqual(locked.write(self.text)[1], [])
+        locked.commit()
+        self.assertTrue(locked.committed)
 
     def test_source_tamper_cannot_be_approved_by_metadata_hash_alone(self):
         self.approved()
@@ -215,7 +222,7 @@ class ConformanceDeliveryTest(unittest.TestCase):
                 raise OSError("second write failed after mutation")
             return result
         revised = deepcopy(self.oracle)
-        revised["commands"][0]["cases"].append({"args": [3, 4]})
+        revised["commands"][0]["data"]["count"] = 8
         with mock.patch.object(self.toolbox, "write_text", side_effect=fail_source), self.assertRaises(OSError):
             session.write(yaml.safe_dump(revised))
         self.assertEqual(self.bytes(), before)

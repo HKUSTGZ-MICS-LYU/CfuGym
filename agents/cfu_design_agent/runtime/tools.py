@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from . import source_visibility
 from .persistence import RunPersistence
 from .policy import AccessPolicy, PolicyError, load_policy, normalize_repo_path
 from ..state import CommandResult, RepoContext
@@ -164,6 +165,9 @@ class RepoToolbox:
     embench_benchmark: str = ""
     run_root: str = ""
     apply_patch: bool = False
+    # Set by the host stage factory for prepared Embench runs. Direct synthetic
+    # tool fixtures remain independent of benchmark preparation.
+    enforce_embench_integrity: bool = False
 
     def __post_init__(self) -> None:
         self.workdir = self.workdir.resolve()
@@ -191,6 +195,14 @@ class RepoToolbox:
                 f"{RUN_DIR_TOKEN}/08_isa/cfu_isa.yaml"
             )
         return expanded
+
+    def benchmark_integrity_problems(self, candidates: dict[str, str] | None = None) -> list[str]:
+        """Host-owned check; never a model deliverable or a new tool capability."""
+        if not self.enforce_embench_integrity or self.dry_run:
+            return []
+        from ..benchmark import embench_integrity
+        return embench_integrity.validate_candidate(
+            self.workdir, self.run_root, self.embench_benchmark, candidates)
 
     def normalize(self, rel_path: str | Path) -> str:
         return normalize_repo_path(self.workdir, self.expand_run_dir(rel_path))
@@ -409,12 +421,40 @@ class RepoToolbox:
                 "redirected_paths": redirects,
             }
             return check
-        result = self.run_command(
-            ["git", "apply", "-", "--unsafe-paths"],
-            input_text=patch_text,
-            command_id="git_apply",
-            mutate=True,
-        )
+        snapshots = {
+            path: ((self.workdir / path).read_bytes() if (self.workdir / path).is_file() else None)
+            for path in normalized
+        } if self.enforce_embench_integrity else {}
+
+        def restore() -> None:
+            for path, content in snapshots.items():
+                if not self.is_current_run_path(path) or not self.is_write_allowed(path):
+                    raise PolicyError(f"patch rollback target is outside this run: {path}")
+                full = self.resolve(path)
+                if content is None:
+                    full.unlink(missing_ok=True)
+                else:
+                    full.write_bytes(content)
+
+        try:
+            result = self.run_command(
+                ["git", "apply", "-", "--unsafe-paths"],
+                input_text=patch_text,
+                command_id="git_apply",
+                mutate=True,
+            )
+            problems = self.benchmark_integrity_problems() if result.get("returncode") == 0 else []
+            if problems or result.get("returncode") != 0:
+                restore()
+                if problems:
+                    result = CommandResult(command="patch", cwd=str(self.workdir), returncode=1,
+                        stdout_tail="", stderr_tail="benchmark integrity: " + "; ".join(problems),
+                        parsed={})
+                result["parsed"] = {**result.get("parsed", {}), "touched_paths": [], "redirected_paths": []}
+                return result
+        except Exception:
+            restore()
+            raise
         result["parsed"] = {
             **result.get("parsed", {}),
             "touched_paths": normalized,
@@ -578,7 +618,7 @@ class RepoToolbox:
         try:
             with _tool_operation(self, "edit_files", ",".join(sorted(pending))):
                 self._commit_files(pending)
-        except OSError as exc:
+        except (PolicyError, OSError) as exc:
             return CommandResult(command="edit", cwd=str(self.workdir), returncode=1,
                                  stdout_tail="", stderr_tail=str(exc), parsed={"touched_paths": []})
         applied = list(pending)
@@ -595,7 +635,10 @@ class RepoToolbox:
         )
 
     def _commit_files(self, pending: dict[str, str]) -> None:
-        """Rollback on in-process I/O failure; not a crash-atomic transaction."""
+        """Check the complete candidate, then commit with in-process rollback."""
+        problems = self.benchmark_integrity_problems(pending)
+        if problems:
+            raise PolicyError("benchmark integrity: " + "; ".join(problems))
         before = {name: ((self.workdir / name).read_bytes() if (self.workdir / name).exists() else None)
                   for name in pending}
         attempted: list[str] = []
@@ -657,7 +700,9 @@ class RepoToolbox:
             policy=self.policy,
             stage=stage,
             run_root=self.run_root,
+            embench_benchmark=self.embench_benchmark,
             apply_patch=self.apply_patch,
+            enforce_embench_integrity=self.enforce_embench_integrity,
         )
 
     def copy_tree(self, src_rel: str, dst_rel: str) -> str:
@@ -1075,6 +1120,9 @@ def _describe_mismatch(content_lines: list[str], search_lines: list[str]) -> str
             "target content shown in the prompt and rebuild the edit from it."
         )
     search_no, content_no, expected, actual = located
+    visible = source_visibility.mask_verifier_bodies("\n".join(content_lines)).splitlines()
+    if 1 <= content_no <= len(visible):
+        actual = visible[content_no - 1]
     return (
         f"First difference: SEARCH line {search_no} of {len(search_lines)} vs current file "
         f"line {content_no}.\n"
@@ -1234,6 +1282,8 @@ def render_change_diff(before: str, after: str, rel_path: str) -> str:
     """Compact unified diff of one before -> after file change ("" when equal)."""
     if before == after:
         return ""
+    before = source_visibility.mask_verifier_bodies(before)
+    after = source_visibility.mask_verifier_bodies(after)
     return "".join(
         difflib.unified_diff(
             before.splitlines(keepends=True),
@@ -1259,6 +1309,10 @@ def cap_change_diffs(diff_text: str, max_chars: int = EDIT_DIFF_MAX_CHARS) -> st
 def parse_command_output(text: str) -> dict[str, object]:
     text = filter_output(text)
     parsed: dict[str, object] = {}
+    from ..benchmark import cfu_execution
+    status = cfu_execution.parse_status(text)
+    if status is not None:
+        parsed["cfu_status"] = status
     profiles: list[dict[str, object]] = []
     for match in PROFILE_RE.finditer(text):
         entry: dict[str, object] = {"name": match.group("name")}

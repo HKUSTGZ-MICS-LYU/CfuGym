@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ...benchmark import embench
 from ...flow import gates as gates_mod, optimize
-from ...runtime import llm
+from ...runtime import failures, llm, provenance, request_usage, stage_services
 from ...state import CfuDesignState
 
 
@@ -65,6 +66,58 @@ def ablation_lines(state: CfuDesignState) -> list[str]:
     return active
 
 
+def measurement_lines(state: CfuDesignState) -> list[str]:
+    """Auditable Embench timing scope, distinct from integrity/semantic evidence."""
+    project = state.get("benchmark_project") or {}
+    sim = (state.get("gates") or {}).get("sim") or {}
+    if not (project.get("kind") == "embench_benchmark" or state.get("benchmark_name")
+            or sim.get("measurement_protocol") or sim.get("measurement")):
+        return []
+    measurement = sim.get("measurement") or project.get("measurement") or {}
+    protocol = str(sim.get("measurement_protocol") or measurement.get("protocol") or "legacy")
+    lines = [f"- measurement_protocol: {protocol}"]
+    if sim.get("terminal_reason"):
+        view = provenance.performance_view(state) if state.get("run_root") else {}
+        current = view.get("current_performance") or {}
+        matched = not view or current.get("performance_valid") is True
+        label = "current simulation outcome" if matched else "last observed simulation outcome"
+        lines.append(f"- {label}: {sim['terminal_reason']}")
+        lines.append(f"- correctness_ok: {sim.get('correctness_ok') if matched else None}; timing_ok: {sim.get('timing_ok') if matched else None}; "
+                     f"performance_valid: {sim.get('performance_valid') if matched else False}")
+        if not matched or sim.get("performance_valid") is False:
+            lines.append("- speedup: unavailable (this attempt has no trustworthy valid performance result)")
+        if view and view.get("last_observed_valid_performance"):
+            lines.append(f"- last_observed_valid_performance: {view['last_observed_valid_performance']}")
+    if protocol == embench.MEASUREMENT_PROTOCOL:
+        lines.extend([
+            "- measurement: cold single invocation; no warmup; local_scale_factor=1; "
+            "global_scale_factor=1",
+            "- timing scope: includes original preparation, memory and CFU configuration; "
+            "not pure math-kernel latency",
+            "- comparability: new and legacy Embench measurements are not comparable",
+        ])
+    elif protocol == "legacy":
+        lines.append("- measurement: legacy (protocol evidence absent); not comparable with "
+                     "cold single invocation; start a new run rather than resume legacy evidence")
+    else:
+        lines.append("- measurement: recorded protocol differs from the current Embench default; "
+                     "do not combine measurements from different protocols")
+    if measurement:
+        lines.append(f"- measurement metadata: {measurement}")
+    integrity = sim.get("benchmark_integrity") or {}
+    if integrity:
+        status = "pass" if integrity.get("ok") is True else "FAIL" if integrity.get("ok") is False else "unknown"
+        lines.append(f"- integrity gate status: {status}")
+        lines.append(f"- integrity gate evidence: {integrity}")
+    else:
+        lines.append("- integrity gate status: not recorded (not inferred from sim success)")
+    if project.get("integrity"):
+        lines.append(f"- integrity guard metadata: {project['integrity']}")
+    lines.append("- integrity checks protect scaffold/oracle bytes; passing them is not proof of "
+                 "true operation equivalence or an arbitrary semantic anti-cheat guarantee")
+    return lines
+
+
 def render_report(state: CfuDesignState) -> str:
     lines: list[str] = [
         "# CFU Design Agent Report",
@@ -106,6 +159,13 @@ def render_report(state: CfuDesignState) -> str:
         lines.append("## Ablation")
         lines.extend(ablation)
         lines.append("")
+    if state.get("termination"):
+        lines.extend(["## Typed Termination", f"- termination: {state['termination']}", ""])
+    view = provenance.performance_view(state)
+    if state.get("run_root"):
+        lines.extend(["## Performance Provenance",
+                      f"- current_performance: {view['current_performance']}",
+                      f"- last_observed_valid_performance: {view['last_observed_valid_performance']}", ""])
     lines.append("## Gates")
     for key, value in (state.get("gates") or {}).items():
         lines.append(f"- {key}: {value}")
@@ -162,6 +222,11 @@ def render_report(state: CfuDesignState) -> str:
     lines.append("## Benchmark Project")
     lines.append(format_mapping(state.get("benchmark_project", {})))
     lines.append("")
+    measurement = measurement_lines(state)
+    if measurement:
+        lines.append("## Embench Measurement and Integrity")
+        lines.extend(measurement)
+        lines.append("")
     lines.append("## Profile Result")
     lines.append(format_mapping(state.get("profile_result", {})))
     lines.append("")
@@ -233,11 +298,23 @@ def render_report(state: CfuDesignState) -> str:
         lines.append("No LLM calls were recorded for this run.")
     lines.append("")
     lines.append("## Token Usage")
-    usage = llm.usage_totals()
+    usage = state.get("token_usage") or llm.usage_totals()
+    audit = state.get("request_usage") or {}
+    if not audit and state.get("run_root"):
+        audit = request_usage.load_request_usage(
+            Path(state.get("workdir", ".")) / state["run_root"] / "request_audit.jsonl")
+    if audit:
+        usage = {"calls": audit["calls"], "input": audit["input_tokens"],
+                 "output": audit["output_tokens"], "total": audit["total_tokens"]}
     lines.append(f"- llm_calls: {usage['calls']}")
-    lines.append(f"- input tokens: {usage['input']}")
-    lines.append(f"- output tokens: {usage['output']}")
-    lines.append(f"- total tokens: {usage['total']}")
+    lines.append(f"- input tokens: {usage['input'] if usage['input'] is not None else 'n/a'}")
+    lines.append(f"- output tokens: {usage['output'] if usage['output'] is not None else 'n/a'}")
+    lines.append(f"- total tokens: {usage['total'] if usage['total'] is not None else 'n/a'}")
+    if audit:
+        lines.extend([f"- token usage source: {audit['source']}",
+                      f"- cached input tokens: {audit['cached_input_tokens']}",
+                      f"- known usage (lower bound): {audit['known_usage']}",
+                      f"- missing usage requests: {audit['missing_usage_requests']}"])
     lines.append("")
     by_stage = state.get("token_usage_by_stage") or llm.usage_by_stage()
     if by_stage:
@@ -264,9 +341,52 @@ def render_report(state: CfuDesignState) -> str:
     lines.append("## Iteration History")
     lines.append("\n".join(f"- {line}" for line in state.get("iteration_history", [])))
     lines.append("")
+    if state.get("report_warnings"):
+        lines.extend(["## Report Warnings", *[f"- {warning}" for warning in state["report_warnings"]], ""])
     lines.append("## Errors")
     lines.append("\n".join(f"- {err}" for err in state.get("errors", [])) or "None")
     return "\n".join(lines) + "\n"
+
+
+def write_partial_report(initial_state: CfuDesignState, exc: Exception) -> CfuDesignState:
+    """Persist an exceptional run without routing it as a validated result.
+
+    The runner/wrapper provide observed state. Input-only fallback is labelled as
+    such; no unobserved gate verdict, candidate metric or budget is fabricated.
+    """
+    import traceback
+
+    state = {**initial_state, **(getattr(exc, "partial_state", None) or {})}
+    typed = failures.termination(exc)
+    typed.setdefault("state_source", "cli_input")
+    state.update(status="failed", termination_reason={
+        "model_delivery_failure": "MODEL_DELIVERY_FAILURE",
+        "infrastructure": "INFRASTRUCTURE_EXCEPTION",
+        "precondition": "PRECONDITION_FAILURE",
+    }.get(typed["kind"], "RUNTIME_EXCEPTION"), termination=typed,
+                 token_usage=state.get("token_usage") or llm.usage_totals(),
+                 token_usage_by_stage=state.get("token_usage_by_stage") or llm.usage_by_stage())
+    if typed.get("stage"):
+        state["stopped_at"] = typed["stage"]
+    state["errors"] = [*(state.get("errors") or []), f"{typed['exception_type']}: {typed['reason']}"]
+    artifacts = stage_services._artifacts(state, stage_services._policy(state))
+    state.update(run_id=artifacts.run_id, run_root=artifacts.root_rel)
+    state["llm_request"] = artifacts.manifest.get("llm_request") or state.get("llm_request") or {}
+    warnings: list[str] = []
+    audit = request_usage.load_request_usage(artifacts.root / "request_audit.jsonl", warnings)
+    if audit:
+        state["request_usage"] = audit
+    state["report_warnings"] = warnings
+    artifacts.write_json("review", "12_review/termination.json", typed, status="failed")
+    artifacts.write_text("review", "12_review/exception.txt", "".join(traceback.format_exception(exc)), status="failed")
+    artifacts.set_manifest_metadata("review", "termination", typed)
+    artifacts.set_manifest_metadata("review", "token_usage", state["token_usage"])
+    if audit:
+        artifacts.set_manifest_metadata("review", "request_usage", audit)
+    artifacts.write_text("review", "report.md", render_report(state), kind="markdown", status="failed")
+    artifacts.set_status("review", "failed", error=f"{typed['exception_type']}: {typed['reason']}")
+    state["final_report_path"] = str(artifacts.path("report.md"))
+    return state
 
 
 def format_rung_results(state: CfuDesignState, rung: str) -> str:

@@ -1,4 +1,5 @@
 """Oracle authoring inside Implement for the no-tool delivery mode."""
+from pathlib import Path
 from ... import prompts
 from ...runtime import commands as commands_mod, conformance_delivery, effects, llm_step, stage_services
 from ...state import CfuDesignState
@@ -44,7 +45,9 @@ def write_conformance(state: CfuDesignState) -> dict:
     from .. import feedback
     user = prompts.conformance_prompt(state["task"], state.get("isa_spec") or {},
         state.get("workload_spec") or {}, feedback=feedback.conformance_feedback(state),
-        agent_tools=False, workdir=state.get("workdir", ""), run_root=state.get("run_root", ""))
+        agent_tools=False, workdir=state.get("workdir", ""), run_root=state.get("run_root", ""),
+        scalar_sources=[Path(p).name for p in
+                        commands_mod.conformance_scalar_sources(state)])
     paths = dict(conformance_delivery.delivery_paths(state))
     header = intrinsics.intrinsics_header_path(state)
     if header:

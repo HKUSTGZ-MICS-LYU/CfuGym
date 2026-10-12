@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import sys
+import traceback
 
 from .graph import enable_progress, export_graph_visualization, run_agent
 from .runtime.llm import (
@@ -12,6 +14,7 @@ from .runtime.llm import (
 )
 from .runtime.llm_config import LlmConfigError, effective_config, list_configs
 from .flow import optimize as flow_optimize
+from .runtime import provenance
 from .stages.review import report as report_mod
 from .state import CfuDesignState
 
@@ -221,10 +224,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--visibility",
         choices=("basic", "standard", "extended"),
-        default=os.environ.get("CFU_AGENT_VISIBILITY", "standard"),
+        default=os.environ.get("CFU_AGENT_VISIBILITY", "extended"),
         help="Read-only file visibility tier, shared by every stage. basic: workload/"
         "integration/AgentCfu only (no skills, no sibling CFU designs); standard: adds "
-        "skills and sibling designs; extended: adds ext/SpinalHDL. Default: standard.",
+        "skills and sibling designs; extended: adds ext/SpinalHDL. Default: extended.",
     )
     parser.add_argument("--export-graph", default="", help="Directory for Mermaid/ASCII graph visualization.")
     parser.add_argument("--checkpoint", action="store_true", help="Persist LangGraph checkpoints within this run (requires an explicit --run-id to resume later).")
@@ -311,15 +314,28 @@ def main(argv: list[str] | None = None) -> int:
         "agent_cfu": True,
     }
     graph_dir = args.export_graph or str(Path(args.out_dir) / "graph")
-    graph_paths = export_graph_visualization(workdir / graph_dir)
+    graph_paths = {}
     enable_progress()
-    final_state = run_agent(
-        state,
-        thread_id=args.thread_id,
-        checkpoint=args.checkpoint or bool(args.resume),
-        stream=args.stream,
-        resume=bool(args.resume),
-    )
+    try:
+        graph_paths = export_graph_visualization(workdir / graph_dir)
+        final_state = run_agent(
+            state,
+            thread_id=args.thread_id,
+            checkpoint=args.checkpoint or bool(args.resume),
+            stream=args.stream,
+            resume=bool(args.resume),
+        )
+    except Exception as exc:
+        print(f"agent-error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if _flag_env("CFU_AGENT_DEBUG"):
+            traceback.print_exc(file=sys.stderr)
+        try:
+            final_state = report_mod.write_partial_report(state, exc)
+        except Exception as report_exc:
+            print(f"partial-report-error: {type(report_exc).__name__}: {report_exc}", file=sys.stderr)
+            if _flag_env("CFU_AGENT_DEBUG"):
+                traceback.print_exc(file=sys.stderr)
+            return 1
     print(f"status={final_state.get('status')}")
     print(f"termination={final_state.get('termination_reason', '')}")
     print(f"visibility={final_state.get('visibility', '')}")
@@ -393,6 +409,13 @@ def _print_token_usage(final_state: CfuDesignState) -> None:
 def _print_run_summary(final_state: CfuDesignState) -> None:
     """Headline results: reference/CFU cycles, speedup, and Yosys cost."""
     sim = _sim_gate(final_state)
+    if final_state.get("run_root"):
+        view = provenance.performance_view(final_state)
+        if not view["current_performance"]["performance_valid"]:
+            sim = {"reason": view["current_performance"]["reason"]}
+        historical = view["last_observed_valid_performance"]
+        if historical:
+            print(f"last_observed_valid_performance={historical}")
     reference = int(sim.get("reference_cycles", 0) or 0)
     cfu = int(sim.get("cfu_cycles", 0) or 0)
     speedup_x100 = int(sim.get("speedup_x100", 0) or 0)
@@ -404,6 +427,11 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
     if ablation:
         print("  ablation:")
         for line in ablation:
+            print(f"    {line.removeprefix('- ')}")
+    measurement = report_mod.measurement_lines(final_state)
+    if measurement:
+        print("  embench_measurement:")
+        for line in measurement:
             print(f"    {line.removeprefix('- ')}")
     if reference and cfu:
         print(f"  cycles_before = {reference}")
@@ -463,6 +491,12 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
 
 def _print_token_summary(final_state: CfuDesignState) -> None:
     usage = final_state.get("token_usage") or {}
+    audit = final_state.get("request_usage") or {}
+    if audit:
+        usage = {"calls": audit["calls"], "input": audit["input_tokens"], "output": audit["output_tokens"],
+                 "total": audit["total_tokens"]}
+        print(f"request_usage_missing={audit['missing_usage_requests']}")
+        print(f"request_usage_known={audit['known_usage']}")
     if usage:
         print()
         print("token_usage:")

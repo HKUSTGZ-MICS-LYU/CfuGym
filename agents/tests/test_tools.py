@@ -82,6 +82,30 @@ class ToolsTest(unittest.TestCase):
         )
         self.assertEqual(virtualize_run_paths("no run path here", run_root), "no run path here")
 
+    def test_tool_argument_log_rendering_never_raises(self) -> None:
+        """A malformed tool argument must not crash the CLI.
+
+        Observed 2026-10-04 (ablation matrix): the model sent ``edits`` as a list
+        of strings, the live-log renderer raised AttributeError, and the run
+        exited with code 1 and no ``status=`` line.
+        """
+        from agents.cfu_design_agent.runtime.llm_step import _render_tool_arguments
+
+        self.assertEqual(_render_tool_arguments("edit_hardware", {"edits": ["a string"]}),
+                         "edits=[<str>]")
+        self.assertEqual(_render_tool_arguments("edit_hardware", {"edits": "not-a-list"}),
+                         "edits=?")
+        self.assertEqual(_render_tool_arguments("edit_hardware", "not-a-mapping"), "<str>")
+        self.assertEqual(_render_tool_arguments("edit_software", {}), "path= search=0 replace=0")
+        rendered = _render_tool_arguments("edit_hardware", {"edits": [
+            {"path": "agents/generated/runs/r/workspace/design/AgentCfu.scala",
+             "search": "a", "replace": "bb"},
+            {"path": None, "search": None, "replace": None},
+            "junk",
+        ]})
+        self.assertIn("AgentCfu.scala search=1 replace=2", rendered)
+        self.assertIn("<str>", rendered)
+
     def test_failed_check_results_are_not_ok(self) -> None:
         # Run 20261003-130005: a real "check failed" was journaled ok while the
         # budget-refusal (error:) was the only thing marked ERROR.

@@ -108,7 +108,7 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
         state.get("workload_analysis", ""),
         state.get("context", {}),
         profile=state.get("embench_profiles"),
-        feedback=feedback_mod.isa_repair_feedback(state),
+        feedback=feedback_mod.isa_repair_feedback(state) + feedback_mod.upstream_repair_feedback(state),
         agent_tools=tools_enabled,
         tool_rounds=_tool_rounds(state),
         artifact_paths=_contract_evidence_paths(state),

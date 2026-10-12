@@ -194,7 +194,8 @@ def _failure_feedback(result: dict, command: str) -> str:
 def check_feedback(state: CfuDesignState, rung: str, *, limit: int = 2) -> str:
     """Bounded structured evidence (or legacy tails) for one validation rung."""
     chunks: list[str] = []
-    for result in (state.get("validation_results") or []):
+    start = int((state.get("repair_evidence_epoch") or {}).get("validation_results", 0))
+    for result in (state.get("validation_results") or [])[start:]:
         if result.get("rung") != rung:
             continue
         if result.get("returncode") == 0 and not result.get("skipped"):
@@ -215,7 +216,8 @@ def cost_feedback(state: CfuDesignState, *, limit: int = 2) -> str:
     cost failure into the hardware repair prompt.
     """
     chunks: list[str] = []
-    for result in (state.get("cost_results") or []):
+    start = int((state.get("repair_evidence_epoch") or {}).get("cost_results", 0))
+    for result in (state.get("cost_results") or [])[start:]:
         if result.get("returncode") == 0 and not result.get("skipped"):
             chunks.clear()
             continue
@@ -224,6 +226,31 @@ def cost_feedback(state: CfuDesignState, *, limit: int = 2) -> str:
         command = str(result.get("command", ""))[:200]
         chunks.append(_failure_feedback(result, command))
     return "\n\n".join(chunks[-limit:])
+
+
+def repair_route_guidance(*, tool_mode: bool = False) -> str:
+    """Layer choice belongs to the existing implementation repair interaction."""
+    common = (
+        "\nREPAIR LAYER SELECTION: use current failure evidence to decide whether the defect "
+        "is implementation, ISA/semantic contract, or workload analysis. An upstream rewind "
+        "rolls back this round's source/oracle edits, abandons the frozen contract, clears "
+        "dependent validation/reuse and spends one existing design-repair slot; contract "
+        "answer retries do not provide free route changes. No route changes on first delivery.\n"
+    )
+    if tool_mode:
+        return common + (
+            "After submit_repair_diagnosis, call request_repair_route(target=analysis|contract|implement, "
+            "reason, failure_ids). Cite exact current IDs from that diagnosis. analysis/contract "
+            "close this transaction: call submit_stage with a short rewind summary, not a patch. "
+            "implement stays in this same round and requires real edits before submit.\n")
+    return common + (
+        'Instead of a patch, you may emit REPAIR_ROUTE followed by one JSON object: '
+        '{"target":"analysis|contract","reason":"why this layer",'
+        '"failure_ids":["current failure id"],"diagnosis":{'
+        '"failure_ids":["current failure id"],"observed_errors":["observed message"],'
+        '"root_cause":"cause","repair_mapping":["layer change"],"regression_risks":["risk"]}}. '
+        'Do not mix an upstream REPAIR_ROUTE with EDIT/FILE/PATCH content. '
+        'To stay at implement, deliver the ordinary diagnosed source repair.\n')
 
 
 def labeled_feedback(label: str, text: str) -> str:
@@ -283,6 +310,19 @@ def implementation_feedback(state: CfuDesignState, rung: str, *, limit: int = 3)
     gate = (state.get("gates", {}) or {}).get(rung, {}) or {}
     errors = [str(item) for item in (gate.get("errors") or []) if str(item).strip()]
     return "\n".join(errors[-limit:])
+
+
+def upstream_repair_feedback(state: CfuDesignState) -> str:
+    """Carry the diagnosed layer decision to the existing upstream model call."""
+    route = state.get("repair_route") or {}
+    if route.get("target") not in ("analysis", "contract"):
+        return ""
+    return (
+        "\n## Implementation diagnosis requesting upstream revision\n"
+        "The old contract/implementation approvals are invalidated. These cited failures "
+        "are historical evidence for this revision, not current claims about new bytes. "
+        "Address the diagnosed layer error; do not recreate the old contract unchanged.\n"
+        + json.dumps(route, ensure_ascii=False) + "\n")
 
 
 def isa_repair_feedback(state: CfuDesignState) -> str:
@@ -463,9 +503,15 @@ def attempt_ledger_block(attempts: Any) -> str:
     return "\n".join(lines)
 
 
+def current_attempts(state: CfuDesignState, key: str) -> list:
+    """Old delivery fingerprints remain historical after an upstream rewind."""
+    start = int((state.get("repair_evidence_epoch") or {}).get(key, 0))
+    return list(state.get(key) or [])[start:]
+
+
 def software_stuck_directive(state: CfuDesignState) -> str:
     """Stuck-retry directive for the software rung (see _repeated_attempt_directive)."""
-    return _repeated_attempt_directive(state.get("sw_attempts"))
+    return _repeated_attempt_directive(current_attempts(state, "sw_attempts"))
 
 
 def hardware_stuck_directive(state: CfuDesignState) -> str:
@@ -475,7 +521,7 @@ def hardware_stuck_directive(state: CfuDesignState) -> str:
     a model stuck on one byte-identical broken answer burned the whole repair
     budget (observed 2026-09-26, three identical deliveries in a row).
     """
-    return _repeated_attempt_directive(state.get("hw_attempts"))
+    return _repeated_attempt_directive(current_attempts(state, "hw_attempts"))
 
 
 def conformance_feedback(state: CfuDesignState) -> str:
@@ -496,7 +542,7 @@ def conformance_oracle_directive(state: CfuDesignState) -> str:
     constraint at once.
     """
     attempts = [
-        item for item in (state.get("conformance_attempts") or []) if isinstance(item, dict)
+        item for item in current_attempts(state, "conformance_attempts") if isinstance(item, dict)
     ]
     if len(attempts) < 2:
         return ""

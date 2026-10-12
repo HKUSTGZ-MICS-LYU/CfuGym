@@ -9,7 +9,7 @@ from ... import prompts, state as state_mod
 from ...flow import outcome
 from ...prompts import SYSTEM_PROMPT
 from ...runtime.llm import DEFAULT_MAX_TOOL_ROUNDS
-from ...runtime import effects, commands, llm_step, observations, parsing, stage_services, tools
+from ...runtime import coding_tools, effects, commands, llm_step, observations, parsing, stage_services, tools
 from ...runtime.hardware_tools import HardwareCodingToolset
 from ...runtime.policy import PolicyError
 from ...runtime.tools import DESIGN_SOURCE_FILES, RepoToolbox
@@ -74,7 +74,7 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
     if feedback:
         # The ledger is repair-context only: appending it to a clean prompt
         # would turn every re-run (e.g. an optimization round) into a "repair".
-        ledger = feedback_mod.attempt_ledger_block(state.get("hw_attempts"))
+        ledger = feedback_mod.attempt_ledger_block(feedback_mod.current_attempts(state, "hw_attempts"))
         if ledger:
             feedback = f"{feedback}\n\n{ledger}"
     system = SYSTEM_PROMPT
@@ -103,6 +103,9 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
 
             def check_elaboration() -> dict[str, Any]:
                 nonlocal check_index
+                problems = stage_services.hardware_integrity_problems(state, toolbox)
+                if problems:
+                    return {"returncode": 1, "stderr_tail": "hardware integrity: " + "; ".join(problems)}
                 check_index += 1
                 check_commands = commands.agent_cfu_check_commands(state, check_index=check_index)
                 check_toolbox = stage_services._toolbox_for_stage(state, "implementation")
@@ -122,11 +125,7 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
                     / commands._agent_cfu_check_out_dir(state, check_index)
                     / "AgentCfu.v"
                 )
-                if result.get("returncode") == 0 and (not rtl.is_file() or rtl.stat().st_size == 0):
-                    result = dict(result)
-                    result["returncode"] = 1
-                    result["stderr_tail"] = f"isolated elaboration produced no non-empty RTL at {rtl}"
-                return result
+                return coding_tools.audit_hardware_result(state, check_toolbox, result, rtl)
 
             toolset_kwargs = {
                 "allowed_targets": hardware_targets,
@@ -177,6 +176,16 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         toolset_factory=coding_factory,
         toolset_kwargs=toolset_kwargs,
     )
+    try:
+        route_update = delivery.repair_route_output(state, result.text, toolbox)
+    except ValueError as exc:
+        route_update = None
+        route_error = "repair route rejected: " + str(exc)
+    else:
+        route_error = ""
+    if route_update is not None:
+        return {**route_update, "llm_raw_outputs": [raw_output],
+                "tool_calls": [llm_step._tool_call_summary(call) for call in tool_calls]}
     coding_toolset = coding_session.get("toolset")
     if coding_toolset and coding_toolset.touched_paths:
         apply_result = {
@@ -200,7 +209,7 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
             state,
             result.text,
             toolbox=toolbox,
-            attempts=state.get("hw_attempts"), domain="hardware",
+            attempts=feedback_mod.current_attempts(state, "hw_attempts"), domain="hardware",
             # The repair contract is enforced, not just prompted: a repair answer
             # without a REPAIR_DIAGNOSIS is rejected before anything is applied.
             require_diagnosis=(
@@ -209,10 +218,18 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
                 and not bool(coding_toolset and coding_toolset.session.diagnosis)
             ),
         )
+    if route_error:
+        apply_result["errors"] = [route_error]
+        apply_result["gate_ok"] = False
     intent_error = feedback_mod.tool_intent_error(result.text, str(getattr(result, "degraded_reason", "") or ""))
     if intent_error and not apply_result["applied"]:
         apply_result["errors"].append(intent_error)
         apply_result["summary"] += "\n\n" + intent_error
+    if apply_result["gate_ok"] and not apply_result["errors"]:
+        problems = stage_services.hardware_integrity_problems(state, toolbox)
+        if problems:
+            apply_result["errors"].extend(problems)
+            apply_result["gate_ok"] = False
     accepted = bool(apply_result["gate_ok"] and not apply_result["errors"])
     if coding_toolset:
         if accepted:

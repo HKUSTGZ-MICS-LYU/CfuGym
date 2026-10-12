@@ -17,27 +17,23 @@ be built from the exact bytes on disk.
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import yaml
 
+from .runtime import source_visibility
 from .runtime.llm import DEFAULT_MAX_TOOL_CALLS_PER_ROUND
 from .runtime.tools import RUN_DIR_TOKEN, virtualize_run_paths
 from .state import RepoContext, WorkloadSpec
 
 
-ROOFLINE_GUIDANCE = """Roofline analysis is mandatory. Use operations/byte arithmetic
-intensity at a named memory boundary and compare it with compute and bandwidth
-ceilings: attainable <= min(compute_peak, bandwidth_peak * arithmetic_intensity).
-Compute the ridge point (compute_peak / bandwidth_peak) when both ceilings are
-known, classify the bottleneck only from those quantities, and distinguish
-algorithmic from achieved intensity. Count external loads/stores plus packing,
-writeback, setup, waits, fences and residual scalar work; describe CFU RF traffic
-and reuse separately. Label every quantity as measured, parameter-derived or an
-explicit assumption, and use `unknown` when a value is unavailable instead of
-guessing. Translate the result into a CFU choice and a verification metric.
-Roofline estimates guide design but never replace cycle profiling, SoC
-simulation or Yosys cost evidence."""
+ROOFLINE_GUIDANCE = """Use lightweight Roofline reasoning when evidence supports it: relate
+operations and external bytes at a named memory boundary, and compare arithmetic
+intensity with compute and bandwidth ceilings when those values are known. Classify
+a bottleneck only from evidence; otherwise say what is unknown. Count meaningful
+setup/data-movement costs and describe CFU reuse when relevant. Label estimates as
+measured, parameter-derived or assumptions; never guess. This is design guidance,
+not a validation result or a required calculation exercise."""
 
 
 SYSTEM_PROMPT = """You are a hardware/software co-design agent for CfuGym (VexiiRiscv CFU). You analyze a workload, define a CFU ISA contract, design SpinalHDL hardware, write the accelerated C kernel, and verify correctness, cycles and cost.
@@ -49,18 +45,22 @@ Hard rules:
 - Keep the AgentCfu contract stable (AgentCfuParameter, class AgentCfu, the AgentCfuFiber helpers, AgentCfuFunction ids) and build on CfuBus and CfuLsu.
 - The accelerated (CFU) build must actually execute CFU instructions for the hot operation. Calling cfu_enable() and then running the scalar loop, or calling an intrinsic and discarding both its CPU result and its declared vector/memory effects, is not acceleration and is rejected.
 - Only files your visibility tier exposes are readable; a denied reference returns a policy error. Never assume or fabricate the contents of a document you were not shown.
+- verify_benchmark is Host-owned: its signature is visible but its implementation is hidden in Agent source views. Hidden-body markers are not file bytes. Never edit that function, copy a marker into source, or replace a whole file using a redacted view; target only visible kernel/algorithm regions.
+- Correctness means equivalence over the frozen contract's valid input domain, not merely passing the observed benchmark input. Do not prestore benchmark answers, approximate the promised algorithm, cancel operands, or add decorative operand/LSU reads to disguise fixed answers. Algorithm constants, exact algorithmic lookup tables, and declared fixed-shape specialization are allowed; input dependence alone is not proof of equivalence.
+- A fixed zero may be a legitimate success status only when the contracted computation and all declared vector/memory effects actually complete. Conditional Boolean results are legitimate computations; do not confuse them with unconditional fixed answers.
+- Match every Instruction function id AND subop to the generated intrinsics. Do not rely on an unchecked default subop, ignore unsupported/error CFU responses, clear error status inside the kernel to hide failures, or claim acceleration for a datapath that software never selects.
+- Include a concise command coverage table in the implementation delivery: map each frozen command to its actual function/subop, effective enable condition, operand/data route, completion and declared result/memory effects; disclose unchecked or omitted semantics. This table is a claim, not a substitute for Host evidence.
+- If the complete contract cannot be implemented, state the missing semantics and request analysis/contract repair when those routes are offered; otherwise report the limitation or abstain. Never silently narrow the contract or patch only the observed answer. For a repair, explain why implement is sufficient or why an upstream route is necessary.
 - Return concise, implementable text. Do not invent performance results."""
 
 
-ROOFLINE_ANALYSIS_FIELDS = """The `roofline` mapping is mandatory in the YAML and must contain:
-`hot_function`, `hot_loop`, `trip_count`, `memory_boundary`, `operations`,
-`operation_convention`, `bytes`,
-`arithmetic_intensity`, `compute_peak`, `bandwidth_peak`, `ridge_point`,
-`predicted_ceiling`, `bottleneck`, `gap_to_ceiling`, `design_action`,
-`verification_metric`, and `unknowns`. For each peak, include `value` and
-`basis` (`measured`, `parameter-derived`, or `assumption`) when known. Use
-`unknown` rather than guessing. State whether intensity is algorithmic or
-achieved and include setup/data-movement costs in the end-to-end view."""
+ROOFLINE_ANALYSIS_FIELDS = """A `roofline` mapping is useful but optional. Include whichever facts are
+supported by the available evidence: `hot_function`, `hot_loop`, `trip_count`,
+`memory_boundary`, `operations`, `bytes`, `arithmetic_intensity`, `compute_peak`,
+`bandwidth_peak`, `ridge_point`, `predicted_ceiling`, `bottleneck`, `design_action`,
+`verification_metric`, and `unknowns`. Omit unavailable fields or mark them
+`unknown`; do not fill a schema for its own sake. The downstream contract uses a
+conservative Roofline fallback when this mapping is absent."""
 
 
 ROOFLINE_DECISION_RULE = """Preserve the Roofline conclusion in the next artifact. The CFU
@@ -195,6 +195,7 @@ READ_TOOL_USAGE: dict[str, str] = {
     "inspect_observation": "`inspect_observation(id, view=summary|asm|ir|features)` — measured observation evidence.",
     "inspect_failure": "`inspect_failure(id, view=summary|log)` — typed failure evidence.",
     "submit_repair_diagnosis": "`submit_repair_diagnosis(...)` — required before any edit in repair mode.",
+    "request_repair_route": "`request_repair_route(target=analysis|contract|implement, reason, failure_ids)` — diagnosed repair-layer choice; upstream routes rollback and spend design budget.",
     "edit_hardware": "`edit_hardware(edits=[{path, search, replace}])` — atomic SEARCH/REPLACE on the approved hardware overlay files.",
     "check_hardware_elaboration": "`check_hardware_elaboration()` — isolated host-owned elaboration; evidence only, the hw_build gate reruns it.",
     "edit_software": "`edit_software(...)` — one exact SEARCH/REPLACE pair on the approved kernel target.",
@@ -316,6 +317,7 @@ def context_digest(
             continue
         if any(marker in path for marker in SENSITIVE_PATH_MARKERS):
             continue
+        text = source_visibility.mask_file_view(text, path)
         excerpt = text[:6000]
         if len(text) > len(excerpt):
             excerpt += "\n...[truncated]"
@@ -498,7 +500,7 @@ def stage_brief(
 
 
 def spec_digest(spec: WorkloadSpec) -> str:
-    return yaml.safe_dump(dict(spec), sort_keys=False)
+    return yaml.safe_dump(source_visibility.mask_model_payload(dict(spec)), sort_keys=False)
 
 
 def profile_digest(profile: dict | None) -> str:
@@ -545,7 +547,12 @@ def embench_instructions(spec: WorkloadSpec) -> str:
         "  cfu_enable() once before the first CFU instruction.\n"
         "- The kernel must produce exactly the same observable result as the scalar\n"
         "  path: Embench verify_benchmark() is the correctness oracle.\n"
-        "- Do not change the benchmark data layout, scaling factors, or verify logic.\n"
+        "- The host measures one cold workload invocation (lsf=gsf=1), without warmup.\n"
+        "  Accelerate the computation, not the measurement: do not precompute expected\n"
+        "  outputs, substitute fixed answers, or reuse a cached answer instead of computing.\n"
+        "- Benchmark inputs/data layout, scaling factors, entry/init/warmup functions,\n"
+        "  verification and timing are host-owned; edits to them are rejected. Keep\n"
+        "  existing function interfaces; edit benchmark_body/kernel bodies and add helpers.\n"
         "- The scalar path belongs in the #else branch (the reference build). The\n"
         "  #ifdef USE_AGENT_CFU branch must call the generated CFU intrinsic(s) for the\n"
         "  hot operation: cfu_enable() followed by the scalar loop is not acceleration\n"
@@ -602,14 +609,13 @@ def workload_prompt(
     feedback: str = "",
 ) -> str:
     run_root = str((context or {}).get("run_root", "") or "")
-    # The next node parses this reply directly with a YAML parser, and nothing
-    # else in this prompt says so. Observed runs (2026-09-29) wrapped the mapping
-    # in a prose sentence and a ```yaml fence, and the whole analysis was lost.
+    # Analysis is advisory evidence, not a source-generation contract. Prefer a
+    # mapping when convenient, but don't make its serialization a model task.
     deliverable = (
-        "One YAML analysis mapping and nothing else. Do not return prose, a "
-        "preamble, Markdown fences, or the mapping inside another key. The "
-        "response is parsed directly by a YAML parser, so a fence or a bad "
-        "indent invalidates the entire analysis."
+        "Provide concise, useful workload analysis. A YAML mapping is preferred "
+        "but not required; plain prose or Markdown is acceptable. This is context "
+        "for later design, not a strict schema or generated source file, so do not "
+        "spend time on formatting."
     )
     if run_root:
         deliverable += f" It is written to `{run_root}/07_analysis/workload_analysis.yaml`."
@@ -686,10 +692,10 @@ def workload_prompt(
 
 Analyze the workload. Classify the acceleration pattern, identify hardware/software state, data movement, expected bottlenecks, and the minimum validation needed.
 When WorkloadSpec.hot_loop is present, use its measured loop id, source function and line to identify the kernel; nested region cycles are inclusive and must not be summed. Name the exact function and loop that should become the CFU kernel.
-Return exactly one YAML mapping and nothing else: no prose before or after it, no
-Markdown code fence, no nested ``analysis`` key, and no trailing commentary. Keep
-list items and mapping keys distinct — a value that mixes a sequence with mapping
-keys on the same indent is not valid YAML and discards the whole reply.
+Keep the analysis concise and factual. Preserve useful workload facts, design
+implications, evidence sources and unresolved unknowns; do not invent measurements.
+Use YAML if convenient, otherwise concise prose or Markdown is fine. The harness
+normalizes the response for downstream context.
 {ROOFLINE_ANALYSIS_FIELDS}"""
 
 
@@ -704,6 +710,7 @@ def contract_prompt(
     tool_rounds: int = 0,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
 ) -> str:
+    analysis = source_visibility.mask_model_payload(analysis)
     run_root = str((context or {}).get("run_root", "") or "").rstrip("/")
     contract_path = f"{run_root}/08_isa/cfu_isa.yaml" if run_root else "08_isa/cfu_isa.yaml"
     if agent_tools:
@@ -844,9 +851,37 @@ def conformance_prompt(
     workdir: str = "",
     run_root: str = "",
     artifact_paths: Iterable[str | tuple[str, str]] = (),
+    scalar_sources: Iterable[str] = (),
 ) -> str:
     """Prompt for the hw_conformance rung: the oracle, and nothing else."""
     run_root = run_root.rstrip("/")
+    scalar_block = ""
+    sources = [str(item) for item in scalar_sources if str(item).strip()]
+    if sources:
+        listed = "\n".join(f"      {item}" for item in sources)
+        scalar_block = (
+            "\n=== PRISTINE SCALAR REFERENCE AVAILABLE ===\n"
+            "The harness puts the workload's own scalar implementation on the include\n"
+            "path, together with the benchmark's own -D set. Prefer `helpers: |` with\n"
+            "`#include \"<file>\"` and compute `reference` by calling that code on the data\n"
+            "the DUT read, instead of transcribing its constant tables by hand: a\n"
+            "hand-copied table is the single most error-prone line in an oracle (an MD5 K\n"
+            "table copied with 63 of 64 entries made the rung fail *correct* hardware for\n"
+            "three rounds). The tree is harness-owned and cannot be edited by you, and the\n"
+            "accelerated `cfu` copy is deliberately NOT on the path, so an include of the\n"
+            "scalar tree can never call the DUT.\n"
+            "How to use it:\n"
+            "- READ the file first: find the function that implements the command's\n"
+            "  semantics and any file-scope state it leaves the result in (globals).\n"
+            "- Include the allocator too when the scalar code allocates\n"
+            "  (`#include \"beebsc.c\"`). The Embench allocator never reclaims: call\n"
+            "  `init_heap_beebs(heap, sizeof heap)` at the start of every reference helper,\n"
+            "  with a static heap array of the benchmark's own `HEAP_SIZE`.\n"
+            "- Never include `support/main.c`: it defines `main`.\n"
+            "- A command whose semantics have no workload counterpart (a config/reset/\n"
+            "  acknowledgement) still needs its own independent scalar expression.\n"
+            "Available (all repo-relative, already on the include path):\n" + listed + "\n"
+        )
     oracle_path = (
         f"{run_root}/09_implementation/conformance/oracle.yaml"
         if run_root
@@ -862,9 +897,9 @@ def conformance_prompt(
             "Fix every listed problem at once. You cannot change the test: the harness\n"
             "generates the C file from this oracle, so an unverifiable command is a hard\n"
             "failure. Do not fix one field while reintroducing another violation; in\n"
-            "particular `cases[i].args` must be integer literals only (no casts,\n"
-            "addresses, identifiers or expressions) with exactly one per CPU-value role,\n"
-            "and any address/data preparation belongs in `setup`.\n"
+            "particular `data.roles` must carry exactly one descriptor per CPU-value role\n"
+            "(rs1/rs2 order), `data.buffer` is required whenever a role is an address, and\n"
+            "a `length` bound may not exceed that buffer.\n"
         )
     if agent_tools:
         contract_block = (
@@ -899,7 +934,7 @@ Commands and what each one needs:
 {_conformance_command_table(isa)}
 
 {contract_block}
-{feedback_block}
+{feedback_block}{scalar_block}
 This is CONFORMANCE AUTHORING inside Implement, not a simulation step. The host
 renders a minimal C program from your oracle; Verify later compiles and simulates
 that committed test without asking a model to rewrite it. Do not author arbitrary
@@ -921,15 +956,37 @@ commands:
       // C statements that seed the vector slot(s) this command reads
     reference: "ref_<name>(a, b)"   # required when the command writes CPU rd
     verify: "..."                   # required instead when it has no CPU result
-    cases:
-      - args: [0, 1]      # one value per CPU-value argument, in rs1/rs2 order
+    data:                 # input space; the HARNESS generates the actual vectors
+      buffer: 64          # optional: harness-owned byte block the DUT reads (4..1024)
+      count: 4            # optional: random cases on top of the boundary sweep (0..16)
+      roles:              # one entry per CPU-value argument, in rs1/rs2 order
+        - kind: address   # the harness block base; requires `buffer`
+        - kind: length    # 0..max bytes of that block; `max` required, <= buffer
+        # - kind: index   # 1..max; `max` required
+        # - kind: value   # 0..max; `max` optional (default 0xFFFFFFFF)
 
 Rules:
+- YOU DO NOT CHOOSE THE TEST DATA. There is no `cases` field: the harness owns a
+  fixed-seed generator that sweeps boundaries (0, 1, half, full, max) and adds
+  deterministic random draws, and owns the byte block the DUT reads. Declare only
+  the *shape* of the input space in `data`. A command with CPU-value arguments must
+  declare `data.roles` with exactly one entry per argument, in rs1/rs2 order.
+- `kind: address` means "the harness block base"; declare `data.buffer: <bytes>` and
+  the harness defines `<NAME>_CONF_DATA_BASE` and `<NAME>_CONF_DATA_BYTES` (the
+  command name upper-cased) so your `setup`/helpers can read the same data. Use
+  `kind: length` for a byte count into that block, `kind: index` for a selector with
+  a required `max`, and `kind: value` for a plain data word (set `max` when the
+  operand is really a count or a shift amount, so no case can hang the simulation).
+- Your `reference` must read the SAME harness data the DUT reads: with a `buffer`,
+  dereference the argument address (e.g. `ref_md5(const uint8_t *p, uint32_t n)`) or
+  use `<NAME>_CONF_DATA_BASE`/`_BYTES` directly. Computing the expectation from
+  anything else is rejected as a self-decided check.
 - `reference` must be an INDEPENDENT scalar implementation of the command's
   documented semantics, transcribed from the workload's own scalar code. Never
   copy a constant table or an expected value out of your hardware design, and never
   make the reference call the CFU intrinsic: that would only re-state the hardware
-  and prove nothing.
+  and prove nothing. A transcribed constant table is your most error-prone line —
+  check it entry by entry against the workload source before you deliver.
 - `verify` is only for commands with no CPU result (a vector write or an
   acknowledgement), which cannot be read back generically. It is a C expression
   that must be non-zero after the call, evaluated over state your `setup`/`helpers`
@@ -939,19 +996,10 @@ Rules:
   inputs. Observe real state your `setup`/a helper reads back (memory or a slot the
   command acts on), and prefer declaring a readback command with a CPU `rd` so the
   harness can compare it against `reference`.
-- `args` bind to `a` (rs1 value) and `b` (rs2 value) in the declared order; the
-  same names are available to `reference` and `verify`.
-- Every `args` entry must be an INTEGER LITERAL (decimal, or a C-style integer
-  string such as `0xFFFFFFFF`). Casts like `(uintptr_t)ptr`, addresses of your
-  `helpers` arrays, identifiers and expressions are rejected: the harness embeds
-  each arg as a compile-time constant into the generated intrinsic call. If a
-  command loads or stores data, put that address/data preparation in `setup` and
-  give the argument the literal address/value it uses (e.g. `args: [0x80000000]`
-  for a load whose data your `setup` seeded at that address); if the command
-  declares no CPU-value role, use `args: []`.
-- At least one case per command must bind a NON-ZERO argument. An all-zero case
-  set only exercises the zero boundary and is rejected, so a real address, slot
-  index or count is never touched.
+- Case arguments bind to `a` (rs1 value) and `b` (rs2 value) in the declared order;
+  the harness fills them from your `data` spec, and the same names are available to
+  `reference` and `verify`. The harness always renders both names, so a stale oracle
+  cannot fail the generated C build.
 - The oracle's C (`helpers`/`setup`/`reference`/`verify`) may call ONLY the
   generated intrinsics named in the command table above (exact spellings!) plus
   `cfu_enable` and `cfu_memory_fence`. Never invent a plausible name like
@@ -965,21 +1013,40 @@ Rules:
   are all rejected as self-decided. Compute the expectation from the workload's
   scalar code or from memory the DUT wrote, never from a constant you wrote next to
   the check.
-- You choose ALL test inputs and data sizes; the harness executes exactly your
-  declared `cases` and never appends hidden edge or random inputs. Use SMALL DATA
-  VOLUMES for a quick functional smoke test, not a full benchmark or stress test.
-  Choose sizes/counts/loop bounds that finish in well under 32000 cycles per
-  blocking CFU call, and keep scalar reference/setup work small. For length/count
-  operands start with 0/1/2 (if legal), then a few short representative values;
-  do NOT use 0xFFFFFFFF or unconstrained 32-bit random values as iteration counts,
-  lengths, repetitions or allocations. Full-width seeds/data values are fine only
-  when they do not increase work. Cover useful boundaries with affordable inputs.
-- Give each command at least one case. One representative case per command is
-  enough; add more only if they are genuinely useful.
+- Keep every case cheap. `data.buffer` is capped at 1024 bytes and the generator
+  never produces an unbounded count, so a case still finishes in well under 32000
+  cycles per blocking CFU call: keep the scalar reference/setup work small too.
 - Do not measure or print anything: no cycles, counters, timers or throughput.
   The harness owns all reporting.
-- `cases`, `reference`/`verify` and vector `setup` are mandatory for every command;
+- `data`, `reference`/`verify` and vector `setup` are mandatory for every command;
   a missing one fails the rung instead of being skipped."""
+
+
+def repair_scope_note(state: Mapping[str, Any]) -> str:
+    """The banner a repair round carries about what its failure does (not) prove.
+
+    A conformance rung that reached a verdict and disagreed with its own reference
+    is *unattributed*: nothing validates the model's scalar reference, so a wrong
+    reference makes correct hardware look broken (run 20261005-073745: an oracle
+    whose MD5 K table held 63 of 64 entries). Telling the model "oracle-only"
+    there would push it away from a real RTL bug, and demanding a hardware edit
+    would push it into a dummy one. Both notes live here so the two implement
+    modes cannot drift.
+    """
+    gate = (state.get("gates") or {}).get("hw_conformance") or {}
+    if gate.get("oracle_unattributed"):
+        return (
+            "\nCONFORMANCE MISMATCH (UNATTRIBUTED): the differential test disagreed with its own "
+            "scalar reference. Either side may be wrong — nothing else validates your reference C, "
+            "so re-derive it from the workload's scalar code before blaming the design, and inspect "
+            "the design as well. Fix whichever is actually wrong; a hardware edit is not required."
+        )
+    if state.get("repair_scope") == "conformance":
+        return (
+            "\nCONFORMANCE-ONLY REPAIR: repair oracle/test authoring; reuse healthy HW/SW "
+            "without dummy edits."
+        )
+    return ""
 
 
 def hardware_prompt(
@@ -1001,6 +1068,8 @@ def hardware_prompt(
     artifact_paths: Iterable[str | tuple[str, str]] = (),
 ) -> str:
     """Prompt for the hardware rung: AgentCfu.scala / AgentCfuFiber.scala only."""
+    analysis = source_visibility.mask_model_payload(analysis)
+    contract = source_visibility.mask_model_payload(contract)
     run_root = str((context or {}).get("run_root", "") or "").rstrip("/")
     tool_names = ["read_file", "list_dir", "search_text", "list_command_logs"]
     if coding_tools:
@@ -1172,6 +1241,9 @@ def hardware_prompt(
             "complete hardware files or patch as a fallback. Do not silently rewrite the "
             "design without this diagnosis, and do not claim success before the next build.\n"
         )
+        if not coding_tools:
+            from .stages import feedback as feedback_mod
+            feedback_block += feedback_mod.repair_route_guidance()
     else:
         feedback_block = (
             "\nThis is the first hardware attempt. Do not present a repair diagnosis; design "
@@ -1259,11 +1331,11 @@ def optimization_prompt(
     else:
         design_block = (
             "ISA spec:\n"
-            + (yaml.safe_dump(isa_spec, sort_keys=False).strip() if isa_spec else "n/a")
+            + (spec_digest(isa_spec).strip() if isa_spec else "n/a")
             + "\n\nHardware design summary:\n"
-            + (hardware_summary or "n/a")
+            + (source_visibility.mask_model_payload(hardware_summary) or "n/a")
             + "\n\nSoftware design summary:\n"
-            + (software_summary or "n/a")
+            + (source_visibility.mask_model_payload(software_summary) or "n/a")
         )
     brief = stage_brief(
         "optimization decision",
@@ -1375,6 +1447,8 @@ def software_prompt(
     run-workspace path the model must use in FILE_BEGIN / the diff header.
     Bodies are inlined only when no tool loop can read them.
     """
+    analysis = source_visibility.mask_model_payload(analysis)
+    contract = source_visibility.mask_model_payload(contract)
     targets = targets or []
     run_root = str((context or {}).get("run_root", "") or "").rstrip("/")
     if agent_tools and intrinsics_path:
@@ -1419,6 +1493,9 @@ def software_prompt(
             "Then emit the repair as targeted SEARCH/REPLACE edits (preferred), or the "
             "complete software files or patch as a fallback, and keep the scalar fallback.\n"
         )
+        if not coding_tools:
+            from .stages import feedback as feedback_mod
+            feedback_block += feedback_mod.repair_route_guidance()
     else:
         feedback_block = (
             "\nThis is the first software attempt. Do not present a repair diagnosis; "
@@ -1492,7 +1569,11 @@ def software_prompt(
     else:
         target_note = (
             "Exact current contents of the software targets (base your change on these):\n\n"
-            + "\n\n".join(f"### {path}\n```c\n{text}\n```" for path, text in targets if text)
+            + "\n\n".join(
+                f"### {path}\n```c\n{source_visibility.mask_verifier_bodies(text)}\n```"
+                for path, text in targets if text
+            )
+            + "\nHost-owned verify_benchmark bodies are hidden; do not edit or reconstruct them."
         )
     target_list = "\n".join(f"   - {path}" for path in target_paths)
     optimization_block = _optimization_block(optimization)

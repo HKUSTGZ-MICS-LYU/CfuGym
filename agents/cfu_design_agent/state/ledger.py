@@ -29,6 +29,12 @@ class Ledger(TypedDict, total=False):
     # not consume the design-repair budget (``repairs_used``).
     delivery_retries: int
     last_repair_target: str
+    # Historical command evidence before an upstream rewind is no longer current.
+    repair_evidence_epoch: dict[str, int]
+    repair_route: dict[str, Any]
+    # Provenance of the current repair entry; a layer choice can reuse one paid
+    # design slot, never an answer/delivery retry and never the same slot twice.
+    repair_entry: dict[str, Any]
     stopped_at: str
     final_report_path: str
     status: Literal["initialized", "needs_iteration", "failed", "complete", "blocked", "planned"]

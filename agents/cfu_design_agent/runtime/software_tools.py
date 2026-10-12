@@ -61,7 +61,7 @@ class SoftwareCodingToolset:
     failure_index: dict[str, Any] | None = None
     diagnosis_required: bool = False
     max_edits: int = 10
-    max_checks: int = 10
+    max_checks: int | None = None
     max_edit_chars: int = 60_000
     edits_used: int = 0
     checks_used: int = 0
@@ -133,7 +133,7 @@ class SoftwareCodingToolset:
     def _check(self, args: dict[str, Any]) -> str:
         if args:
             return "usage error: check_software_compile accepts no arguments"
-        if self.checks_used >= self.max_checks:
+        if self.max_checks is not None and self.checks_used >= self.max_checks:
             return f"error: software check budget exhausted ({self.max_checks})"
         if not self.edited_since_check:
             return "usage error: edit software before requesting a compile check"

@@ -77,7 +77,7 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
     if feedback:
         # The ledger is repair-context only: appending it to a clean prompt
         # would turn every re-run (e.g. an optimization round) into a "repair".
-        ledger = feedback_mod.attempt_ledger_block(state.get("sw_attempts"))
+        ledger = feedback_mod.attempt_ledger_block(feedback_mod.current_attempts(state, "sw_attempts"))
         if ledger:
             feedback = f"{feedback}\n\n{ledger}"
     client = llm_step._llm(state)
@@ -103,6 +103,9 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
         check_commands = commands._isolated_software_check_commands(state, check_toolbox)
         if check_commands:
             def check_compile() -> dict[str, Any]:
+                problems = stage_services.benchmark_integrity_problems(check_toolbox)
+                if problems:
+                    return {"returncode": 1, "stderr_tail": "benchmark integrity: " + "; ".join(problems)}
                 results = [
                     effects.run_command(
                         state, check_toolbox, command,
@@ -143,7 +146,10 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
             intrinsics=(isa.render_cfu_intrinsics(isa_spec) if state.get("isa_contract", True)
                         else intrinsics.intrinsics_template_text(str(state.get("workdir", ".")))),
             intrinsics_path=intrinsics_path,
-            targets=targets,
+            targets=(targets if tools_enabled else [
+                (path, stage_services.model_source_text(toolbox, path, limit=1_000_000))
+                for path, _ in targets
+            ]),
             contract_free=not state.get("isa_contract", True),
             feedback=feedback,
             optimization=feedback_mod.optimization_directive(state),
@@ -168,6 +174,16 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
         toolset_factory=coding_factory,
         toolset_kwargs=toolset_kwargs,
     )
+    try:
+        route_update = delivery.repair_route_output(state, result.text, toolbox)
+    except ValueError as exc:
+        route_update = None
+        route_error = "repair route rejected: " + str(exc)
+    else:
+        route_error = ""
+    if route_update is not None:
+        return {**route_update, "llm_raw_outputs": [raw_output],
+                "tool_calls": [llm_step._tool_call_summary(call) for call in tool_calls]}
     coding_toolset = coding_session.get("toolset")
     if coding_toolset and coding_toolset.touched_paths:
         apply_result = {
@@ -191,18 +207,22 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
             state,
             result.text,
             toolbox=toolbox,
-            attempts=state.get("sw_attempts"), domain="software",
+            attempts=feedback_mod.current_attempts(state, "sw_attempts"), domain="software",
             require_diagnosis=(
                 bool(feedback)
                 and bool(getattr(result, "used_llm", False))
                 and not bool(coding_toolset and coding_toolset.session.diagnosis)
             ),
         )
+    if route_error:
+        apply_result["errors"] = [route_error]
+        apply_result["gate_ok"] = False
     errors.extend(apply_result["errors"])
     intent_error = feedback_mod.tool_intent_error(result.text, str(getattr(result, "degraded_reason", "") or ""))
     if intent_error and not apply_result["applied"]:
         errors.append(intent_error)
     if apply_result["applied"]:
+        errors.extend(stage_services.benchmark_integrity_problems(toolbox))
         uses_cfu, cfu_problem = intrinsics._software_exercises_cfu(state, toolbox, targets)
         if not uses_cfu:
             errors.append(cfu_problem)

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from . import flow_memory
+from . import flow_memory, source_visibility
 from . import tools as tools_mod
 from .policy import PolicyError
 from .tools import RepoToolbox, redirect_target
@@ -294,7 +294,8 @@ class ReadOnlyToolset:
 
     def _render(self, text: str) -> str:
         """Show this run's real root as ``{{run-dir}}``, matching the prompt."""
-        return tools_mod.virtualize_run_paths(text, str(self.toolbox.run_root or ""))
+        return tools_mod.virtualize_run_paths(
+            source_visibility.mask_model_payload(text), str(self.toolbox.run_root or ""))
 
     def _list_command_logs(self, args: dict[str, Any]) -> str:
         """Enumerate the run's persisted command logs so the model can read them.
@@ -403,7 +404,8 @@ class ReadOnlyToolset:
                     maximum = max(8, min(200, int(maximum)))
                 except (TypeError, ValueError):
                     raise ToolUsageError("max_lines must be an integer in 8..200")
-                text = self.toolbox.read_text(path, limit=self.max_file_bytes)
+                text = source_visibility.mask_verifier_bodies(
+                    self.toolbox.read_text(path, limit=self.max_file_bytes))
                 raw_lines = text.splitlines()
                 excerpt = raw_lines[-maximum:]
                 lines.extend([
@@ -627,7 +629,8 @@ class ReadOnlyToolset:
             raise ToolUsageError("path is required")
         rel = self._live_path(path)
         try:
-            text = self.toolbox.read_text(rel, limit=self.max_file_bytes)
+            text = source_visibility.mask_file_view(
+                self.toolbox.read_text(rel, limit=self.max_file_bytes), rel)
         except PolicyError:
             # A path that does not exist is a typo, not a policy denial: saying
             # "denied" for a mistyped path left the model retrying a policy it
@@ -702,7 +705,8 @@ class ReadOnlyToolset:
                     continue
                 rel = self._rel(path)
                 try:
-                    text = self.toolbox.read_text(self._live_path(rel), limit=self.max_file_bytes)
+                    text = source_visibility.mask_file_view(
+                        self.toolbox.read_text(self._live_path(rel), limit=self.max_file_bytes), rel)
                 except PolicyError:
                     continue
                 if not text:

@@ -113,6 +113,37 @@ class CodingSessionTest(unittest.TestCase):
         })
         self.assertIn("accepted", good)
 
+    def test_diagnosis_accepts_the_failing_rung_name_and_names_current_ids(self):
+        session = CodingSession(
+            self.toolbox,
+            frozenset({"a.c"}),
+            failure_index={"failures": {
+                "fail_hw_build_old": {"status": "resolved", "rung": "hw_build"},
+                "fail_hw_conformance_live": {"status": "current", "rung": "hw_conformance"},
+            }},
+            diagnosis_required=True,
+        )
+        # The model naturally cites the rung it saw fail; that must expand to the
+        # current failure id instead of bouncing on a naming technicality.
+        by_rung = session.submit_diagnosis({
+            "failure_ids": ["hw_conformance"], "observed_errors": ["got != ref"],
+            "root_cause": "the oracle reference is wrong", "repair_mapping": ["re-derive it"],
+            "regression_risks": ["none"],
+        })
+        self.assertIn("accepted", by_rung)
+        self.assertEqual(session.diagnosis["failure_ids"], ["fail_hw_conformance_live"])
+        # An unknown id must not name an unrelated resolved failure as the thing
+        # the model cited; it reports the current ids instead.
+        session.diagnosis = None
+        unknown = session.submit_diagnosis({
+            "failure_ids": ["hw_build"], "observed_errors": ["elaboration failed"],
+            "root_cause": "width mismatch", "repair_mapping": ["resize it"],
+            "regression_risks": ["none"],
+        })
+        self.assertIn("rejected", unknown)
+        self.assertIn("fail_hw_conformance_live", unknown)
+        self.assertIn("already resolved", unknown)
+
     def test_edit_tools_map_tracked_scaffold_paths_onto_the_overlay(self):
         overlay = "agents/generated/runs/r-1/workspace/design/AgentCfu.scala"
         target = self.root / overlay

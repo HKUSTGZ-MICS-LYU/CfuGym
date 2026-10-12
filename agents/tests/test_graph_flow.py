@@ -80,11 +80,6 @@ class TestHermeticityTest(unittest.TestCase):
             self.assertIs(llm_step._llm({}), patched)
             self.assertFalse(llm_step._llm({}).available)
 
-    @unittest.skipIf(
-        __import__("os").environ.get("CFU_AGENT_TESTS_ALLOW_NETWORK", "").lower()
-        in {"1", "true", "yes", "on"},
-        "network explicitly allowed for this run",
-    )
     def test_outbound_network_is_blocked(self) -> None:
         import socket
 

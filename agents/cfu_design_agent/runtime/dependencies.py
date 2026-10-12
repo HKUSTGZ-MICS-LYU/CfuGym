@@ -70,7 +70,9 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
     analysis = _hash({"profile": state.get("profile_result"), "workload": state.get("workload_spec"),
                       "analysis": state.get("workload_analysis"), "ir": state.get("ir_result")})
     isa = _hash({"analysis": analysis, "isa": state.get("isa_spec")})
-    hw_input = _hash({"isa": isa, "hardware": hw})
+    from . import hardware_integrity
+    hw_input = _hash({"isa": isa, "hardware": hw,
+                      "hardware_integrity_version": hardware_integrity.VERSION})
     sw_input = _hash({"isa": isa, "software": sw})
     built = _hash({"hardware": hw_input})
     conformance_inputs = {name: _source_hash(root, f"{run_root}/09_implementation/conformance/{name}")
@@ -84,6 +86,9 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
                                               "test": project.get("test_cmd"),
                                               "isa": state.get("isa_spec"),
                                               "benchmark": project.get("benchmark"),
+                                               **({"measurement": project.get("measurement"),
+                                                   "benchmark_integrity": project.get("integrity")}
+                                                  if project.get("kind") == "embench_benchmark" else {}),
                                               "flags": state.get("soc_flags")}})
     return {
         "analysis": analysis, "isa": isa, "implementation_hw": hw_input,
@@ -93,8 +98,20 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def completed_gate_inputs(state: dict[str, Any]) -> None:
-    """Refuse resume when a currently passing gate no longer matches its inputs."""
+def completed_gate_inputs(state: dict[str, Any], *, resume: bool = False) -> None:
+    """Refuse stale gates; resume additionally validates prepared workload protocol."""
+    project = state.get("benchmark_project") or {}
+    if resume and project.get("kind") == "embench_benchmark":
+        from ..benchmark import embench, embench_integrity
+        expected = embench.measurement_parameters()
+        if (project.get("measurement") != expected
+                or (project.get("integrity") or {}).get("version") != embench_integrity.INTEGRITY_VERSION):
+            raise ValueError("legacy Embench checkpoint measurement; start a new run")
+        problems = embench_integrity.validate_candidate(
+            Path(state.get("workdir", ".")), str(state.get("run_root", "")),
+            str(project.get("benchmark", "")))
+        if problems:
+            raise ValueError("checkpoint benchmark integrity: " + "; ".join(problems))
     current = input_fingerprints(state)
     saved = state.get("input_fingerprints") or {}
     gates = state.get("gates") or {}

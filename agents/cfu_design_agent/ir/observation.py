@@ -129,6 +129,13 @@ def _asm_absence(state: str) -> str:
     return state
 
 
+def _asm_symbol_matches(symbol: str, function: str) -> bool:
+    # A dotted prefix alone is insufficient: avoid unrelated foo.bar.
+    clone = re.fullmatch(re.escape(function) +
+                         r"\.(?:isra|constprop|part|cold|clone|llvm|lto_priv)(?:\.\d+)*", symbol)
+    return symbol == function or clone is not None
+
+
 def _asm_candidates(lines: list[str], function: str, excerpt_limit: int
                    ) -> list[tuple[str, int, list[tuple[int, str]]]]:
     sections: list[tuple[str, int, list[tuple[int, str]]]] = []
@@ -137,15 +144,114 @@ def _asm_candidates(lines: list[str], function: str, excerpt_limit: int
         match = _SYMBOL.match(text)
         if match:
             symbol = match.group(1)
-            # A dotted prefix alone is insufficient: avoid unrelated foo.bar.
-            clone = re.fullmatch(re.escape(function) +
-                                 r"\.(?:isra|constprop|part|cold|clone|llvm|lto_priv)(?:\.\d+)*", symbol)
-            current = (symbol, lineno, []) if symbol == function or clone else None
+            current = (symbol, lineno, []) if _asm_symbol_matches(symbol, function) else None
             if current is not None:
                 sections.append(current)
         elif current is not None and len(current[2]) < excerpt_limit:
             current[2].append((lineno, text))
     return sections
+
+
+_RV_BASE_MNEMONICS = frozenset((
+    "lui auipc jal jalr beq bne blt bge bltu bgeu lb lh lw lbu lhu sb sh sw"
+    " addi slti sltiu xori ori andi slli srli srai add sub sll slt sltu xor srl sra or and"
+    " fence fence.i ecall ebreak"
+    " lwu ld sd addiw slliw srliw sraiw addw subw sllw srlw sraw"
+    " mul mulh mulhsu mulhu div divu rem remu mulw divw divuw remw remuw"
+    " lr.w sc.w lr.d sc.d amoadd.w amoadd.d amoswap.w amoswap.d amoxor.w amoxor.d"
+    " amoand.w amoand.d amoor.w amoor.d amomin.w amomin.d amomax.w amomax.d"
+    " amominu.w amominu.d amomaxu.w amomaxu.d"
+    " nop mv not neg seqz snez sltz sgtz beqz bnez blez bgez bltz bgtz bgt ble bgtu bleu"
+    " j jr ret call tail li la"
+    " clz ctz cpop sext.b sext.h zext.h rol ror rori rev8 orc.b andn orn xnor min minu max maxu"
+    " sh1add sh2add sh3add sh1add.uw sh2add.uw sh3add.uw add.uw slli.uw clmul clmulh clmulr"
+    " csrr csrw csrs csrc csrwi csrsi csrci rdcycle rdtime rdinstret"
+    " flw fld fsw fsd fadd.s fsub.s fmul.s fdiv.s fsqrt.s fsgnj.s fsgnjn.s fsgnjx.s"
+    " fmin.s fmax.s fcvt.w.s fcvt.wu.s fcvt.s.w fcvt.s.wu feq.s flt.s fle.s fclass.s"
+    " fmv.x.w fmv.w.x fadd.d fsub.d fmul.d fdiv.d fsqrt.d fsgnj.d fsgnjn.d fsgnjx.d"
+    " fmin.d fmax.d fcvt.w.d fcvt.wu.d fcvt.d.w fcvt.d.wu feq.d flt.d fle.d fclass.d"
+    " fmv.x.d fmv.d.x"
+).split())
+_RV_MNEMONIC = re.compile(r"[a-z][a-z0-9_.]*\Z")
+_ASM_ADDRESS = re.compile(r"^\s*(?:0x)?[0-9a-fA-F]+:\s*")
+
+
+def _is_riscv_mnemonic(token: str) -> bool:
+    if token in _RV_BASE_MNEMONICS:
+        return True
+    # Compressed, floating-point, vector, and atomic extension spellings.
+    if re.fullmatch(r"c\.[a-z][a-z0-9.]*", token):
+        return True
+    if re.fullmatch(r"f(?:add|sub|mul|div|sqrt|sgnj|sgnjn|sgnjx|min|max|class|eq|lt|le|mv|cvt)\.[sd]", token):
+        return True
+    if re.fullmatch(r"v[a-z][a-z0-9]*\.(?:vv|vx|vi|v|wv|wx|wi|w|iv|ix|i|m)", token):
+        return True
+    if token in ("vsetvli", "vsetivli", "vsetvl"):
+        return True
+    if re.fullmatch(r"amo(?:add|swap|xor|and|or|min|max|minu|maxu)\.(?:w|d)(?:\.(?:aq|rl|aqrl))?", token):
+        return True
+    # Include future/optional ISA extensions; disassembly's mnemonic slot is
+    # unambiguous once hexadecimal encoding fields have been skipped.
+    return bool(_RV_MNEMONIC.fullmatch(token)
+                and not re.fullmatch(r"(?:0x)?[0-9a-fA-F]{2,16}", token))
+
+
+def _asm_instruction_mnemonic(text: str) -> str | None:
+    """Extract a RISC-V mnemonic from a disassembly or plain-assembly line."""
+    text = _ASM_ADDRESS.sub("", text.split("#", 1)[0]).strip()
+    if not text:
+        return None
+    # llvm-objdump/objdump may print one encoding word or individual bytes
+    # before the mnemonic. Check tokens in order, ignoring only hex fields.
+    for token in text.split()[:12]:
+        candidate = token.lower().rstrip(",")
+        if _is_riscv_mnemonic(candidate):
+            return candidate
+        if re.fullmatch(r"(?:0x)?[0-9a-fA-F]{2,16}", candidate):
+            continue
+        # A non-encoding token before an opcode is a directive/label/comment.
+        return None
+    return None
+
+
+def _asm_instruction_counts(lines: list[str], function: str) -> dict[str, dict[str, int]]:
+    """Count recognized instruction mnemonics in matching function symbols."""
+    from collections import Counter
+
+    counts: dict[str, Counter[str]] = {}
+    current: str | None = None
+    for text in lines:
+        match = _SYMBOL.match(text)
+        if match:
+            symbol = match.group(1)
+            current = symbol if _asm_symbol_matches(symbol, function) else None
+            if current is not None:
+                counts.setdefault(current, Counter())
+            continue
+        if current is not None:
+            mnemonic = _asm_instruction_mnemonic(text)
+            if mnemonic is not None:
+                counts[current][mnemonic] += 1
+    return {symbol: dict(mnemonics) for symbol, mnemonics in counts.items()}
+
+
+def _format_asm_instruction_counts(sections: list[tuple[str, int, list[tuple[int, str]]]],
+                                   counts: dict[str, dict[str, int]], state: str,
+                                   truncated: bool) -> str:
+    if not sections:
+        return "Hot-spot ASM instruction counts: " + _asm_absence(state)
+    entries = []
+    for symbol, _, _ in sections[:4]:
+        mnemonics = counts.get(symbol, {})
+        total = sum(mnemonics.values())
+        detail = ", ".join(f"{name}={mnemonics[name]}" for name in sorted(mnemonics)) or "none recognized"
+        entries.append(f"{symbol}: total={total} ({detail})")
+    if len(sections) > 4:
+        entries.append(f"... {len(sections) - 4} additional symbols omitted")
+    if truncated:
+        entries.append("scan truncated")
+    return ("Hot-spot ASM static instruction counts (function candidates, not exact loop addresses): "
+            + "; ".join(entries))
 
 
 def _ir_candidates(lines: list[str], function: str, filename: str, source_line: int | None,
@@ -269,8 +375,10 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
                         *, allow_ir: bool = True) -> str:
     """Read only approved artifact paths through ``toolbox.read_text``.
 
-    Results are capped to 8..100 output lines and 12,000 characters. ASM
-    symbols and LLVM debug locations are candidate evidence, not loop identity.
+    Results are capped to 8..100 output lines and 12,000 characters. Summary
+    includes bounded per-mnemonic counts from matching reference ASM function
+    symbols. ASM symbols and LLVM debug locations are candidate evidence, not
+    loop identity.
     ``allow_ir=False`` (ablation ``--no-llvm-ir``) removes the ir/features views
     and the LLVM IR lines of the summary; asm/summary stay.
     """
@@ -304,10 +412,17 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
         raise ValueError("invalid observation index")
     if type(max_lines) is not int:
         raise ValueError("max_lines must be an integer")
+    if function == "verify_benchmark":
+        return "verify_benchmark implementation is hidden from the agent (including IR/ASM/features)."
     budget = min(100, max(8, max_lines))
-    asm_lines, asm_cut, asm_state = (_read(toolbox, asm) if view == "asm"
+    asm_lines, asm_cut, asm_state = (_read(toolbox, asm) if view in ("summary", "asm")
                                      else ([], False, "not inspected in this view"))
     sections = _asm_candidates(asm_lines, function, budget) if asm_lines else []
+    instruction_counts = (_asm_instruction_counts(asm_lines, function)
+                          if view == "summary" and asm_lines else {})
+    asm_count_summary = _format_asm_instruction_counts(
+        sections, instruction_counts, asm_state, asm_cut,
+    ) if view == "summary" else ""
     ir_path = item["ir_path"]
     ir_lines, ir_cut, ir_state = (_read(toolbox, ir_path) if view == "ir" and ir_path
                                   else ([], False, "not recorded" if not ir_path else "not inspected in this view"))
@@ -337,6 +452,8 @@ def inspect_observation(index: dict, toolbox: RepoToolbox, observation_id: str,
               (f"{len(sections)} function symbol(s); {'ambiguous clones' if len(sections) > 1 else 'function-level only'}"
                if sections else _asm_absence(asm_state)) +
               (" [bounded scan truncated; further symbols may exist]" if asm_cut else "")]
+    if view == "summary":
+        output.append(asm_count_summary)
     if allow_ir:
         output.extend([
             f"LLVM IR candidate: {ir_path or 'not recorded'} — " +

@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from .agent_tools import FAILURE_SCHEMA, READ_ONLY_TOOL_SCHEMAS, ReadOnlyToolset
 from .coding_session import CodingSession
-from .coding_tools import DIAGNOSIS_SCHEMA, render_check_result
+from . import coding_tools
 from .tools import RepoToolbox
 
 
@@ -62,7 +62,7 @@ class HardwareCodingToolset:
     failure_index: dict[str, Any] | None = None
     diagnosis_required: bool = False
     max_edits: int = 10
-    max_checks: int = 10
+    max_checks: int | None = None
     max_edit_chars: int = 100_000
     edits_used: int = 0
     checks_used: int = 0
@@ -88,7 +88,7 @@ class HardwareCodingToolset:
         if (self.failure_index or {}).get("failures"):
             offered.append(FAILURE_SCHEMA)
         if self.diagnosis_required:
-            offered.append(DIAGNOSIS_SCHEMA)
+            offered.append(coding_tools.DIAGNOSIS_SCHEMA)
         offered.extend([EDIT_HARDWARE_SCHEMA, CHECK_HARDWARE_SCHEMA])
         return [{**item, "function": {**item["function"], "parameters": {
             **item["function"]["parameters"],
@@ -150,7 +150,7 @@ class HardwareCodingToolset:
     def _check(self, args: dict[str, Any]) -> str:
         if args:
             return "usage error: check_hardware_elaboration accepts no arguments"
-        if self.checks_used >= self.max_checks:
+        if self.max_checks is not None and self.checks_used >= self.max_checks:
             return f"error: hardware check budget exhausted ({self.max_checks})"
         if not self.edited_since_check:
             return "usage error: edit hardware before requesting elaboration"
@@ -158,6 +158,6 @@ class HardwareCodingToolset:
         result = self.check_elaboration()
         self.session.record_check(result)
         self.edited_since_check = False
-        return render_check_result(
+        return coding_tools.render_check_result(
             result, label="hardware elaboration", final_gate="final hw_build gate"
         )

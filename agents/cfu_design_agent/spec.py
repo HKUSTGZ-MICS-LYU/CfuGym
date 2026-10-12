@@ -10,6 +10,7 @@ from typing import Any, Callable
 import yaml
 
 from .benchmark.embench import list_benchmarks
+from .runtime import source_visibility
 from .runtime.llm import LlmResult, OpenAiTextClient, clean_llm_text
 from .state import RepoContext, WorkloadSpec
 
@@ -356,4 +357,4 @@ def clean_description(text: str) -> str:
 def read_optional(path: Path) -> str:
     if not path.exists() or not path.is_file():
         return ""
-    return path.read_text(errors="replace")[:20000]
+    return source_visibility.mask_verifier_bodies(path.read_text(errors="replace"))[:20000]

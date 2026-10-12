@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 from typing import Any, Iterator, Mapping, Sequence
 
+from . import source_visibility
 from .tools import RepoToolbox
 
 MEMORY_VERSION = 2
@@ -120,8 +121,9 @@ def capture_read(toolbox: RepoToolbox, resolved_path: str,
                  arguments: Mapping[str, Any], numbered_result: str) -> None:
     """Capture a successful read *at execution time*, using resolved overlay path.
 
-    Each numbered complete result line must equal the current file byte-derived
-    text. Partial/truncated output records only the lines actually returned, not
+    Each numbered complete result line must match the current raw or masked
+    file view; stored excerpts use only the masked view with the raw file hash.
+    Partial/truncated output records only the lines actually returned, not
     the full file; captures are discarded on end-of-node hash mismatch. No-op
     outside a graph-node collector. The caller never needs to pass source prose.
     """
@@ -133,18 +135,19 @@ def capture_read(toolbox: RepoToolbox, resolved_path: str,
         return
     rel, data = value
     text = data.decode("utf-8", errors="replace")
-    lines = text.split("\n")
+    raw_lines = text.split("\n")
+    lines = source_visibility.mask_file_view(text, rel).split("\n")
     observed: list[tuple[int, str]] = []
     for row in numbered_result.split("\n"):
         match = re.fullmatch(r"\s*(\d+)\t(.*)", row)
         if not match:
             break
         number, content = int(match[1]), match[2]
-        if not 1 <= number <= len(lines) or lines[number - 1] != content:
+        if not 1 <= number <= len(lines) or content not in (lines[number - 1], raw_lines[number - 1]):
             break  # partial last line is not exact evidence
         if observed and number != observed[-1][0] + 1:
             break
-        observed.append((number, content))
+        observed.append((number, lines[number - 1]))
     if not observed:
         return
     first, last = observed[0][0], observed[-1][0]
@@ -155,6 +158,10 @@ def capture_read(toolbox: RepoToolbox, resolved_path: str,
         "coverage": {"first_line": first, "last_line": last, "full": complete},
         "excerpt": excerpt[:_EXCERPT_CHARS],
     }})
+
+
+def _range_excerpt(lines: list[str], first: int, last: int) -> str:
+    return "\n".join(f"{number}: {lines[number - 1]}" for number in range(first, last + 1))[:_EXCERPT_CHARS]
 
 
 def _contract_dependent(path: str, role: str, root: str) -> bool:
@@ -187,8 +194,11 @@ def validate_memory(memory: Any, state: Mapping[str, Any], toolbox: RepoToolbox)
         sha = item.get("sha256")
         if not isinstance(sha, str) or not _SHA.fullmatch(sha):
             continue
-        current = _file_hash(toolbox, item.get("path"))
-        if current is None or current[1] != sha or current[0] in seen:
+        snapshot = _file_bytes(toolbox, item.get("path"))
+        if snapshot is None:
+            continue
+        current = (snapshot[0], hashlib.sha256(snapshot[1]).hexdigest())
+        if current[1] != sha or current[0] in seen:
             continue
         if item.get("contract_sha256") is not None and item["contract_sha256"] != contract:
             continue
@@ -199,7 +209,17 @@ def validate_memory(memory: Any, state: Mapping[str, Any], toolbox: RepoToolbox)
         if isinstance(coverage, dict) and isinstance(excerpt, str) and len(excerpt) <= _EXCERPT_CHARS:
             first, last = coverage.get("first_line"), coverage.get("last_line")
             if type(first) is int and type(last) is int and 1 <= first <= last and type(coverage.get("full")) is bool:
-                entry.update(coverage=dict(coverage), excerpt=excerpt)
+                text = snapshot[1].decode("utf-8", errors="replace")
+                raw_lines = text.split("\n")
+                if last <= len(raw_lines):
+                    visible_lines = source_visibility.mask_file_view(text, snapshot[0]).split("\n")
+                    raw_excerpt = _range_excerpt(raw_lines, first, last)
+                    visible_excerpt = _range_excerpt(visible_lines, first, last)
+                    # Restored old captures may contain only verifier-body lines,
+                    # with no signature to mask. Rebuild from the complete,
+                    # hash-matched file, not by masking that stored fragment.
+                    if excerpt in (raw_excerpt, visible_excerpt):
+                        entry.update(coverage=dict(coverage), excerpt=visible_excerpt)
         seen.add(current[0])
         clean["entries"].append(entry)
     # Rebuild deterministic accepted facts from current domain state rather than
@@ -239,7 +259,8 @@ def _facts(state: Mapping[str, Any]) -> list[dict[str, str]]:
                              ("profile", "profile_result", "profile")):
         value = state.get(key)
         if value and _gate_ok(state.get("gates"), gate):
-            body = value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False)
+            visible = source_visibility.mask_model_payload(value)
+            body = visible if isinstance(visible, str) else json.dumps(visible, sort_keys=True, ensure_ascii=False)
             facts.append({"role": role, "source": f"state.{key} (accepted {gate} gate)",
                           "sha256": _digest(value), "excerpt": body[:1000]})
     # Domain records are already source-fingerprinted by the graph wrapper.
@@ -249,12 +270,14 @@ def _facts(state: Mapping[str, Any]) -> list[dict[str, str]]:
                             ("implementation_sw", "software_plan", "source")):
         if state.get(key) and _gate_ok(state.get("gates"), gate):
             facts.append({"role": role, "source": f"state.{key} (intent; formal verification independent)",
-                          "sha256": _digest(state[key]), "excerpt": str(state[key])[:600]})
+                          "sha256": _digest(state[key]),
+                          "excerpt": str(source_visibility.mask_model_payload(state[key]))[:600]})
     recent = [item for item in (state.get("validation_results") or []) if isinstance(item, dict)][-3:]
     for item in recent:
         observation = item.get("failure_observation") or {}
         body = {"rung": item.get("rung"), "returncode": item.get("returncode"),
-                "failure_id": observation.get("id"), "summary": str(observation.get("summary") or "")[:500],
+                "failure_id": observation.get("id"),
+                "summary": str(source_visibility.mask_model_payload(observation.get("summary") or ""))[:500],
                 "log_path": item.get("log_path")}
         facts.append({"role": "hardware", "source": "validation history (not a current gate pass)",
                       "sha256": _digest(body), "excerpt": json.dumps(body, ensure_ascii=False)[:800]})

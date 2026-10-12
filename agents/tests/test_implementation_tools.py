@@ -68,6 +68,27 @@ class ImplementationToolsTest(unittest.TestCase):
         self.assertNotEqual(old_hash, tool.hardware_session.candidate_hash())
         self.assertIsNone(tool.hardware_session.current_check())
 
+    def test_lightweight_checks_are_unlimited_by_default(self):
+        tool = self.make_tool()
+        self.assertIsNone(tool.max_hardware_checks)
+        self.assertIsNone(tool.max_software_checks)
+        hw_text = "class AgentCfu {}\n"
+        sw_text = "int x = 1;\n"
+        for index in range(3):
+            next_hw = f"class AgentCfu {{ val n{index} = {index} }}\n"
+            self.assertNotIn("rejected", tool.run("edit_hardware", {"edits": [{
+                "path": self.hw, "search": hw_text, "replace": next_hw}]}))
+            self.assertIn("passed (evidence only", tool.run("check_hardware_elaboration", {}))
+            hw_text = next_hw
+
+            next_sw = f"int x = {index + 2};\n"
+            self.assertNotIn("rejected", tool.run("edit_software", {
+                "path": self.sw, "search": sw_text, "replace": next_sw}))
+            self.assertIn("failed", tool.run("check_software_compile", {}))
+            sw_text = next_sw
+        self.assertEqual((self.hw_calls, self.sw_calls), (3, 3))
+        self.assertEqual((len(tool.checks["hardware"]), len(tool.checks["software"])), (3, 3))
+
     def test_first_internal_check_failure_is_inspectable_and_resolved_in_place(self):
         for kind, name in (("hardware", "check_hardware_elaboration"),
                            ("software", "check_software_compile")):

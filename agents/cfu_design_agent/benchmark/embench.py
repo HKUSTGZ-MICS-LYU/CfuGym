@@ -16,10 +16,12 @@ so the run never claims correctness for them.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from pathlib import Path
 
+from . import cfu_execution, embench_integrity
 from .embench_instrument import find_definition_brace
 from .profile_lines import profile_lines
 from ..runtime.tools import RepoToolbox, embench_cfu_rel
@@ -31,8 +33,17 @@ SUPPORT_FILES = ("main.c", "beebsc.c", "beebsc.h", "support.h")
 BOARD_FILES = ("boardsupport.c", "boardsupport.h", "embench_obs.h")
 CONFIGS = ("reference", "profile", "cfu")
 DEFAULT_MARCH = "rv32imc_zicsr_zifencei"
+DEFAULT_C_STANDARD = "-std=gnu11"
 DEFAULT_WARMUP_HEAT = 1
 DEFAULT_GLOBAL_SCALE_FACTOR = 1
+MEASUREMENT_PROTOCOL = "cold_single_invocation_v1"
+
+def measurement_parameters() -> dict:
+    """One Host protocol shared by preparation, integrity and checkpoint checks."""
+    return {"protocol": MEASUREMENT_PROTOCOL, "local_scale_factor": 1,
+            "global_scale_factor": DEFAULT_GLOBAL_SCALE_FACTOR, "warmup": False,
+            "cfu_status_protocol": cfu_execution.PROTOCOL}
+
 
 # The SoC harness stops on the pass/fail symbol, which only says main() returned
 # non-zero. The harness owns the generated embench_main.c, so it adds one
@@ -61,10 +72,15 @@ VERIFY_DIAGNOSTIC = """
 
 
 def instrument_embench_main(text: str) -> str:
-    """Add a machine-readable verify pass/fail line to the generated main.c."""
+    """Omit warmup entirely and add the machine-readable verification line."""
+    text = embench_integrity.omit_warmup(text)
     if VERIFY_CALL not in text:
         return text
-    injected = text.replace(VERIFY_CALL, VERIFY_CALL + VERIFY_DIAGNOSTIC, 1)
+    text = cfu_execution.instrument_main(text, VERIFY_CALL)
+    # Status must affect `correct` before the diagnostic prints the final verdict.
+    status_verdict = VERIFY_CALL + cfu_execution.VERDICT
+    anchor = status_verdict if status_verdict in text else VERIFY_CALL
+    injected = text.replace(anchor, anchor + VERIFY_DIAGNOSTIC, 1)
     return VERIFY_PREAMBLE + injected
 
 
@@ -164,6 +180,11 @@ def config_defines(name: str, config: str) -> list[str]:
     return defines
 
 
+def config_cflags(name: str, config: str) -> list[str]:
+    """C flags shared by every Embench build configuration."""
+    return [*config_defines(name, config), DEFAULT_C_STANDARD]
+
+
 def build_command(run_root: str, name: str, config: str) -> list[str]:
     """make invocation that builds one Embench configuration."""
     cfg = config_workspace(run_root, name, config)
@@ -172,7 +193,7 @@ def build_command(run_root: str, name: str, config: str) -> list[str]:
         [f"{rel}/src/*.c", f"{rel}/support/beebsc.c", f"{rel}/board/boardsupport.c"]
     )
     includes = " ".join([f"{rel}/support", f"{rel}/board", f"{rel}/include"])
-    defines = " ".join(config_defines(name, config))
+    defines = " ".join(config_cflags(name, config))
     return [
         "make",
         "-C",
@@ -235,6 +256,12 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
         source_texts[Path(rel_src).name] = text
         if verification == "none" and "verify_benchmark" in text and has_real_verification(text):
             verification = "bench_verify"
+    source_texts = embench_integrity.normalize_local_scale_factor(source_texts)
+    source_root = toolbox.workdir / benchmark_dir(name)
+    header_texts = {
+        path.name: toolbox.read_text(str(path.relative_to(toolbox.workdir)), limit=2_000_000)
+        for path in sorted(source_root.glob("*.h"))
+    }
     support_texts = {
         fname: toolbox.read_text(f"{EMBENCH_ROOT}/support/{fname}", limit=2_000_000)
         for fname in SUPPORT_FILES
@@ -245,20 +272,36 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
     }
     main_text = instrument_embench_main(support_texts.get("main.c", ""))
 
+    reference_sources: dict[str, str] = {}
+    protected_files: dict[str, str] = {}
+
+    def source_hash(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     for config in CONFIGS:
         cfg = config_workspace(run_root, name, config)
         for fname, text in source_texts.items():
+            if config == "reference":
+                reference_sources[f"{cfg}/src/{fname}"] = source_hash(text)
+            copied.append(f"{cfg}/src/{fname}")
+            if not toolbox.dry_run:
+                toolbox.write_text(f"{cfg}/src/{fname}", text)
+        for fname, text in header_texts.items():
+            protected_files[f"{cfg}/src/{fname}"] = source_hash(text)
             copied.append(f"{cfg}/src/{fname}")
             if not toolbox.dry_run:
                 toolbox.write_text(f"{cfg}/src/{fname}", text)
         for fname, text in support_texts.items():
+            protected_files[f"{cfg}/support/{fname}"] = source_hash(text)
             copied.append(f"{cfg}/support/{fname}")
             if not toolbox.dry_run:
                 toolbox.write_text(f"{cfg}/support/{fname}", text)
         for fname, text in board_texts.items():
+            protected_files[f"{cfg}/board/{fname}"] = source_hash(text)
             copied.append(f"{cfg}/board/{fname}")
             if not toolbox.dry_run:
                 toolbox.write_text(f"{cfg}/board/{fname}", text)
+        protected_files[f"{cfg}/embench_main.c"] = source_hash(main_text)
         copied.append(f"{cfg}/embench_main.c")
         if not toolbox.dry_run:
             toolbox.write_text(f"{cfg}/embench_main.c", main_text)
@@ -275,6 +318,12 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
         "source_files": source_files,
         "header_path": f"{ws}/board/embench_obs.h",
         "verification": verification,
+        "measurement": measurement_parameters(),
+        "integrity": {
+            "version": embench_integrity.INTEGRITY_VERSION,
+            "reference_sources": reference_sources,
+            "protected_files": protected_files,
+        },
         "configs": list(CONFIGS),
         "elf_path": elf_path(run_root, name, "reference"),
         "elf_paths": {config: elf_path(run_root, name, config) for config in CONFIGS},

@@ -9,11 +9,11 @@ CFU contract, simulation or QoR gate passed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Protocol, TypedDict
 
 from .agent_tools import ReadOnlyToolset
-from . import tools as tools_mod
+from . import failures, source_visibility, tools as tools_mod
 from .llm import (
     DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     DEFAULT_MAX_TOOL_ROUNDS,
@@ -46,7 +46,8 @@ class _RunDirView:
         return self._toolset.schemas()
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
-        return tools_mod.virtualize_run_paths(self._toolset.run(name, arguments), self._run_root)
+        return tools_mod.virtualize_run_paths(
+            source_visibility.mask_model_payload(self._toolset.run(name, arguments)), self._run_root)
 
     def __getattr__(self, item: str) -> Any:  # rollback/commit/session and friends
         return getattr(self._toolset, item)
@@ -139,6 +140,10 @@ class StageExecutor:
         client: Any,
     ) -> StageExecutionResult:
         """Obtain a final deliverable without applying or validating it."""
+        request = replace(request,
+            system=source_visibility.mask_model_payload(request.system),
+            user=source_visibility.mask_model_payload(request.user),
+            deliverable_hint=source_visibility.mask_model_payload(request.deliverable_hint))
         if not request.tools_enabled:
             result, raw_output = self._plain(state, request, client)
             return StageExecutionResult(result=result, raw_output=raw_output)
@@ -193,24 +198,20 @@ class StageExecutor:
                 rollback()
             elif session is not None and hasattr(session, "rollback"):
                 session.rollback()
+            if isinstance(exc, failures.StageDeliveryFailure):
+                exc.stage = request.stage
+                exc.tool_calls = tuple(native_trace)
+                exc.tool_calls_relpath = request.tool_calls_relpath
             self._write_tool_calls(
                 state, request.artifact_stage, request.tool_calls_relpath,
                 native_trace + [{"round": 0, "name": "(tool loop failed)",
-                                 "arguments": {"error": str(exc)}, "result": "",
-                                 "ok": False}],
+                                 "arguments": {"error": str(exc), "exception_type": type(exc).__name__,
+                                               "failure_kind": getattr(exc, "failure_kind", "runtime_exception")},
+                                 "result": "", "ok": False}],
             )
             raise
 
         try:
-            raw_output = self._record_output(
-                state,
-                request.stage,
-                request.label,
-                result,
-                client=client,
-                system=request.system,
-                user=request.user,
-            )
             tool_calls = list(getattr(result, "tool_calls", ()) or ())
             degraded = str(getattr(result, "degraded_reason", "") or "")
             if degraded:
@@ -220,7 +221,11 @@ class StageExecutor:
                                    "arguments": {"error": degraded}, "result": "",
                                    "ok": False}],
                 )
-                raise RuntimeError(f"stage tools unavailable: {degraded}")
+                raise failures.StageToolsUnavailable(f"stage tools unavailable: {degraded}")
+            raw_output = self._record_output(
+                state, request.stage, request.label, result,
+                client=client, system=request.system, user=request.user,
+            )
             if tool_calls:
                 self._write_tool_calls(
                     state,
@@ -273,12 +278,20 @@ class _LoopState(TypedDict, total=False):
     delivered: bool
     delivery: str
     empty_turns: int
+    # explore -> repair (bounded) -> finalize (submit_stage only).
+    phase: str
+    finalize_only: bool
+    repair_turns_remaining: int
     # Rejected submissions so far. A gate rejection is correctable once; the
     # bound keeps a model that cannot satisfy the gate from looping forever.
     rejections: int
 
 
 DEFAULT_SUBMIT_RETRIES = 1
+# A repair may need separate model turns for hardware, software and an
+# independent conformance oracle before the final delivery can pass the gate.
+DEFAULT_CORRECTION_TURNS = 4
+FINALIZE_TURNS = 2
 
 
 def _submit_verdict(
@@ -318,7 +331,7 @@ def _native_stage_loop(
     from langgraph.graph import END, START, StateGraph
 
     if not getattr(client, "available", False) or not callable(getattr(client, "_chat_round", None)):
-        raise RuntimeError("native loop needs an available single-round chat client")
+        raise failures.StageToolsUnavailable("native loop needs an available single-round chat client")
     schemas = toolset.schemas()
     permitted = {str(item.get("function", {}).get("name", "")) for item in schemas}
     if "submit_stage" in permitted:
@@ -348,44 +361,65 @@ def _native_stage_loop(
     # Never broaden the existing per-model-round fanout limit.
     per_round = DEFAULT_MAX_TOOL_CALLS_PER_ROUND
     submit_retries = DEFAULT_SUBMIT_RETRIES
+    correction_turn_limit = DEFAULT_CORRECTION_TURNS
+    # Reserve a final submit-only window after exploration and, if the first
+    # delivery is rejected, one bounded repair + resubmission window.
+    model_turn_limit = (
+        round_limit + FINALIZE_TURNS
+        + submit_retries * (correction_turn_limit + FINALIZE_TURNS)
+    )
     sdk = getattr(client, "_stage_round_client", None)
     if sdk is None:
         from openai import OpenAI
         sdk = OpenAI(api_key=client.api_key, base_url=client.base_url, max_retries=0)
 
     def decide(s: _LoopState) -> dict[str, Any]:
-        # A rejection grants a corrective round (tools plus a resubmission), so
-        # the turn ceiling has to leave room for it: observed run-0003 died on
-        # "model-turn hard limit reached without submission" one turn after the
-        # gate asked for a change it was still allowed to make.
-        if s["model_turns"] >= round_limit + 3 + 2 * submit_retries:
-            raise RuntimeError("native stage failed: model-turn hard limit reached without submission")
-        # A rejected submission grants one corrective round with the tools
-        # available again. The gate asked for an applied change, and a turn that
-        # can only resubmit cannot produce one.
-        correction = s["rejections"] > 0
-        allow_tools = correction or (
-            s["tool_rounds"] < round_limit
-            and (total_limit == 0 or s["total_calls"] < total_limit)
+        if s["model_turns"] >= model_turn_limit:
+            raise failures.StageDeliveryFailure("model-turn hard limit reached without submission", terminal_reason="delivery_missing")
+
+        phase = s.get("phase", "explore")
+        repair_remaining = max(0, int(s.get("repair_turns_remaining", 0)))
+        exhausted = (
+            s["tool_rounds"] >= round_limit
+            or (total_limit > 0 and s["total_calls"] >= total_limit)
+            or s["model_turns"] >= round_limit
         )
-        # Submission remains available after exploration budget is exhausted.
+        if phase == "repair" and repair_remaining == 0:
+            phase = "finalize"
+        elif phase == "explore" and exhausted:
+            phase = "finalize"
+        # Protect the final submit/retry window even if empty model turns or a
+        # corrective path consumed more turns than expected.
+        if (phase != "repair"
+                and s["model_turns"] >= model_turn_limit - FINALIZE_TURNS):
+            phase = "finalize"
+
+        finalize_only = phase == "finalize"
+        correction = phase == "repair"
+        allow_tools = not finalize_only
         tools = offered if allow_tools else offered[-1:]
         messages = list(s["messages"])
-        if not allow_tools:
+        if finalize_only:
             messages.append({"role": "user", "content": (
-                "Tool exploration budget exhausted. Submit the final stage deliverable "
-                "with submit_stage now; otherwise this stage fails."
+                "Finalize this stage now. Only submit_stage is available: call it with "
+                "a factual summary of changes actually applied, evidence actually run, "
+                "and remaining unknowns. Do not claim unapplied work or call other tools."
             )})
-        elif not correction and s["tool_rounds"] == round_limit - 1:
-            # Warn while the tools are still there. Observed 2026-09-30: a stage
-            # that reads for every round and is then told only "submit now"
-            # submits work it never applied, which the gate must reject.
+        elif correction:
             messages.append({"role": "user", "content": (
-                "This is your last tool round. Make every remaining change with the "
+                f"The gate rejected the previous submission. Apply and check the needed "
+                f"correction now; {repair_remaining} bounded repair model turn(s) remain, "
+                "after which only submit_stage will be available."
+            )})
+        elif s["tool_rounds"] == round_limit - 1:
+            # Warn while tools remain, but do not rely on a reminder alone to
+            # protect the final submission turn.
+            messages.append({"role": "user", "content": (
+                "This is your last tool round. Make any remaining changes with the "
                 "offered tools now; after this round only submit_stage is available."
             )})
         round_ = client._chat_round(
-            sdk, messages, allow_tools=True, tools=tools,
+            sdk, source_visibility.mask_model_payload(messages), allow_tools=True, tools=tools,
             response_format=None,
         )
         messages = list(getattr(client, "_prepared_messages", messages))
@@ -393,6 +427,7 @@ def _native_stage_loop(
         record_usage(current_stage(), round_.input_tokens, round_.output_tokens,
                      round_.total_tokens, cached)
         calls = list(getattr(round_.message, "tool_calls", None) or [])
+        next_repair_remaining = repair_remaining - 1 if correction else repair_remaining
         return {
             "messages": messages, "round_data": {
                 "text": round_.text, "reasoning": round_.reasoning,
@@ -404,6 +439,10 @@ def _native_stage_loop(
                        "name": str(getattr(getattr(call, "function", None), "name", "") or ""),
                        "arguments": str(getattr(getattr(call, "function", None), "arguments", "") or "")}
                       for call in calls],
+            "phase": phase,
+            "finalize_only": finalize_only,
+            "repair_turns_remaining": next_repair_remaining,
+            "empty_turns": 0 if finalize_only and not s.get("finalize_only", False) else s["empty_turns"],
             "model_turns": s["model_turns"] + 1,
             "input_tokens": s["input_tokens"] + round_.input_tokens,
             "output_tokens": s["output_tokens"] + round_.output_tokens,
@@ -436,7 +475,10 @@ def _native_stage_loop(
         for index, call in enumerate(calls):
             name = call["name"]
             arguments = _parse_tool_arguments(call["arguments"])
-            if name not in permitted:
+            if s.get("finalize_only", False):
+                observation = "skipped: finalization phase only allows submit_stage"
+                ok = False
+            elif name not in permitted:
                 observation = "denied by access policy: tool not offered for this stage"
                 ok = False
             elif index >= per_round or (
@@ -477,20 +519,35 @@ def _native_stage_loop(
         entries, tool_messages, used = execute_batch(s, s["calls"])
         messages = list(s["messages"]) + [assistant_message(s, s["calls"])] + tool_messages
         return {"messages": messages, "transcript": list(s["transcript"]) + entries,
-                "total_calls": used, "tool_rounds": s["tool_rounds"] + 1}
+                "total_calls": used, "tool_rounds": s["tool_rounds"] + 1,
+                "empty_turns": 0}
 
     def observe(s: _LoopState) -> dict[str, Any]:
         if s["calls"]:
             return {}
-        # A prose answer is not submission. Give exactly one corrective re-ask;
-        # never mistake the forced reminder or a final paragraph for acceptance.
-        if s["empty_turns"] >= 2:
-            raise RuntimeError("native stage failed: model did not call submit_stage")
+        # A prose answer is not submission. Finalization gets exactly one
+        # submit-only retry; never mistake a final paragraph for acceptance.
+        max_empty_turns = 1 if s.get("finalize_only", False) else 2
+        if s["empty_turns"] >= max_empty_turns:
+            raise failures.StageDeliveryFailure("model did not call submit_stage", terminal_reason="delivery_missing")
         messages = list(s["messages"])
         messages.append({"role": "assistant", "content": s["round_data"]["text"]})
-        messages.append({"role": "user", "content":
-                         "No stage was submitted. Call an authorized tool, or call "
-                         "submit_stage with the final delivery. Prose alone cannot pass."})
+        if s.get("finalize_only", False):
+            reminder = (
+                "No stage was submitted. Only submit_stage is available; call it now "
+                "with a factual delivery. Prose alone cannot pass."
+            )
+        elif s.get("phase") == "repair" and s.get("repair_turns_remaining", 0) == 0:
+            reminder = (
+                "No corrective tool was called. The repair window is over; next only "
+                "submit_stage will be available. Submit a factual delivery."
+            )
+        else:
+            reminder = (
+                "No stage was submitted. Call an authorized tool or continue working; "
+                "when ready, call submit_stage. Prose alone cannot pass."
+            )
+        messages.append({"role": "user", "content": reminder})
         return {"messages": messages, "empty_turns": s["empty_turns"] + 1}
 
     def final_deliver(s: _LoopState) -> dict[str, Any]:
@@ -503,14 +560,14 @@ def _native_stage_loop(
         submits = [call for call in s["calls"] if call["name"] == "submit_stage"]
         companions = [call for call in s["calls"] if call["name"] != "submit_stage"]
         if len(submits) != 1:
-            raise RuntimeError(
-                "native stage failed: the final batch needs exactly one submit_stage call"
+            raise failures.StageDeliveryFailure(
+                "the final batch needs exactly one submit_stage call", terminal_reason="delivery_missing"
             )
         submit = submits[0]
         args = _parse_tool_arguments(submit["arguments"])
         delivery = args.get("delivery")
         if not isinstance(delivery, str) or not delivery.strip():
-            raise RuntimeError("native stage failed: empty submit_stage delivery")
+            raise failures.StageDeliveryFailure("empty submit_stage delivery", terminal_reason="delivery_missing")
         entries, tool_messages, used = execute_batch(s, companions)
         accepted, reason = _submit_verdict(request, delivery, has_deliverable)
         entry = {"round": s["tool_rounds"] + 1, "name": "submit_stage",
@@ -527,8 +584,8 @@ def _native_stage_loop(
                                           "content": entry["result"]}]
         if not accepted:
             if s["rejections"] >= submit_retries:
-                raise RuntimeError(
-                    "native stage failed: independent submit_stage gate rejected "
+                raise failures.StageDeliveryFailure(
+                    "independent submit_stage gate rejected "
                     f"delivery ({reason or 'no reason given'})"
                 )
             # A rejected delivery is a correctable mistake, not a dead end: hand
@@ -542,7 +599,10 @@ def _native_stage_loop(
                 "again; describing the change is not enough."
             )})
             return {"messages": messages, "calls": [], "transcript": transcript,
-                    "total_calls": used, "rejections": s["rejections"] + 1}
+                    "total_calls": used, "rejections": s["rejections"] + 1,
+                    "phase": "repair",
+                    "repair_turns_remaining": correction_turn_limit,
+                    "finalize_only": False, "empty_turns": 0}
         return {"delivery": delivery, "delivered": True, "transcript": transcript,
                 "total_calls": used}
 
@@ -566,12 +626,13 @@ def _native_stage_loop(
         "total_calls": 0, "model_turns": 0, "input_tokens": 0,
         "output_tokens": 0, "total_tokens": 0, "cached_input_tokens": 0,
         "cached_usage_reported": False, "delivered": False, "delivery": "",
-        "empty_turns": 0, "rejections": 0,
+        "empty_turns": 0, "phase": "explore", "repair_turns_remaining": 0,
+        "finalize_only": False, "rejections": 0,
     }, config={"recursion_limit": max(25, (round_limit + 3) * 4),
                "configurable": {"thread_id": request.stage_thread_id}}
     )
     if not result["delivered"]:
-        raise RuntimeError("native stage failed: no accepted submit_stage delivery")
+        raise failures.StageDeliveryFailure("no accepted submit_stage delivery", terminal_reason="delivery_missing")
     last = result["round_data"]
     return clean_llm_text(LlmResult(
         result["delivery"], used_llm=True,

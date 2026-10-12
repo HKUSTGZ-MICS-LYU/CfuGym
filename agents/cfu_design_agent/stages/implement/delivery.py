@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...runtime import conformance_delivery, stage_services, tools
+from ...runtime import coding_session, coding_tools, conformance_delivery, observations, stage_services, tools
 from ...runtime.policy import PolicyError
 from ...runtime.tools import RepoToolbox
 from ...stages import feedback
@@ -31,6 +31,31 @@ class DeliveryTransaction:
 
     def rollback(self) -> None:
         conformance_delivery._restore(self.toolbox, self.snapshot)
+
+
+def repair_route_output(state, text, toolbox):
+    """Validate a plain-delivery rewind before applying any source content."""
+    value = coding_tools.parse_repair_route(text)
+    if value is None:
+        return None
+    if tools.extract_edit_blocks(text) or tools.extract_file_blocks(text) or tools.extract_patch(text):
+        raise ValueError("an upstream REPAIR_ROUTE cannot be mixed with source delivery")
+    if set(value) != {"target", "reason", "failure_ids", "diagnosis"}:
+        raise ValueError("REPAIR_ROUTE requires target, reason, failure_ids and diagnosis")
+    index = observations.failure_index(state)
+    session = coding_session.CodingSession(toolbox, frozenset(), failure_index=index, diagnosis_required=True)
+    if not isinstance(value["diagnosis"], dict):
+        raise ValueError("REPAIR_ROUTE requires a structured diagnosis")
+    answer = session.submit_diagnosis(value["diagnosis"])
+    if not answer.startswith("diagnosis accepted"):
+        raise ValueError(answer)
+    route = coding_tools.validate_repair_route(
+        {key: value[key] for key in ("target", "reason", "failure_ids")},
+        diagnosis=session.diagnosis, failure_index=index,
+        repair_mode=bool(feedback.all_failure_feedback(state)))
+    if route["target"] == "implement":
+        raise ValueError("implement stays in this round: deliver the ordinary diagnosed source repair")
+    return {"repair_route": route}
 
 
 def _validate_targets(state, toolbox, edit_blocks, file_blocks, patch_text, domain):
@@ -87,6 +112,10 @@ def _apply_agent_output(
     skips the REPAIR_DIAGNOSIS section is rejected before anything is applied,
     so root-cause reasoning can never be silently skipped.
     """
+    # A malformed/unauthorized route is a delivery rejection, never a source edit.
+    if "REPAIR_ROUTE" in (text or ""):
+        return {"patch": "", "summary": text or "", "errors": ["invalid REPAIR_ROUTE delivery"],
+                "applied": False, "files": [], "apply_result": None, "gate_ok": False, "proposed": False}
     if require_diagnosis and "REPAIR_DIAGNOSIS" not in (text or ""):
         reason = (
             "the repair response omitted the required REPAIR_DIAGNOSIS section (Observed "
