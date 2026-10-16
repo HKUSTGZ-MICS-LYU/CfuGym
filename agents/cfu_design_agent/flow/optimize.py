@@ -21,8 +21,20 @@ from ..state import CfuDesignState
 OPTIMIZATION_TARGETS = ("implement", "extend_isa")
 
 
-def _cost_metric(state: CfuDesignState) -> dict[str, int]:
-    """Area proxy from the last parsed Yosys cost line."""
+def _cost_metric(state: CfuDesignState) -> dict[str, Any]:
+    """Backend-specific area; LUTs must never masquerade as generic cells."""
+    if state.get("cost_backend") == "vivado":
+        from ..runtime import ppa
+        measured = ppa.view(state)
+        if not measured["valid"]:
+            return {}
+        data = measured["data"]
+        area = (data.get("cfu") or {}).get("area") or {}
+        if area.get("lut") is None:
+            return {}
+        return {"backend": "vivado", "metric": "cfu_post_route_lut",
+                "part": data.get("part"), "target_frequency_mhz": data.get("target_frequency_mhz"),
+                "lut": area["lut"], "ff": area.get("ff"), "bram_36k": area.get("bram_36k"), "dsp": area.get("dsp")}
     for result in reversed(state.get("cost_results") or []):
         parsed = result.get("parsed") or {}
         cost = parsed.get("cost") if isinstance(parsed, dict) else None
@@ -48,13 +60,15 @@ def optimization_score(state: CfuDesignState) -> str:
         else ["no cycle measurement"]
     )
     cost = _cost_metric(state)
-    if cost:
+    if cost.get("backend") == "vivado":
+        parts.append(f"CFU {cost['lut']:g} LUT, {cost.get('ff')} FF, {cost.get('bram_36k')} BRAM36, {cost.get('dsp')} DSP (post-route)")
+    elif cost:
         parts.append(
             f"{cost['cells']} cells, {cost['wire_bits']} wire bits, "
             f"{cost['memories']} memories ({cost['memory_bits']} bits)"
         )
     else:
-        parts.append("no Yosys cost measurement")
+        parts.append("no current EDA cost measurement")
     return "; ".join(parts)
 
 
@@ -93,8 +107,11 @@ def _round_metrics_text(entry: dict[str, Any]) -> str:
     if not entry.get("measured"):
         return "not measured"
     speedup = int(entry.get("speedup_x100", 0) or 0)
-    cells = int((entry.get("cost") or {}).get("cells", 0) or 0)
+    cost = entry.get("cost") or {}
+    cells = int(cost.get("cells", 0) or 0)
     text = f"speedup={speedup / 100:.2f}x" if speedup else "speedup=n/a"
+    if cost.get("backend") == "vivado":
+        return text + f" CFU_LUT={cost.get('lut', 'n/a')}"
     return text + (f" cells={cells}" if cells else " cells=n/a")
 
 
@@ -111,6 +128,13 @@ def _metric_deltas(entry: dict[str, Any], previous: dict[str, Any] | None) -> st
     before_cells = int((previous.get("cost") or {}).get("cells", 0) or 0)
     if cells and before_cells:
         parts.append(f"{'+' if cells >= before_cells else ''}{cells - before_cells} cells")
+    current_cost, previous_cost = entry.get("cost") or {}, previous.get("cost") or {}
+    if current_cost.get("backend") == previous_cost.get("backend") == "vivado":
+        basis = ("part", "target_frequency_mhz", "metric")
+        if all(current_cost.get(key) == previous_cost.get(key) for key in basis):
+            current_lut, old_lut = current_cost.get("lut"), previous_cost.get("lut")
+            if current_lut is not None and old_lut is not None:
+                parts.append(f"{current_lut - old_lut:+g} CFU LUT")
     return f" ({', '.join(parts)})" if parts else ""
 
 
@@ -136,8 +160,17 @@ def _round_improved(entry: dict[str, Any], best: dict[str, Any] | None) -> bool:
         return True
     speed = int(entry.get("speedup_x100", 0) or 0)
     best_speed = int(best.get("speedup_x100", 0) or 0)
-    cells = int((entry.get("cost") or {}).get("cells", 0) or 0)
-    best_cells = int((best.get("cost") or {}).get("cells", 0) or 0)
+    cost, best_cost = entry.get("cost") or {}, best.get("cost") or {}
+    if cost.get("backend") == "vivado" or best_cost.get("backend") == "vivado":
+        basis = ("backend", "part", "target_frequency_mhz", "metric")
+        if any(cost.get(key) != best_cost.get(key) for key in basis):
+            return False
+        if cost.get("lut") is None or best_cost.get("lut") is None:
+            return False
+        cells, best_cells = cost["lut"], best_cost["lut"]
+    else:
+        cells = int(cost.get("cells", 0) or 0)
+        best_cells = int(best_cost.get("cells", 0) or 0)
     # Compare exact ratios by integer cross multiplication; display rounding
     # must not hide small real improvements (e.g. the depthconv 1.85x rounds).
     ref, cycles = int(entry.get("reference_cycles", 0)), int(entry.get("cfu_cycles", 0))
@@ -146,10 +179,11 @@ def _round_improved(entry: dict[str, Any], best: dict[str, Any] | None) -> bool:
     slower = ref * best_cycles < best_ref * cycles if exact else bool(best_speed) and speed < best_speed
     if slower:
         return False
-    if best_cells and (not cells or cells > best_cells):
+    vivado_area = cost.get("backend") == "vivado"
+    if (cells > best_cells if vivado_area else best_cells and (not cells or cells > best_cells)):
         return False
     faster = ref * best_cycles > best_ref * cycles if exact else bool(best_speed) and speed > best_speed
-    smaller = bool(best_cells and cells) and cells < best_cells
+    smaller = cells < best_cells if vivado_area else bool(best_cells and cells) and cells < best_cells
     return faster or smaller
 
 

@@ -232,7 +232,7 @@ class FlowMemoryTests(unittest.TestCase):
             with self.subTest(maximum=maximum), self.assertRaises(ValueError):
                 flow_memory.render_memory(memory, self.state, self.toolbox, "implementation", max_chars=maximum)
 
-    def test_failed_gate_publishes_no_fresh_captures_but_retains_valid_old_reads(self):
+    def test_failed_gate_retains_hash_matched_reads_without_accepting_facts(self):
         old_calls, _ = self.capture(self.doc)
         self.state["flow_memory"] = self.derive({}, old_calls)
         fresh_calls, _ = self.capture(self.source)
@@ -247,8 +247,8 @@ class FlowMemoryTests(unittest.TestCase):
         for node_name, update in attempts:
             with self.subTest(node_name=node_name, update=update):
                 memory = self.derive(update, fresh_calls, node_name=node_name)
-                self.assertEqual([entry["path"] for entry in memory["entries"]], [self.doc])
-                self.assertNotIn("return 42", str(memory))
+                self.assertEqual([entry["path"] for entry in memory["entries"]], [self.doc, self.source])
+                self.assertIn("return 42", str(memory))
                 self.assertEqual(memory["facts"], [])
 
     def test_successful_node_reads_survive_an_unrelated_failed_gate(self):

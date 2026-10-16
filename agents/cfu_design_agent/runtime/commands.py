@@ -294,7 +294,7 @@ def agent_cfu_overlay_commands(state: CfuDesignState, spec: dict) -> list[list[s
         "set run / baseDirectory := (Compile/baseDirectory).value / "
         f'"{state.get("run_root", "")}/{SOC_WORKSPACE_SUBDIR}"'
     )
-    flags = agent_cfu_gen_flags(spec)
+    flags = agent_cfu_gen_flags(spec, state.get("target_frequency_mhz"))
     # sbt takes each command as one argv element, so the subcommand and its
     # flags are joined into a single element.
     run_main = " ".join(["runMain vexiiriscv.soc.mico.MiCoSocGen", *flags])
@@ -393,7 +393,7 @@ def agent_cfu_sim_commands(
         "set Compile/unmanagedSources := "
         "AgentCfuSourceFilter.sources((Compile/unmanagedSourceDirectories).value)"
     )
-    flags = agent_cfu_gen_flags(spec)
+    flags = agent_cfu_gen_flags(spec, state.get("target_frequency_mhz"))
     run_main = " ".join(
         ["runMain vexiiriscv.soc.mico.MiCoSocSim", "--load-elf", elf, *flags]
     )
@@ -434,9 +434,17 @@ def agent_cfu_datapath_flags(spec: dict) -> list[str]:
     return flags
 
 
-def agent_cfu_gen_flags(spec: dict) -> list[str]:
+def agent_cfu_gen_flags(spec: dict, frequency_mhz: float | None = None) -> list[str]:
     """CLI flags for an agent-CFU SoC build, derived from the ISA datapath."""
+    frequency = []
+    if frequency_mhz is not None:
+        import math
+        value = float(frequency_mhz)
+        if not math.isfinite(value) or not 0 < value <= 1000:
+            raise ValueError("target frequency must be finite and between 0 and 1000 MHz")
+        frequency = ["--system-frequency", str(round(value * 1_000_000))]
     return [
+        *frequency,
         "--with-rvc",
         "--with-rvm",
         "--with-rdtime",

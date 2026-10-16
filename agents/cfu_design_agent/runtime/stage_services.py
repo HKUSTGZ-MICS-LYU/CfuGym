@@ -158,7 +158,16 @@ def hardware_integrity_problems(state: CfuDesignState, toolbox: RepoToolbox, *,
         problems.extend(encoding["source"]["problems"])
         if rtl_path is not None:
             try:
-                rtl = toolbox.read_text(str(rtl_path), limit=20_000_000)
+                rtl_ref = Path(rtl_path)
+                if rtl_ref.is_absolute():
+                    workdir = Path(getattr(toolbox, "workdir", state.get("workdir", "."))).resolve()
+                    rtl_ref = rtl_ref.resolve().relative_to(workdir)
+                rtl = toolbox.read_text(rtl_ref.as_posix(), limit=20_000_000)
+            except ValueError as exc:
+                problems.append(
+                    f"hardware integrity cannot read generated RTL {rtl_path}: "
+                    f"path is outside the repository workdir ({exc})"
+                )
             except (OSError, policy_mod.PolicyError) as exc:
                 problems.append(f"hardware integrity cannot read generated RTL {rtl_path}: {exc}")
             else:

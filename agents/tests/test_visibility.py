@@ -95,6 +95,21 @@ class VisibilityToolTest(unittest.TestCase):
         tools = self._toolset("standard")
         self.assertIn("denied by access policy", tools.run("read_file", {"path": SPINAL}))
 
+    def test_standard_opens_vexii_sources_but_hides_example_cfus(self) -> None:
+        standard = self._toolset("standard")
+        readable = standard.run(
+            "read_file", {"path": "src/main/scala/vexiiriscv/execute/MiCoPlugin.scala"}
+        )
+        self.assertNotIn("denied by access policy", readable)
+        for path in (
+            "src/main/scala/vexiiriscv/soc/mico/VpuCfu.scala",
+            "src/main/scala/vexiiriscv/soc/mico/BitNetCfu.scala",
+        ):
+            self.assertIn("denied by access policy", standard.run("read_file", {"path": path}))
+        listing = standard.run("list_dir", {"path": "src/main/scala/vexiiriscv/soc/mico"})
+        self.assertNotIn("VpuCfu.scala", listing)
+        self.assertNotIn("BitNetCfu.scala", listing)
+
     def test_list_dir_hides_a_gated_subtree_but_says_why(self) -> None:
         tools = self._toolset("basic", stage="load_context")
         listing = tools.run("list_dir", {"path": "skills/cfu-designer"})
@@ -123,9 +138,13 @@ class VisibilityPromptTest(unittest.TestCase):
         basic = context_digest({"files": {}, "visibility": "basic"})
         self.assertIn("## Visibility: basic", basic)
         self.assertIn("may NOT read the cfu-designer skills", basic)
+        standard = context_digest({"files": {}, "visibility": "standard"})
+        self.assertIn("src/main/scala/vexiiriscv/**", standard)
+        self.assertIn("denied at every tier", standard)
         extended = context_digest({"files": {}, "visibility": "extended"})
         self.assertIn("## Visibility: extended", extended)
         self.assertIn("ext/SpinalHDL", extended)
+        self.assertIn("example CFUs remain denied", extended)
 
     def test_unknown_level_adds_no_guidance(self) -> None:
         self.assertNotIn("## Visibility", context_digest({"files": {}}))

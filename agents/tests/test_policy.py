@@ -233,16 +233,27 @@ class VisibilityPolicyTest(unittest.TestCase):
     VPU = "src/main/scala/vexiiriscv/soc/mico/VpuCfu.scala"
     AGENT_CFU = "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"
     SPINAL = "ext/SpinalHDL/core/src/main/scala/spinal/core/Bits.scala"
+    EXAMPLE_CFUS = (
+        VPU,
+        "src/main/scala/vexiiriscv/soc/mico/TilelinkVpuCfuFiber.scala",
+        "src/main/scala/vexiiriscv/soc/mico/BitNetCfu.scala",
+        "src/main/scala/vexiiriscv/soc/mico/BitNetCfuV2.scala",
+        "src/main/scala/vexiiriscv/soc/mico/BitQuant.scala",
+        "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuFiber.scala",
+        "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuV2Fiber.scala",
+        "src/main/scala/vexiiriscv/execute/BitNetPlugin.scala",
+    )
 
     def test_default_level_is_standard(self) -> None:
         self.assertEqual(load_policy(REPO_ROOT).visibility, "standard")
 
-    def test_basic_hides_skills_siblings_and_spinalhdl(self) -> None:
+    def test_basic_hides_unexposed_vexii_sources_and_examples(self) -> None:
         policy = load_policy(REPO_ROOT, visibility="basic")
         for path in (
             self.SKILL,
             self.VPU,
             "src/main/scala/vexiiriscv/soc/mico/BitNetCfu.scala",
+            "src/main/scala/vexiiriscv/execute/MiCoPlugin.scala",
             self.SPINAL,
         ):
             self.assertFalse(policy.can_read(path), path)
@@ -253,12 +264,33 @@ class VisibilityPolicyTest(unittest.TestCase):
             "benchmarks/embench-iot/src/matmult-int/matmult-int.c",
         ):
             self.assertTrue(policy.can_read(path), path)
+        self.assertTrue(policy.may_contain_readable("src/main/scala/vexiiriscv/execute"))
 
-    def test_standard_adds_skills_and_siblings_but_not_spinalhdl(self) -> None:
+    def test_standard_reads_vexii_tree_but_examples_remain_denied(self) -> None:
         policy = load_policy(REPO_ROOT, visibility="standard")
         self.assertTrue(policy.can_read(self.SKILL))
-        self.assertTrue(policy.can_read(self.VPU))
+        for path in (
+            "src/main/scala/vexiiriscv/execute/MiCoPlugin.scala",
+            "src/main/scala/vexiiriscv/execute/IntAluPlugin.scala",
+            "src/main/scala/vexiiriscv/soc/mico/MiCoSoc.scala",
+        ):
+            self.assertTrue(policy.can_read(path), path)
+        for path in (
+            self.VPU,
+            "src/main/scala/vexiiriscv/soc/mico/TilelinkVpuCfuFiber.scala",
+            "src/main/scala/vexiiriscv/soc/mico/BitNetCfu.scala",
+            "src/main/scala/vexiiriscv/soc/mico/BitNetCfuV2.scala",
+            "src/main/scala/vexiiriscv/execute/BitNetPlugin.scala",
+        ):
+            self.assertFalse(policy.can_read(path), path)
         self.assertFalse(policy.can_read(self.SPINAL))
+
+    def test_example_cfus_remain_denied_at_every_visibility_level(self) -> None:
+        for level in ("basic", "standard", "extended"):
+            policy = load_policy(REPO_ROOT, visibility=level)
+            for path in self.EXAMPLE_CFUS:
+                with self.subTest(level=level, path=path):
+                    self.assertFalse(policy.can_read(path), path)
 
     def test_extended_exposes_spinalhdl_to_the_whole_flow(self) -> None:
         policy = load_policy(REPO_ROOT, visibility="extended")
@@ -283,9 +315,8 @@ class VisibilityPolicyTest(unittest.TestCase):
 
     def test_a_directory_is_visible_when_a_readable_file_may_live_below_it(self) -> None:
         policy = load_policy(REPO_ROOT)
-        # Directories are never themselves in the read tree...
-        self.assertFalse(policy.can_read("src/main/scala/vexiiriscv/soc/mico"))
-        # ...but navigation must see them.
+        # Broad recursive read globs can match directory paths too; navigation
+        # still uses may_contain_readable rather than exposing directory bodies.
         for path in ("src", "src/main/scala/vexiiriscv/soc/mico", "agents", "skills"):
             self.assertTrue(policy.may_contain_readable(path), path)
             self.assertEqual(policy.subtree_exclusion(path), "", path)

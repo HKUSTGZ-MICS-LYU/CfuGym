@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .tools import design_workspace_paths
+from . import vivado
 
 
 DOWNSTREAM = {
@@ -23,8 +24,9 @@ DOWNSTREAM = {
     "hw_build": ("hw_conformance", "sw_build", "sim", "cost"),
     "hw_conformance": ("sw_build", "sim", "cost"),
     "sw_build": ("sim", "cost"),
-    "sim": ("cost",),
-    "cost": (),
+    "sim": ("cost", "validation_pair"),
+    "cost": ("validation_pair",),
+    "validation_pair": (),
 }
 
 
@@ -74,6 +76,10 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
     hw_input = _hash({"isa": isa, "hardware": hw,
                       "hardware_integrity_version": hardware_integrity.VERSION})
     sw_input = _hash({"isa": isa, "software": sw})
+    # Old checkpoints retain their exact fingerprint vocabulary. New hardware
+    # includes the same declared clock frequency as simulation and Vivado.
+    if "target_frequency_mhz" in state:
+        hw_input = _hash({"hardware": hw_input, "frequency_mhz": state["target_frequency_mhz"]})
     built = _hash({"hardware": hw_input})
     conformance_inputs = {name: _source_hash(root, f"{run_root}/09_implementation/conformance/{name}")
                           for name in ("oracle.yaml", "cfu_conformance.c")} if run_root else {}
@@ -90,11 +96,24 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
                                                    "benchmark_integrity": project.get("integrity")}
                                                   if project.get("kind") == "embench_benchmark" else {}),
                                               "flags": state.get("soc_flags")}})
+    cost_input = measured
+    if state.get("cost_backend") == "vivado":
+        cost_input = _hash({"measurement": measured, "backend": "vivado",
+                            "part": state.get("fpga_part", vivado.DEFAULT_PART),
+                            "frequency_mhz": state.get("target_frequency_mhz", 100.0),
+                            "rtl_sha256": (state.get("rtl_snapshot") or {}).get("sha256"),
+                             "vivado_threads": int(state.get("vivado_threads", 4)),
+                             "parser": _source_hash(root, "agents/cfu_design_agent/runtime/vivado.py"),
+                            "flow_schema": 1, "top": "MiCoSoc", "cfu": "AgentCfu",
+                            "runner": _source_hash(root, "skills/cfu-designer/scripts/vivado_ppa_report.py"),
+                            "tcl": _source_hash(root, "skills/cfu-designer/scripts/vivado_ppa.tcl")})
     return {
         "analysis": analysis, "isa": isa, "implementation_hw": hw_input,
         "hw_build": hw_input, "hw_conformance": checked,
         "implementation_sw": sw_input, "sw_build": sw_built,
-        "sim": measured, "cost": measured,
+        "sim": measured, "cost": cost_input,
+        **({"validation_pair": _hash({"sim": measured, "cost": cost_input})}
+           if int(state.get("flow_version", 1)) >= 2 else {}),
     }
 
 

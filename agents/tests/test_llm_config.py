@@ -572,7 +572,10 @@ class StreamingTest(unittest.TestCase):
             self._chunk(content="LO"),
             self._chunk(
                 finish="stop",
-                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+                usage=SimpleNamespace(
+                    prompt_tokens=10, completion_tokens=4, total_tokens=14,
+                    completion_tokens_details=SimpleNamespace(reasoning_tokens=2),
+                ),
             ),
         ]
 
@@ -598,6 +601,35 @@ class StreamingTest(unittest.TestCase):
         self.assertIn("stream", result.extra_keys)
         self.assertTrue(seen, "the live progress callback must be called")
         self.assertGreater(seen[-1]["chars"], 0)
+
+    def test_stream_reads_sdk_extra_reasoning_and_preserves_exact_tool_transcript(self) -> None:
+        from types import SimpleNamespace
+
+        from agents.cfu_design_agent.runtime import llm
+
+        call = SimpleNamespace(index=0, id="call-1", function=SimpleNamespace(
+            name="read_file", arguments='{"path":"x"}'))
+        usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=14, total_tokens=24,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=9),
+        )
+        chunks = [
+            SimpleNamespace(usage=None, choices=[SimpleNamespace(finish_reason=None, delta=
+                SimpleNamespace(content=None, tool_calls=None,
+                                model_extra={"reasoning_content": "  think"}))]),
+            SimpleNamespace(usage=None, choices=[SimpleNamespace(finish_reason=None, delta=
+                SimpleNamespace(content=None, tool_calls=[call],
+                                model_extra={"reasoning_content": "-more \n"}))]),
+            SimpleNamespace(usage=usage, choices=[]),
+        ]
+        round_ = llm._chat_round_from_stream(iter(chunks))
+        self.assertEqual(round_.reasoning, "think-more")
+        self.assertEqual(round_.reasoning_source, "stream.reasoning_content")
+        self.assertEqual(round_.message.reasoning_content, "  think-more \n")
+        self.assertEqual(round_.reasoning_tokens, 9)
+        self.assertIn("reasoning_content", round_.extra_keys)
+        self.assertEqual(llm._assistant_tool_message(round_.message)["reasoning_content"],
+                         "  think-more \n")
 
     def test_chat_stream_accumulates_tool_call_fragments(self) -> None:
         from types import SimpleNamespace

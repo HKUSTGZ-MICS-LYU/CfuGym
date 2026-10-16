@@ -663,7 +663,9 @@ class ReadOnlyToolset:
         if len(body) > self.max_read_chars:
             body = body[: self.max_read_chars] + f"\n...[truncated at {self.max_read_chars} chars]"
         result = body or "(empty file range)"
-        flow_memory.capture_read(self.toolbox, rel, args, result)
+        # Store canonical live paths, not the model's {{run-dir}} spelling.
+        # Policy checks above still govern the read; memory must not relax them.
+        flow_memory.capture_read(self.toolbox, self.toolbox.normalize(rel), args, result)
         return result
 
     def _list_dir(self, args: dict[str, Any]) -> str:

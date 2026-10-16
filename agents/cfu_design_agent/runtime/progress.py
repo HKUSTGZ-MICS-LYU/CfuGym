@@ -24,7 +24,8 @@ STAGE_LABELS: dict[str, str] = {
     "check_conformance": "check conformance",
     "build_sw": "compile SW",
     "simulate": "simulate",
-    "estimate_cost": "cost (yosys)",
+    "estimate_cost": "cost (EDA)",
+    "validate_candidate": "validate sim + EDA (fail-fast)",
     "review_and_route": "review & route",
     "final_report": "final report",
 }
@@ -50,6 +51,7 @@ STEP_GROUPS: dict[str, str] = {
     "sw_build": "VERIFY",
     "sim": "VERIFY",
     "cost": "VERIFY",
+    "validation_pair": "VERIFY",
     "review": "DECIDE",
     "final_report": "DECIDE",
 }
@@ -91,6 +93,7 @@ NODE_TO_STEP: dict[str, str] = {
     "build_sw": "sw_build",
     "simulate": "sim",
     "estimate_cost": "cost",
+    "validate_candidate": "sim",
     "review_and_route": "review",
     "final_report": "final_report",
 }

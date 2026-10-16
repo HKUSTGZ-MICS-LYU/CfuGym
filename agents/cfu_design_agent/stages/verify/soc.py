@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 from ...flow import gates as gates_mod, ladder, outcome
-from ...runtime import effects, commands as commands_mod, hardware_integrity, stage_services
+from ...runtime import effects, commands as commands_mod, hardware_integrity, rtl_snapshot, stage_services
 from ...runtime.tools import SOC_WORKSPACE_SUBDIR
 from ...stages.implement import intrinsics
 from ...state import CfuDesignState
@@ -84,6 +84,13 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
         if before and before != encoding_evidence.get("candidate_hash"):
             errors.append("hardware_integrity/stale_candidate: candidate changed during SoC generation")
     ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
+    snapshot = {}
+    if ok and state.get("cost_backend") == "vivado" and not state.get("skip_cost"):
+        try:
+            snapshot = rtl_snapshot.freeze(state)
+        except (ValueError, OSError) as exc:
+            errors.append(f"hardware RTL snapshot failed: {exc}")
+            ok = False
     integrity_failed = any("hardware_integrity/" in error or "hardware integrity" in error for error in errors)
     evidence = {"errors": errors, "terminal_reason": "hardware_integrity" if integrity_failed else "",
                 "candidate_hash": encoding_evidence.get("candidate_hash", ""),
@@ -127,6 +134,7 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
     extra["iteration_history"] = [*(extra.get("iteration_history") or []), *history]
     update = {
         "validation_results": results,
+        **({"rtl_snapshot": snapshot} if snapshot else {}),
         "stage_jobs": "validation",
         "errors": errors,
         "gates": gates,

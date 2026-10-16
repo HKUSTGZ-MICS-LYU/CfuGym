@@ -156,21 +156,25 @@ VISIBILITY_GUIDANCE: dict[str, str] = {
         "You may read the workload/benchmark sources, the CFU integration contract "
         "(CfuBus/CfuPlugin/CfuLib), the AgentCfu/AgentCfuFiber scaffold, "
         "MiCoSoc/MiCoSocParam, the ISA template, sw/tests, and this run's artifacts.\n"
-        "You may NOT read the cfu-designer skills or any existing sibling CFU design "
-        "(for example VpuCfu, BitNetCfu); read attempts on those paths are denied. "
-        "Design from first principles using only the visible contract and scaffold, "
-        "and do not cite or assume the contents of an unavailable document."
+        "Only the explicitly exposed integration paths in the VexiiRiscv tree are readable; "
+        "the rest of src/main/scala/vexiiriscv/** requires standard visibility. You may NOT "
+        "read the cfu-designer skills or Vpu/BitNet example CFU sources and their helpers; "
+        "those VexiiRiscv paths are denied at every tier. Design from first principles using "
+        "only the visible contract and scaffold, and do not assume unavailable source."
     ),
     "standard": (
-        "You may additionally read the cfu-designer skills (skills/cfu-designer/**) and "
-        "the existing sibling CFU designs (VpuCfu/BitNetCfu); use them for patterns and "
-        "idioms.\n"
+        "You may read the cfu-designer skills (skills/cfu-designer/**) and the full "
+        "VexiiRiscv source subtree (src/main/scala/vexiiriscv/**) on demand as read-only "
+        "reference; use read_file/list_dir/search_text to inspect relevant files. "
+        "Vpu/BitNet example CFU sources and their helper/plugin files are denied at "
+        "every tier; do not try to inspect them.\n"
         "The SpinalHDL source tree (ext/SpinalHDL/**) is NOT available at this level; "
         "work from the AgentCfu scaffold and standard SpinalHDL idioms."
     ),
     "extended": (
         "You may additionally read the SpinalHDL source tree (ext/SpinalHDL/**); the "
-        "tier is flow-wide, so every stage of this run sees the same tree.\n"
+        "tier is flow-wide, so every stage of this run sees the same tree. The Vpu/BitNet "
+        "example CFUs remain denied at this level.\n"
         "Before writing hardware, use read_file/list_dir/search_text to confirm the exact "
         "SpinalHDL API you intend to call (for example spinal.core Bits/Vec/Stream/Reg and "
         "the fiber/Area patterns) instead of guessing method names, and prefer the idioms "
@@ -715,8 +719,8 @@ def contract_prompt(
     contract_path = f"{run_root}/08_isa/cfu_isa.yaml" if run_root else "08_isa/cfu_isa.yaml"
     if agent_tools:
         analysis_block = (
-            "Prior analysis (read it before deciding; carry its Roofline conclusion "
-            "into `roofline`):\n"
+            "Prior analysis (reuse matching Run memory; read missing details before "
+            "deciding; carry its Roofline conclusion into `roofline`):\n"
             f"- {run_root}/07_analysis/workload_analysis.yaml"
         )
     else:
@@ -1203,7 +1207,7 @@ def hardware_prompt(
     if contract_free:
         if agent_tools:
             analysis_ref = (
-                "Prior analysis (read it). There is NO frozen ISA contract in this run: "
+                "Prior analysis (reuse matching Run memory; read missing details). There is NO frozen ISA contract in this run: "
                 "you design the instruction encodings yourself (custom0 opcode 0x0B; "
                 "funct3 0..7; funct7 0..127) and the software side calls them through the "
                 "`cfu_intrinsics.h` it writes — keep the RTL decodable for exactly those "
@@ -1214,7 +1218,7 @@ def hardware_prompt(
             analysis_ref = "Analysis:\n" + analysis
     elif agent_tools:
         analysis_ref = (
-            "Prior analysis and contract (read them; the ISA contract is the frozen interface):\n"
+            "Prior analysis and contract (reuse matching Run memory; read missing details; the ISA contract is the frozen interface):\n"
             f"- {run_root}/07_analysis/workload_analysis.yaml\n"
             f"- {run_root}/08_isa/cfu_isa.yaml"
         )
@@ -1546,7 +1550,7 @@ def software_prompt(
     if contract_free:
         if agent_tools:
             context_ref = (
-                "Prior analysis (read it). There is NO ISA contract in this run: the "
+                "Prior analysis (reuse matching Run memory; read missing details). There is NO ISA contract in this run: the "
                 "`cfu_intrinsics.h` you write IS the instruction interface — design it from "
                 "the intrinsic template and keep it consistent with the hardware:\n"
                 f"- {run_root}/07_analysis/workload_analysis.yaml"
@@ -1555,7 +1559,7 @@ def software_prompt(
             context_ref = "Analysis:\n" + analysis
     elif agent_tools:
         context_ref = (
-            "Prior analysis and contract (read them; the ISA contract is the frozen interface):\n"
+            "Prior analysis and contract (reuse matching Run memory; read missing details; the ISA contract is the frozen interface):\n"
             f"- {run_root}/07_analysis/workload_analysis.yaml\n"
             f"- {run_root}/08_isa/cfu_isa.yaml"
         )

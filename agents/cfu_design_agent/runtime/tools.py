@@ -9,12 +9,18 @@ import hashlib
 import os
 import re
 import shutil
-import subprocess
+import subprocess as _subprocess
+from types import SimpleNamespace
+from uuid import uuid4
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from . import source_visibility
+from . import processes, source_visibility
+
+# Keep the longstanding tools.subprocess.run mock seam local to this module;
+# never replace the standard library's process runner for unrelated callers.
+subprocess = SimpleNamespace(run=processes.run, PIPE=_subprocess.PIPE)
 from .persistence import RunPersistence
 from .policy import AccessPolicy, PolicyError, load_policy, normalize_repo_path
 from ..state import CommandResult, RepoContext
@@ -97,9 +103,8 @@ def _tool_operation(toolbox: "RepoToolbox", action: str, target: str):
     if not toolbox.run_root or toolbox.workdir / toolbox.run_root != persisted.run_root:
         raise RuntimeError("tool mutation does not belong to the active persisted run")
     digest = hashlib.sha256(target.encode()).hexdigest()[:16]
-    attempt = len(persisted.journal._load()["operations"]) + 1
     with persisted.journal.external_operation(
-        action, f"{action}-{attempt:08d}-{digest}",
+        action, f"{action}-{uuid4().hex}-{digest}",
         {"stage": toolbox.stage, "target": target[:500]},
     ):
         yield

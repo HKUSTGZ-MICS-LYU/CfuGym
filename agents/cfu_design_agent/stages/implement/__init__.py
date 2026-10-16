@@ -28,6 +28,19 @@ from ...flow import gates, ladder, outcome
 
 
 def implement(state: CfuDesignState) -> CfuDesignState:
+    """Freeze the first candidate baseline, then deliver or repair HW/SW."""
+    baseline = state.get("design_baseline")
+    if not intrinsics._valid_design_baseline(baseline) and state.get("run_root"):
+        toolbox = stage_services._toolbox_for_stage(state, "implementation")
+        baseline = intrinsics._initial_design_baseline(state, toolbox)
+        state = {**state, "design_baseline": baseline}
+    update = _implement(state)
+    if intrinsics._valid_design_baseline(baseline):
+        return {**update, "design_baseline": baseline}
+    return update
+
+
+def _implement(state: CfuDesignState) -> CfuDesignState:
     """Deliver both sides of the accepted ISA contract.
 
     The mode is a property of the environment, not a user-facing switch: a run

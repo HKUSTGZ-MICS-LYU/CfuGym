@@ -17,7 +17,7 @@ from . import failures, source_visibility, tools as tools_mod
 from .llm import (
     DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     DEFAULT_MAX_TOOL_ROUNDS,
-    LlmResult, _parse_tool_arguments, clean_llm_text,
+    LlmResult, _object_value, _parse_tool_arguments, clean_llm_text,
     current_stage, record_usage,
 )
 
@@ -431,6 +431,7 @@ def _native_stage_loop(
         return {
             "messages": messages, "round_data": {
                 "text": round_.text, "reasoning": round_.reasoning,
+                "reasoning_content": _object_value(round_.message, "reasoning_content"),
                 "finish_reason": round_.finish_reason,
                 "reasoning_source": round_.reasoning_source,
                 "extra_keys": tuple(round_.extra_keys),
@@ -507,13 +508,21 @@ def _native_stage_loop(
                                   "content": observation})
         return entries, tool_messages, used
 
-    @staticmethod
+    def assistant_text_message(s: _LoopState) -> dict[str, Any]:
+        message = {"role": "assistant", "content": s["round_data"]["text"]}
+        reasoning_content = s["round_data"].get("reasoning_content")
+        if reasoning_content is not None:
+            message["reasoning_content"] = reasoning_content
+        return message
+
     def assistant_message(s: _LoopState, calls: list[dict[str, str]]) -> dict[str, Any]:
-        return {"role": "assistant", "content": s["round_data"]["text"],
-                "tool_calls": [{"id": call["id"], "type": "function",
-                                "function": {"name": call["name"],
-                                             "arguments": call["arguments"]}}
-                               for call in calls]}
+        message = assistant_text_message(s)
+        message["tool_calls"] = [
+            {"id": call["id"], "type": "function",
+             "function": {"name": call["name"], "arguments": call["arguments"]}}
+            for call in calls
+        ]
+        return message
 
     def guarded_tools(s: _LoopState) -> dict[str, Any]:
         entries, tool_messages, used = execute_batch(s, s["calls"])
@@ -531,7 +540,7 @@ def _native_stage_loop(
         if s["empty_turns"] >= max_empty_turns:
             raise failures.StageDeliveryFailure("model did not call submit_stage", terminal_reason="delivery_missing")
         messages = list(s["messages"])
-        messages.append({"role": "assistant", "content": s["round_data"]["text"]})
+        messages.append(assistant_text_message(s))
         if s.get("finalize_only", False):
             reminder = (
                 "No stage was submitted. Only submit_stage is available; call it now "

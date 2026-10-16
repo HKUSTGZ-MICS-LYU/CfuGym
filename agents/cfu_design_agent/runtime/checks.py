@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import subprocess
+from uuid import uuid4
 from typing import Any
 
-from ..runtime import observations, stage_services, tools
+from ..runtime import observations, processes, stage_services, tools, validation_parallel
 from ..runtime.policy import PolicyError
 from ..runtime.tools import RepoToolbox
 from ..state import CfuDesignState
@@ -36,7 +37,9 @@ def _run_check(
     ``log_stage``'s directory (default: the validation/cost rung's own), so the
     run keeps a readable trace of what it built, simulated or synthesised.
     """
+    processes.check_cancelled()
     result: dict[str, Any] | None = None
+    cancelled: processes.ValidationCancelled | None = None
     if not command_id:
         # Resolve the declared command id here so an unallowlisted user command
         # (for example a custom C-project run_cmd) becomes a repairable failure
@@ -75,6 +78,18 @@ def _run_check(
             "stdout_tail": "",
             "stderr_tail": f"command rejected by the access policy: {exc}",
         }
+    except processes.ValidationCancelled as exc:
+        if not exc.started:
+            raise
+        cancelled = exc
+        result = {
+            "command": " ".join(argv), "cwd": str(toolbox.workdir),
+            "returncode": exc.returncode, "cancelled": True,
+            "stdout_tail": tools.filter_output(exc.stdout)[-2000:],
+            "stderr_tail": tools.filter_output(exc.stderr)[-2000:],
+            "_stdout_full": tools.filter_output(exc.stdout),
+            "_stderr_full": tools.filter_output(exc.stderr),
+        }
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ""
         stderr = exc.stderr or ""
@@ -99,28 +114,56 @@ def _run_check(
             "stdout_tail": "",
             "stderr_tail": f"command could not start: {exc}",
         }
+    if cancelled is None:
+        try:
+            processes.check_cancelled()
+        except processes.ValidationCancelled as exc:
+            cancelled = exc
+            result["cancelled"] = True
+    if cancelled is None and result.get("returncode") not in (0, None):
+        validation_parallel.command_failed()
     result["rung"] = rung
     stdout_full = str(result.pop("_stdout_full", result.get("stdout_tail", "")) or "")
     stderr_full = str(result.pop("_stderr_full", result.get("stderr_tail", "")) or "")
-    if result.get("returncode") is not None:
+    if cancelled is None:
+        try:
+            return _persist_check_log(state, toolbox, result, stdout_full, stderr_full,
+                                      rung=rung, command_id=command_id, log_stage=log_stage)
+        except processes.ValidationCancelled as exc:
+            cancelled = exc
+            result["cancelled"] = True
+    # Cancellation is not a second failure. Save complete output with an explicit
+    # cancelled status, then let the coordinator discard the lane's state update.
+    with processes.record_cancelled_output():
+        _persist_check_log(state, toolbox, result, stdout_full, stderr_full,
+                           rung=rung, command_id=command_id, log_stage=log_stage)
+    cancelled.result = result
+    raise cancelled
+
+
+def _persist_check_log(state, toolbox, result, stdout_full, stderr_full, *,
+                       rung, command_id, log_stage):
+    if result.get("returncode") is not None or result.get("cancelled"):
         # Keep complete output outside graph state.  The immutable artifact and
         # bounded state tails together provide both replayability and compact
         # checkpoints.  One combined file preserves stdout/stderr attribution.
         artifact_stage = log_stage or ("cost" if rung == "cost" else "validation")
         artifacts = stage_services._artifacts_for_stage(state, artifact_stage)
-        command_index = sum(
-            1
-            for item in artifacts.manifest.get("artifacts", [])
-            if item.get("kind") == "command_log" and item.get("rung") == rung
-        )
         directory = _LOG_DIRS.get(artifact_stage, f"{artifact_stage}/logs")
-        relative = f"{directory}/{rung}_{command_index:03d}.log"
+        evaluation_id = str(state.get("evaluation_id") or "")
+        if evaluation_id:
+            root = directory.removesuffix("/logs")
+            directory = f"{root}/evaluations/{evaluation_id}/{rung}/logs"
+        # Indexing a stale manifest is not an allocation protocol. Unique IDs
+        # prevent overlapping instances from overwriting each other's logs.
+        relative = f"{directory}/{rung}_{uuid4().hex}.log"
         log_text = (
             f"command: {result.get('command', '')}\n"
             f"command_id: {command_id}\n"
             f"cwd: {result.get('cwd', '')}\n"
             f"returncode: {result.get('returncode')}\n"
-            f"timed_out: {bool(result.get('timed_out', False))}\n\n"
+            f"timed_out: {bool(result.get('timed_out', False))}\n"
+            f"cancelled: {bool(result.get('cancelled', False))}\n\n"
             "=== STDOUT ===\n" + stdout_full + "\n\n=== STDERR ===\n" + stderr_full
         )
         ref = artifacts.write_text(
@@ -128,14 +171,18 @@ def _run_check(
             relative,
             log_text,
             kind="command_log",
-            status="passed" if result.get("returncode") == 0 else "failed",
-            metadata={"rung": rung, "command": str(result.get("command", ""))[:500]},
+            status="cancelled" if result.get("cancelled") else "passed" if result.get("returncode") == 0 else "failed",
+            metadata={"rung": rung, "command": str(result.get("command", ""))[:500],
+                      **({"evaluation_id": evaluation_id} if evaluation_id else {})},
         )
         result["log_path"] = ref["path"]
         result["full_log_path"] = ref["path"]
         result["command_id"] = command_id
         result["stdout_truncated"] = len(stdout_full) > len(str(result.get("stdout_tail", "")))
         result["stderr_truncated"] = len(stderr_full) > len(str(result.get("stderr_tail", "")))
+        if result.get("cancelled"):
+            result.pop("failure_observation", None)
+            return result
         observation = observations.build_failure_observation(
             rung,
             result,

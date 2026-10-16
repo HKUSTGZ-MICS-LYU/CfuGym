@@ -43,6 +43,15 @@ class RunConfig(TypedDict, total=False):
     visibility: Visibility
     skip_sim: bool
     skip_yosys: bool
+    skip_cost: bool
+    cost_backend: Literal["yosys", "vivado"]
+    fpga_part: str
+    target_frequency_mhz: float
+    eda_timeout: int
+    vivado_threads: int
+    validation_mode: Literal["parallel", "serial"]
+    flow_version: int
+    resume_eda_options: dict[str, Any]
     # Ablation switches (all default True; the --no-* CLI flags set False).
     llvm_ir: bool
     require_conformance: bool

@@ -1,34 +1,34 @@
 version: "1"
 
 # Visibility tiers gate what the agent may READ. A path matched by a level's
-# globs is readable only at that level or above; everything not listed is
-# readable at every level. `basic` is the floor and therefore has no entries.
+# globs is readable only at that level or above, unless an `exemptions` pattern
+# preserves a lower-tier subtree. Top-level deny rules always take precedence.
+# Everything outside the read tree is unreadable at every level.
 # This is a read-only gate: writes, command allowlists, and the effect flags
 # (--dry-run / --no-apply-patch / --no-run-commands) are unchanged. Tiers are
 # flow-wide: a level applies to every stage, never to one stage alone.
 #
-#   basic    - workload/integration/sw plus the AgentCfu surface only;
-#              skills and existing sibling CFU designs are hidden.
-#   standard - default: basic + skills + sibling CFU designs (Vpu/BitNet).
-#   extended - standard + the SpinalHDL source tree.
+#   basic    - existing integration subtrees plus workload/sw; the rest of the
+#              VexiiRiscv tree, skills and example CFUs are hidden.
+#   standard - default: basic + skills + the full VexiiRiscv source subtree,
+#              except the explicitly denied BitNet/Vpu example CFUs.
+#   extended - standard + the SpinalHDL source tree; example CFUs stay denied.
 visibility:
   default: standard
   levels: [basic, standard, extended]
   gated:
     standard:
       - "skills/cfu-designer/**"
-      - "src/main/scala/vexiiriscv/soc/mico/VpuCfu.scala"
-      - "src/main/scala/vexiiriscv/soc/mico/TilelinkVpuCfuFiber.scala"
-      - "src/main/scala/vexiiriscv/soc/mico/BitNetCfu.scala"
-      - "src/main/scala/vexiiriscv/soc/mico/BitNetCfuV2.scala"
-      - "src/main/scala/vexiiriscv/soc/mico/BitQuant.scala"
-      - "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuFiber.scala"
-      - "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuV2Fiber.scala"
-      # Not in the read tree today; declared so nothing can expose the BitNet
-      # plugin below `standard`.
-      - "src/main/scala/vexiiriscv/execute/BitNetPlugin.scala"
+      - "src/main/scala/vexiiriscv/**"
     extended:
       - "ext/SpinalHDL/**"
+  # Existing basic-tier integration sources remain available inside the broader
+  # VexiiRiscv standard gate; these exceptions never override deny rules.
+  exemptions:
+    standard:
+      - "src/main/scala/vexiiriscv/execute/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/cfu/**"
+      - "src/main/scala/vexiiriscv/soc/mico/**"
 
 # What the agent may READ. This is ONE list for the whole flow: a run's
 # knowledge is shared, so every stage sees the same tree and only what a stage
@@ -42,6 +42,9 @@ read:
   - "agents/generated/cache/**"
   # Repository sources and build inputs the design touches.
   - "MiCoSoc.v"
+  # Whole source subtree is opened at standard, with the basic-tier subtrees
+  # exempted above and Vpu/BitNet example designs denied below.
+  - "src/main/scala/vexiiriscv/**"
   - "src/main/scala/vexiiriscv/execute/cfu/**"
   - "src/main/scala/vexiiriscv/soc/cfu/**"
   - "src/main/scala/vexiiriscv/soc/mico/**"
@@ -57,6 +60,16 @@ read:
 
 # Deny rules always take precedence over the read tree.
 deny:
+  # Reference/example CFUs are not part of the agent's source corpus, even when
+  # the surrounding VexiiRiscv tree is available at standard/extended.
+  - "src/main/scala/vexiiriscv/soc/mico/VpuCfu.scala"
+  - "src/main/scala/vexiiriscv/soc/mico/TilelinkVpuCfuFiber.scala"
+  - "src/main/scala/vexiiriscv/soc/mico/BitNetCfu.scala"
+  - "src/main/scala/vexiiriscv/soc/mico/BitNetCfuV2.scala"
+  - "src/main/scala/vexiiriscv/soc/mico/BitQuant.scala"
+  - "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuFiber.scala"
+  - "src/main/scala/vexiiriscv/soc/mico/TilelinkBitNetCfuV2Fiber.scala"
+  - "src/main/scala/vexiiriscv/execute/BitNetPlugin.scala"
   # Request debug logs contain whole application prompts; the host may audit
   # them, but they are never an input source for the model or run memory.
   - "agents/generated/runs/**/request_audit.jsonl"
@@ -176,7 +189,7 @@ stages:
       - "agents/generated/runs/**/11_cost/**"
       - "agents/generated/runs/**/workspace/**"
       - "agents/generated/runs/**/run.yaml"
-    commands: [cfu_generate_agent, yosys_cost]
+    commands: [cfu_generate_agent, yosys_cost, vivado_cost]
   review:
     write: ["agents/generated/runs/**/12_review/**", "agents/generated/runs/**/report.md", "agents/generated/runs/**/run.yaml"]
     commands: []
@@ -241,6 +254,10 @@ commands:
   yosys_cost:
     executable: python3
     argv_prefix: [python3, skills/cfu-designer/scripts/yosys_cost_report.py]
+  vivado_cost:
+    executable: python3
+    argv_prefix: [python3, skills/cfu-designer/scripts/vivado_ppa_report.py]
+    required_tokens: [--run-dir, --out-dir, --rtl, --part, --target-frequency-mhz]
   # Retain the legacy descriptor for compatibility. RepoToolbox validates all
   # text-patch targets and strips --unsafe-paths before invoking Git; ignored
   # workspace paths do not require unsafe path execution.

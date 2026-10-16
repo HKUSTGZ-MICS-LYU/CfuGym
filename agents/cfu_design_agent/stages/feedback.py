@@ -196,6 +196,8 @@ def check_feedback(state: CfuDesignState, rung: str, *, limit: int = 2) -> str:
     chunks: list[str] = []
     start = int((state.get("repair_evidence_epoch") or {}).get("validation_results", 0))
     for result in (state.get("validation_results") or [])[start:]:
+        if result.get("cancelled") or result.get("status") == "cancelled":
+            continue
         if result.get("rung") != rung:
             continue
         if result.get("returncode") == 0 and not result.get("skipped"):
@@ -218,6 +220,8 @@ def cost_feedback(state: CfuDesignState, *, limit: int = 2) -> str:
     chunks: list[str] = []
     start = int((state.get("repair_evidence_epoch") or {}).get("cost_results", 0))
     for result in (state.get("cost_results") or [])[start:]:
+        if result.get("cancelled") or result.get("status") == "cancelled":
+            continue
         if result.get("returncode") == 0 and not result.get("skipped"):
             chunks.clear()
             continue
@@ -271,7 +275,7 @@ def hardware_repair_feedback(state: CfuDesignState) -> str:
         labeled_feedback("hw_build (SoC generation) errors", check_feedback(state, "hw_build")),
         labeled_feedback("hw_conformance errors", conformance_feedback(state)),
         sim_feedback(state),
-        labeled_feedback("cost (Yosys) errors", cost_feedback(state)),
+        labeled_feedback(f"cost ({'Vivado' if state.get('cost_backend') == 'vivado' else 'Yosys'}) errors", cost_feedback(state)),
         labeled_feedback(
             "implementation_hw rejection", implementation_feedback(state, "implementation_hw")
         ),

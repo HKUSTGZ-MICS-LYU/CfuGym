@@ -22,7 +22,8 @@ from typing import Any, Iterator
 
 import yaml
 
-from .artifacts import ARTIFACT_SCHEMA_VERSION, new_run_id
+from . import processes
+from .artifacts import ARTIFACT_SCHEMA_VERSION, new_run_id, metadata_lock
 from .policy import PolicyError, normalize_repo_path
 
 
@@ -214,22 +215,41 @@ class OperationJournal:
     @contextmanager
     def external_operation(self, node: str, operation_id: str,
                            details: dict[str, Any] | None = None) -> Iterator[None]:
-        """Write pending before a node side effect; commit only on normal return.
+        """Write pending before an effect; commit normal or confirmed-cancelled exits.
 
         Call only while the owning run context holds its exclusive writer lock.
         A duplicate id is refused, including an already committed operation.
         """
         if not node or not isinstance(node, str) or not _RUN_ID.fullmatch(operation_id):
             raise ValueError("node and operation_id must be nonempty; id uses [A-Za-z0-9_-]")
-        journal = self._load()
-        if operation_id in journal["operations"]:
-            raise PersistenceRiskError(f"operation id already recorded: {operation_id}")
-        entry = {"node": node, "status": "pending", "details": details or {}}
-        journal["operations"][operation_id] = entry
-        _atomic_json(self.path, journal)
-        yield
-        entry["status"] = "committed"
-        _atomic_json(self.path, journal)
+        with metadata_lock(self.path):
+            journal = self._load()
+            if operation_id in journal["operations"]:
+                raise PersistenceRiskError(f"operation id already recorded: {operation_id}")
+            entry = {"node": node, "status": "pending", "details": details or {}}
+            journal["operations"][operation_id] = entry
+            _atomic_json(self.path, journal)
+        # Never hold the metadata lock across the actual external operation.
+        # Exceptions deliberately leave pending evidence for reconciliation.
+        try:
+            yield
+        except processes.ValidationCancelled:
+            # The managed runner raises cancellation only after terminating and
+            # reaping the process group (or before spawning). Its outcome is
+            # known, unlike an interrupted/uncertain external operation.
+            self._commit_operation(operation_id, cancelled=True)
+            raise
+        else:
+            self._commit_operation(operation_id)
+
+    def _commit_operation(self, operation_id: str, *, cancelled: bool = False) -> None:
+        with metadata_lock(self.path):
+            journal = self._load()
+            entry = journal["operations"][operation_id]
+            entry["status"] = "committed"
+            if cancelled:
+                entry["outcome"] = "cancelled"
+            _atomic_json(self.path, journal)
 
 
 @dataclass

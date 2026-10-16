@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agents.cfu_design_agent import conformance, graph
+from agents.cfu_design_agent import conformance, graph, prompts
 from agents.cfu_design_agent.runtime.llm import LlmResult
 from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.runtime.tools import RepoToolbox, design_workspace_paths
@@ -137,6 +137,10 @@ class Stage3IntegrationTest(unittest.TestCase):
             except Exception as exc:
                 self.fail(f"Stage 3 failed: {exc}; calls={observed!r}")
         self.assertEqual(client.turns, [])
+        request_user = client.messages[0][1]["content"]
+        shared = prompts.workload_digest_block(self.state["workload_spec"], None)
+        self.assertIn(shared, request_user)
+        self.assertLess(request_user.index(shared), request_user.index("## Stage:"))
         self.assertEqual(update["gates"]["implementation_hw"]["ok"], True)
         self.assertEqual(update["gates"]["implementation_sw"]["ok"], True)
         self.assertNotIn("hw_build", update["gates"])

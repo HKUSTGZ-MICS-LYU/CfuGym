@@ -11,7 +11,7 @@ from typing import Any
 
 from contextlib import nullcontext
 
-from ..runtime import dependencies, effects, failures, flow_memory, llm, progress as progress_mod, request_audit
+from ..runtime import dependencies, effects, failures, flow_memory, llm, progress as progress_mod, request_audit, stage_history
 from ..runtime.persistence import RunPersistence
 from ..runtime.progress import StageProgress
 
@@ -67,6 +67,7 @@ _NODE_TO_GATE: dict[str, str] = {
     "build_sw": "sw_build",
     "simulate": "sim",
     "estimate_cost": "cost",
+    "validate_candidate": ("sim", "cost", "validation_pair"),
     "review_and_route": "review",
     "final_report": "final_report",
 }
@@ -142,8 +143,8 @@ def _audit_context(state):
     )
 
 
-def _with_flow_memory(state, update, transcript, name):
-    """Fold this node's verified reads and accepted artifacts into run memory."""
+def _with_flow_memory(state, update, transcript, name, *, history_events=()):
+    """Publish verified observations and bounded, outcome-labelled handoffs."""
     if not isinstance(update, dict):
         return update
     try:
@@ -153,11 +154,20 @@ def _with_flow_memory(state, update, transcript, name):
         memory = flow_memory.derive_memory(
             state, update, list(transcript or ()), toolbox, node_name=name
         )
+        if memory:
+            update = {**update, "flow_memory": memory}
+        if history_events or state.get("stage_history"):
+            history = stage_history.derive_history(
+                state, update, list(history_events or ()), toolbox,
+                node_name=name, accepted=_update_ok(update, name),
+            )
+            if history:
+                update = {**update, "stage_history": history}
     except (ValueError, OSError):
         # Memory is advisory evidence; a pathological state must not hide the
         # node's own result. Stale entries are revalidated before every use.
         return update
-    return {**update, "flow_memory": memory} if memory else update
+    return update
 
 
 def _wrap_node(fn):
@@ -199,10 +209,15 @@ def _wrap_node(fn):
             # run memory) and the run-scoped request audit for every model call.
             try:
                 audit = _audit_context(state)
-                with effects.use_state(state), flow_memory.collect_tool_transcripts() as transcript, audit:
+                with (effects.use_state(state),
+                      flow_memory.collect_tool_transcripts(state) as transcript,
+                      stage_history.collect_executions() as history_events,
+                      audit):
                     update = fn(state)
                 update = apply_fingerprints(update)
-                return _with_flow_memory(state, update, transcript, name)
+                return _with_flow_memory(
+                    state, update, transcript, name, history_events=history_events,
+                )
             except Exception as exc:
                 failures.attach_partial_state(exc, state, source="node_entry", stage=name)
                 raise

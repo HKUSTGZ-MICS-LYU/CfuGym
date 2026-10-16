@@ -71,7 +71,7 @@ def _optimization_paths(state: CfuDesignState) -> list[tuple[str, str]]:
         (f"{run_root}/09_implementation/hw_plan.md", "current hardware design plan"),
         (f"{run_root}/09_implementation/sw_plan.md", "current software design plan"),
         (f"{run_root}/10_validation/embench.yaml", "measured validation result"),
-        (f"{run_root}/11_cost/result.yaml", "Yosys cost result"),
+        (f"{run_root}/11_cost/result.yaml", "EDA cost/PPA result"),
         (f"{run_root}/12_review/optimization_rounds.yaml", "optimization ledger"),
     ])
 

@@ -108,7 +108,7 @@ def profile_embench(state: CfuDesignState) -> CfuDesignState:
         build_commands={
             config: embench.build_command(run_root, name, config) for config in configs
         },
-        cpu_flags=commands_mod.agent_cfu_gen_flags(state.get("isa_spec", {}) or {}),
+        cpu_flags=commands_mod.agent_cfu_gen_flags(state.get("isa_spec", {}) or {}, state.get("target_frequency_mhz")),
         observation_plan=planned_observation,
         measurement_protocol=(project.get("measurement") or {}).get("protocol"),
     )

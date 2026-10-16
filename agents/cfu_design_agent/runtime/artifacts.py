@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -10,7 +11,10 @@ import os
 from pathlib import Path
 import secrets
 import tempfile
+import threading
 from typing import Any
+
+from . import processes
 
 import yaml
 
@@ -18,6 +22,19 @@ from .policy import AccessPolicy, PolicyError, normalize_repo_path
 
 
 ARTIFACT_SCHEMA_VERSION = "1"
+
+_METADATA_LOCKS: dict[str, threading.RLock] = {}
+_METADATA_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def metadata_lock(path: Path):
+    """Short per-file thread lock; the run writer lock excludes other processes."""
+    key = str(path.resolve())
+    with _METADATA_LOCKS_GUARD:
+        lock = _METADATA_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
 
 
 @dataclass
@@ -153,18 +170,11 @@ class RunArtifacts:
         )
 
     def set_status(self, stage: str, status: str, *, error: str = "") -> None:
-        self.manifest["status"] = status
-        self.manifest["last_stage"] = stage
-        if error:
-            self.manifest.setdefault("errors", []).append(error)
-        self._write_manifest(stage)
+        self._write_manifest(stage, updates={"status": status, "last_stage": stage}, error=error)
 
     def set_manifest_metadata(self, stage: str, key: str, value: Any) -> None:
         """Record run-level metadata (for example the resolved LLM request)."""
-        if self.manifest.get(key) == value:
-            return
-        self.manifest[key] = value
-        self._write_manifest(stage)
+        self._write_manifest(stage, updates={key: value})
 
     def _write(
         self,
@@ -178,6 +188,7 @@ class RunArtifacts:
         visible_files: list[str],
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
+        processes.check_cancelled()
         rel_path = normalize_repo_path(self.workdir, f"{self.root_rel}/{relative}")
         self.policy.check_write(stage, rel_path)
         path = self.workdir / rel_path
@@ -209,50 +220,39 @@ class RunArtifacts:
             "created_at": _now(),
         }
         ref.update(metadata)
-        self.manifest.setdefault("artifacts", []).append(ref)
-        self.manifest["last_stage"] = stage
-        self._write_manifest(stage)
+        self._write_manifest(stage, ref=ref, updates={"last_stage": stage})
         return ref
 
-    def _write_manifest(self, stage: str) -> None:
+    def _write_manifest(self, stage: str, *, ref: dict | None = None,
+                        updates: dict | None = None, error: str = "") -> None:
         rel_path = f"{self.root_rel}/run.yaml"
         self.policy.check_write(stage, rel_path)
         path = self.workdir / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        text = yaml.safe_dump(
-            self._merged_manifest(path), sort_keys=False, allow_unicode=False
-        ).encode("utf-8")
-        _atomic_write(path, text)
+        with metadata_lock(path):
+            processes.check_cancelled()
+            manifest = self._merged_manifest(path, ref=ref, updates=updates)
+            if error:
+                manifest.setdefault("errors", []).append(error)
+            text = yaml.safe_dump(manifest, sort_keys=False, allow_unicode=False).encode("utf-8")
+            _atomic_write(path, text)
+            self.manifest = manifest
 
-    def _merged_manifest(self, path: Path) -> dict[str, Any]:
-        """This instance's view unioned with the on-disk artifact refs.
-
-        RunArtifacts instances are cheap and often short-lived, and each write
-        rewrites run.yaml wholesale. Without this merge, an instance created
-        before another instance's write silently dropped that write's ref: this
-        is how the hw_conformance answers vanished from run.yaml and every retry
-        re-used the same ``conformance_000.txt`` number (observed 2026-09-26).
-        Scalars stay last-writer-wins; artifact refs merge by path, newest
-        entry winning.
-        """
+    def _merged_manifest(self, path: Path, *, ref: dict | None = None,
+                         updates: dict | None = None) -> dict[str, Any]:
+        """Reload under metadata_lock; stale instances publish only their delta."""
         try:
             loaded = yaml.safe_load(path.read_text(errors="replace"))
         except (OSError, yaml.YAMLError):
             loaded = None
-        if not isinstance(loaded, dict):
-            return self.manifest
-        manifest = {**loaded, **{k: v for k, v in self.manifest.items() if k != "artifacts"}}
-        merged: list[Any] = []
-        for ref in [
-            *(loaded.get("artifacts") or []),
-            *(self.manifest.get("artifacts") or []),
-        ]:
-            if not isinstance(ref, dict):
-                continue
-            key = str(ref.get("path", ""))
-            merged = [entry for entry in merged if str(entry.get("path", "")) != key]
-            merged.append(ref)
-        manifest["artifacts"] = merged
+        manifest = dict(loaded if isinstance(loaded, dict) else self.manifest)
+        manifest.update(updates or {})
+        if ref is not None:
+            # The public manifest retains one latest ref per logical path;
+            # immutable version files preserve historical bytes.
+            refs = [entry for entry in (manifest.get("artifacts") or [])
+                    if isinstance(entry, dict) and entry.get("path") != ref["path"]]
+            manifest["artifacts"] = [*refs, ref]
         return manifest
 
 

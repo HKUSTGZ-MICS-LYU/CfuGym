@@ -30,18 +30,95 @@ def _hardware_candidate_hash(state: CfuDesignState, toolbox: RepoToolbox) -> str
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _software_candidate_hash(toolbox: RepoToolbox, targets: list[tuple[str, str]]) -> str:
-    """Hash current candidate paths/content for check freshness and final audit."""
+def _candidate_source_hash(
+    toolbox: RepoToolbox, paths, *, missing_content: dict[str, str] | None = None,
+) -> str:
+    """Hash source paths and bytes, with optional content for not-yet-seeded files."""
     digest = hashlib.sha256()
-    for path, _shown in sorted(targets):
+    missing_content = missing_content or {}
+    for path in sorted(set(paths)):
         digest.update(path.encode("utf-8"))
         digest.update(b"\0")
         try:
-            digest.update(toolbox.read_text(path, limit=2_000_000).encode("utf-8"))
+            if path in missing_content:
+                full_path = Path(toolbox.workdir) / path
+                if not full_path.is_file():
+                    text = missing_content[path]
+                else:
+                    text = toolbox.read_text(path, limit=2_000_000)
+            else:
+                text = toolbox.read_text(path, limit=2_000_000)
+            digest.update(text.encode("utf-8"))
         except (AttributeError, OSError, PolicyError):
             digest.update(b"<unreadable>")
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _software_candidate_hash(toolbox: RepoToolbox, targets: list[tuple[str, str]]) -> str:
+    """Hash current candidate paths/content for check freshness and final audit."""
+    return _candidate_source_hash(toolbox, (path for path, _shown in targets))
+
+
+def _design_source_hashes(state: CfuDesignState, toolbox: RepoToolbox) -> dict[str, str]:
+    """Hash the editable HW/SW sources, excluding contracts and generated products."""
+    hardware_paths = tools.design_workspace_paths(state.get("run_root", "")).values()
+    try:
+        software_targets = stage_services._software_targets(state, toolbox)
+    except (AttributeError, OSError, PolicyError):
+        software_targets = []
+
+    # Under --no-isa-contract the host seeds an editable header from this template.
+    # Treat the expected seed bytes as the initial content when it does not exist yet,
+    # so Host setup alone is not mistaken for an agent-authored software change.
+    missing_software_content: dict[str, str] = {}
+    if (not state.get("isa_contract", True) and state.get("apply_patch", False)
+            and not state.get("dry_run", False)):
+        header = intrinsics_header_path(state)
+        if header and any(path == header for path, _shown in software_targets):
+            full_path = Path(toolbox.workdir) / header
+            if not full_path.is_file():
+                missing_software_content[header] = intrinsics_template_text(str(toolbox.workdir))
+
+    return {
+        "hardware": _candidate_source_hash(toolbox, hardware_paths),
+        "software": _candidate_source_hash(
+            toolbox, (path for path, _shown in software_targets),
+            missing_content=missing_software_content,
+        ),
+    }
+
+
+def _candidate_change_domains(state: CfuDesignState, toolbox: RepoToolbox) -> dict[str, bool]:
+    """Compare final candidate sources with the immutable first-implement baseline.
+
+    Legacy/checkpoint states without a baseline fall back to the current attempt's
+    touched-path ledgers. New runs always use content hashes, so later repair rounds
+    cannot erase an earlier HW or SW change by returning an empty touched-path list.
+    """
+    baseline = state.get("design_baseline")
+    if isinstance(baseline, dict) and baseline.get("version") == 1 and all(
+            key in baseline for key in ("hardware", "software")):
+        current = _design_source_hashes(state, toolbox)
+        return {domain: current[domain] != baseline[domain]
+                for domain in ("hardware", "software")}
+    return {
+        "hardware": bool(state.get("changed_design_files")),
+        "software": bool(state.get("changed_sw_files")),
+    }
+
+
+def _initial_design_baseline(state: CfuDesignState, toolbox: RepoToolbox) -> dict[str, Any]:
+    """Capture the candidate source baseline once, before any implementation edits."""
+    return {"version": 1, **_design_source_hashes(state, toolbox)}
+
+
+DESIGN_BASELINE_VERSION = 1
+
+
+def _valid_design_baseline(value: Any) -> bool:
+    return (isinstance(value, dict) and value.get("version") == DESIGN_BASELINE_VERSION
+            and all(isinstance(value.get(key), str) for key in ("hardware", "software")))
 
 
 

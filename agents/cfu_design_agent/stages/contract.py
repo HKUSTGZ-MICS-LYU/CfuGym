@@ -173,7 +173,8 @@ def extend_isa(state: CfuDesignState) -> CfuDesignState:
     run_root = str(state.get("run_root", "") or "").rstrip("/")
     if tools_enabled and run_root:
         incumbent_block = (
-            "Incumbent contract (read it before extending; every existing command must be kept):\n"
+            "Incumbent contract (reuse complete hash-matched Run memory, otherwise read it "
+            "before extending; every existing command must be kept):\n"
             f"- {run_root}/08_isa/cfu_isa.yaml"
         )
     else:

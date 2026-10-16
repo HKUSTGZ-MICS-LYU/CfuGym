@@ -74,6 +74,30 @@ class ModeDispatchTest(unittest.TestCase):
             self.assertEqual(implement_stage.implement(self.state)["stage_jobs"], "tools")
         self.assertTrue(tool_mode.called)
 
+    def test_initial_candidate_baseline_is_captured_once_and_preserved_on_repairs(self) -> None:
+        baseline = {"version": 1, "hardware": "hw-initial", "software": "sw-initial"}
+        state = {**self.state, "run_root": "agents/generated/runs/baseline-test"}
+        client = mock.Mock(available=True)
+        with mock.patch.object(llm_step, "_llm", return_value=client), \
+                mock.patch.object(implement_stage.stage_services, "_toolbox_for_stage",
+                                  return_value=mock.Mock()), \
+                mock.patch.object(implement_stage.intrinsics, "_initial_design_baseline",
+                                  return_value=baseline) as capture, \
+                mock.patch.object(implement_stage.unified, "implement_with_tools",
+                                  return_value={"stage_jobs": "tools"}) as tool_mode:
+            first = implement_stage.implement(state)
+        capture.assert_called_once()
+        self.assertEqual(first["design_baseline"], baseline)
+        self.assertEqual(tool_mode.call_args.args[0]["design_baseline"], baseline)
+
+        with mock.patch.object(llm_step, "_llm", return_value=client), \
+                mock.patch.object(implement_stage.intrinsics, "_initial_design_baseline",
+                                  side_effect=AssertionError("repair must keep the initial baseline")), \
+                mock.patch.object(implement_stage.unified, "implement_with_tools",
+                                  return_value={"stage_jobs": "repair"}):
+            repair = implement_stage.implement({**state, "design_baseline": baseline})
+        self.assertEqual(repair["design_baseline"], baseline)
+
     def test_delivery_mode_is_used_without_tools(self) -> None:
         with mock.patch.object(llm_step, "_llm", return_value=mock.Mock(available=True)), \
                 mock.patch.object(implement_stage.hardware, "implement_hw",

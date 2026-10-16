@@ -7,7 +7,7 @@ from pathlib import Path
 from ...benchmark import cfu_execution, embench
 from ...flow import gates, ladder, outcome
 from ...flow.gates import MIN_EMBENCH_SPEEDUP_X100
-from ...runtime import effects, commands as commands_mod, observations, provenance, software_encoding, stage_services
+from ...runtime import effects, commands as commands_mod, observations, provenance, software_encoding, stage_services, validation_parallel
 from ...runtime.policy import PolicyError
 from ...stages import feedback
 from ...stages.implement import intrinsics
@@ -132,8 +132,9 @@ def _cycle_count(value) -> int | None:
 
 def _simulation_outcome(*, results: list[dict], name: str, reference: dict,
                         profile: dict, verification: str, changed: bool,
-                        integrity_errors: list[str], cfu_status_expected: bool = False) -> dict:
-    """Current attempt only: execution/timing, correctness, then performance.
+                        integrity_errors: list[str], changed_domains: dict[str, bool] | None = None,
+                        cfu_status_expected: bool = False) -> dict:
+    """Assess this execution; ``changed`` compares final sources to the run baseline.
 
     Old verify-only benchmarks are supported when *both* observable values are
     absent. Once either side records a value, the other side must record it too.
@@ -195,6 +196,7 @@ def _simulation_outcome(*, results: list[dict], name: str, reference: dict,
                        "reverting to scalar inside the CFU build is not acceleration"))
     return {"terminal_reason": issues[0][0] if issues else "passed",
             "correctness_ok": bool(correctness_ok), "timing_ok": timing_ok,
+            "design_changed": bool(changed), "changed_domains": dict(changed_domains or {}),
             "performance_valid": performance_valid, "reference_cycles": ref_cycles,
             "cfu_cycles": cfu_cycles, "speedup_x100": speedup,
             "reference_result": ref_result, "cfu_result": cfu_result,
@@ -215,7 +217,7 @@ def _semantic_failure_result(state: CfuDesignState, evidence: dict, results: lis
     return check
 
 
-def simulate(state: CfuDesignState) -> CfuDesignState:
+def simulate(state: CfuDesignState, *, transition: bool = True) -> CfuDesignState:
     """Rung 5: run the ELF on the generated SoC and check the result."""
     rung = "sim"
     reason = stage_services._profile_reason(state)
@@ -231,6 +233,8 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
         }
 
     toolbox = stage_services._toolbox_for_stage(state, "validation")
+    changed_domains = intrinsics._candidate_change_domains(state, toolbox)
+    design_changed = any(changed_domains.values())
     project = state.get("benchmark_project", {})
     spec = state.get("workload_spec", {})
     run_root = state.get("run_root", "")
@@ -272,13 +276,14 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
         sim_evidence = _simulation_outcome(
             results=results, name=name, reference=reference.get(name, {}) or {},
             profile=cfu_profile.get(name, {}) or {}, verification=verification,
-            changed=bool(state.get("changed_design_files")), integrity_errors=integrity_errors,
+            changed=design_changed, integrity_errors=integrity_errors,
+            changed_domains=changed_domains,
             cfu_status_expected=measurement.get("cfu_status_protocol") == cfu_execution.PROTOCOL,
         )
         errors.extend(sim_evidence["errors"])
-    elif not state.get("changed_design_files"):
-        # Without an applied design change the ELF exercises the scaffold, so
-        # there is nothing to validate.
+    elif not design_changed:
+        # Without a HW or SW source change from the run's initial candidate,
+        # the ELF exercises the scaffold, so there is nothing to validate.
         errors.append("no design change was applied; the simulation runs the scaffold CFU")
 
     integrity_errors = sorted(set(integrity_errors + stage_services.benchmark_integrity_problems(toolbox)))
@@ -291,6 +296,8 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
     if is_embench:
         measurement_evidence["performance_provenance"] = provenance.candidate_provenance(state)
     ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
+    if not ok and not transition:
+        validation_parallel.command_failed()
     # Persist current terminal evidence, never the state's historical errors.
     if is_embench and integrity_errors:
         sim_evidence.update(terminal_reason="benchmark_integrity", performance_valid=False,
@@ -331,9 +338,11 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
     # One implementation stage owns both sides, so a failed simulation has a
     # single repair target: the agent decides inside the stage what to change.
     repair_target = "implement" if not ok else "estimate_cost"
-    extra, next_node = ladder._ladder_transition(
-        state, rung, ok=ok, default="estimate_cost", repair_target=repair_target
-    )
+    extra, next_node = ({}, None)
+    if transition:
+        extra, next_node = ladder._ladder_transition(
+            state, rung, ok=ok, default="estimate_cost", repair_target=repair_target
+        )
     update = {
         "validation_results": results,
         "stage_jobs": "cost",
@@ -344,6 +353,7 @@ def simulate(state: CfuDesignState) -> CfuDesignState:
             state, rung=rung, ok=ok, skipped=False, next=next_node,
             round=int(state.get("optimization_round", 0) or 0),
             **({**sim_evidence, **measurement_evidence} if is_embench else {
+                **sim_evidence,
                 "reference_cycles": None, "cfu_cycles": None, "speedup_x100": None,
                 "attribution": attribution, "errors": errors}),
             history="Ran the SoC simulation.",

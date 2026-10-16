@@ -181,14 +181,64 @@ artifacts are not rewritten. No new multi-case semantic adapter is implemented h
 
 ### Run-wide memory, context budgets, and request debugging
 
-Every node shares a bounded `flow_memory` in LangGraph state. It contains accepted
-workload/analysis/ISA facts and read-time file snapshots with byte hashes and exact
-line coverage—not an ever-growing conversation. Later stages and repair revisits
-receive relevant facts/observed excerpts. File edits, contract revisions and policy
-changes invalidate dependent entries; unchanged methodology remains reusable.
-Reference-only paths are not claimed as previously read. `--checkpoint` persists
-this state through the existing SQLite checkpointer and conservative resume checks.
-Memory never replaces the independent build/conformance/simulation gates.
+Context reuse uses two bounded **native parent-state channels**, rather than a
+second session database or one global conversation shared by every stage:
+
+- `flow_memory` shares accepted workload/analysis/ISA facts and actual read-time
+  source fragments. A file retains multiple observed line ranges, not just its
+  most recent read or a file-header summary. Identical reads are idempotent and
+  do not reorder existing entries. Canonical live overlay paths are retained;
+  the model's `{{run-dir}}` spelling is expanded before recording provenance.
+  Reference-only paths are never claimed as previously read. Rendered ranges
+  distinguish historical observation from the exact lines supplied **now**;
+  missing lines, modifications and exact-edit preconditions still require reads.
+  Gate-bound fact replacements also require acceptance fingerprints: an inherited
+  old pass cannot authorize a rejected replacement. A tracked scaffold snapshot
+  shadowed by a live overlay is discarded, never relabelled as an overlay read.
+- `stage_history` retains bounded, artifact-backed execution notes for same-stage
+  revisits and downstream handoffs. Summaries are rebuilt from hash-matched,
+  policy-readable answer artifacts; stored prose is not trusted as evidence.
+  Historical FILE/EDIT/PATCH bodies and fenced code are omitted, and old tool
+  calls are **not replayed**. Notes are labelled `pending` inside an unfinished
+  node, then `completed` or `rejected` from the node's final outcome. Rejected
+  notes stay within their own stage. A completed note is still a model claim,
+  never a build/conformance/simulation verdict. ISA lint-rejection notes follow
+  an explicitly stored candidate for the next ISA retry, without accepting it.
+  Artifact, task, contract, policy and relevant source changes invalidate notes;
+  newly accepted delivery summaries bind graph-reported workspace outputs to their
+  committed versions.
+
+Collectors make earlier reads/notes available to independent model calls inside
+one node without mutating its input state. Only a normally returning node publishes
+new memory. On a rejected delivery, hash-matched read-only observations can survive
+rollback, while rejected domain facts do not become accepted facts. Exceptions
+publish neither new read memory nor execution history.
+
+**Cache-Hit-first layout remains unchanged:** the system prompt and the shared
+user prefix precede every stage-specific section. Memory and historical notes are
+appended only at the dynamic tail, with a **4000-character combined cap including
+section headings** (historical notes get at most 900 characters). No timestamps,
+run IDs, history counters or source bodies are inserted ahead of the shared head,
+and tool schemas are not changed by this feature. All dynamic content is masked
+and its canonical run paths virtualized only after assembling the complete prompt,
+for plain, ordinary-tool and native-tool calls alike. The existing context-window
+preflight still applies; retained/cached content is not free context capacity.
+
+File storage is bounded to 24 entries, four ranges / 12000 characters per file,
+4000 characters per retained range, and 48 ranges / 48000 characters globally.
+The legacy aliases separately duplicate at most 24 × 600 characters; domain facts
+retain their own existing bounds. Execution notes (including active collectors)
+retain at most 12 entries globally and three per stage/label;
+summary text is at most 1200 characters before prompt selection. Legacy v2
+single-excerpt memory remains readable. These are storage limits, not promises
+that every stored byte fits the next model input.
+
+Both channels use LangGraph's existing state and opt-in SQLite `--checkpoint`;
+there is no new Store, embedding service, summarization model call, persistent
+side-effecting subgraph or automatic interrupted-tool resume. State-only summaries
+are intentionally not full conversation continuation. Independent validation gates,
+visibility masking, transaction rollback and conservative resume checks remain
+authoritative. See the native [StateGraph state model](https://docs.langchain.com/oss/python/langgraph/graph-api#state).
 
 Each actual model request gets a conservative context preflight, including tool
 schemas and reserved output. Named LLM JSON configurations may set:
@@ -402,7 +452,7 @@ The design is checked by the tool that owns each artifact **immediately after it
 - The build rungs are guarded by the implementation stage that feeds them: if `implementation_hw` applied nothing, `hw_build` fails without invoking `sbt` (the seeded scaffold would otherwise compile and "pass" while validating nothing) and repairs `implement`; if `implementation_sw` applied nothing, `sw_build` fails without invoking `make` and repairs `implement`.
 - A failed rung enters the single implementation stage with current failure evidence. In that existing repair interaction the model may keep fixing `implement`, or, after an accepted `submit_repair_diagnosis`, use `request_repair_route(target, reason, failure_ids)` to return to `analysis` or `contract`. This adds no separate LLM routing call. Upstream selection rolls back the entire pending HW/SW/oracle transaction, invalidates the old ISA, conformance approval, downstream gates, reuse/fingerprints and selected candidate, and preserves old failure records as stale history. Routing remains bounded by the design-repair budget, not the contract answer-retry pool. Plain delivery supports the corresponding structured `REPAIR_ROUTE` JSON; a model cannot silently edit a frozen contract or certify a gate.
 - Hardware delivery and the independent `hw_build` preflight run a host-owned **bounded fixed-result lint**, even with `--no-conformance`: a compute/value instruction that returns a recognizable literal, constant alias/helper, or init-only fixed register is rejected as `hardware_integrity`. A dummy pointer read or waiting for `lsu.done` does not validate a constant answer. Configuration/status acknowledgements are not computational results. The guard is versioned in input fingerprints, so old hardware passes cannot be reused under a new rule. This is not a Scala compiler, full taint analysis, or arbitrary anti-cheat/semantic-equivalence proof; conformance and workload differential checks remain necessary.
-- Embench simulation records **current-round typed evidence** (`terminal_reason`, `correctness_ok`, `timing_ok`, `performance_valid`, reference/CFU result and cycle values) in the gate and validation artifacts. Execution/assertion failures and wrong/missing results take precedence over speedup thresholds. Missing cycle counts and invalid performance are `null`, never a fictitious zero-cycle measurement or a speedup for a wrong answer; a verified but slow design still records its measured ratio. The experiment collector/classifier consumes these reasons, with a conservative legacy fallback, rather than deriving the terminal failure from the entire accumulated error history.
+- Embench simulation records **current-round typed evidence** (`terminal_reason`, `correctness_ok`, `timing_ok`, `design_changed`/`changed_domains`, `performance_valid`, reference/CFU result and cycle values) in the gate and validation artifacts. Execution/assertion failures and wrong/missing results take precedence over speedup thresholds. Missing cycle counts and invalid performance are `null`, never a fictitious zero-cycle measurement or a speedup for a wrong answer; a verified but slow design still records its measured ratio. The experiment collector/classifier consumes these reasons, with a conservative legacy fallback, rather than deriving the terminal failure from the entire accumulated error history.
 
 - The implementation stage writes both sides before the ladder runs, so `hw_build`, `hw_conformance`, `sw_build`, `sim` and `cost` always validate what the stage actually delivered. Whether the kernel was rewritten is the stage's own decision; the ladder compiles whatever is in the workspace and still enforces the correctness oracle and the speedup floor.
 
@@ -410,7 +460,7 @@ The design is checked by the tool that owns each artifact **immediately after it
 - The oracle declares the input space, never the values: `data.buffer` (the harness-owned byte block the DUT reads), `data.count` (random draws on top of the boundary sweep) and `data.roles` (one `kind: address|length|index|value` descriptor per CPU-value argument, rs1/rs2 order, with `max` for `length`/`index`). The validator rejects a legacy `cases` block, a model-supplied `data.seed`, an `address` role without a buffer, a `length` bound larger than the buffer, a buffer that is not a ≤1024-byte multiple of 4, an out-of-range `count`, an unknown kind (listing the vocabulary) and a role-count mismatch, each naming the fix. The oracle's C may call only the **generated intrinsics named in the prompt's command table** (plus `cfu_enable`/`cfu_memory_fence`, and the harness `<NAME>_CONF_DATA_BASE`/`<NAME>_CONF_DATA_BYTES` macros); an invented name such as `cfu_load` is caught by a static lint before the build (`unknown intrinsic cfu_load (did you mean cfu_vector_load_i32?)`) instead of surfacing as a bare linker error. Conformance build/sim failures embed the compiler/linker diagnostics in the repair feedback (previously only the `make` command line reached the model, so it repaired blind), and a **recurring** rejection — validator failure or build failure — is flagged as a `REPEATED ORACLE REJECTION` with the correct shape pinned. `run.yaml` merges artifact refs across writer instances, so every oracle attempt's raw answer stays registered and numbered (`conformance_000/001/...`) instead of being dropped and overwritten.
 - With `--loop` a run does not have to stop when it succeeds (see **Multi-instruction ISA evolution** below for the current exploration and delivery rules). If every gate passes **and** the `--max-iters` budget still has room, the review node asks the agent (stage `optimize`, plus at most one stop reconsideration) whether another round is worth spending on: `{"continue": true|false, "target": "implement_hw"|"implement_sw"|"extend_isa", "focus": "performance"|"cost", "reason": ...}`. A round re-enters the normal ladder (`implement_hw` → `generate_soc` → software reuse-or-rewrite → `build_sw` → `simulate` → `estimate_cost` → review, or `implement_sw` → `build_sw` → …), so it can never skip verify, the 1.05x speedup floor, or a build rung. An optimization round is budgeted like a repair: `--max-iters N` stays the single bound on the whole run, and a round with no budget left, an unusable target, or a missing "concrete change" reason stops the loop deterministically; in default explore mode a `continue: false` is reconsidered once before the framework accepts it (no model answer can extend a run). The chosen rung receives an `=== OPTIMIZATION ROUND ===` block (not a `*_REPAIR MODE` block) with the current measured result, the focus, and the rule that the accepted ISA revision is frozen during implementation; only `extend_isa` may append compatible commands before re-entering hardware and software validation. Every round that produced its own measurement is recorded in `12_review/optimization_rounds.yaml` (speedup, reference/CFU cycles, Yosys cells/wires/memories), and `simulate`/`estimate_cost` stamp their gates with the round they ran in, so a round that failed before measuring is listed as `not measured` instead of repeating the previous round's numbers. The report's `## Optimization Rounds` section and the end-of-run CLI `summary:` each print one line per round with the change against the previous measured round — for example `round 1: implement_hw speedup=2.50x cells=1300 (+0.50x, +100 cells) (best)` — so the whole progression of speedup and cost is traceable; the first round is the initial ladder. A round counts as an improvement only when it is Pareto-better than the best round so far (not slower, not larger, better on at least one axis); a final measured round that regresses is reported with an explicit warning in the report and in the CLI summary. `--loop` is off by default (env `CFU_AGENT_LOOP`); without it, review stops as before.
 - The cost rung synthesizes the CFU **in isolation** rather than the whole SoC: `GenAgentCfu` (a tracked, non-agent-editable entry point) elaborates only the overlaid `AgentCfu` class into `11_cost/cfu_rtl/AgentCfu.v`, and Yosys runs `synth -top AgentCfu` on it. Cost numbers therefore track the agent's CFU design instead of the CPU/SoC, and the cost rung needs no CPU build. If the standalone generation produces no RTL, the cost rung fails and repairs `implement_hw`.
-- The simulation rung also fails when no design change was applied, so a benchmark whose cfu build is byte-identical to the reference cannot be reported as an accelerated result.
+- The simulation rung compares final hardware-overlay and software-source hashes with an immutable snapshot captured before the first implementation attempt. A repair may change either side or both; `no_design_change` is raised only when both still match that initial baseline. The verdict does not depend on the latest repair's touched-file list, so an earlier HW edit or a software-only repair is not lost when a later round leaves the other side untouched.
 - A rung that was skipped (`--dry-run`, `--skip-sim`, execution disabled) never repairs and can never produce `complete`. A rung **disabled by an ablation flag** (`--no-conformance`, `--no-isa-contract`) is different: it is recorded as never validated but out of scope, so it neither fails the run nor blocks `complete` (see **Ablation flags**).
 - A hanging simulator (`TimeoutExpired`) or a missing toolchain is a failed rung, not a crashed run.
 
@@ -483,7 +533,7 @@ them keep the full flow.
 
 ### Visibility levels
 
-`--visibility {basic,standard,extended}` (env `CFU_AGENT_VISIBILITY`, default `standard`)
+`--visibility {basic,standard,extended}` (env `CFU_AGENT_VISIBILITY`; CLI default `extended`, policy fallback `standard`)
 controls **which files the agent may read** — the key-path index it is shown and the read-only tool loop
 (`read_file`/`list_dir`/`search_text`). The tier is flow-wide: every stage of a run sees the
 same tree. It is a read-only gate: writes, command allowlists, and the effect flags
@@ -492,12 +542,13 @@ confinement to `workspace/design/AgentCfu*.scala` still applies at every level.
 
 | Level | Adds | Still hidden |
 | --- | --- | --- |
-| `basic` | workload/benchmark sources, the CFU contract (`CfuBus`/`CfuPlugin`/`CfuLib`), `AgentCfu*`/`GenAgentCfu`, `MiCoSoc*`, the ISA template, `sw/tests`, run artifacts | `skills/cfu-designer/**` and sibling CFU designs (Vpu/BitNet) |
-| `standard` (default) | the cfu-designer skills and the sibling CFU designs | `ext/SpinalHDL/**` |
-| `extended` | `ext/SpinalHDL/**` for the whole flow, with prompt guidance to confirm the SpinalHDL API before writing hardware | — |
+| `basic` | workload/benchmark sources, the CFU contract (`CfuBus`/`CfuPlugin`/`CfuLib`), `AgentCfu*`/`GenAgentCfu`, `MiCoSoc*`, the ISA template, `sw/tests`, run artifacts | the rest of `src/main/scala/vexiiriscv/**`, skills, Vpu/BitNet example CFUs and `ext/SpinalHDL/**` |
+| `standard` (policy fallback) | cfu-designer skills and the full `src/main/scala/vexiiriscv/**` source tree | Vpu/BitNet example CFUs and `ext/SpinalHDL/**` |
+| `extended` | `ext/SpinalHDL/**` for the whole flow, with prompt guidance to confirm the SpinalHDL API before writing hardware | Vpu/BitNet example CFUs remain denied |
 
 - The gate is declarative: `agents/specs/agent_access_policy.yaml` has a `visibility` section
-  whose `gated` globs list the paths that require `standard` or `extended`. A path outside the
+  whose `gated` globs list paths requiring `standard` or `extended`; `exemptions` preserve
+  selected lower-tier subtrees, while top-level `deny` rules always win. A path outside the
   shared `read` tree stays unreadable regardless of level.
 - Hiding a context file is expected at a lower level, so `load_context` records it under
   `withheld_files` in `01_context/manifest.yaml` (and does **not** fail the gate); only a real
@@ -507,9 +558,10 @@ confinement to `workspace/design/AgentCfu*.scala` still applies at every level.
 - A read blocked by the tier returns an actionable policy error
   (`requires visibility level 'standard' (current: basic)`), and the level-specific prompt
   block tells the model not to assume the contents of a document it was not shown.
-- `extended` never pre-reads `ext/SpinalHDL` (925 sources); it only makes the tree readable so
-  the agent can look up the exact API on demand. With `--no-agent-tools` the tree is
-  unreachable, and the prompt says so.
+- `standard` does not pre-read the full VexiiRiscv subtree; it makes the tree available for
+  on-demand source lookup. `extended` likewise does not pre-read `ext/SpinalHDL` (925 sources);
+  it only makes the tree readable so the agent can look up the exact API on demand. With
+  `--no-agent-tools` these trees are unreachable, and the prompt says so.
 
 ### AgentCfu design file vs. read-only platform
 
@@ -1134,3 +1186,23 @@ The `unittest` suite checks path traversal, deny precedence, command allowlistin
 Run it inside `mico_env`: that environment has `langgraph`, so the LangGraph runner is the live path and its tests are not skipped. The suite exercises LangGraph's native state reducers and routing; there is no parallel pure-Python fallback runner.
 
 Ready-to-run examples are under `agents/examples/`.
+
+### Vivado FPGA evaluation and parallel validation
+
+`--cost-backend vivado --fpga-part xcau25p-ffvb676-2-e --target-frequency-mhz 100`
+selects real whole-SoC FPGA synthesis and PnR, with CFU hierarchy PPA attribution
+(no second standalone CFU run). New runs default to Artix UltraScale+ AU25P,
+FFVB676, speed grade -2, extended temperature (`xcau25p-ffvb676-2-e`) at 100 MHz.
+An explicit `--fpga-part` overrides this choice; existing checkpoints are not
+retargeted. Yosys remains the default fast cost proxy.
+New CLI runs execute simulation and EDA with `--validation-mode parallel` by
+default: first command/semantic failure cancels the sibling process tree and
+spends at most one repair slot. `--validation-mode serial` is available for
+troubleshooting. Only bounded termination cleanup is awaited, not normal sibling
+completion. `--skip-cost` skips either backend; `--skip-yosys` remains Yosys-only.
+
+The reports distinguish whole-SoC and CFU hierarchical area/timing/dynamic power,
+vectorless estimates from board measurement, and current from historical PPA.
+Input hardware RTL is frozen and hashed before EDA. See
+[the Vivado/parallel-validation guide](../docs/cfu_agent_vivado_ppa.md) for exact
+options, artifact layout, recovery semantics and validation limits.

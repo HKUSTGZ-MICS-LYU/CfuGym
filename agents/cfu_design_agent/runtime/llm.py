@@ -405,6 +405,23 @@ def _reasoning_value(value: Any) -> str:
     return _scalar_text(value)
 
 
+def _object_value(value: Any, key: str) -> Any:
+    """Read a field from a dict, SDK model, or its preserved extra fields."""
+    if isinstance(value, dict):
+        return value.get(key)
+    candidate = getattr(value, key, None)
+    if candidate is not None:
+        return candidate
+    extra = getattr(value, "model_extra", None)
+    return extra.get(key) if isinstance(extra, dict) else None
+
+
+def _reasoning_token_usage(usage: Any) -> int | None:
+    details = _object_value(usage, "completion_tokens_details")
+    value = _object_value(details, "reasoning_tokens")
+    return int(value) if value is not None else None
+
+
 # Chat-completions reasoning carriers used by OpenAI-compatible gateways.
 # ``reasoning_items`` is a list some gateways use when ``reasoning_content`` is
 # empty, so both are read.
@@ -495,6 +512,15 @@ def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _assistant_text_message(message: Any, content: str) -> dict[str, Any]:
+    """Build an assistant transcript turn without dropping provider reasoning."""
+    result = {"role": "assistant", "content": content}
+    reasoning_content = _object_value(message, "reasoning_content")
+    if reasoning_content is not None:
+        result["reasoning_content"] = reasoning_content
+    return result
+
+
 def _assistant_tool_message(message: Any) -> dict[str, Any]:
     """Convert an SDK assistant message with tool_calls back into request form."""
     calls = []
@@ -510,12 +536,18 @@ def _assistant_tool_message(message: Any) -> dict[str, Any]:
                 },
             }
         )
-    return {
+    result = {
         "role": "assistant",
         "content": getattr(message, "content", None),
         "tool_calls": calls,
     }
-
+    # DeepSeek requires the exact reasoning_content from each previous turn to
+    # be echoed when tools are enabled. Other gateways that don't return it see
+    # no change to the assistant transcript.
+    reasoning_content = _object_value(message, "reasoning_content")
+    if reasoning_content is not None:
+        result["reasoning_content"] = reasoning_content
+    return result
 
 @dataclass
 class _ChatRound:
@@ -532,6 +564,7 @@ class _ChatRound:
     message: Any
     cached_input_tokens: int | None = None
     fallback_reason: str = ""
+    reasoning_tokens: int | None = None
 
 
 def _usage_counts(usage: Any, kind: str) -> tuple[int, int, int]:
@@ -569,6 +602,10 @@ def _chat_round_from_stream(stream: Any) -> "_ChatRound":
     _emit_stream(stage, "start", 0)
     content: list[str] = []
     reasoning: list[str] = []
+    reasoning_content: list[str] = []
+    observed_reasoning_keys: set[str] = set()
+    reasoning_source = ""
+    reasoning_field = ""
     calls: dict[int, dict[str, str]] = {}
     usage = None
     finish = ""
@@ -581,14 +618,38 @@ def _chat_round_from_stream(stream: Any) -> "_ChatRound":
             delta = getattr(choice, "delta", None)
             if delta is None:
                 continue
-            piece = getattr(delta, "content", None)
+            piece = _object_value(delta, "content")
             if piece:
                 content.append(str(piece))
-            reasoning_piece = getattr(delta, "reasoning_content", None)
-            if reasoning_piece is None:
-                reasoning_piece = getattr(delta, "reasoning", None)
-            if reasoning_piece:
-                reasoning.append(str(reasoning_piece))
+            for field in _CHAT_REASONING_FIELDS:
+                reasoning_piece = _object_value(delta, field)
+                if reasoning_piece is None:
+                    continue
+                observed_reasoning_keys.add(field)
+                reasoning_text = _reasoning_value(reasoning_piece)
+                if reasoning_text:
+                    if not reasoning_field:
+                        reasoning_field = field
+                        reasoning_source = f"stream.{field}"
+                    if field == reasoning_field:
+                        reasoning.append(reasoning_text)
+                # This is kept byte-for-byte (as decoded text) for DeepSeek's
+                # required multi-turn tool transcript, not normalized for UI.
+                if field == "reasoning_content" and isinstance(reasoning_piece, str):
+                    reasoning_content.append(reasoning_piece)
+            provider_fields = _object_value(delta, "provider_specific_fields")
+            provider_reasoning = (
+                provider_fields.get("reasoning") if isinstance(provider_fields, dict) else None
+            )
+            if provider_reasoning is not None:
+                observed_reasoning_keys.add("provider_specific_fields.reasoning")
+                provider_text = _reasoning_value(provider_reasoning)
+                if provider_text:
+                    if not reasoning_field:
+                        reasoning_field = "provider_specific_fields.reasoning"
+                        reasoning_source = "stream.provider_specific_fields.reasoning"
+                    if reasoning_field == "provider_specific_fields.reasoning":
+                        reasoning.append(provider_text)
             for call in getattr(delta, "tool_calls", None) or []:
                 index = int(getattr(call, "index", 0) or 0)
                 slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
@@ -611,7 +672,9 @@ def _chat_round_from_stream(stream: Any) -> "_ChatRound":
             )
     text = "".join(content)
     # Streamed deltas are fragments of one string: concatenate, do not join.
-    thinking = "".join(reasoning).strip()
+    reasoning_raw = "".join(reasoning)
+    thinking = reasoning_raw.strip()
+    thinking_content_raw = "".join(reasoning_content)
     tool_calls = [
         SimpleNamespace(
             id=slot["id"] or f"call_{index}",
@@ -620,21 +683,27 @@ def _chat_round_from_stream(stream: Any) -> "_ChatRound":
         )
         for index, slot in sorted(calls.items())
     ]
-    message = SimpleNamespace(content=text or None, tool_calls=tool_calls or None)
+    message = SimpleNamespace(
+        content=text or None,
+        tool_calls=tool_calls or None,
+        reasoning_content=thinking_content_raw if "reasoning_content" in observed_reasoning_keys else None,
+    )
     clean_text, inline = split_reasoning(text)
-    api_source = "stream.reasoning_content" if thinking else ""
+    api_source = reasoning_source if thinking else ""
     inp, out, total = _usage_counts(usage, "chat")
+    response_keys = ("stream",) + tuple(sorted(observed_reasoning_keys))
     return _ChatRound(
         text=clean_text,
         reasoning=_merge_reasoning(thinking, inline),
         reasoning_source=_reasoning_source(api_source, inline),
         finish_reason=finish,
-        extra_keys=("stream",) + (("reasoning_content",) if thinking else ()),
+        extra_keys=response_keys,
         input_tokens=inp,
         output_tokens=out,
         total_tokens=total,
         message=message,
         cached_input_tokens=_cached_usage(usage, "chat"),
+        reasoning_tokens=_reasoning_token_usage(usage),
     )
 
 
@@ -935,7 +1004,7 @@ class OpenAiTextClient:
                     # block got none. Let it retry once with tools still available
                     # instead of wasting the remaining budget.
                     nudges += 1
-                    messages.append({"role": "assistant", "content": text})
+                    messages.append(_assistant_text_message(message, text))
                     messages.append(
                         {
                             "role": "user",
@@ -1299,9 +1368,16 @@ class OpenAiTextClient:
         except Exception as exc:
             request_audit.record_result(request_id, error={"type": type(exc).__name__})
             raise
-        request_audit.record_result(request_id, result={"status": "completed", "input_tokens": round_.input_tokens,
-                                                         "output_tokens": round_.output_tokens,
-                                                         "cached_input_tokens": round_.cached_input_tokens})
+        request_audit.record_result(
+            request_id,
+            result={"status": "completed", "input_tokens": round_.input_tokens,
+                    "output_tokens": round_.output_tokens,
+                    "cached_input_tokens": round_.cached_input_tokens},
+            metadata={"reasoning_chars": len(round_.reasoning),
+                      "reasoning_source": round_.reasoning_source,
+                      "reasoning_tokens": round_.reasoning_tokens,
+                      "response_extra_keys": list(round_.extra_keys)},
+        )
         return round_
 
     def _chat(

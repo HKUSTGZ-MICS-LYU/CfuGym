@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..flow import instrument
-from ..runtime import flow_memory, llm, llm_config, parsing, source_visibility, stage_services, tools as tools_mod
+from ..runtime import flow_memory, llm, llm_config, parsing, source_visibility, stage_history, stage_services, tools as tools_mod
 from ..runtime.llm import LlmResult, OpenAiTextClient
 from ..runtime.stage_executor import StageExecutionRequest, StageExecutor
 from ..runtime.tools import RepoToolbox
@@ -165,6 +165,14 @@ def _record_llm_output(
             kind="llm_reasoning_output",
             metadata={**metadata, "kind": "reasoning"},
         )
+    if metadata["used_llm"] and stage_history.collecting():
+        try:
+            stage_history.record_execution(
+                state, stage_services._toolbox_for_stage(state, stage),
+                stage, label, str(ref["path"]),
+            )
+        except (ValueError, OSError):
+            pass  # Advisory history cannot turn a valid delivery into a failure.
     if instrument._PROGRESS is not None:
         instrument._LIVE_LINE.clear()
         note = ""
@@ -202,8 +210,11 @@ def _complete_llm(
     client=None,
 ) -> tuple[LlmResult, str]:
     client = client or _llm(state)
-    if state.get("flow_memory") and "## Run memory" not in user:
-        user = _with_run_memory(state, stage_services._toolbox_for_stage(state, stage), stage, user)
+    if (state.get("flow_memory") or state.get("stage_history")
+            or (state.get("run_root") and state.get("workdir"))):
+        user = _with_run_memory(
+            state, stage_services._toolbox_for_stage(state, stage), stage, user, label=label,
+        )
     if response_format and response_format.get("type") == "json_object":
         # OpenAI-compatible gateways reject json_object mode with an opaque HTTP 400
         # when the messages never contain the word "json". Enforce the protocol here
@@ -320,11 +331,11 @@ def _write_tool_calls_artifact(
     relative: str,
     tool_calls: list[dict],
 ) -> None:
-    # Feed the node-level run-memory collector: these are the exact tool
-    # observations, and only their successful read_file paths are folded in.
+    # Preserve the notification seam; exact read provenance is captured by
+    # read_file itself. Generic tool prose belongs to this audit, not read memory.
     flow_memory.record_tool_transcript(tool_calls)
     artifacts = stage_services._artifacts_for_stage(state, artifact_stage)
-    artifacts.write_yaml(
+    ref = artifacts.write_yaml(
         artifact_stage,
         relative,
         {
@@ -338,6 +349,16 @@ def _write_tool_calls_artifact(
         },
         status="produced",
     )
+    if (stage_history.collecting() and isinstance(ref, dict)
+            and any(call.get("name") == "(tool loop failed)" for call in tool_calls)):
+        try:
+            label = Path(relative).stem.removesuffix("_tool_calls")
+            stage_history.record_execution(
+                state, stage_services._toolbox_for_stage(state, artifact_stage),
+                artifact_stage, label, str(ref["path"]), kind="tools",
+            )
+        except (ValueError, OSError):
+            pass
 
 
 def _tools_enabled(state: CfuDesignState, client) -> bool:
@@ -350,21 +371,36 @@ def _has_delivery_block(text: str) -> bool:
                 or tools_mod.extract_patch(text) or re.search(r"(?m)^REPAIR_ROUTE\b", text))
 
 
-def _with_run_memory(state: CfuDesignState, toolbox: RepoToolbox, stage: str, user: str) -> str:
-    """Append revalidated run memory at the dynamic tail of the prompt.
+# Keep the original stable system/shared user prefix intact. Reuse is a bounded
+# dynamic tail, not another ever-growing conversation or a change to tool schemas.
+_CONTEXT_TAIL_CHARS = 4000
+_HISTORY_CHARS = 900
 
-    The block carries only hash-matched references and byte-derived excerpts
-    that this run already showed the model, so later stages can reuse them
-    instead of re-reading unchanged files.
+
+def _with_run_memory(state: CfuDesignState, toolbox: RepoToolbox, stage: str,
+                     user: str, *, label: str = "") -> str:
+    """Append version-checked file fragments and historical notes, exactly once.
+
+    No original prompt bytes are moved or rewritten. Canonical stored paths are
+    virtualized only after assembling this tail, at the model-request boundary.
     """
+    if "\n\n## Run memory\n" in user or "\n\n## Stage history\n" in user:
+        return user
     try:
+        history = stage_history.render_history(
+            state, toolbox, stage, label=label, max_chars=_HISTORY_CHARS,
+        )
+        history_tail = f"\n\n## Stage history\n{history}" if history else ""
+        memory_header = "\n\n## Run memory\n"
         block = flow_memory.render_memory(
-            state.get("flow_memory"), state, toolbox,
-            flow_memory.memory_stage(stage), max_chars=4000,
+            flow_memory.memory_for_prompt(state, toolbox), state, toolbox,
+            flow_memory.memory_stage(stage),
+            max_chars=_CONTEXT_TAIL_CHARS - len(history_tail) - len(memory_header),
         )
     except (ValueError, OSError):
         return user
-    return f"{user}\n\n## Run memory\n{block}" if block else user
+    memory_tail = f"{memory_header}{block}" if block else ""
+    return user + memory_tail + history_tail
 
 
 def _run_agent_step(
@@ -396,6 +432,8 @@ def _run_agent_step(
     run artifact semantics remain stable while stages migrate incrementally.
     """
     client = client or _llm(state)
+    user = _with_run_memory(state, toolbox, stage, user, label=label)
+    # Virtualize LAST: dynamic memory/history contain canonical stored paths.
     system, user = _virtual_paths(state, system, user)
     executor_kwargs = dict(
         complete=_complete_llm,
@@ -416,7 +454,7 @@ def _run_agent_step(
             artifact_stage=artifact_stage,
             tool_calls_relpath=tool_calls_relpath,
             system=system,
-            user=_with_run_memory(state, toolbox, stage, user),
+            user=user,
             fallback=fallback,
             tools_enabled=_tools_enabled(state, client),
             response_format=response_format,

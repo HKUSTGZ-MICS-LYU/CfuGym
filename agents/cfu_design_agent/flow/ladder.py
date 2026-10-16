@@ -282,7 +282,14 @@ def _route_after_hw_conformance(state: CfuDesignState) -> str:
 
 
 def _route_after_sw_build(state: CfuDesignState) -> str:
-    return gates._rung_next(state, "sw_build", "simulate")
+    target = gates._rung_next(state, "sw_build", "simulate")
+    if target == "simulate" and int(state.get("flow_version", 1)) >= 2:
+        return "validate_candidate"
+    return target
+
+
+def _route_after_validation(state: CfuDesignState) -> str:
+    return gates._rung_next(state, "validation_pair", "review_and_route")
 
 
 def _route_after_sim(state: CfuDesignState) -> str:

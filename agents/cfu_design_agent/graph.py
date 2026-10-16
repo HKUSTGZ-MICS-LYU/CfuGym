@@ -15,7 +15,7 @@ from typing import Any
 
 from .flow import instrument, policies, wiring
 from .flow.instrument import STAGE_ORDER, disable_progress, enable_progress, progress
-from .flow.ladder import _route_after_analysis, _route_after_cost, _route_after_hw_build, _route_after_hw_conformance, _route_after_implement, _route_after_isa, _route_after_prepare, _route_after_profile, _route_after_review, _route_after_sim, _route_after_sw_build, _route_input_target
+from .flow.ladder import _route_after_analysis, _route_after_cost, _route_after_hw_build, _route_after_hw_conformance, _route_after_implement, _route_after_isa, _route_after_prepare, _route_after_profile, _route_after_review, _route_after_sim, _route_after_sw_build, _route_after_validation, _route_input_target
 from .flow.wiring import NODE_NAMES, ROUTER_NAMES, ROUTE_TARGETS, SUCCESSORS as FLOW_SUCCESSORS
 from .runtime import dependencies, failures, llm, persistence, tools
 from .runtime.llm import LlmResult
@@ -30,6 +30,7 @@ from .stages.profile import collect_ir_evidence, extract_hotspot, instrument_and
 from .stages.review import final_report, review_and_route
 from .stages.verify.conformance import check_conformance
 from .stages.verify.cost import estimate_cost
+from .stages.verify.parallel import validate_candidate
 from .stages.verify.soc import generate_soc
 from .stages.verify.software import build_sw, simulate
 from .state import CfuDesignState
@@ -89,6 +90,13 @@ def run_agent(
                 if not snapshot or not snapshot.values or not snapshot.next:
                     raise PersistenceRiskError("no unfinished checkpoint is available for this run")
                 previous = snapshot.values
+                # Historical defaults interpret missing checkpoint fields; never
+                # retarget an old run when the default for new runs changes.
+                defaults = {"cost_backend": "yosys", "fpga_part": "xc7a200tsbg484-1", "target_frequency_mhz": 100.0,
+                            "eda_timeout": 3600, "vivado_threads": 4, "validation_mode": "serial"}
+                for key, value in (initial_state.get("resume_eda_options") or {}).items():
+                    if value != previous.get(key, defaults.get(key)):
+                        raise PersistenceRiskError(f"resume cannot change recorded EDA configuration: {key}")
                 if previous.get("run_id") != persisted.run_id:
                     raise PersistenceRiskError("checkpoint run_id differs from run manifest")
                 if str(previous.get("workdir", "")) != str(Path(initial_state.get("workdir", ".")).resolve()):

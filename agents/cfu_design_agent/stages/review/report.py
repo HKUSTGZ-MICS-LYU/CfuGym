@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ...benchmark import embench
 from ...flow import gates as gates_mod, optimize
-from ...runtime import failures, llm, provenance, request_usage, stage_services
+from ...runtime import failures, llm, ppa, provenance, request_usage, stage_services
 from ...state import CfuDesignState
 
 
@@ -24,6 +24,8 @@ def render_ladder(state: CfuDesignState) -> str:
             continue
         if gate.get("disabled"):
             status = f"DISABLED by ablation ({gate.get('reason') or gate.get('disabled')})"
+        elif gate.get("cancelled"):
+            status = f"cancelled ({gate.get('reason') or 'sibling failed'})"
         elif gate.get("skipped"):
             status = f"skipped ({gate.get('reason', '')})"
         else:
@@ -276,6 +278,10 @@ def render_report(state: CfuDesignState) -> str:
     lines.append(format_rung_results(state, "sim"))
     lines.append("")
     lines.append("## Hardware Cost")
+    ppa_lines = ppa.lines(state)
+    if ppa_lines:
+        lines.extend(ppa_lines)
+        lines.append("")
     lines.append(format_results(state.get("cost_results", [])))
     lines.append("")
     lines.append("## Tool Calls")

@@ -105,11 +105,18 @@ class _RoundClient:
         self.seen.append((list(messages), [item["function"]["name"] for item in tools]))
         if not self.turns:
             raise AssertionError("unexpected model request")
-        text, calls = self.turns.pop(0)
+        turn = self.turns.pop(0)
+        text, calls = turn[:2]
+        reasoning_content = turn[2] if len(turn) > 2 else None
         return SimpleNamespace(
-            text=text, reasoning="", reasoning_source="", finish_reason="stop",
-            extra_keys=(), input_tokens=2, output_tokens=3, total_tokens=5,
-            message=SimpleNamespace(content=text, tool_calls=[
+            text=text,
+            reasoning=reasoning_content or "",
+            reasoning_source="stream.reasoning_content" if reasoning_content is not None else "",
+            finish_reason="stop",
+            extra_keys=("stream", "reasoning_content") if reasoning_content is not None else (),
+            input_tokens=2, output_tokens=3, total_tokens=5,
+            message=SimpleNamespace(content=text, reasoning_content=reasoning_content,
+                                    tool_calls=[
                 SimpleNamespace(id=f"call_{len(self.seen)}_{i}", function=SimpleNamespace(
                     name=name, arguments=json.dumps(arguments)))
                 for i, (name, arguments) in enumerate(calls)
@@ -260,6 +267,23 @@ class StageExecutorTest(unittest.TestCase):
         self.assertEqual(client.seen[-1][1], ["submit_stage"])
         self.assertEqual(saver.get_tuple({"configurable": {
             "thread_id": "test-stage-native-unique-1"}}).checkpoint["channel_values"]["total_calls"], 2)
+
+    def test_native_graph_echoes_provider_reasoning_on_followup_tool_turn(self) -> None:
+        reasoning = "  provider reasoning must round-trip exactly \n"
+        client = _RoundClient([
+            ("", [("read_file", {"path": "one"})], reasoning),
+            ("", [("submit_stage", {"delivery": "done"})]),
+        ])
+        executor, _ = self._executor()
+        output = executor.execute(
+            {"max_tool_rounds": 1}, object(),
+            self._request(tools_enabled=True, native_tool_loop=True,
+                          submit_stage=lambda _delivery: True), client=client,
+        )
+        assistant_turn = next(item for item in client.seen[1][0]
+                              if item.get("role") == "assistant")
+        self.assertEqual(assistant_turn["reasoning_content"], reasoning)
+        self.assertEqual(output.result.text, "done")
 
     def test_native_graph_default_accepts_four_calls_in_one_round(self) -> None:
         client = _RoundClient([

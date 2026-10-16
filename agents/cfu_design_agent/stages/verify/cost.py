@@ -5,21 +5,24 @@ from __future__ import annotations
 from pathlib import Path
 
 from ...flow import gates, ladder, outcome
-from ...runtime import effects, commands, stage_services
+from ...runtime import effects, commands, dependencies, rtl_snapshot, stage_services, validation_parallel
 from ...runtime.tools import SOC_WORKSPACE_SUBDIR
 from ...stages.verify import software
 from ...state import CfuDesignState
 
 
-def estimate_cost(state: CfuDesignState) -> CfuDesignState:
-    if state.get("skip_yosys", False):
-        result = [stage_services._skipped_result("python3 skills/cfu-designer/scripts/yosys_cost_report.py", state, "--skip-yosys")]
-        stage_services._write_cost_artifact(state, result, "planned", "--skip-yosys")
+def estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesignState:
+    if state.get("cost_backend", "yosys") == "vivado":
+        return _estimate_vivado(state, transition=transition)
+    if state.get("skip_yosys", False) or state.get("skip_cost", False):
+        reason = "--skip-cost" if state.get("skip_cost") else "--skip-yosys"
+        result = [stage_services._skipped_result("python3 skills/cfu-designer/scripts/yosys_cost_report.py", state, reason)]
+        stage_services._write_cost_artifact(state, result, "planned", reason)
         return {
             "cost_results": result,
             "stage_jobs": "review",
             **outcome.stage_result(state, rung="cost", ok=False, skipped=True,
-                                   reason="--skip-yosys",
+                                   reason=reason,
                                    history="Skipped Yosys cost estimation by request."),
         }
 
@@ -28,7 +31,7 @@ def estimate_cost(state: CfuDesignState) -> CfuDesignState:
     spec = state.get("workload_spec", {}) or {}
     task = state.get("task", "")
     case = commands.cost_case_for_spec(spec, task, agent_cfu=agent_cfu)
-    execute = bool(state.get("run_commands", False))
+    execute = bool(state.get("run_commands", False)) and not state.get("dry_run", False)
     workdir = Path(state.get("workdir", ".")).resolve()
 
     # Command side effects must stay inside the stage's declared write roots, so
@@ -85,18 +88,18 @@ def estimate_cost(state: CfuDesignState) -> CfuDesignState:
                 errors.append(f"Yosys cost estimation failed: {' '.join(yosys_command)[:200]}")
         ok = not errors and bool(results) and all(item.get("returncode") == 0 for item in results)
 
+    if not ok and execute and not transition:
+        validation_parallel.command_failed()
     reason = "; ".join(errors)[:400] if errors else ""
     stage_services._write_cost_artifact(
         state, results, "passed" if ok else ("planned" if not execute else "failed"), reason
     )
-    extra, next_node = ladder._ladder_transition(
-        state,
-        "cost",
-        ok=ok,
-        default="review_and_route",
-        repair_target="implement",
-        skipped=not execute,
-    )
+    extra, next_node = ({}, None)
+    if transition:
+        extra, next_node = ladder._ladder_transition(
+            state, "cost", ok=ok, default="review_and_route",
+            repair_target="implement", skipped=not execute,
+        )
     update = {
         "cost_results": results,
         "stage_jobs": "review",
@@ -108,4 +111,84 @@ def estimate_cost(state: CfuDesignState) -> CfuDesignState:
             history="Ran Yosys cost estimation.",
         ),
     }
+    return ladder._apply_transition(update, extra)
+
+
+def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignState:
+    """FPGA implementation of the immutable hardware fileset, not simulator RTL."""
+    from ...runtime import vivado
+    import re
+    import uuid
+
+    execute = bool(state.get("run_commands")) and not state.get("dry_run")
+    skipped = bool(state.get("skip_cost")) or not execute
+    reason = "--skip-cost" if state.get("skip_cost") else ("execution-disabled" if not execute else "")
+    results: list[dict] = []
+    errors: list[str] = []
+    ppa: dict = {}
+    run = str(state.get("run_root") or "")
+    evaluation_id = str(state.get("evaluation_id") or f"cost-{uuid.uuid4().hex}")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", evaluation_id):
+        raise ValueError("invalid evaluation id")
+    out_dir = f"{run}/11_cost/evaluations/{evaluation_id}/vivado"
+    cost_input = dependencies.input_fingerprints(state)["cost"]
+    snapshot: dict = {}
+    if skipped:
+        results = [stage_services._skipped_result(
+            ["python3", "skills/cfu-designer/scripts/vivado_ppa_report.py"], state, reason)]
+    else:
+        toolbox = stage_services._toolbox_for_stage(state, "cost")
+        try:
+            if state.get("skip_yosys"):
+                raise ValueError("--skip-yosys is incompatible with Vivado; use --skip-cost")
+            snapshot = rtl_snapshot.validate(state)
+            argv = vivado.build_command(state, snapshot["root"], out_dir)
+            result = effects.run_command(
+                state, toolbox, argv, stage="cost", rung="cost", command_id="vivado_cost",
+                timeout=int(state.get("eda_timeout", 3600)) + 30, mutate=True)
+            results.append(result)
+            if not result.get("cancelled"):
+                try:
+                    ppa = vivado.load_summary(Path(state.get("workdir", ".")), out_dir)
+                except (OSError, ValueError) as exc:
+                    errors.append(f"Vivado produced no valid PPA summary: {exc}")
+                if result.get("returncode") != 0:
+                    errors.append(f"Vivado FPGA evaluation failed (returncode={result.get('returncode')})")
+                if ppa and ppa.get("status") != "passed":
+                    blocking = [item for item in ppa.get("issues", [])
+                                if not isinstance(item, dict) or item.get("severity", "error") == "error"]
+                    errors.extend((f"{item.get('code', 'fpga')}: {item.get('detail', '')}"
+                                   if isinstance(item, dict) else str(item))
+                                  for item in blocking or ["Vivado implementation/timing did not pass"])
+        except (OSError, ValueError) as exc:
+            errors.append(f"Vivado evaluation precondition failed: {exc}")
+    cancelled = any(item.get("cancelled") for item in results)
+    if ppa:
+        ppa["evidence"] = {"evaluation_id": evaluation_id, "input_sha256": cost_input,
+                           "rtl_sha256": snapshot.get("sha256"),
+                           "summary_path": f"{out_dir}/summary.json"}
+        results[-1].setdefault("parsed", {})["ppa"] = ppa
+    ok = not skipped and not cancelled and not errors and bool(ppa) and ppa.get("status") == "passed"
+    if errors and not cancelled:
+        if not transition:
+            validation_parallel.command_failed()
+        # Include semantic/tool precondition failures even if Vivado exited 0.
+        results.append(stage_services.gate_failure_result(state, "cost", "fpga_ppa", errors))
+    for result in results:
+        result["evaluation_id"] = evaluation_id
+    reason = "; ".join(errors)[:800] if errors else reason
+    stage_services._write_cost_artifact(
+        state, results, "cancelled" if cancelled else "passed" if ok else "planned" if skipped else "failed", reason)
+    extra, next_node = ({}, None)
+    if transition:
+        extra, next_node = ladder._ladder_transition(
+            state, "cost", ok=ok, skipped=skipped or cancelled,
+            default="review_and_route", repair_target="implement")
+    update = {"cost_results": results, "stage_jobs": "review", "errors": errors if not cancelled else [],
+              **outcome.stage_result(
+                  state, rung="cost", ok=ok, skipped=skipped, next=next_node,
+                  reason=reason, cancelled=cancelled, backend="vivado", evaluation_id=evaluation_id,
+                  ppa=ppa, input_sha256=cost_input,
+                  round=int(state.get("optimization_round", 0) or 0),
+                  history="Evaluated whole-SoC FPGA PPA with Vivado (CFU hierarchy attribution).")}
     return ladder._apply_transition(update, extra)

@@ -14,7 +14,7 @@ from .runtime.llm import (
 )
 from .runtime.llm_config import LlmConfigError, effective_config, list_configs
 from .flow import optimize as flow_optimize
-from .runtime import provenance
+from .runtime import provenance, ppa, vivado
 from .stages.review import report as report_mod
 from .state import CfuDesignState
 
@@ -135,7 +135,17 @@ def build_parser() -> argparse.ArgumentParser:
         "from the intrinsic template with free encodings. Implies --no-conformance.",
     )
     parser.add_argument("--skip-sim", action="store_true", help="Skip SBT generation/simulation.")
-    parser.add_argument("--skip-yosys", action="store_true", help="Skip Yosys cost estimation.")
+    parser.add_argument("--skip-yosys", action="store_true", help="Skip Yosys cost estimation (Yosys backend only).")
+    parser.add_argument("--skip-cost", action="store_true", help="Skip the selected EDA cost backend.")
+    parser.add_argument("--cost-backend", choices=("yosys", "vivado"), default="yosys",
+                        help="Cost backend: Yosys proxy (default) or real Vivado FPGA implementation.")
+    parser.add_argument("--fpga-part", default=vivado.DEFAULT_PART,
+                        help=f"Vivado part (default: {vivado.DEFAULT_PART}, Artix UltraScale+ AU25P).")
+    parser.add_argument("--target-frequency-mhz", type=float, default=100.0)
+    parser.add_argument("--eda-timeout", type=int, default=3600, help="EDA command timeout in seconds.")
+    parser.add_argument("--vivado-threads", type=int, default=4)
+    parser.add_argument("--validation-mode", choices=("parallel", "serial"), default="parallel",
+                        help="Run simulation and EDA concurrently with fail-fast cancellation (default).")
     parser.add_argument(
         "--agent-tools",
         dest="agent_tools",
@@ -225,9 +235,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--visibility",
         choices=("basic", "standard", "extended"),
         default=os.environ.get("CFU_AGENT_VISIBILITY", "extended"),
-        help="Read-only file visibility tier, shared by every stage. basic: workload/"
-        "integration/AgentCfu only (no skills, no sibling CFU designs); standard: adds "
-        "skills and sibling designs; extended: adds ext/SpinalHDL. Default: extended.",
+        help="Read-only file visibility tier, shared by every stage. basic: existing "
+        "integration paths; standard: adds skills and the full VexiiRiscv source tree "
+        "(except denied Vpu/BitNet example CFUs); extended: adds ext/SpinalHDL. "
+        "Vpu/BitNet examples stay denied at every tier. Default: extended.",
     )
     parser.add_argument("--export-graph", default="", help="Directory for Mermaid/ASCII graph visualization.")
     parser.add_argument("--checkpoint", action="store_true", help="Persist LangGraph checkpoints within this run (requires an explicit --run-id to resume later).")
@@ -250,6 +261,16 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--thread-id must equal --run-id (or --resume)")
     if args.checkpoint and not (args.run_id or args.resume):
         raise SystemExit("--checkpoint requires --run-id for safe recovery")
+    import math
+    import re
+    if args.skip_yosys and args.cost_backend != "yosys":
+        raise SystemExit("--skip-yosys requires --cost-backend yosys; use --skip-cost for Vivado")
+    if not math.isfinite(args.target_frequency_mhz) or not 0 < args.target_frequency_mhz <= 1000:
+        raise SystemExit("--target-frequency-mhz must be finite and between 0 and 1000")
+    if args.eda_timeout <= 0 or not 1 <= args.vivado_threads <= 16:
+        raise SystemExit("--eda-timeout must be positive; --vivado-threads must be between 1 and 16")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", args.fpga_part):
+        raise SystemExit("--fpga-part must be a Vivado part name, not a path or Tcl expression")
     if args.max_evals < 0:
         raise SystemExit("--max-evals must be zero or positive")
     if args.no_llvm_ir and args.ir_features in ("require", "approx"):
@@ -304,6 +325,14 @@ def main(argv: list[str] | None = None) -> int:
         "mode": "dry-run" if dry_run else "autonomous",
         "skip_sim": args.skip_sim,
         "skip_yosys": args.skip_yosys,
+        "skip_cost": args.skip_cost,
+        "cost_backend": args.cost_backend,
+        "fpga_part": args.fpga_part,
+        "target_frequency_mhz": args.target_frequency_mhz,
+        "eda_timeout": args.eda_timeout,
+        "vivado_threads": args.vivado_threads,
+        "validation_mode": args.validation_mode,
+        "flow_version": 2,
         "max_iters": args.max_iters,
         "max_answer_repairs": args.max_answer_repairs,
         "iteration": 0,
@@ -313,6 +342,14 @@ def main(argv: list[str] | None = None) -> int:
         # choice explicit instead of inferring it from an always-set run root.
         "agent_cfu": True,
     }
+    if args.resume:
+        explicit = argv if argv is not None else sys.argv[1:]
+        names = ("cost_backend", "fpga_part", "target_frequency_mhz", "eda_timeout", "vivado_threads", "validation_mode")
+        state["resume_eda_options"] = {
+            name: getattr(args, name) for name in names
+            if any(token == "--" + name.replace("_", "-") or token.startswith("--" + name.replace("_", "-") + "=")
+                   for token in explicit)
+        }
     graph_dir = args.export_graph or str(Path(args.out_dir) / "graph")
     graph_paths = {}
     enable_progress()
@@ -442,7 +479,10 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
         print("  cycles_before = n/a")
         print("  cycles_after  = n/a")
         print(f"  speedup       = n/a ({reason})")
-    if cost:
+    if final_state.get("cost_backend") == "vivado":
+        for line in ppa.lines(final_state):
+            print("  " + line)
+    elif cost:
         print(
             "  yosys_cost    = top={top} cells={cells} wire_bits={wire_bits} "
             "memories={memories} memory_bits={memory_bits}".format(**cost)

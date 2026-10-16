@@ -152,6 +152,7 @@ class HardwareGateConsistencyTest(TestCase):
             path = Path(tmp) / 'AgentCfu.v'
             path.write_text(rtl(((1, 0),)))
             box = mock.Mock()
+            box.workdir = Path(tmp)
             box.read_text.side_effect = lambda p, **kw: table(instruction()) if p.endswith('AgentCfu.scala') else path.read_text() if p.endswith('.v') else '// fiber'
             result = coding_tools.audit_hardware_result({'run_root': 'unit', 'isa_spec': spec()}, box, {'returncode': 0}, path)
         self.assertEqual(result['returncode'], 1)

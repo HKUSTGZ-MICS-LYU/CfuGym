@@ -55,11 +55,14 @@ class AccessPolicy:
     # One shared read tree for the whole flow. Every stage sees the same paths;
     # `is_current_run_path` still scopes run artifacts to the executing run.
     read: tuple[str, ...] = ()
-    # Visibility tiers are an ordered ladder (lowest first). A path matched by
-    # ``visibility_gated[level]`` may only be read at that level or above.
+    # Visibility tiers are an ordered ladder (lowest first). Paths matched by
+    # ``visibility_gated[level]`` require that tier unless exempted for it.
     visibility: str = DEFAULT_VISIBILITY
     visibility_levels: tuple[str, ...] = DEFAULT_VISIBILITY_LEVELS
     visibility_gated: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Patterns that retain lower-tier visibility inside a gated subtree. They
+    # never override the shared read allowlist or deny rules.
+    visibility_exemptions: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @classmethod
     def from_file(cls, path: Path, visibility: str = "") -> "AccessPolicy":
@@ -113,7 +116,7 @@ class AccessPolicy:
                 priority=int(raw.get("priority", 0) or 0),
             )
 
-        levels, gated, default_level = _parse_visibility(data.get("visibility", {}))
+        levels, gated, exemptions, default_level = _parse_visibility(data.get("visibility", {}))
 
         return cls(
             version=str(data.get("version", "1")),
@@ -125,6 +128,7 @@ class AccessPolicy:
             visibility=_resolve_visibility(visibility or default_level, levels),
             visibility_levels=levels,
             visibility_gated=gated,
+            visibility_exemptions=exemptions,
         )
 
     def level_index(self, level: str) -> int:
@@ -136,16 +140,37 @@ class AccessPolicy:
                 f"{', '.join(self.visibility_levels)}"
             ) from exc
 
+    def _exempt_from_visibility_gate(self, rel_path: str, level: str) -> bool:
+        patterns = self.visibility_exemptions.get(level, ())
+        return self._matches(rel_path, patterns) or any(
+            _under_root(rel_path, root)
+            for root in map(_subtree_root, patterns)
+            if root
+        )
+
+    def _has_visibility_exemption_below(self, rel_path: str) -> bool:
+        """Whether navigation may reach an exemption below a gated directory."""
+        for level, patterns in self.visibility_exemptions.items():
+            if self.level_index(level) <= self.level_index(self.visibility):
+                continue
+            for pattern in patterns:
+                root = _subtree_root(pattern)
+                if root and _under_root(root, rel_path):
+                    return True
+        return False
+
     def required_visibility(self, rel_path: str) -> str:
         """The lowest level allowed to read ``rel_path`` or anything below it.
 
         A gate is usually declared as a subtree (``ext/SpinalHDL/**``), so the
-        directory that roots it must report the same level as its contents:
-        otherwise a walk matches nothing on the directory and descends into a
-        tree that can never yield a readable file.
+        directory that roots it must report the same level as its contents.
+        Exemptions keep an already-visible child subtree available at lower
+        tiers while the rest of a broader tree remains gated.
         """
         required = ""
         for level, patterns in self.visibility_gated.items():
+            if self._exempt_from_visibility_gate(rel_path, level):
+                continue
             hit = self._matches(rel_path, patterns) or any(
                 _under_root(rel_path, root)
                 for root in map(_subtree_root, patterns)
@@ -214,8 +239,8 @@ class AccessPolicy:
         rel = (rel_path or "").strip("/")
         if not rel:
             return True
-        if self.visibility_block(rel):
-            # The directory roots a gated subtree: nothing below it is readable.
+        if self.visibility_block(rel) and not self._has_visibility_exemption_below(rel):
+            # The directory roots a gated subtree with no lower-tier exception.
             return False
         if self.can_read(rel):
             return True
@@ -347,10 +372,12 @@ def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _parse_visibility(raw: Any) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]], str]:
+def _parse_visibility(
+    raw: Any,
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]], dict[str, tuple[str, ...]], str]:
     """Parse the optional top-level ``visibility`` section."""
     if raw in (None, {}):
-        return DEFAULT_VISIBILITY_LEVELS, {}, DEFAULT_VISIBILITY
+        return DEFAULT_VISIBILITY_LEVELS, {}, {}, DEFAULT_VISIBILITY
     if not isinstance(raw, dict):
         raise PolicyError("visibility must be a mapping")
 
@@ -367,18 +394,21 @@ def _parse_visibility(raw: Any) -> tuple[tuple[str, ...], dict[str, tuple[str, .
             f"({', '.join(levels)})"
         )
 
-    raw_gated = raw.get("gated", {})
-    if not isinstance(raw_gated, dict):
-        raise PolicyError("visibility.gated must be a mapping of level -> patterns")
-    gated: dict[str, tuple[str, ...]] = {}
-    for level, patterns in raw_gated.items():
-        if level not in levels:
-            raise PolicyError(
-                f"visibility.gated level {level!r} is not in visibility.levels "
-                f"({', '.join(levels)})"
-            )
-        gated[level] = _string_tuple(patterns, f"visibility.gated.{level}")
-    return levels, gated, default_level
+    def parse_patterns(key: str) -> dict[str, tuple[str, ...]]:
+        raw_patterns = raw.get(key, {})
+        if not isinstance(raw_patterns, dict):
+            raise PolicyError(f"visibility.{key} must be a mapping of level -> patterns")
+        parsed: dict[str, tuple[str, ...]] = {}
+        for level, patterns in raw_patterns.items():
+            if level not in levels:
+                raise PolicyError(
+                    f"visibility.{key} level {level!r} is not in visibility.levels "
+                    f"({', '.join(levels)})"
+                )
+            parsed[level] = _string_tuple(patterns, f"visibility.{key}.{level}")
+        return parsed
+
+    return levels, parse_patterns("gated"), parse_patterns("exemptions"), default_level
 
 
 def _resolve_visibility(requested: str, levels: tuple[str, ...]) -> str:

@@ -183,11 +183,15 @@ class LlmRequestAuditTest(unittest.TestCase):
         self.assertEqual(payload["thinking"], {"type": "enabled"})
 
     def test_stream_final_usage_preserves_cached_tokens(self) -> None:
-        final_usage = SimpleNamespace(prompt_tokens=12, completion_tokens=3, total_tokens=15,
-                                      prompt_tokens_details={"cached_tokens": 8})
+        final_usage = SimpleNamespace(
+            prompt_tokens=12, completion_tokens=8, total_tokens=20,
+            prompt_tokens_details={"cached_tokens": 8},
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=5),
+        )
         stream = [
             SimpleNamespace(usage=None, choices=[SimpleNamespace(finish_reason=None,
-                delta=SimpleNamespace(content="ok", tool_calls=None))]),
+                delta=SimpleNamespace(content="ok", reasoning_content="private thought",
+                                       tool_calls=None))]),
             SimpleNamespace(usage=final_usage, choices=[]),
         ]
         completions = _ChatCompletions([iter(stream)])
@@ -195,7 +199,13 @@ class LlmRequestAuditTest(unittest.TestCase):
         with request_audit.use_request_audit(self.run_root, self.workdir):
             result = self._client(stream=True)._chat(sdk, "s", "u")
         self.assertEqual(result.cached_input_tokens, 8)
-        self.assertEqual(self._events()[-1]["result"]["cached_input_tokens"], 8)
+        events = self._events()
+        self.assertEqual(events[-1]["result"]["cached_input_tokens"], 8)
+        self.assertEqual(events[-1]["metadata"]["reasoning_chars"], len("private thought"))
+        self.assertEqual(events[-1]["metadata"]["reasoning_source"], "stream.reasoning_content")
+        self.assertEqual(events[-1]["metadata"]["reasoning_tokens"], 5)
+        self.assertIn("reasoning_content", events[-1]["metadata"]["response_extra_keys"])
+        self.assertNotIn("private thought", self.audit.read_text())
 
     def test_compaction_is_persisted_and_audited(self) -> None:
         def batch(ident, text):

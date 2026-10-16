@@ -204,7 +204,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         evidence = [(f"{run_root}/07_analysis/workload_analysis.yaml", "workload analysis")]
         if state.get("isa_contract", True):
             evidence.append(
-                (f"{run_root}/08_isa/cfu_isa.yaml", "frozen ISA contract (read it before using an encoding)")
+                (f"{run_root}/08_isa/cfu_isa.yaml", "frozen ISA contract (reuse exact hash-matched Run memory; read any missing encoding details)")
             )
         artifact_paths = stage_services.existing_evidence(state, evidence)
     conformance_step = (
@@ -259,6 +259,9 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         tool_rounds=int(state.get("max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS) or DEFAULT_MAX_TOOL_ROUNDS),
         agent_tools=True,
         artifact_paths=artifact_paths,
+        shared=prompts.workload_digest_block(
+            state.get("workload_spec", {}), state.get("embench_profiles"),
+        ),
     )
     schedule_line = (
         "\nYou schedule the work: read/search, edit_hardware, edit_software, "

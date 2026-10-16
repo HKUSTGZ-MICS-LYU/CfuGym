@@ -10,13 +10,19 @@ class Evidence(TypedDict, total=False):
     """What the run has observed or produced: the domain artifacts."""
 
     ir_result: dict[str, Any]
+    rtl_snapshot: dict[str, Any]
+    evaluation_id: str
+    evaluation: dict[str, Any]
     design_workspace: dict[str, Any]
     design_files: list[str]
+    design_baseline: dict[str, Any]
     changed_design_files: list[str]
     stage_jobs: str
     context: RepoContext
     # Bounded, source-fingerprinted knowledge shared by all nodes in this run.
     flow_memory: dict[str, Any]
+    # Bounded artifact-backed execution notes; replacement, not append-reduced.
+    stage_history: dict[str, Any]
     workload_spec: WorkloadSpec
     spec_text: str
     spec_unknowns: list[str]

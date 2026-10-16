@@ -200,12 +200,14 @@ class InstructionEncodingTest(TestCase):
 
     def test_soc_post_generation_uses_actual_rtl_and_binds_candidate(self):
         with TemporaryDirectory() as tmp:
-            target = Path(tmp) / 'MiCoSoc.v'
+            target = Path(tmp) / 'agents/generated/runs/unit/workspace/soc/MiCoSoc.v'
+            target.parent.mkdir(parents=True)
             target.write_text(rtl(((1, 0),)))
             box = mock.Mock()
+            box.workdir = Path(tmp)
             box.read_text.side_effect = lambda p, **kw: (table(instruction()) if p.endswith('AgentCfu.scala')
                                                        else target.read_text() if p.endswith('MiCoSoc.v') else '// fiber')
-            state = {'workdir': tmp, 'run_root': 'unit', 'isa_spec': spec(), 'max_iters': 1,
+            state = {'workdir': tmp, 'run_root': 'agents/generated/runs/unit', 'isa_spec': spec(), 'max_iters': 1,
                      'gates': {'implementation_hw': {'ok': True}}, 'require_conformance': False}
             with mock.patch.object(stage_services, '_profile_reason', return_value=''), \
                  mock.patch.object(stage_services, '_toolbox_for_stage', return_value=box), \
@@ -216,6 +218,8 @@ class InstructionEncodingTest(TestCase):
                  mock.patch.object(soc.effects, 'run_command', return_value={'returncode': 0}):
                 result = soc.generate_soc(state)
         gate = result['gates']['hw_build']
+        box.read_text.assert_any_call('agents/generated/runs/unit/workspace/soc/MiCoSoc.v',
+                                      limit=20_000_000)
         self.assertFalse(gate['ok'])
         self.assertEqual(gate['terminal_reason'], 'hardware_integrity')
         self.assertEqual(gate['instruction_encoding']['rtl']['actual_pairs'], [[1, 0]])

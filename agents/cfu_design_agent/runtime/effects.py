@@ -32,6 +32,19 @@ from . import checks, stage_services
 _RUN_STATE: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "cfu_effect_run_state", default=None
 )
+_PLAIN_COMMANDS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cfu_plain_commands", default=False
+)
+
+
+@contextmanager
+def plain_commands() -> Iterator[None]:
+    """Group tasks own durability; worker threads must not spawn nested tasks."""
+    token = _PLAIN_COMMANDS.set(True)
+    try:
+        yield
+    finally:
+        _PLAIN_COMMANDS.reset(token)
 
 
 @contextmanager
@@ -57,7 +70,7 @@ def inside_run() -> bool:
     test, or a helper reused outside the flow) must fall back to the plain call
     rather than raise ``Called get_config outside of a runnable context``.
     """
-    if _RUN_STATE.get() is None:
+    if _PLAIN_COMMANDS.get() or _RUN_STATE.get() is None:
         return False
     from langgraph.config import get_config
 

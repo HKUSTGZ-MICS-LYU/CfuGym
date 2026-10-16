@@ -1,9 +1,10 @@
 """Bounded run-local memory with read-time byte/range provenance.
 
-The graph owns publication: only after a node returns successfully does it fold
-captured reads and accepted domain facts into state. A file reference alone is
-not evidence that the model saw its content. Rendered file excerpts come from
-read-time snapshots, never a fresh unobserved file head.
+The graph owns publication: after a node returns it folds hash-matched reads
+and independently accepted domain facts into state. A rejected delivery does
+not invalidate an unchanged read, nor does a read certify that delivery. Active
+reads may also be reused by later calls in the same node without changing state.
+A file reference alone is not evidence that the model saw its content.
 """
 from __future__ import annotations
 
@@ -19,14 +20,21 @@ from typing import Any, Iterator, Mapping, Sequence
 from . import source_visibility
 from .tools import RepoToolbox
 
-MEMORY_VERSION = 2
+MEMORY_VERSION = 2  # Additive ranges; legacy coverage/excerpt remains readable.
 MAX_ENTRIES = 24
 MAX_FILE_BYTES = 2_000_000
-_EXCERPT_CHARS = 600
+MAX_RANGE_CHARS = 4000
+MAX_RANGES_PER_FILE = 4
+MAX_FILE_EXCERPT_CHARS = 12000
+MAX_RANGES = 48
+MAX_TOTAL_EXCERPT_CHARS = 48000
+_EXCERPT_CHARS = 600  # Backward-compatible alias, not the range storage budget.
+_RENDER_RANGE_CHARS = 1600
 _MAX_PATH = 240
 _SAFE_PATH = re.compile(r"[A-Za-z0-9_./+ -]+\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _ACTIVE_TRANSCRIPT: ContextVar[list | None] = ContextVar("flow_memory_transcript", default=None)
+_READ_CONTEXT: ContextVar[dict | None] = ContextVar("flow_memory_read_context", default=None)
 _ROLES = frozenset({"source", "hardware", "analysis", "contract", "profile", "workload"})
 _ORIGINS = frozenset({"state", "tool"})
 _STAGE_ROLES = {
@@ -48,18 +56,26 @@ def memory_stage(stage: str) -> str:
 
 
 @contextmanager
-def collect_tool_transcripts() -> Iterator[list]:
+def collect_tool_transcripts(state: Mapping[str, Any] | None = None) -> Iterator[list]:
     token = _ACTIVE_TRANSCRIPT.set([])
+    context = {"run_root": state.get("run_root") if isinstance(state, Mapping) else None,
+               "contract_sha256": (_digest(state.get("isa_spec") or {})
+                                   if isinstance(state, Mapping) else None)}
+    context_token = _READ_CONTEXT.set(context)
     try:
         yield _ACTIVE_TRANSCRIPT.get()
     finally:
+        _READ_CONTEXT.reset(context_token)
         _ACTIVE_TRANSCRIPT.reset(token)
 
 
 def record_tool_transcript(calls: Sequence[Mapping[str, Any]] | None) -> None:
-    collector = _ACTIVE_TRANSCRIPT.get()
-    if collector is not None and isinstance(calls, (list, tuple)):
-        collector.extend(item for item in calls if isinstance(item, Mapping))
+    # Audit transcripts are written separately by llm_step. Generic tool results
+    # cannot establish byte provenance, and retaining them here would make the
+    # active read cache unbounded across independent calls in one graph node.
+    # Keep the public seam for existing callers, but capture_read is its sole
+    # evidence producer (including for reserved-looking tool names).
+    return None
 
 
 def _digest(value: Any) -> str:
@@ -117,16 +133,118 @@ def _file_hash(toolbox: RepoToolbox, candidate: Any) -> tuple[str, str] | None:
     return (value[0], hashlib.sha256(value[1]).hexdigest()) if value else None
 
 
+def _copy_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(entry)
+    if "coverage" in result:
+        result["coverage"] = dict(result["coverage"])
+    if "ranges" in result:
+        result["ranges"] = [{"coverage": dict(part["coverage"]), "excerpt": part["excerpt"]}
+                            for part in result["ranges"]]
+    return result
+
+
+def _sync_alias(entry: dict[str, Any]) -> None:
+    """Old readers retain a small alias, never a second unbounded text copy."""
+    if "ranges" not in entry:
+        return
+    if entry["ranges"]:
+        first = entry["ranges"][0]
+        entry.update(coverage=dict(first["coverage"]), excerpt=first["excerpt"][:_EXCERPT_CHARS])
+    else:
+        entry.pop("coverage", None)
+        entry.pop("excerpt", None)
+
+
+def _observations(entry: Mapping[str, Any]) -> list:
+    if "ranges" in entry:
+        return entry["ranges"]
+    return [entry] if entry.get("coverage") else []
+
+
+def _bound_entries(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Stable FIFO trimming; identical re-reads never refresh insertion order.
+
+    The active collector may contain several byte versions of one path so a
+    rollback can recover a previous observation. Those versions share the same
+    per-file budget. Legacy aliases add at most MAX_ENTRIES * 600 characters.
+    """
+    result = [_copy_entry(entry) for entry in entries[-MAX_ENTRIES:]]
+
+    def cost(group):
+        parts = [part for entry in group for part in _observations(entry)]
+        return len(parts), sum(len(part["excerpt"]) for part in parts)
+
+    def trim(group, count, chars):
+        while True:
+            size, length = cost(group)
+            if size <= count and length <= chars:
+                return
+            oldest = next(entry for entry in group if _observations(entry))
+            if "ranges" in oldest:
+                oldest["ranges"].pop(0)
+                _sync_alias(oldest)
+            else:
+                oldest.pop("coverage", None)
+                oldest.pop("excerpt", None)
+
+    for path in dict.fromkeys(entry["path"] for entry in result):
+        trim([entry for entry in result if entry["path"] == path],
+             MAX_RANGES_PER_FILE, MAX_FILE_EXCERPT_CHARS)
+    trim(result, MAX_RANGES, MAX_TOTAL_EXCERPT_CHARS)
+    for entry in result:
+        _sync_alias(entry)
+    return result
+
+
+def _merge_entry(old: Mapping[str, Any] | None, new: Mapping[str, Any]) -> dict[str, Any]:
+    if not old or old["sha256"] != new["sha256"]:
+        return _copy_entry(new)
+    # Neither references nor duplicate reads replace earlier observed metadata.
+    result = _copy_entry(old if old.get("coverage") else new)
+    ranges = []
+    seen = set()
+    for entry in (old, new):
+        for part in entry.get("ranges", []):
+            coverage = part["coverage"]
+            key = (coverage["first_line"], coverage["last_line"])
+            if key not in seen:
+                ranges.append({"coverage": dict(coverage), "excerpt": part["excerpt"]})
+                seen.add(key)
+    if ranges:
+        result["ranges"] = ranges
+        _sync_alias(result)
+    return result
+
+
+def _capture_ranges(observed: list[tuple[int, str]], line_count: int, complete: bool) -> list[dict]:
+    """Split only at complete lines; skip overlarge lines, never bridge the gap."""
+    ranges, rows = [], []
+    chars = 0
+
+    def flush():
+        if rows:
+            first, last = rows[0][0], rows[-1][0]
+            ranges.append({"coverage": {"first_line": first, "last_line": last,
+                                        "full": complete and first == 1 and last == line_count},
+                           "excerpt": "\n".join(row for _, row in rows)})
+            rows.clear()
+
+    for number, content in observed:
+        row = f"{number}: {content}"
+        if rows and (number != rows[-1][0] + 1 or chars + 1 + len(row) > MAX_RANGE_CHARS):
+            flush()
+            chars = 0
+        if len(row) > MAX_RANGE_CHARS:
+            continue
+        chars += len(row) + bool(rows)
+        rows.append((number, row))
+    flush()
+    return ranges
+
+
 def capture_read(toolbox: RepoToolbox, resolved_path: str,
                  arguments: Mapping[str, Any], numbered_result: str) -> None:
-    """Capture a successful read *at execution time*, using resolved overlay path.
-
-    Each numbered complete result line must match the current raw or masked
-    file view; stored excerpts use only the masked view with the raw file hash.
-    Partial/truncated output records only the lines actually returned, not
-    the full file; captures are discarded on end-of-node hash mismatch. No-op
-    outside a graph-node collector. The caller never needs to pass source prose.
-    """
+    """Capture exact returned lines at read time, under the resolved overlay path."""
     collector = _ACTIVE_TRANSCRIPT.get()
     if collector is None:
         return
@@ -134,6 +252,17 @@ def capture_read(toolbox: RepoToolbox, resolved_path: str,
     if value is None or not isinstance(numbered_result, str):
         return
     rel, data = value
+    context = _READ_CONTEXT.get()
+    if context is not None and context["run_root"] is not None and context["run_root"] != toolbox.run_root:
+        return
+    root = str(toolbox.run_root or "")
+    identity = _identity({"run_id": root.rsplit("/", 1)[-1], "run_root": root,
+                          "workdir": str(toolbox.workdir),
+                          "visibility": getattr(toolbox.policy, "visibility", None)}, toolbox)
+    if identity is None or (context is not None and context.get("identity", identity) != identity):
+        return
+    if context is not None:
+        context["identity"] = identity
     text = data.decode("utf-8", errors="replace")
     raw_lines = text.split("\n")
     lines = source_visibility.mask_file_view(text, rel).split("\n")
@@ -144,24 +273,42 @@ def capture_read(toolbox: RepoToolbox, resolved_path: str,
             break
         number, content = int(match[1]), match[2]
         if not 1 <= number <= len(lines) or content not in (lines[number - 1], raw_lines[number - 1]):
-            break  # partial last line is not exact evidence
+            break
         if observed and number != observed[-1][0] + 1:
             break
         observed.append((number, lines[number - 1]))
-    if not observed:
+    complete = bool(observed and observed[0][0] == 1 and observed[-1][0] == len(lines)
+                    and "...[truncated" not in numbered_result)
+    ranges = _capture_ranges(observed, len(lines), complete)
+    if not ranges:
         return
-    first, last = observed[0][0], observed[-1][0]
-    complete = first == 1 and last == len(lines) and "...[truncated" not in numbered_result
-    excerpt = "\n".join(f"{number}: {content}" for number, content in observed)
-    collector.append({"name": "_memory_read", "entry": {
-        "path": rel, "sha256": hashlib.sha256(data).hexdigest(), "role": "source", "origin": "tool",
-        "coverage": {"first_line": first, "last_line": last, "full": complete},
-        "excerpt": excerpt[:_EXCERPT_CHARS],
-    }})
+    entry = {"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
+             "role": "source", "origin": "tool", "ranges": ranges}
+    if (context is not None and context.get("contract_sha256") is not None
+            and _contract_dependent(rel, "source", toolbox.run_root)):
+        entry["contract_sha256"] = context["contract_sha256"]
+    # Normalize this read's retained window BEFORE merging it with old reads.
+    # Otherwise repeating an oversized read reintroduces evicted head chunks
+    # after its retained tail and rotates the cache on every identical call.
+    entry = _bound_entries([entry])[0]
+    captures = [call["entry"] for call in collector
+                if isinstance(call, Mapping) and call.get("name") == "_memory_read"
+                and isinstance(call.get("entry"), dict) and call.get("identity", identity) == identity]
+    key = (rel, entry["sha256"], entry.get("contract_sha256"))
+    for index, old in enumerate(captures):
+        if (old["path"], old["sha256"], old.get("contract_sha256")) == key:
+            captures[index] = _merge_entry(old, entry)
+            break
+    else:
+        captures.append(entry)
+    collector[:] = [{"name": "_memory_read", "entry": item, "identity": dict(identity)}
+                    for item in _bound_entries(captures) if _observations(item)]
 
 
-def _range_excerpt(lines: list[str], first: int, last: int) -> str:
-    return "\n".join(f"{number}: {lines[number - 1]}" for number in range(first, last + 1))[:_EXCERPT_CHARS]
+def _range_excerpt(lines: list[str], first: int, last: int,
+                   limit: int | None = _EXCERPT_CHARS) -> str:
+    text = "\n".join(f"{number}: {lines[number - 1]}" for number in range(first, last + 1))
+    return text if limit is None else text[:limit]
 
 
 def _contract_dependent(path: str, role: str, root: str) -> bool:
@@ -171,6 +318,97 @@ def _contract_dependent(path: str, role: str, root: str) -> bool:
     )
 
 
+def _valid_coverage(coverage: Any, count: int) -> bool:
+    if not isinstance(coverage, dict) or set(coverage) != {"first_line", "last_line", "full"}:
+        return False
+    first, last, full = coverage["first_line"], coverage["last_line"], coverage["full"]
+    return (type(first) is int and type(last) is int and 1 <= first <= last <= count
+            and type(full) is bool and (not full or (first == 1 and last == count)))
+
+
+def _validate_entry(item: Any, state: Mapping[str, Any], toolbox: RepoToolbox,
+                    snapshots: dict) -> dict[str, Any] | None:
+    allowed = {"path", "sha256", "role", "origin", "contract_sha256", "coverage", "excerpt", "ranges"}
+    if (not isinstance(item, dict) or not set(item) <= allowed
+            or not isinstance(item.get("role"), str) or item["role"] not in _ROLES
+            or not isinstance(item.get("origin"), str) or item["origin"] not in _ORIGINS):
+        return None
+    gate = {"analysis": "analysis", "contract": "isa", "profile": "profile"}.get(item["role"])
+    if gate and not _gate_ok(state.get("gates"), gate):
+        return None
+    sha, path = item.get("sha256"), item.get("path")
+    if not isinstance(sha, str) or not _SHA.fullmatch(sha) or not isinstance(path, str):
+        return None
+    # Match the tool's existing live-path semantics without changing physical
+    # hashing helpers. A formerly direct scaffold name may now select an overlay;
+    # its unchanged tracked bytes are no longer the bytes read_file would show.
+    from . import tools as tools_mod
+    redirected = tools_mod.redirect_target(path, str(toolbox.run_root or ""), toolbox.embench_benchmark)
+    if (redirected and (toolbox.workdir / redirected).is_file()
+            and toolbox.is_read_allowed(redirected)):
+        return None
+    if path not in snapshots:
+        snapshot = _file_bytes(toolbox, path)
+        if snapshot:
+            text = snapshot[1].decode("utf-8", errors="replace")
+            snapshots[path] = (hashlib.sha256(snapshot[1]).hexdigest(), text.split("\n"),
+                               source_visibility.mask_file_view(text, path).split("\n"))
+        else:
+            snapshots[path] = None
+    snapshot = snapshots[path]
+    if snapshot is None or snapshot[0] != sha:
+        return None
+    contract = item.get("contract_sha256")
+    dependent = _contract_dependent(path, item["role"], str(state.get("run_root") or ""))
+    if dependent and (not isinstance(contract, str) or not _SHA.fullmatch(contract)):
+        return None
+    if contract is not None and contract != _digest(state.get("isa_spec") or {}):
+        return None
+    entry = {key: item[key] for key in ("path", "sha256", "role", "origin")}
+    if item.get("contract_sha256"):
+        entry["contract_sha256"] = item["contract_sha256"]
+    raw_lines, visible_lines = snapshot[1:]
+    coverage, excerpt = item.get("coverage"), item.get("excerpt")
+    legacy_range = None
+    if (_valid_coverage(coverage, len(raw_lines)) and isinstance(excerpt, str)
+            and len(excerpt) <= _EXCERPT_CHARS):
+        first, last = coverage["first_line"], coverage["last_line"]
+        raw = _range_excerpt(raw_lines, first, last, None)
+        visible = _range_excerpt(visible_lines, first, last, None)
+        # A body-only legacy fragment cannot mask itself. Always derive its
+        # visible view from the complete, raw-hash-matched file first.
+        if excerpt in (raw[:_EXCERPT_CHARS], visible[:_EXCERPT_CHARS]):
+            entry.update(coverage=dict(coverage), excerpt=visible[:_EXCERPT_CHARS])
+            # Never expand a truncated old excerpt to its wider coverage claim.
+            if excerpt in (raw, visible) and len(visible) <= MAX_RANGE_CHARS:
+                legacy_range = {"coverage": dict(coverage), "excerpt": visible}
+    ranges = item.get("ranges")
+    if isinstance(ranges, list) and len(ranges) <= MAX_RANGES_PER_FILE:
+        valid, seen = [], set()
+        for part in ranges:
+            if not isinstance(part, dict) or set(part) != {"coverage", "excerpt"}:
+                continue
+            coverage, excerpt = part["coverage"], part["excerpt"]
+            if (not _valid_coverage(coverage, len(raw_lines)) or not isinstance(excerpt, str)
+                    or not 0 < len(excerpt) <= MAX_RANGE_CHARS):
+                continue
+            first, last = coverage["first_line"], coverage["last_line"]
+            raw = _range_excerpt(raw_lines, first, last, None)
+            visible = _range_excerpt(visible_lines, first, last, None)
+            if (first, last) not in seen and excerpt in (raw, visible) and len(visible) <= MAX_RANGE_CHARS:
+                valid.append({"coverage": dict(coverage), "excerpt": visible})
+                seen.add((first, last))
+        if valid:
+            entry["ranges"] = valid
+    elif "ranges" not in item and legacy_range:
+        entry["ranges"] = [legacy_range]
+    # Invalid new ranges cannot be laundered through an otherwise valid alias.
+    if "ranges" in item and not entry.get("ranges"):
+        entry.pop("coverage", None)
+        entry.pop("excerpt", None)
+    return entry
+
+
 def validate_memory(memory: Any, state: Mapping[str, Any], toolbox: RepoToolbox) -> dict[str, Any]:
     identity = _identity(state, toolbox)
     if identity is None:
@@ -178,53 +416,22 @@ def validate_memory(memory: Any, state: Mapping[str, Any], toolbox: RepoToolbox)
     clean = {**identity, "entries": [], "facts": []}
     if not isinstance(memory, dict) or any(memory.get(key) != val for key, val in identity.items()):
         return clean
+    bindings = _fact_bindings(memory)
+    if bindings is not None:
+        clean["fact_sha256"] = bindings
     items = memory.get("entries")
     if not isinstance(items, list) or len(items) > MAX_ENTRIES:
         return clean
-    contract = _digest(state.get("isa_spec") or {})
-    seen: set[str] = set()
+    seen, snapshots = set(), {}
     for item in items:
-        allowed = {"path", "sha256", "role", "origin", "contract_sha256", "coverage", "excerpt"}
-        if (not isinstance(item, dict) or not set(item) <= allowed
-                or item.get("role") not in _ROLES or item.get("origin") not in _ORIGINS):
-            continue
-        gate = {"analysis": "analysis", "contract": "isa", "profile": "profile"}.get(item["role"])
-        if gate and not _gate_ok(state.get("gates"), gate):
-            continue
-        sha = item.get("sha256")
-        if not isinstance(sha, str) or not _SHA.fullmatch(sha):
-            continue
-        snapshot = _file_bytes(toolbox, item.get("path"))
-        if snapshot is None:
-            continue
-        current = (snapshot[0], hashlib.sha256(snapshot[1]).hexdigest())
-        if current[1] != sha or current[0] in seen:
-            continue
-        if item.get("contract_sha256") is not None and item["contract_sha256"] != contract:
-            continue
-        entry = {key: item[key] for key in ("path", "sha256", "role", "origin")}
-        if item.get("contract_sha256"):
-            entry["contract_sha256"] = item["contract_sha256"]
-        coverage, excerpt = item.get("coverage"), item.get("excerpt")
-        if isinstance(coverage, dict) and isinstance(excerpt, str) and len(excerpt) <= _EXCERPT_CHARS:
-            first, last = coverage.get("first_line"), coverage.get("last_line")
-            if type(first) is int and type(last) is int and 1 <= first <= last and type(coverage.get("full")) is bool:
-                text = snapshot[1].decode("utf-8", errors="replace")
-                raw_lines = text.split("\n")
-                if last <= len(raw_lines):
-                    visible_lines = source_visibility.mask_file_view(text, snapshot[0]).split("\n")
-                    raw_excerpt = _range_excerpt(raw_lines, first, last)
-                    visible_excerpt = _range_excerpt(visible_lines, first, last)
-                    # Restored old captures may contain only verifier-body lines,
-                    # with no signature to mask. Rebuild from the complete,
-                    # hash-matched file, not by masking that stored fragment.
-                    if excerpt in (raw_excerpt, visible_excerpt):
-                        entry.update(coverage=dict(coverage), excerpt=visible_excerpt)
-        seen.add(current[0])
-        clean["entries"].append(entry)
-    # Rebuild deterministic accepted facts from current domain state rather than
-    # trusting serialized model prose or an artifact's current filename/hash.
-    clean["facts"] = _facts(state)
+        entry = _validate_entry(item, state, toolbox, snapshots)
+        if entry is not None and entry["path"] not in seen:
+            clean["entries"].append(entry)
+            seen.add(entry["path"])
+    clean["entries"] = _bound_entries(clean["entries"])
+    # Serialized facts are never authoritative; domain gates still own them.
+    # Fingerprints additionally prevent a rejected value inheriting an old pass.
+    clean["facts"] = _facts_for_memory(state, bindings)
     return clean
 
 
@@ -249,6 +456,62 @@ def _paths(state: Mapping[str, Any]) -> list[tuple[Any, str]]:
 def _gate_ok(gates: Any, key: str) -> bool:
     gate = gates.get(key) if isinstance(gates, Mapping) else None
     return isinstance(gate, Mapping) and gate.get("ok") is True and not gate.get("stale")
+
+
+_FACT_GATES = {
+    "workload_spec": "workload_spec", "workload_analysis": "analysis", "isa_spec": "isa",
+    "profile_result": "profile", "hardware_plan": "implementation_hw",
+    "software_plan": "implementation_sw", "conformance_delivery": None,
+}
+
+
+def _fact_key(fact: Mapping[str, Any]) -> str | None:
+    return next((key for key in _FACT_GATES if fact["source"].startswith(f"state.{key} (")), None)
+
+
+def _fact_bindings(memory: Mapping[str, Any]) -> dict[str, str | None] | None:
+    """Fixed-size acceptance constraints, not serialized model prose.
+
+    Legacy memories without constraints still derive facts from domain state.
+    An explicit null blocks an unaccepted field until a fresh successful gate.
+    """
+    if "fact_sha256" not in memory:
+        return None
+    value = memory["fact_sha256"]
+    if not isinstance(value, dict):
+        return dict.fromkeys(_FACT_GATES)
+    return {key: value[key] if isinstance(value[key], str) and _SHA.fullmatch(value[key]) else None
+            for key in _FACT_GATES if key in value}
+
+
+def _facts_for_memory(state: Mapping[str, Any], bindings: Mapping[str, Any] | None) -> list[dict[str, str]]:
+    facts = _facts(state)
+    if bindings is None:
+        return facts
+    return [fact for fact in facts if _fact_key(fact) not in bindings
+            or bindings[_fact_key(fact)] == fact["sha256"]]
+
+
+def _updated_fact_bindings(state: Mapping[str, Any], update: Mapping[str, Any],
+                           previous: Mapping[str, Any] | None) -> dict[str, str | None]:
+    bindings = dict(previous or {})
+    for fact in _facts(state):
+        key = _fact_key(fact)
+        if key:
+            bindings.setdefault(key, fact["sha256"])
+    merged = {**state, **update}
+    gates = update.get("gates")
+    for key, gate in _FACT_GATES.items():
+        fresh_pass = (not update.get("errors") and
+                      ((gate is None and key in update) or (gate is not None and _gate_ok(gates, gate))))
+        if fresh_pass:
+            bindings[key] = _digest(merged[key]) if merged.get(key) else None
+        elif key in update:
+            # No fresh acceptance: retain the previous accepted digest, or an
+            # explicit denial if no accepted value existed. Merely rendering or
+            # running an unrelated node must not bless the rejected replacement.
+            bindings.setdefault(key, None)
+    return bindings
 
 
 def _facts(state: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -299,45 +562,85 @@ def derive_memory(state: Mapping[str, Any], node_update: Mapping[str, Any],
     clean = validate_memory(state.get("flow_memory"), merged, toolbox)
     if not clean:
         return {}
-    # The wrapper may call this on a normal-return failure update. Keep valid
-    # old reads but do not publish this failed attempt's new read/edit evidence.
-    new_gates = node_update.get("gates") or {}
-    own_gate = {
-        "analyze_workload": ("analysis",), "design_contract": ("isa",), "extend_isa": ("isa",),
-        "implement": ("implementation_hw", "implementation_sw"),
-        "implement_with_tools": ("implementation_hw", "implementation_sw"),
-    }.get(node_name, ())
-    checked = [new_gates.get(key) for key in own_gate] if own_gate else []
-    accepted = not node_update.get("errors") and all(
-        not isinstance(gate, Mapping) or gate.get("ok") is not False for gate in checked
-    )
     contract = _digest(merged.get("isa_spec") or {})
     candidates = []
     for path, role in _paths(merged):
         current = _file_hash(toolbox, path)
         if current:
             candidates.append({"path": current[0], "sha256": current[1], "role": role, "origin": "state"})
-    if accepted and isinstance(tool_calls, (list, tuple)):
-        # Only read-time captures are observation evidence. Generic transcript
-        # read_file records have no byte snapshot and cannot certify end bytes.
+    # Normal failed deliveries reach here only after transaction rollback. Read
+    # observations are independent of acceptance and still require exact current
+    # hashes. Exceptions never reach this publication seam. Generic transcripts
+    # and edit/check output are not read evidence.
+    if isinstance(tool_calls, (list, tuple)):
         for call in tool_calls:
-            if isinstance(call, Mapping) and call.get("name") == "_memory_read" and isinstance(call.get("entry"), dict):
-                entry = dict(call["entry"])
-                current = _file_hash(toolbox, entry.get("path"))
-                if current and current[1] == entry.get("sha256"):
-                    candidates.append(entry)
+            if (isinstance(call, Mapping) and call.get("name") == "_memory_read"
+                    and isinstance(call.get("entry"), dict)
+                    and call.get("identity", _identity(merged, toolbox)) == _identity(merged, toolbox)):
+                candidates.append(dict(call["entry"]))
     by_path = {entry["path"]: entry for entry in clean["entries"]}
-    for entry in candidates:
-        if _contract_dependent(entry["path"], entry["role"], merged["run_root"]):
-            entry["contract_sha256"] = contract
-        old = by_path.get(entry["path"])
-        if old and old["sha256"] == entry["sha256"]:
-            # Do not let unobserved state references overwrite precise captures.
-            entry = {**entry, **old} if not entry.get("coverage") else {**old, **entry}
-        by_path[entry["path"]] = entry
-    clean["entries"] = list(by_path.values())[-MAX_ENTRIES:]
-    clean["facts"] = _facts(merged)
+    snapshots = {}
+    for item in candidates:
+        path, role = item.get("path"), item.get("role")
+        if (isinstance(path, str) and isinstance(role, str)
+                and _contract_dependent(path, role, merged["run_root"])):
+            # A captured dependency is immutable. Missing fingerprints occur
+            # only for legacy callers without a node-bound collector context.
+            item.setdefault("contract_sha256", contract)
+        entry = _validate_entry(item, merged, toolbox, snapshots)
+        if entry is not None:
+            by_path[entry["path"]] = _merge_entry(by_path.get(entry["path"]), entry)
+    clean["entries"] = _bound_entries(list(by_path.values()))
+    bindings = _updated_fact_bindings(state, node_update, clean.get("fact_sha256"))
+    clean["fact_sha256"] = bindings
+    clean["facts"] = _facts_for_memory(merged, bindings)
     return clean
+
+
+def memory_for_prompt(state: Mapping[str, Any], toolbox: RepoToolbox) -> dict[str, Any]:
+    """Read-only view of persisted memory plus this node's still-current reads.
+
+    Never publish, consume the collector, accept a pending answer, or synthesize
+    observations from state references. Revalidate on every independent call so
+    edits, rollbacks, policy changes and contract revisions take effect at once.
+    """
+    return derive_memory(state, {}, tuple(_ACTIVE_TRANSCRIPT.get() or ()), toolbox)
+
+
+def _entry_header(entry: Mapping[str, Any]) -> str:
+    return f"- {entry['role']}: {entry['path']} [sha256:{entry['sha256'][:12]}] "
+
+
+def _render_observation(entry: Mapping[str, Any], part: Mapping[str, Any],
+                        budget: int, *, legacy: bool = False) -> str:
+    coverage, excerpt = part["coverage"], part["excerpt"]
+    first, last = coverage["first_line"], coverage["last_line"]
+    heading = (_entry_header(entry) + f"observed lines {first}-{last}"
+               + (" (full read)" if coverage["full"] else " (partial read)"))
+    if legacy:
+        # Legacy coverage can exceed the 600 characters actually retained.
+        chunk = heading + "; provided legacy excerpt prefix only\n" + excerpt
+        return chunk if len(chunk) <= budget else ""
+    chunk = heading + "\n" + excerpt
+    if len(chunk) <= budget and len(excerpt) <= _RENDER_RANGE_CHARS:
+        return chunk
+    rows, selected = excerpt.split("\n"), []
+    best = ""
+    for index, row in enumerate(rows):
+        body = "\n".join([*selected, row])
+        # One complete long line may use more than the usual fair-share budget;
+        # never pretend that a character-truncated line is exact edit text.
+        if selected and len(body) > _RENDER_RANGE_CHARS:
+            break
+        provided_last = first + index
+        label = ("" if provided_last == last else
+                 f"; provided lines {first}-{provided_last} (bounded excerpt)")
+        candidate = heading + label + "\n" + body
+        if len(candidate) > budget:
+            break
+        selected.append(row)
+        best = candidate
+    return best
 
 
 def render_memory(memory: Any, state: Mapping[str, Any], toolbox: RepoToolbox,
@@ -348,23 +651,40 @@ def render_memory(memory: Any, state: Mapping[str, Any], toolbox: RepoToolbox,
     if roles is None or max_chars == 0:
         return ""
     clean = validate_memory(memory, state, toolbox)
-    chunks = ["Run-local memory: accepted facts and hash-matched observed ranges below may be reused. "
-              "References alone are not prior reads; re-read missing ranges or exact edit text."]
+    heading = ("Run-local memory: accepted facts and hash-matched observed ranges below may be reused. "
+               "References alone are not prior reads; re-read missing ranges or exact edit text.")
+    available = max_chars - len(heading)
+    entries = [entry for entry in clean.get("entries", []) if entry["role"] in roles]
+    observed = [entry for entry in entries if _observations(entry)]
+    # Facts cannot starve usable source. Unused fact space is given back to reads;
+    # reference-only rows have the lowest priority. Ordering has no timestamps or
+    # recency refreshes, and rendering itself does not mutate either memory view.
+    fact_budget = min(2000, available // 3) if observed else available
+    facts = []
     for fact in clean.get("facts", []):
         if fact["role"] in roles:
             chunk = f"- {fact['source']} [sha256:{fact['sha256'][:12]}]\n{fact['excerpt']}"
-            if len("\n".join(chunks + [chunk])) <= max_chars:
-                chunks.append(chunk)
-    for entry in clean.get("entries", []):
-        if entry["role"] not in roles:
-            continue
-        coverage = entry.get("coverage")
-        label = (f"observed lines {coverage['first_line']}-{coverage['last_line']}"
-                 + (" (full read)" if coverage["full"] else " (partial read)")
-                 if coverage else "reference only; not observed")
-        chunk = f"- {entry['role']}: {entry['path']} [sha256:{entry['sha256'][:12]}] {label}"
-        if entry.get("excerpt"):
-            chunk += "\n" + entry["excerpt"]
-        if len("\n".join(chunks + [chunk])) <= max_chars:
-            chunks.append(chunk)
-    return "\n".join(chunks) if len(chunks) > 1 else ""
+            if len(chunk) + 1 <= fact_budget:
+                facts.append(chunk)
+                fact_budget -= len(chunk) + 1
+    remaining = available - sum(len(chunk) + 1 for chunk in facts)
+    sources = []
+    # Fair, stable selection: one range per file before each file's next range.
+    for index in range(MAX_RANGES_PER_FILE):
+        for entry in observed:
+            parts = _observations(entry)
+            if index < len(parts):
+                chunk = _render_observation(entry, parts[index], remaining - 1,
+                                            legacy="ranges" not in entry)
+                if chunk:
+                    sources.append(chunk)
+                    remaining -= len(chunk) + 1
+    references = []
+    for entry in entries:
+        if not _observations(entry):
+            chunk = _entry_header(entry) + "reference only; not observed"
+            if len(chunk) + 1 <= remaining:
+                references.append(chunk)
+                remaining -= len(chunk) + 1
+    chunks = sources + facts + references
+    return "\n".join([heading, *chunks]) if chunks else ""
