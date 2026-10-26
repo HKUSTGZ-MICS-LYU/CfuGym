@@ -121,6 +121,18 @@ class FpgaReportingTest(unittest.TestCase):
             self.assertIn("| CFU hierarchy | 0 | 0 | n/a | n/a |", text)
             self.assertEqual(optimize._cost_metric(state)["lut"], 0)
 
+    def test_vivado_summary_includes_yosys_precheck_metrics(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = self.state(root)
+            state["gates"]["cost"]["ppa"]["yosys_precheck"] = {
+                "status": "passed", "top": "AgentCfu",
+                "metrics": {"cells": 123, "wire_bits": 456, "memories": 7, "memory_bits": 890},
+            }
+            text = "\n".join(ppa.lines(state))
+            self.assertIn("Yosys pre-synthesis passed (AgentCfu)", text)
+            self.assertIn("cells=123", text)
+            self.assertIn("memory bits=890", text)
+
     def test_vivado_pareto_never_treats_zero_as_unknown_or_crosses_basis(self):
         base_cost = {"backend": "vivado", "metric": "cfu_post_route_lut", "part": "p",
                      "target_frequency_mhz": 100, "lut": 0}
@@ -135,16 +147,32 @@ class FpgaReportingTest(unittest.TestCase):
 
 
 class VivadoCostWorkerTest(unittest.TestCase):
-    def call(self, *, status="passed", returncode=0, skip=False, fault=None):
+    def call(self, *, status="passed", returncode=0, yosys_returncode=0, skip=False,
+             agent_cfu=False, fault=None):
         with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
             state = {"workdir": root, "run_root": "agents/generated/runs/worker-test",
-                     "cost_backend": "vivado", "run_commands": True,
+                     "cost_backend": "vivado", "run_commands": True, "agent_cfu": agent_cfu,
                      "evaluation_id": "eval-worker", "eda_timeout": 2, "skip_cost": skip}
             stack.enter_context(mock.patch.object(stage_services, "_toolbox_for_stage", return_value=mock.Mock()))
             write = stack.enter_context(mock.patch.object(stage_services, "_write_cost_artifact"))
             stack.enter_context(mock.patch.object(rtl_snapshot, "validate", return_value={"root": "snapshot", "sha256": "rtl"}))
             stack.enter_context(mock.patch.object(vivado, "build_command", return_value=["python3", "fixed-runner"]))
-            run = stack.enter_context(mock.patch.object(effects, "run_command", return_value={"returncode": returncode}, side_effect=fault))
+            if agent_cfu:
+                stack.enter_context(mock.patch.object(
+                    commands, "agent_cfu_cost_commands",
+                    side_effect=lambda _state, *, out_dir: [["sbt", "--out-dir", out_dir, "mock-agentcfu-generator"]]))
+                stack.enter_context(mock.patch.object(cost.software, "_rtl_ready", return_value=True))
+
+            def run_command(_state, _toolbox, argv, **_kwargs):
+                if "mock-agentcfu-generator" in argv:
+                    return {"returncode": 0}
+                if any("yosys_cost_report.py" in token for token in argv):
+                    return {"returncode": yosys_returncode, "parsed": {"cost": {
+                        "top": "AgentCfu" if agent_cfu else "U8WeightedAvgCfu", "cells": 123, "wire_bits": 456,
+                        "memories": 7, "memory_bits": 890}}}
+                return {"returncode": returncode}
+
+            run = stack.enter_context(mock.patch.object(effects, "run_command", side_effect=fault or run_command))
             load = stack.enter_context(mock.patch.object(vivado, "load_summary", return_value={
                 "backend": "vivado", "status": status,
                 "issues": [{"code": "power_assumptions", "severity": "warning", "detail": "vectorless estimate"}]
@@ -154,21 +182,46 @@ class VivadoCostWorkerTest(unittest.TestCase):
             update = cost.estimate_cost(state, transition=False)
             return update, run, load, notify, write
 
-    def test_success_retains_evaluation_bound_ppa_without_ladder_or_generation(self):
+    def test_success_runs_yosys_before_vivado_and_retains_both_evidence(self):
         update, run, load, notify, write = self.call()
         gate = update["gates"]["cost"]
         self.assertTrue(gate["ok"])
         self.assertEqual(gate["ppa"]["evidence"]["evaluation_id"], "eval-worker")
-        self.assertEqual(run.call_args.kwargs["timeout"], 32)
-        self.assertEqual(run.call_args.kwargs["command_id"], "vivado_cost")
+        self.assertEqual(gate["ppa"]["yosys_precheck"]["metrics"]["cells"], 123)
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("yosys_cost_report.py", run.call_args_list[0].args[2][1])
+        self.assertEqual(run.call_args_list[1].args[2], ["python3", "fixed-runner"])
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 32)
+        self.assertEqual(run.call_args_list[1].kwargs["command_id"], "vivado_cost")
         self.assertNotIn("next", gate)
         notify.assert_not_called()
         load.assert_called_once()
 
+    def test_agent_cfu_generates_standalone_rtl_before_yosys_and_vivado(self):
+        update, run, load, notify, write = self.call(agent_cfu=True)
+        self.assertTrue(update["gates"]["cost"]["ok"])
+        self.assertEqual(run.call_count, 3)
+        self.assertIn("mock-agentcfu-generator", run.call_args_list[0].args[2])
+        self.assertIn("yosys_cost_report.py", run.call_args_list[1].args[2][1])
+        self.assertIn("eval-worker/yosys/rtl", run.call_args_list[0].args[2][2])
+        self.assertEqual(run.call_args_list[2].args[2], ["python3", "fixed-runner"])
+        load.assert_called_once()
+        notify.assert_not_called()
+
+    def test_yosys_failure_short_circuits_vivado_and_notifies(self):
+        update, run, load, notify, write = self.call(yosys_returncode=1)
+        self.assertFalse(update["gates"]["cost"]["ok"])
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("yosys_cost_report.py", run.call_args.args[2][1])
+        load.assert_not_called()
+        notify.assert_called_once()
+        self.assertIn("Vivado was not started", ";".join(update["errors"]))
+
     def test_zero_exit_semantic_failure_notifies_and_retains_partial_ppa(self):
         update, run, load, notify, write = self.call(status="failed")
         self.assertFalse(update["gates"]["cost"]["ok"])
-        self.assertEqual(update["cost_results"][0]["parsed"]["ppa"]["status"], "failed")
+        vivado_result = next(item for item in update["cost_results"] if "ppa" in (item.get("parsed") or {}))
+        self.assertEqual(vivado_result["parsed"]["ppa"]["status"], "failed")
         notify.assert_called_once()
         self.assertIn("timing_not_closed", ";".join(update["errors"]))
         self.assertNotIn("power_assumptions", ";".join(update["errors"]))

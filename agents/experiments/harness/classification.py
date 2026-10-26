@@ -166,10 +166,18 @@ def classify_failure(record: dict) -> dict | None:
     attribution = str(record.get("sim_attribution") or "")
     detail_text = f"{errors} {sim_errors} {attribution}".lower()
 
+    verify_submissions = record.get("verify_submissions")
+    try:
+        max_iters = int(record.get("max_iters")) if record.get("max_iters") is not None else None
+    except (TypeError, ValueError):
+        max_iters = None
     repairs_used = record.get("repairs_used")
-    max_repairs = (int(record.get("max_iters") or 1) - 1) if record.get("max_iters") else record.get("max_repairs")
+    max_repairs = (int(max_iters) - 1) if isinstance(max_iters, int) else record.get("max_repairs")
     budget_exhausted = None
-    if isinstance(repairs_used, int) and isinstance(max_repairs, int):
+    if isinstance(verify_submissions, int) and isinstance(max_iters, int):
+        budget_exhausted = verify_submissions >= max_iters
+    elif isinstance(repairs_used, int) and isinstance(max_repairs, int):
+        # Historical records used repairs_used + 1 as their attempt index.
         budget_exhausted = repairs_used >= max_repairs
 
     failure_class, detail = _classify_rung(failing_rung, failing_gate, detail_text, record, status)
@@ -177,7 +185,7 @@ def classify_failure(record: dict) -> dict | None:
     if infra.get("infra"):
         failure_class = infra.get("infra_kind") or "infra_error"
         detail = infra.get("infra_reason") or detail
-        budget_exhausted = None  # An endpoint incident did not exhaust a model repair budget.
+        budget_exhausted = None  # An endpoint incident did not exhaust the candidate submission budget.
     detail = " ".join(part for part in ((detail or errors or status), guard_note) if part)
     return {
         "failure_class": failure_class,

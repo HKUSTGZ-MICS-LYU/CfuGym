@@ -532,6 +532,7 @@ class NoExecutionStatusTest(unittest.TestCase):
         final = self._run()
         self.assertEqual(final["status"], "planned")
         self.assertEqual(final.get("iteration", 0), 0)
+        self.assertEqual(final.get("verify_submissions", 0), 0)
         self.assertEqual(final["gates"]["hw_build"]["skipped"], True)
 
     def test_failed_rung_with_budget_repairs_instead_of_reviewing(self) -> None:
@@ -1031,6 +1032,7 @@ class LoopOptimizationTest(unittest.TestCase):
         fields = {
             "loop_optimize": True,
             "max_iters": 3,
+            "verify_submissions": 1,
             "gates": self._gates(),
             "cost_results": [
                 {
@@ -1272,6 +1274,38 @@ class LoopOptimizationTest(unittest.TestCase):
         self.assertNotIn("## Optimization Rounds", report_mod.render_report(self._state()))
 
 
+class VerifySubmissionCounterTest(unittest.TestCase):
+    def _run_soc(self, accepted: bool) -> dict:
+        state = _base_state(
+            "verify-count-00000000",
+            max_iters=1,
+            verify_submissions=0,
+            gates={"implementation_hw": {"ok": accepted}},
+            skip_cost=True,
+        )
+        with (
+            mock.patch.object(verify_soc.stage_services, "_profile_reason", return_value=""),
+            mock.patch.object(verify_soc.stage_services, "_toolbox_for_stage", return_value=object()),
+            mock.patch.object(verify_soc.stage_services, "_write_ladder_artifact"),
+            mock.patch.object(verify_soc.stage_services, "hardware_integrity_problems", return_value=[]),
+            mock.patch.object(verify_soc.commands_mod, "agent_cfu_overlay_commands", return_value=[]),
+            mock.patch.object(verify_soc.commands_mod, "_legacy_ladder_commands", return_value={"generate": []}),
+            mock.patch.object(verify_soc.commands_mod, "_missing_design_files", return_value=[]),
+            mock.patch.object(verify_soc.commands_mod, "_soc_rtl_path", return_value=None),
+        ):
+            return verify_soc.generate_soc(state)
+
+    def test_accepted_candidate_consumes_one_submission(self) -> None:
+        update = self._run_soc(accepted=True)
+        self.assertEqual(update["verify_submissions"], 1)
+        self.assertEqual(update["stopped_at"], "hw_build")
+
+    def test_rejected_delivery_does_not_consume_submission(self) -> None:
+        update = self._run_soc(accepted=False)
+        self.assertEqual(update["verify_submissions"], 0)
+        self.assertEqual(update["stage_jobs"], "implement")
+
+
 class RepairBudgetSplitTest(unittest.TestCase):
     """Answer-only repairs draw from their own pool (2026-09-28 audit fix).
 
@@ -1287,20 +1321,35 @@ class RepairBudgetSplitTest(unittest.TestCase):
         )
 
     def test_answer_repair_spends_only_the_answer_pool(self) -> None:
-        state = _base_state("budget-split-00000000", max_iters=2, repairs_used=1)
+        state = _base_state("budget-split-00000000", max_iters=3, verify_submissions=1,
+                            repairs_used=0)
         update, target = self._transition(state, "hw_conformance", "check_conformance")
         self.assertEqual(target, "implement")
         self.assertEqual(update.get("answer_repairs_used"), 1)
         self.assertNotIn("repairs_used", update)
+        self.assertNotIn("verify_submissions", update)
 
-    def test_answer_repair_works_with_an_exhausted_design_pool(self) -> None:
-        state = _base_state("budget-split-00000001", max_iters=1, repairs_used=0)
+    def test_preverify_analysis_repair_does_not_consume_submission(self) -> None:
+        state = _base_state("budget-split-analysis", max_iters=1,
+                            max_answer_repairs=1, verify_submissions=0)
+        update, target = ladder._ladder_transition(
+            state, "analysis", ok=False, default="design_contract",
+            repair_target="analyze_workload",
+        )
+        self.assertEqual(target, "analyze_workload")
+        self.assertEqual(update.get("answer_repairs_used"), 1)
+        self.assertNotIn("verify_submissions", update)
+
+    def test_answer_repair_cannot_exceed_submission_limit(self) -> None:
+        state = _base_state("budget-split-00000001", max_iters=1, verify_submissions=1,
+                            repairs_used=0)
         update, target = self._transition(state, "hw_conformance", "check_conformance")
-        self.assertEqual(target, "implement")
+        self.assertEqual(target, "review_and_route")
+        self.assertIn("verification-submission budget", update["errors"][0])
 
     def test_answer_pool_exhaustion_stops_with_a_named_budget(self) -> None:
         state = _base_state(
-            "budget-split-00000002", max_iters=5, repairs_used=0,
+            "budget-split-00000002", max_iters=5, verify_submissions=1, repairs_used=0,
             max_answer_repairs=1, answer_repairs_used=1,
         )
         update, target = self._transition(state, "hw_conformance", "check_conformance")
@@ -1308,13 +1357,31 @@ class RepairBudgetSplitTest(unittest.TestCase):
         self.assertEqual(update.get("stopped_at"), "hw_conformance")
         self.assertIn("answer-repair budget", update["errors"][0])
 
-    def test_design_repair_still_spends_only_the_design_pool(self) -> None:
-        # max_iters=3 gives the design pool 2 rounds; one is already spent.
-        state = _base_state("budget-split-00000003", max_iters=3, repairs_used=1)
+    def test_design_repair_counts_verified_candidates_not_repair_history(self) -> None:
+        state = _base_state("budget-split-00000003", max_iters=3, verify_submissions=1,
+                            repairs_used=0)
         update, target = self._transition(state, "sim", "implement")
         self.assertEqual(target, "implement")
-        self.assertEqual(update.get("repairs_used"), 2)
+        self.assertEqual(update.get("repairs_used"), 1)
         self.assertNotIn("answer_repairs_used", update)
+
+    def test_last_failed_submission_stops_even_if_repair_count_is_low(self) -> None:
+        state = _base_state("budget-split-00000004", max_iters=2, verify_submissions=2,
+                            repairs_used=0)
+        update, target = self._transition(state, "sim", "implement")
+        self.assertEqual(target, "review_and_route")
+        self.assertIn("--max-iters 2", update["errors"][0])
+
+    def test_preverify_reroute_has_independent_bound(self) -> None:
+        state = _base_state("budget-split-00000005", max_iters=1,
+                            max_preverify_repairs=1, verify_submissions=0)
+        update, target = ladder._ladder_transition(
+            state, "implementation_route", ok=False, default="generate_soc",
+            repair_target="design_contract", repair_kind="preverify",
+        )
+        self.assertEqual(target, "design_contract")
+        self.assertEqual(update.get("preverify_repairs_used"), 1)
+        self.assertNotIn("verify_submissions", update)
 
 
 class RepairDiagnosisEnforcementTest(unittest.TestCase):

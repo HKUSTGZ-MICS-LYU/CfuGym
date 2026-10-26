@@ -13,7 +13,9 @@ from agents.cfu_design_agent.runtime import provenance
 RUNS_COLUMNS = [
     "exp_id", "run_name", "run_id", "model_config", "model", "benchmark", "suite",
     "layer", "ablation_flags", "ablation_observed",
-    "repeat", "max_iters", "status", "exit_code", "stopped_at",
+    "repeat", "max_iters", "verify_submissions", "max_verify_submissions",
+    "answer_repairs_used", "max_answer_repairs", "preverify_repairs_used", "max_preverify_repairs",
+    "status", "exit_code", "stopped_at",
     "failure_class", "failure_rung", "failure_detail",
     "repairs_used", "attempt_index", "pass_at_1", "pass_at_3", "pass_at_5",
     "sim_ok", "sim_attempts", "verify_failures", "reference_cycles", "cfu_cycles", "speedup_x100",

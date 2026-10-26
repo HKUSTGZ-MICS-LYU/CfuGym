@@ -7,7 +7,7 @@ import unittest
 
 import yaml
 
-from agents.cfu_design_agent.benchmark import cfu_execution, embench, embench_integrity as integrity
+from agents.cfu_design_agent.benchmark import cfu_execution, embench, embench_integrity as integrity, embench_patchers
 from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
@@ -97,6 +97,24 @@ class IntegrityTest(unittest.TestCase):
         header = '#ifndef CFU_INTRINSICS_H\n#define CFU_INTRINSICS_H\n#include <stdint.h>\n#define CFU_OP 1\nstatic inline uint32_t cfu_compute(uint32_t a) { return a; }\n#endif\n'
         header_rel = f"{embench.config_workspace(self.run_root, self.name, 'cfu')}/include/cfu_intrinsics.h"
         self.assertEqual(self.check(text, {header_rel: header}), [])
+
+    def test_new_host_entry_and_timing_authority_references_rejected(self) -> None:
+        bodies = [
+            "extern void start_trigger(void); start_trigger(); return 1;",
+            "extern void stop_trigger(void); void (*finish)(void) = stop_trigger; finish(); return 1;",
+            "(void)verify_benchmark(0); return 1;",
+            "(void)benchmark(); return 1;",
+            "initialise_benchmark(); return 1;",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                changed = replace_body(self.original, "calculate", body)
+                self.assertTrue(any("authority" in error for error in self.check(changed)))
+        alias = self.original + "\n#define AGENT_TRIGGER start_trigger\n"
+        self.assertTrue(any("authority" in error for error in self.check(alias)))
+        header = self.target.rsplit("/src/", 1)[0] + "/include/cfu_intrinsics.h"
+        text = "static inline int innocent(void) { extern void start_trigger(void); start_trigger(); return 0; }"
+        self.assertTrue(any("authority" in error for error in self.check(extra={header: text})))
 
     def test_every_entry_body_immutable(self) -> None:
         for name in integrity.ENTRY_FUNCTIONS:
@@ -283,7 +301,10 @@ class RealEmbenchIntegrityTest(unittest.TestCase):
                      "cfu_status_protocol": cfu_execution.PROTOCOL})
                 for config in embench.CONFIGS:
                     cfg = self.workdir / embench.config_workspace(self.run_root, name, config)
-                    definitions = [t.value for p in (cfg / "src").glob("*.c") for t in integrity.scan(p.read_text())
+                    source_paths = [*(cfg / "src").glob("*.c"),
+                        *(cfg / "support" / filename for filename in embench_patchers.extra_support_files(name)
+                          if filename.endswith(".c"))]
+                    definitions = [t.value for p in source_paths for t in integrity.scan(p.read_text())
                                    if t.directive and t.value.split()[:3] == ["#", "define", "LOCAL_SCALE_FACTOR"]]
                     self.assertEqual(definitions, ["# define LOCAL_SCALE_FACTOR 1"])
                     main = cfg.joinpath("embench_main.c").read_text()

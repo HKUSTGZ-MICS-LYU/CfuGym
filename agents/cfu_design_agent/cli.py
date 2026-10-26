@@ -71,16 +71,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iters",
         type=int,
         default=2,
-        help="Total repair budget for the validation ladder: N-1 repair rounds. "
-        "1 disables repair, so the first failing rung stops the run. This is the "
-        "design-repair pool; answer-only repairs have their own smaller budget.",
+        help="Maximum candidate submissions to the verification ladder, including the first (default: 2).",
+    )
+    parser.add_argument(
+        "--max-preverify-repairs",
+        type=int,
+        default=2,
+        help="Separate bound for implementation reroutes before a candidate reaches verification (default: 2).",
     )
     parser.add_argument(
         "--max-answer-repairs",
         type=int,
         default=2,
-        help="Separate repair budget for answer-only defects (a malformed conformance "
-        "oracle or ISA contract), so they cannot exhaust --max-iters (default: 2).",
+        help="Separate repair budget for malformed analysis/oracle/ISA answers; any candidate rerun still needs a --max-iters slot (default: 2).",
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Force read-only: never mutate source or run external commands "
@@ -195,8 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="loop_optimize",
         action="store_true",
         default=_flag_env("CFU_AGENT_LOOP"),
-        help="Keep optimizing after a fully passing run: while --max-iters budget "
-        "remains, review explores hardware, software or append-only ISA rounds. "
+        help="Keep optimizing after a fully passing run: while --max-iters verification-submission slots "
+        "remain, review explores hardware, software or append-only ISA rounds. "
         "Premature stops are reconsidered once; patience and total budget bound exploration.",
     )
     parser.add_argument("--loop-policy", choices=("explore", "conservative"), default="explore",
@@ -273,6 +276,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--fpga-part must be a Vivado part name, not a path or Tcl expression")
     if args.max_evals < 0:
         raise SystemExit("--max-evals must be zero or positive")
+    if args.max_iters < 1:
+        raise SystemExit("--max-iters must be at least 1")
+    if args.max_preverify_repairs < 0:
+        raise SystemExit("--max-preverify-repairs must be zero or positive")
     if args.no_llvm_ir and args.ir_features in ("require", "approx"):
         raise SystemExit(
             "--no-llvm-ir conflicts with --ir-features require/approx: "
@@ -335,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         "flow_version": 2,
         "max_iters": args.max_iters,
         "max_answer_repairs": args.max_answer_repairs,
+        "max_preverify_repairs": args.max_preverify_repairs,
         "iteration": 0,
         "thread_id": args.thread_id,
         "run_id": args.resume or args.run_id,

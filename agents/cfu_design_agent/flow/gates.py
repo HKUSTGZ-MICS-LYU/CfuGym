@@ -9,17 +9,15 @@ from ..state import CfuDesignState
 
 
 
-# Answer-only repairs (a malformed conformance oracle or ISA contract) get
-# their own small budget pool so they cannot exhaust the design-repair budget
-# the run needs for actual hardware/software fixes (observed 2026-09-28: an
-# oracle build failure consumed repair 4/4 and the real sim failure went
-# unrepairable). ``--max-answer-repairs`` overrides the default.
+# Answer-only repairs (malformed analysis, conformance oracle or ISA contract)
+# have a separate pool and do not consume verification submissions.
 DEFAULT_MAX_ANSWER_REPAIRS = 10
+DEFAULT_MAX_PREVERIFY_REPAIRS = 2
 
 
 # Answer-only repairs: a malformed answer artifact (the workload analysis, the
-# conformance oracle, the ISA contract) is repaired from a separate small pool,
-# so a formatting slip can never consume the design-repair budget.
+# conformance oracle, the ISA contract) is repaired from a separate pool and does
+# not itself count as a candidate submission.
 ANSWER_REPAIR_TARGETS = {"analyze_workload", "design_contract", "extend_isa"}
 
 
@@ -31,7 +29,7 @@ def is_agent_cfu_run(state: CfuDesignState) -> bool:
     return bool(state.get("agent_cfu", True))
 
 
-LADDER_RUNGS = ("hw_build", "hw_conformance", "sw_build", "sim", "cost")
+LADDER_RUNGS = ("hw_build", "hw_conformance", "sw_build", "sim", "cost", "validation_pair")
 
 
 
@@ -87,20 +85,28 @@ def required_gates(state: CfuDesignState) -> tuple[str, ...]:
     return tuple(required)
 
 
-def max_repairs(state: CfuDesignState) -> int:
-    """Repair rounds the global ``--max-iters`` budget still allows.
+def max_verify_submissions(state: CfuDesignState) -> int:
+    """Maximum candidate submissions to the validation ladder (initial included)."""
+    return max(1, int(state.get("max_iters", 2) or 2))
 
-    ``--max-iters 1`` (the "iteration not allowed" case) yields zero repairs, so
-    the first failing rung stops the run. This is the DESIGN pool; answer-only
-    repairs (a malformed oracle or ISA contract) draw from a separate small pool
-    so they can never exhaust it.
-    """
-    return max(0, int(state.get("max_iters", 2) or 2) - 1)
+
+def _verify_submissions_left(state: CfuDesignState) -> bool:
+    return int(state.get("verify_submissions", 0) or 0) < max_verify_submissions(state)
+
+
+def max_repairs(state: CfuDesignState) -> int:
+    """Maximum repair/optimization rounds after the first verification submission."""
+    return max(0, max_verify_submissions(state) - 1)
 
 
 def answer_repairs_max(state: CfuDesignState) -> int:
-    """Repair rounds the answer-only pool (oracle/spec re-asks) still allows."""
+    """Repair rounds the answer-only pool (analysis/oracle/spec re-asks) allows."""
     return max(0, int(state.get("max_answer_repairs", DEFAULT_MAX_ANSWER_REPAIRS) or 0))
+
+
+def preverify_repairs_max(state: CfuDesignState) -> int:
+    """Bound implementation reroutes that happen before a candidate is submitted."""
+    return max(0, int(state.get("max_preverify_repairs", DEFAULT_MAX_PREVERIFY_REPAIRS) or 0))
 
 
 def _repairs_left(state: CfuDesignState) -> bool:
@@ -111,12 +117,16 @@ def _answer_repairs_left(state: CfuDesignState) -> bool:
     return int(state.get("answer_repairs_used", 0) or 0) < answer_repairs_max(state)
 
 
+def _preverify_repairs_left(state: CfuDesignState) -> bool:
+    return int(state.get("preverify_repairs_used", 0) or 0) < preverify_repairs_max(state)
 
 
-# One corrective retry for a rejected delivery before the design-repair budget
-# is touched: a deterministic rejection (SEARCH not found, missing deliverable,
-# rejected diagnosis) is a protocol mistake, not evidence that the design is
-# wrong, and re-paying --max-iters for it starves real repairs.
+
+
+# One corrective retry for a rejected delivery before verification: a
+# deterministic rejection (SEARCH not found, missing deliverable, rejected
+# diagnosis) is a protocol mistake, not a submitted candidate, and must not
+# consume a --max-iters verification slot.
 DELIVERY_RETRY_MAX = 1
 
 

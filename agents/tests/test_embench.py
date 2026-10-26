@@ -453,6 +453,33 @@ class PrepareWorkspaceTest(unittest.TestCase):
         self.assertEqual(project["verification"], "bench_verify")
         self.assertEqual(set(project["elf_paths"]), {"reference", "profile", "cfu"})
 
+    def test_statemate_time_symbol_is_renamed_only_in_isolated_build_copies(self) -> None:
+        import hashlib
+
+        source_path = self.workdir / embench.benchmark_dir("statemate") / "libstatemate.c"
+        original = source_path.read_text()
+        toolbox = RepoToolbox(
+            self.workdir,
+            policy=load_policy(REPO_ROOT),
+            dry_run=False,
+            stage="prepare_benchmark",
+            run_root=f"agents/generated/runs/{self.run_id}",
+        )
+        project = embench.prepare_embench_benchmark(toolbox, {"benchmark_name": "statemate"})
+        ws = self.workdir / project["workspace"]
+        copies = [(ws / config / "src/libstatemate.c").read_text()
+                  for config in ("reference", "profile", "cfu")]
+        self.assertEqual(copies[0], copies[1])
+        self.assertEqual(copies[1], copies[2])
+        self.assertRegex(copies[0], r"unsigned long statemate_timestamp;")
+        self.assertNotRegex(copies[0], r"unsigned long time;")
+        self.assertIn("statemate_timestamp = 1;", copies[0])
+        self.assertEqual(source_path.read_text(), original)
+        ref_path = f"{embench.config_workspace(f'agents/generated/runs/{self.run_id}', 'statemate', 'reference')}/src/libstatemate.c"
+        self.assertEqual(project["integrity"]["reference_sources"][ref_path],
+                         hashlib.sha256(copies[0].encode()).hexdigest())
+        self.assertTrue(any("time() link collision" in note for note in project["notes"]))
+
     def test_generated_main_c_carries_the_verify_diagnostic(self) -> None:
         toolbox = RepoToolbox(
             self.workdir,

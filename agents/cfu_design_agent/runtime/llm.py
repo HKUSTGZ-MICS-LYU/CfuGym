@@ -33,6 +33,11 @@ DEFAULT_THINKING_BODY: dict[str, Any] = {"thinking": {"type": "enabled"}}
 DEFAULT_MAX_TOOL_ROUNDS = 20
 DEFAULT_MAX_TOOL_CALLS_PER_ROUND = 4
 DEFAULT_MAX_TOOL_CALLS = 96
+# Transport retries are bounded here rather than at the graph-node level, so a
+# transient provider outage never re-runs stage side effects or spends a new turn.
+LLM_REQUEST_MAX_RETRIES = 10
+LLM_REQUEST_RETRY_INITIAL_SECONDS = 5
+LLM_REQUEST_RETRY_MAX_SECONDS = 60
 # Injected before the forced final turn so the model stops exploring and emits
 # the deliverable instead of narrating what it would read next. The rung passes
 # its own deliverable description (a patch block, an analysis mapping, ...).
@@ -48,6 +53,46 @@ TOOL_BUDGET_REMINDER = (
 
 def tool_budget_reminder(deliverable: str = "") -> str:
     return TOOL_BUDGET_REMINDER + (deliverable or DEFAULT_TOOL_DELIVERABLE) + "."
+
+
+def _request_status_code(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        return status
+    if isinstance(status, str) and status.isdigit():
+        return int(status)
+    # Some OpenAI-compatible gateways report a streaming failure as a generic
+    # APIError with text such as "upstream error: 429" and no status_code field.
+    match = re.search(
+        r"(?:^|[^0-9])(?:upstream[ ]+error|stream[ ]+error|rate[ ]+limit(?:[ ]+error)?|"
+        r"HTTP(?:[ ]+status)?|status(?:_code)?)"
+        r"[ ]*[:=]?[ ]*(408|409|425|429|5[0-9][0-9])(?:$|[^0-9])",
+        str(exc), re.IGNORECASE,
+    )
+    return int(match.group(1)) if match else None
+
+
+def _is_retryable_request_error(exc: Exception) -> bool:
+    """Only retry transient HTTP/provider transport failures, never bad input."""
+    status = _request_status_code(exc)
+    if status in {408, 409, 425, 429} or (status is not None and 500 <= status <= 599):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    # OpenAI/httpx transport exceptions are intentionally recognized by their
+    # stable class names, avoiding a hard dependency on a particular SDK version.
+    return type(exc).__name__ in {
+        "APIConnectionError", "APITimeoutError", "ConnectError", "ConnectTimeout",
+        "ReadTimeout", "WriteTimeout", "PoolTimeout",
+    }
+
+
+def _request_retry_delay(retry_index: int) -> int:
+    """Exponential backoff starting at five seconds and capped at one minute."""
+    return min(LLM_REQUEST_RETRY_INITIAL_SECONDS * (2 ** retry_index),
+               LLM_REQUEST_RETRY_MAX_SECONDS)
 
 
 def looks_like_tool_intent(text: str) -> bool:
@@ -874,6 +919,8 @@ class OpenAiTextClient:
         except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
             raise
         except Exception as responses_error:
+            if _is_retryable_request_error(responses_error):
+                raise
             try:
                 result = self._chat(client, system, user, response_format=response_format)
             except Exception as chat_error:
@@ -1179,18 +1226,27 @@ class OpenAiTextClient:
             kwargs["reasoning"] = reasoning or {"effort": DEFAULT_REASONING_EFFORT}
         fallback_reason = ""
         if self.stream:
-            try:
-                inputs, budget = self._budget_messages(
-                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    response_config={k: v for k, v in kwargs.items() if k != "timeout"}, sdk=client)
-                stream, request_id = self._sdk_request(
-                    client, "responses", {"model": self.model, "input": inputs, "stream": True, **kwargs},
-                    budget=budget)
-            except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
-                raise
-            except Exception as exc:
-                fallback_reason = f"streaming unavailable: {type(exc).__name__}: {exc}"
-            else:
+            inputs, budget = self._budget_messages(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                response_config={k: v for k, v in kwargs.items() if k != "timeout"}, sdk=client)
+            # Count retries over the entire Responses stream, not just the initial
+            # SDK call: compatible gateways may report an upstream 429 mid-SSE.
+            for retry_index in range(LLM_REQUEST_MAX_RETRIES + 1):
+                try:
+                    stream, request_id = self._sdk_request(
+                        client, "responses",
+                        {"model": self.model, "input": inputs, "stream": True, **kwargs},
+                        budget=budget, max_retries=0)
+                except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
+                    raise
+                except Exception as exc:
+                    if _is_retryable_request_error(exc):
+                        if retry_index >= LLM_REQUEST_MAX_RETRIES:
+                            raise
+                        time.sleep(_request_retry_delay(retry_index))
+                        continue
+                    fallback_reason = f"streaming unavailable: {type(exc).__name__}: {exc}"
+                    break
                 if hasattr(stream, "output") or hasattr(stream, "output_text"):
                     # Some gateways ignore stream=True and return the response.
                     fallback_reason = "streaming ignored by the endpoint"
@@ -1198,10 +1254,25 @@ class OpenAiTextClient:
                 try:
                     result = self._responses_stream(stream)
                 except Exception as exc:
-                    request_audit.record_result(request_id, error={"type": type(exc).__name__})
-                    raise
-                request_audit.record_result(request_id, result={"status": "completed", "input_tokens": result.input_tokens,
-                                                               "cached_input_tokens": result.cached_input_tokens})
+                    retry = (retry_index < LLM_REQUEST_MAX_RETRIES
+                             and _is_retryable_request_error(exc))
+                    error = {"type": type(exc).__name__}
+                    status = _request_status_code(exc)
+                    if status is not None:
+                        error["status_code"] = status
+                    if retry:
+                        delay = _request_retry_delay(retry_index)
+                        error.update(retry_number=retry_index + 1, retry_delay_seconds=delay)
+                    request_audit.record_result(request_id, error=error)
+                    if not retry:
+                        raise
+                    time.sleep(delay)
+                    continue
+                request_audit.record_result(
+                    request_id,
+                    result={"status": "completed", "input_tokens": result.input_tokens,
+                            "cached_input_tokens": result.cached_input_tokens},
+                )
                 return result
         return self._responses_result(
             self._responses_create(client, system, user, kwargs), fallback_reason
@@ -1221,7 +1292,9 @@ class OpenAiTextClient:
             return response
         except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
             raise
-        except Exception:
+        except Exception as exc:
+            if _is_retryable_request_error(exc):
+                raise
             # A gateway that rejects the summary request must not fail the call.
             reasoning = kwargs.get("reasoning")
             if not isinstance(reasoning, dict) or "summary" not in reasoning:
@@ -1261,13 +1334,14 @@ class OpenAiTextClient:
         return {"input_tokens": inp, "output_tokens": out, "total_tokens": total,
                 "cached_input_tokens": _cached_usage(usage, "chat" if endpoint == "chat" else "responses")}
 
-    def _sdk_request(self, sdk, endpoint: str, body: dict[str, Any], *, budget=None):
+    def _sdk_request(
+        self, sdk, endpoint: str, body: dict[str, Any], *, budget=None,
+        max_retries: int | None = None,
+    ):
         from urllib.parse import urlsplit
         body = source_visibility.mask_model_payload(body)
         metadata = {"stage": current_stage(), "endpoint": endpoint,
                     "base_url_host": urlsplit(self.base_url or "").hostname or "", "model": self.model}
-        self._request_attempt += 1
-        metadata.update(attempt=self._request_attempt, parent_request_id=self._last_request_id)
         if budget is not None:
             metadata["context_budget"] = dict(self._last_budget_metadata)
         # SDK-only options do not belong to HTTP JSON. extra_body is merged by
@@ -1287,25 +1361,45 @@ class OpenAiTextClient:
                 common += 1
             metadata["common_prefix_chars"] = common  # diagnostic, NOT provider cached tokens
         self._previous_payload = serialized
-        request_id = request_audit.record_request(payload, metadata=metadata)
-        self._last_request_id = request_id
         target = sdk.chat.completions.create if endpoint == "chat" else sdk.responses.create
-        try:
-            response = target(**body)
-            # Streaming responses are consumed by their caller. Persist the
-            # initiating request immediately; record completion after consumption.
-            if body.get("stream") and not hasattr(response, "choices") and not hasattr(response, "output"):
+        retry_limit = (LLM_REQUEST_MAX_RETRIES if max_retries is None
+                       else min(LLM_REQUEST_MAX_RETRIES, max(0, int(max_retries))))
+
+        for retry_index in range(retry_limit + 1):
+            self._request_attempt += 1
+            attempt_metadata = {
+                **metadata,
+                "attempt": self._request_attempt,
+                "parent_request_id": self._last_request_id,
+            }
+            request_id = request_audit.record_request(payload, metadata=attempt_metadata)
+            self._last_request_id = request_id
+            try:
+                response = target(**body)
+                # Streaming responses are consumed by their caller. Persist the
+                # initiating request immediately; record completion after consumption.
+                if body.get("stream") and not hasattr(response, "choices") and not hasattr(response, "output"):
+                    return response, request_id
+                usage = self._audit_usage(response, endpoint)
+                request_audit.record_result(request_id, result={"status": "received",
+                    "response_id": str(getattr(response, "id", "") or ""),
+                    "usage": usage,
+                    "input_estimate_error": (usage["input_tokens"] - budget.estimated_input_tokens)
+                    if budget is not None and usage["input_tokens"] else None})
                 return response, request_id
-            usage = self._audit_usage(response, endpoint)
-            request_audit.record_result(request_id, result={"status": "received",
-                "response_id": str(getattr(response, "id", "") or ""),
-                "usage": usage,
-                "input_estimate_error": (usage["input_tokens"] - budget.estimated_input_tokens)
-                if budget is not None and usage["input_tokens"] else None})
-            return response, request_id
-        except Exception as exc:
-            request_audit.record_result(request_id, error={"type": type(exc).__name__})
-            raise
+            except Exception as exc:
+                retry = retry_index < retry_limit and _is_retryable_request_error(exc)
+                error = {"type": type(exc).__name__}
+                status = _request_status_code(exc)
+                if status is not None:
+                    error["status_code"] = status
+                if retry:
+                    delay = _request_retry_delay(retry_index)
+                    error.update(retry_number=retry_index + 1, retry_delay_seconds=delay)
+                request_audit.record_result(request_id, error=error)
+                if not retry:
+                    raise
+                time.sleep(delay)
 
     def _chat_round(
         self,
@@ -1339,46 +1433,68 @@ class OpenAiTextClient:
                 client, "chat", {"model": self.model, "messages": messages, **kwargs}, budget=budget)
             return _chat_round_from_response(response)
         stream_kwargs = {**kwargs, "stream": True, "stream_options": {"include_usage": True}}
-        try:
-            stream, request_id = self._sdk_request(
-                client, "chat", {"model": self.model, "messages": messages, **stream_kwargs},
-                budget=budget)
-        except context_budget.ContextBudgetError:
-            raise
-        except Exception as exc:
-            if "stream" not in str(exc).lower():
-                # Not a streaming problem (for example the tools payload was
-                # rejected): let the caller's retry/degrade logic handle it once
-                # instead of doubling the request here.
+        # Count retries across both request creation and stream consumption. The
+        # SDK call can return HTTP 200 before a gateway emits its upstream 429 in
+        # a later SSE chunk, so retrying only target(**body) is insufficient.
+        for retry_index in range(LLM_REQUEST_MAX_RETRIES + 1):
+            try:
+                stream, request_id = self._sdk_request(
+                    client, "chat", {"model": self.model, "messages": messages, **stream_kwargs},
+                    budget=budget, max_retries=0)
+            except context_budget.ContextBudgetError:
                 raise
-            # Streaming or stream_options is unsupported: retry without either,
-            # and record why so the log can explain a missing live line.
-            response, _ = self._sdk_request(
-                client, "chat", {"model": self.model, "messages": messages, **kwargs}, budget=budget)
-            round_ = _chat_round_from_response(response)
-            round_.fallback_reason = f"streaming unavailable: {type(exc).__name__}: {exc}"
+            except Exception as exc:
+                if _is_retryable_request_error(exc):
+                    if retry_index >= LLM_REQUEST_MAX_RETRIES:
+                        raise
+                    time.sleep(_request_retry_delay(retry_index))
+                    continue
+                if "stream" not in str(exc).lower():
+                    # Not a streaming compatibility problem (for example the
+                    # tools payload was rejected); preserve the original error.
+                    raise
+                # Streaming or stream_options is unsupported: retry without either.
+                response, _ = self._sdk_request(
+                    client, "chat", {"model": self.model, "messages": messages, **kwargs},
+                    budget=budget)
+                round_ = _chat_round_from_response(response)
+                round_.fallback_reason = f"streaming unavailable: {type(exc).__name__}: {exc}"
+                return round_
+
+            if hasattr(stream, "choices"):
+                # Some gateways ignore stream=True and return the whole completion.
+                round_ = _chat_round_from_response(stream)
+                round_.fallback_reason = "streaming ignored by the endpoint"
+                return round_
+            try:
+                round_ = _chat_round_from_stream(stream)
+            except Exception as exc:
+                retry = (retry_index < LLM_REQUEST_MAX_RETRIES
+                         and _is_retryable_request_error(exc))
+                error = {"type": type(exc).__name__}
+                status = _request_status_code(exc)
+                if status is not None:
+                    error["status_code"] = status
+                if retry:
+                    delay = _request_retry_delay(retry_index)
+                    error.update(retry_number=retry_index + 1, retry_delay_seconds=delay)
+                request_audit.record_result(request_id, error=error)
+                if not retry:
+                    raise
+                time.sleep(delay)
+                continue
+            request_audit.record_result(
+                request_id,
+                result={"status": "completed", "input_tokens": round_.input_tokens,
+                        "output_tokens": round_.output_tokens,
+                        "cached_input_tokens": round_.cached_input_tokens},
+                metadata={"reasoning_chars": len(round_.reasoning),
+                          "reasoning_source": round_.reasoning_source,
+                          "reasoning_tokens": round_.reasoning_tokens,
+                          "response_extra_keys": list(round_.extra_keys)},
+            )
             return round_
-        if hasattr(stream, "choices"):
-            # Some gateways ignore stream=True and return the whole completion.
-            round_ = _chat_round_from_response(stream)
-            round_.fallback_reason = "streaming ignored by the endpoint"
-            return round_
-        try:
-            round_ = _chat_round_from_stream(stream)
-        except Exception as exc:
-            request_audit.record_result(request_id, error={"type": type(exc).__name__})
-            raise
-        request_audit.record_result(
-            request_id,
-            result={"status": "completed", "input_tokens": round_.input_tokens,
-                    "output_tokens": round_.output_tokens,
-                    "cached_input_tokens": round_.cached_input_tokens},
-            metadata={"reasoning_chars": len(round_.reasoning),
-                      "reasoning_source": round_.reasoning_source,
-                      "reasoning_tokens": round_.reasoning_tokens,
-                      "response_extra_keys": list(round_.extra_keys)},
-        )
-        return round_
+        raise AssertionError("unreachable: bounded chat stream retry loop exhausted")
 
     def _chat(
         self,

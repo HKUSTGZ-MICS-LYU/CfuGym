@@ -137,7 +137,8 @@ class RepairRouteTest(unittest.TestCase):
             with self.subTest(target=target):
                 update = ladder.repair_route_transition(self.state, route(target))
                 self.assertEqual(ladder._route_after_implement(update), node)
-                self.assertEqual(update["repairs_used"], 2)
+                self.assertEqual(update["preverify_repairs_used"], 1)
+                self.assertNotIn("repairs_used", update)
                 self.assertNotIn("answer_repairs_used", update)
                 for key in ("isa_spec", "conformance_delivery", "input_fingerprints", "best_candidate"):
                     self.assertFalse(update[key])
@@ -154,7 +155,8 @@ class RepairRouteTest(unittest.TestCase):
                 self.assertEqual(observations.failure_index(current)["failures"]["fail_now"]["status"], "current")
 
     def test_last_paid_design_slot_can_select_contract_without_double_charge(self):
-        state = {**self.state, "max_iters": 2, "repairs_used": 0, "iteration": 0}
+        state = {**self.state, "max_iters": 2, "verify_submissions": 1,
+                 "max_preverify_repairs": 0, "repairs_used": 0, "iteration": 0}
         extra, target = ladder._ladder_transition(
             state, "sim", ok=False, default="estimate_cost", repair_target="implement")
         self.assertEqual(target, "implement")
@@ -169,14 +171,17 @@ class RepairRouteTest(unittest.TestCase):
         again = ladder.repair_route_transition({**state, **update}, route("analysis"))
         self.assertEqual(ladder._route_after_implement(again), "review_and_route")
 
-    def test_answer_and_delivery_entries_must_pay_design_budget_for_upstream(self):
+    def test_answer_and_delivery_entries_use_the_preverify_pool_for_upstream(self):
         for kind in ("answer", "delivery"):
             with self.subTest(kind=kind):
-                state = {**self.state, "iteration": 1, "repair_entry": {
-                    "kind": kind, "target": "implement", "iteration": 1, "route_used": False}}
+                state = {**self.state, "iteration": 1, "max_preverify_repairs": 1,
+                         "repair_entry": {"kind": kind, "target": "implement",
+                                          "iteration": 1, "route_used": False}}
                 update = ladder.repair_route_transition(state, route())
-                self.assertEqual(update["repairs_used"], 2)
-                blocked = ladder.repair_route_transition({**state, "max_iters": 2}, route())
+                self.assertEqual(update["preverify_repairs_used"], 1)
+                self.assertNotIn("repairs_used", update)
+                blocked = ladder.repair_route_transition(
+                    {**state, "max_preverify_repairs": 0}, route())
                 self.assertEqual(ladder._route_after_implement(blocked), "review_and_route")
 
     def test_old_delivery_fingerprints_stay_historical_after_rewind(self):
@@ -206,7 +211,8 @@ class RepairRouteTest(unittest.TestCase):
         update = ladder.repair_route_transition(state, route("analysis"))
         self.assertEqual(ladder._route_after_implement(update), "review_and_route")
         self.assertEqual(update["stopped_at"], "implementation_route")
-        self.assertEqual(state["repairs_used"], 3)
+        self.assertEqual(state["preverify_repairs_used"], 2)
+        self.assertEqual(state["repairs_used"], 1)
         self.assertNotIn("answer_repairs_used", update)
 
     def test_every_implementation_conditional_edge_is_registered_natively(self):

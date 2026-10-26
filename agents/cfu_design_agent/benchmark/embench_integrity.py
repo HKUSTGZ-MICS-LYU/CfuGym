@@ -19,7 +19,9 @@ PROTOCOL = "cold_single_invocation_v1"
 ENTRY_FUNCTIONS = frozenset({"benchmark", "warm_caches", "initialise_benchmark", "verify_benchmark"})
 _RESERVED = ENTRY_FUNCTIONS | {"main", "start_trigger", "stop_trigger", "initialise_board",
     "LOCAL_SCALE_FACTOR", "GLOBAL_SCALE_FACTOR", "WARMUP_HEAT", "USE_AGENT_CFU",
-    "EMBENCH_OBS", "EMBENCH_NAME", "HAVE_BOARDSUPPORT_H"}
+    "EMBENCH_OBS", "EMBENCH_NAME", "HAVE_BOARDSUPPORT_H",
+    # Candidate definitions must not interpose trusted harness memory routines.
+    "memcmp", "memcpy", "memmove", "memset"}
 _KEYWORDS = set("auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while _Bool _Complex _Atomic _Alignas _Alignof".split())
 _ATTRIBUTES = {"__attribute__", "__attribute", "__declspec", "_Alignas"}
 _FORBIDDEN = {"constructor", "destructor", "alias", "ifunc", "section", "_Pragma", "__pragma"}
@@ -352,6 +354,9 @@ def _compare(reference: Source, candidate: Source, protected: set[str],
             errors.append("unapproved new preprocessor directive: " + token.value)
     baseline = Counter(v for t in reference.tokens for v in (_plain_tokens(t.value) if t.directive else [t.value]))
     current = Counter(v for t in candidate.tokens for v in (_plain_tokens(t.value) if t.directive else [t.value]))
+    for value in ENTRY_FUNCTIONS | {"main", "start_trigger", "stop_trigger", "initialise_board"}:
+        if current[value] > baseline[value]:
+            errors.append("new reference to Host-owned entry/timing authority: " + value)
     for value in _FORBIDDEN:
         if current[value] > baseline[value]:
             errors.append("forbidden new attribute/pragma mechanism: " + value)
@@ -373,7 +378,7 @@ def validate_candidate(workdir: Path, run_root: str, name: str,
     project, measurement protocol and a versioned SHA256 integrity manifest.
     Missing/legacy metadata, missing files and changed trusted bytes all reject.
     """
-    from . import embench
+    from . import embench, embench_patchers
     workdir = Path(workdir).resolve()
     problems: list[str] = []
     try:
@@ -391,6 +396,8 @@ def validate_candidate(workdir: Path, run_root: str, name: str,
         measurement = embench.measurement_parameters()
         if not isinstance(project, dict) or project.get("benchmark") != name or project.get("measurement") != measurement:
             raise ValueError("missing or legacy measurement metadata; start a new run")
+        if project.get("patches") != embench_patchers.patch_manifest(name):
+            raise ValueError("missing, legacy or changed benchmark patches; start a new run")
         integrity = project.get("integrity")
         if not isinstance(integrity, dict) or integrity.get("version") != INTEGRITY_VERSION:
             raise ValueError("missing or legacy integrity metadata; start a new run")
@@ -413,8 +420,10 @@ def validate_candidate(workdir: Path, run_root: str, name: str,
         } | {f"{cfgs['cfu']}/include/cfu_intrinsics.h"}
         if any(key not in allowed or not isinstance(value, str) for key, value in pending.items()):
             raise ValueError("unknown pending candidate source path")
+        patch_support = embench_patchers.extra_support_files(name)
         required = {f"{cfg}/{rel}" for cfg in cfgs.values() for rel in
-                    ["embench_main.c", *(f"support/{f}" for f in embench.SUPPORT_FILES), *(f"board/{f}" for f in embench.BOARD_FILES)]}
+                    ["embench_main.c", *(f"support/{f}" for f in (*embench.SUPPORT_FILES, *patch_support)),
+                     *(f"board/{f}" for f in embench.BOARD_FILES)]}
         if not required <= harness.keys():
             raise ValueError("missing required harness hashes")
         reference_root = workdir / cfgs["reference"] / "src"
@@ -436,7 +445,14 @@ def validate_candidate(workdir: Path, run_root: str, name: str,
                 parsed[Path(rel).name] = _parse(text)
         if not parsed:
             raise ValueError("no trusted reference C source")
-        entries = Counter(o.name for source in parsed.values() for o in source.objects if o.name in ENTRY_FUNCTIONS)
+        entry_sources = list(parsed.values())
+        for filename in patch_support:
+            if filename.endswith(".c"):
+                # Patches may move the immutable driver/oracle out of editable
+                # kernels. Its bytes were already checked in every config.
+                entry_sources.append(_parse((workdir / cfgs["reference"] / "support" / filename).read_text()))
+        entries = Counter(o.name for source in entry_sources for o in source.objects
+                          if o.name in ENTRY_FUNCTIONS and o.body is not None)
         if entries != Counter({name: 1 for name in ENTRY_FUNCTIONS}):
             raise ValueError("missing or duplicate trusted reference entry functions")
         # The required CFU/ref local headers are hashed just like support headers.

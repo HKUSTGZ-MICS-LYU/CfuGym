@@ -21,7 +21,7 @@ import os
 import re
 from pathlib import Path
 
-from . import cfu_execution, embench_integrity
+from . import cfu_execution, embench_integrity, embench_patchers
 from .embench_instrument import find_definition_brace
 from .profile_lines import profile_lines
 from ..runtime.tools import RepoToolbox, embench_cfu_rel
@@ -190,7 +190,9 @@ def build_command(run_root: str, name: str, config: str) -> list[str]:
     cfg = config_workspace(run_root, name, config)
     rel = os.path.relpath(cfg, "sw")
     sources = " ".join(
-        [f"{rel}/src/*.c", f"{rel}/support/beebsc.c", f"{rel}/board/boardsupport.c"]
+        [f"{rel}/src/*.c", f"{rel}/support/beebsc.c", f"{rel}/board/boardsupport.c",
+         *(f"{rel}/support/{filename}" for filename in embench_patchers.extra_support_files(name)
+           if filename.endswith(".c"))]
     )
     includes = " ".join([f"{rel}/support", f"{rel}/board", f"{rel}/include"])
     defines = " ".join(config_cflags(name, config))
@@ -219,6 +221,15 @@ def config_sources(workdir: Path, run_root: str, name: str, config: str) -> list
     if not root.is_dir():
         return []
     return sorted(str(p.relative_to(workdir)) for p in root.glob("*.c"))
+
+
+def normalize_embench_link_symbols(name: str, sources: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Compatibility API; preparation applies the unified patcher pipeline."""
+    patcher = embench_patchers.StatemateSymbolPatcher()
+    if not patcher.applies_to(name):
+        return sources, []
+    result = patcher.apply(sources)
+    return result.sources, result.notes
 
 
 def cfu_source_targets(workdir: Path, run_root: str, name: str) -> list[tuple[str, str]]:
@@ -256,7 +267,9 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
         source_texts[Path(rel_src).name] = text
         if verification == "none" and "verify_benchmark" in text and has_real_verification(text):
             verification = "bench_verify"
-    source_texts = embench_integrity.normalize_local_scale_factor(source_texts)
+    patched = embench_patchers.apply_benchmark_patches(name, source_texts)
+    source_texts = patched.sources
+    notes.extend(patched.notes)
     source_root = toolbox.workdir / benchmark_dir(name)
     header_texts = {
         path.name: toolbox.read_text(str(path.relative_to(toolbox.workdir)), limit=2_000_000)
@@ -266,6 +279,9 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
         fname: toolbox.read_text(f"{EMBENCH_ROOT}/support/{fname}", limit=2_000_000)
         for fname in SUPPORT_FILES
     }
+    if support_texts.keys() & patched.support_files.keys():
+        raise ValueError("benchmark patch conflicts with Embench support files")
+    support_texts.update(patched.support_files)
     board_texts = {
         fname: toolbox.read_text(f"{BOARD_ROOT}/{fname}", limit=2_000_000)
         for fname in BOARD_FILES
@@ -319,6 +335,7 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
         "header_path": f"{ws}/board/embench_obs.h",
         "verification": verification,
         "measurement": measurement_parameters(),
+        "patches": patched.patches,
         "integrity": {
             "version": embench_integrity.INTEGRITY_VERSION,
             "reference_sources": reference_sources,

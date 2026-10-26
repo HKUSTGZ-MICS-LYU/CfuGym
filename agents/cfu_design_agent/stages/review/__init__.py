@@ -76,7 +76,7 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
         )
     elif status == "planned":
         termination_reason = "PLANNED"
-    elif not gates._repairs_left(state) and status in {"failed", "blocked"}:
+    elif not gates._verify_submissions_left(state) and status in {"failed", "blocked"}:
         termination_reason = "BUDGET_EXHAUSTED"
     else:
         termination_reason = "UNRECOVERABLE_FAILURE"

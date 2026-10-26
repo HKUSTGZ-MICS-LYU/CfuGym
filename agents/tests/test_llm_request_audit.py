@@ -75,6 +75,180 @@ class LlmRequestAuditTest(unittest.TestCase):
         self.assertEqual(events[1]["result"]["usage"]["cached_input_tokens"], 6)
         self.assertEqual(result.cached_input_tokens, 6)
 
+    def test_transient_http_errors_retry_with_increasing_backoff(self) -> None:
+        from unittest import mock
+
+        class HttpError(RuntimeError):
+            def __init__(self, status_code: int):
+                super().__init__(f"HTTP {status_code}")
+                self.status_code = status_code
+
+        completions = _ChatCompletions([HttpError(500), HttpError(429), _response()])
+        sdk = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with mock.patch("agents.cfu_design_agent.runtime.llm.time.sleep") as sleep:
+            with request_audit.use_request_audit(self.run_root, self.workdir):
+                result = self._client()._chat(sdk, "s", "u")
+
+        self.assertEqual(result.text, "ok")
+        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
+        events = self._events()
+        self.assertEqual([event["event"] for event in events], [
+            "request", "error", "request", "error", "request", "result",
+        ])
+        errors = [event["error"] for event in events if event["event"] == "error"]
+        self.assertEqual([error["status_code"] for error in errors], [500, 429])
+        self.assertEqual([error["retry_delay_seconds"] for error in errors], [5, 10])
+        requests = [event for event in events if event["event"] == "request"]
+        self.assertEqual([event["metadata"]["attempt"] for event in requests], [1, 2, 3])
+
+    def test_streaming_upstream_429_retries_after_stream_consumption_fails(self) -> None:
+        from unittest import mock
+
+        def failed_stream():
+            if False:  # make this a generator so the error occurs during iteration
+                yield None
+            raise RuntimeError("upstream error: 429")
+
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=2, total_tokens=12)
+        successful_stream = iter([SimpleNamespace(
+            usage=usage,
+            choices=[SimpleNamespace(finish_reason="stop",
+                                     delta=SimpleNamespace(content="recovered", tool_calls=None))],
+        )])
+        completions = _ChatCompletions([failed_stream(), successful_stream])
+        sdk = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with mock.patch("agents.cfu_design_agent.runtime.llm.time.sleep") as sleep:
+            with request_audit.use_request_audit(self.run_root, self.workdir):
+                result = self._client(stream=True)._chat(sdk, "s", "u")
+
+        self.assertEqual(result.text, "recovered")
+        self.assertEqual(len(completions.calls), 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(5)])
+        events = self._events()
+        self.assertEqual([event["event"] for event in events], [
+            "request", "error", "request", "result",
+        ])
+        self.assertEqual(events[1]["error"]["status_code"], 429)
+        self.assertEqual(events[1]["error"]["retry_delay_seconds"], 5)
+
+    def test_streaming_upstream_429_stops_after_ten_retries(self) -> None:
+        from unittest import mock
+
+        def failed_stream():
+            if False:
+                yield None
+            raise RuntimeError("upstream error: 429")
+
+        completions = _ChatCompletions([failed_stream() for _ in range(11)])
+        sdk = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with mock.patch("agents.cfu_design_agent.runtime.llm.time.sleep") as sleep:
+            with request_audit.use_request_audit(self.run_root, self.workdir):
+                with self.assertRaisesRegex(RuntimeError, "upstream error: 429"):
+                    self._client(stream=True)._chat(sdk, "s", "u")
+
+        self.assertEqual(len(completions.calls), 11)
+        self.assertEqual(sleep.call_args_list, [
+            mock.call(5), mock.call(10), mock.call(20), mock.call(40),
+            *[mock.call(60) for _ in range(6)],
+        ])
+        events = self._events()
+        self.assertEqual(sum(event["event"] == "request" for event in events), 11)
+        self.assertEqual(sum(event["event"] == "error" for event in events), 11)
+        self.assertEqual(events[-1]["error"]["status_code"], 429)
+        self.assertNotIn("retry_delay_seconds", events[-1]["error"])
+
+    def test_responses_streaming_upstream_429_retries(self) -> None:
+        from unittest import mock
+
+        def failed_stream():
+            if False:
+                yield None
+            raise RuntimeError("upstream error: 429")
+
+        response = SimpleNamespace(
+            id="responses-retry", status="completed", output=[], output_text="recovered",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=2, total_tokens=12),
+        )
+
+        class Responses:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return failed_stream()
+                return iter([
+                    SimpleNamespace(type="response.output_text.delta", delta="recovered"),
+                    SimpleNamespace(type="response.completed", response=response),
+                ])
+
+        responses = Responses()
+        sdk = SimpleNamespace(responses=responses)
+        with mock.patch("agents.cfu_design_agent.runtime.llm.time.sleep") as sleep:
+            with request_audit.use_request_audit(self.run_root, self.workdir):
+                result = self._client(stream=True)._responses(sdk, "s", "u")
+
+        self.assertEqual(result.text, "recovered")
+        self.assertEqual(responses.calls, 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(5)])
+        events = self._events()
+        self.assertEqual([event["event"] for event in events], [
+            "request", "error", "request", "result",
+        ])
+        self.assertEqual(events[1]["error"]["status_code"], 429)
+        self.assertEqual(events[1]["error"]["retry_delay_seconds"], 5)
+
+    def test_auto_mode_does_not_fallback_after_transient_retries_exhaust(self) -> None:
+        from unittest import mock
+
+        class HttpError(RuntimeError):
+            status_code = 500
+
+        class Responses:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                raise HttpError("server unavailable")
+
+        responses = Responses()
+        completions = _ChatCompletions([_response()])
+        sdk = SimpleNamespace(responses=responses,
+                              chat=SimpleNamespace(completions=completions))
+        with mock.patch("openai.OpenAI", return_value=sdk):
+            with mock.patch("agents.cfu_design_agent.runtime.llm.time.sleep"):
+                with self.assertRaises(HttpError):
+                    self._client(api_mode="auto").complete("s", "u", fallback="")
+
+        self.assertEqual(responses.calls, 11)
+        self.assertEqual(completions.calls, [])
+
+    def test_transient_http_errors_stop_after_ten_retries(self) -> None:
+        from unittest import mock
+
+        class HttpError(RuntimeError):
+            status_code = 503
+
+        completions = _ChatCompletions([HttpError("temporary outage") for _ in range(11)])
+        sdk = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with mock.patch("agents.cfu_design_agent.runtime.llm.time.sleep") as sleep:
+            with request_audit.use_request_audit(self.run_root, self.workdir):
+                with self.assertRaises(HttpError):
+                    self._client()._chat(sdk, "s", "u")
+
+        self.assertEqual(len(completions.calls), 11)  # initial request + 10 retries
+        self.assertEqual(sleep.call_args_list, [
+            mock.call(5), mock.call(10), mock.call(20), mock.call(40),
+            *[mock.call(60) for _ in range(6)],
+        ])
+        events = self._events()
+        self.assertEqual(sum(event["event"] == "request" for event in events), 11)
+        self.assertEqual(sum(event["event"] == "error" for event in events), 11)
+        self.assertEqual(events[-1]["error"]["status_code"], 503)
+        self.assertNotIn("retry_delay_seconds", events[-1]["error"])
+
     def test_stream_fallback_records_both_attempts(self) -> None:
         completions = _ChatCompletions([
             RuntimeError("stream_options is unsupported"),

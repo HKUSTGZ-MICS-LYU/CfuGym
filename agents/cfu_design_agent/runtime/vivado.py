@@ -307,6 +307,22 @@ def make_summary(metrics: Mapping[str, str], soc_area: str = "", cfu_area: str =
     frequency = number(metrics.get("target_frequency_mhz"))
     instance = metrics.get("cfu.instance") or None
     power_data = parse_power(power, instance)
+    cfu_dynamic = power_data["cfu_dynamic"]
+    cfu_power_method = "whole_soc_hierarchical_vectorless_estimate"
+    if cfu_dynamic["value"] is None and cfu_dynamic["upper_bound"] is None:
+        # Some Vivado versions omit leaf-module rows from the hierarchy table.
+        # The total SoC dynamic power is a conservative upper bound for any
+        # nonnegative component; never present it as a CFU point estimate.
+        soc_dynamic = power_data["soc_dynamic"]
+        soc_bound = (soc_dynamic["value"] if soc_dynamic["value"] is not None
+                     else soc_dynamic["upper_bound"])
+        if soc_bound is not None:
+            cfu_dynamic = {
+                "value": None, "upper_bound": soc_bound,
+                "bound_exclusive": bool(soc_dynamic["bound_exclusive"]),
+                "unit": "W", "reported": f"<= SoC dynamic total ({soc_bound:g} W)",
+            }
+            cfu_power_method = "whole_soc_dynamic_power_upper_bound"
     summary: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION, "backend": "vivado",
         "vivado": {"version": metrics.get("vivado.version") or None},
@@ -329,8 +345,8 @@ def make_summary(metrics: Mapping[str, str], soc_area: str = "", cfu_area: str =
         "cfu": {"instance": instance, "instance_count": number(metrics.get("cfu.instance_count")),
                 "area": parse_utilization(cfu_area),
                 "synthesis_area": parse_utilization(cfu_synthesis_area),
-                "power": {"dynamic": power_data["cfu_dynamic"], "device_static": None,
-                          "method": "whole_soc_hierarchical_vectorless_estimate"},
+                "power": {"dynamic": cfu_dynamic, "device_static": None,
+                          "method": cfu_power_method},
                 "timing": {group: {mode: _path_metrics(metrics, f"cfu.{group}.{mode}")
                                    for mode in ("setup", "hold")} for group in PATH_GROUPS}},
         "provenance": dict(provenance or {}), "status": "failed", "issues": [],
@@ -441,7 +457,8 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
     for scope in ("soc", "cfu"):
         p = summary[scope]["power"]["dynamic"]
         dynamic = p["value"] if p["value"] is not None else (
-            f"<{p['upper_bound']}" if p["upper_bound"] is not None else "unknown")
+            ("<" if p["bound_exclusive"] else "≤") + str(p["upper_bound"])
+            if p["upper_bound"] is not None else "unknown")
         for phase, key in (("synthesis", "synthesis_area"), ("post_route", "area")):
             area = summary[scope][key]
             power_text = dynamic if phase == "post_route" else "not reported"
@@ -461,7 +478,10 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
                           for mode in ("setup", "hold"))
         lines.append(f"| {scope} | " + " | ".join(values) + " |")
     lines += ["", "Internal = endpoints in CFU; entering/leaving = paths crossing its input/output pins;",
-              "through = a path crossing both. Categories may overlap. No Fmax is inferred.",
+              "through = a path crossing both. Categories may overlap. No Fmax is inferred."]
+    if summary["cfu"]["power"]["method"] == "whole_soc_dynamic_power_upper_bound":
+        lines.append("CFU dynamic power is only bounded by total SoC dynamic power because Vivado omitted the CFU leaf from its hierarchy report; this is not a CFU point estimate.")
+    lines += [
               "TNS/THS method: sum_of_reported_worst_endpoint_slacks. Vivado's per-path SLACK is already rounded;",
               "these sums are approximate, not the exact native global totals. The exact vendor SoC totals remain in the",
               "[native timing summary](<timing_summary.rpt>); failing endpoint counts are integer counts, not slack sums.",

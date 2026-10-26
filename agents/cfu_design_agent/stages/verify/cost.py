@@ -115,7 +115,7 @@ def estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesig
 
 
 def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignState:
-    """FPGA implementation of the immutable hardware fileset, not simulator RTL."""
+    """Run a Yosys synthesis gate before Vivado on the frozen candidate."""
     from ...runtime import vivado
     import re
     import uuid
@@ -126,53 +126,114 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
     results: list[dict] = []
     errors: list[str] = []
     ppa: dict = {}
+    yosys_evidence: dict = {}
+    cancelled = False
     run = str(state.get("run_root") or "")
     evaluation_id = str(state.get("evaluation_id") or f"cost-{uuid.uuid4().hex}")
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", evaluation_id):
         raise ValueError("invalid evaluation id")
-    out_dir = f"{run}/11_cost/evaluations/{evaluation_id}/vivado"
+    eval_root = f"{run}/11_cost/evaluations/{evaluation_id}"
+    yosys_out = f"{eval_root}/yosys"
+    yosys_rtl = f"{yosys_out}/rtl"
+    vivado_out = f"{eval_root}/vivado"
     cost_input = dependencies.input_fingerprints(state)["cost"]
     snapshot: dict = {}
     if skipped:
-        results = [stage_services._skipped_result(
-            ["python3", "skills/cfu-designer/scripts/vivado_ppa_report.py"], state, reason)]
+        results = [
+            stage_services._skipped_result(
+                ["python3", "skills/cfu-designer/scripts/yosys_cost_report.py"], state, reason),
+            stage_services._skipped_result(
+                ["python3", "skills/cfu-designer/scripts/vivado_ppa_report.py"], state, reason),
+        ]
     else:
         toolbox = stage_services._toolbox_for_stage(state, "cost")
         try:
             if state.get("skip_yosys"):
-                raise ValueError("--skip-yosys is incompatible with Vivado; use --skip-cost")
+                raise ValueError("--skip-yosys cannot bypass Vivado's mandatory Yosys precheck; use --skip-cost")
             snapshot = rtl_snapshot.validate(state)
-            argv = vivado.build_command(state, snapshot["root"], out_dir)
-            result = effects.run_command(
-                state, toolbox, argv, stage="cost", rung="cost", command_id="vivado_cost",
-                timeout=int(state.get("eda_timeout", 3600)) + 30, mutate=True)
-            results.append(result)
-            if not result.get("cancelled"):
-                try:
-                    ppa = vivado.load_summary(Path(state.get("workdir", ".")), out_dir)
-                except (OSError, ValueError) as exc:
-                    errors.append(f"Vivado produced no valid PPA summary: {exc}")
+
+            # Keep the early gate small: synthesize standalone AgentCfu for agent
+            # runs, or the selected CFU module from the frozen SoC RTL otherwise.
+            agent_cfu = gates.is_agent_cfu_run(state)
+            generator_commands = (commands.agent_cfu_cost_commands(state, out_dir=yosys_rtl)
+                                 if agent_cfu else [])
+            if agent_cfu and not generator_commands:
+                errors.append("Yosys precheck could not create standalone AgentCfu RTL")
+            spec = state.get("workload_spec", {}) or {}
+            task = state.get("task", "")
+            yosys_input = yosys_rtl if agent_cfu else f"{snapshot['root']}/MiCoSoc.v"
+            yosys_top = "AgentCfu" if agent_cfu else commands.cost_top_for_spec(spec, task)
+
+            for argv in generator_commands:
+                result = effects.run_command(
+                    state, toolbox, argv, stage="cost", rung="cost", timeout=1800, mutate=True)
+                results.append(result)
+                if result.get("cancelled"):
+                    break
                 if result.get("returncode") != 0:
-                    errors.append(f"Vivado FPGA evaluation failed (returncode={result.get('returncode')})")
-                if ppa and ppa.get("status") != "passed":
-                    blocking = [item for item in ppa.get("issues", [])
-                                if not isinstance(item, dict) or item.get("severity", "error") == "error"]
-                    errors.extend((f"{item.get('code', 'fpga')}: {item.get('detail', '')}"
-                                   if isinstance(item, dict) else str(item))
-                                  for item in blocking or ["Vivado implementation/timing did not pass"])
+                    errors.append(f"AgentCfu RTL generation for Yosys failed (returncode={result.get('returncode')})")
+                    break
+            cancelled = any(item.get("cancelled") for item in results)
+            if not cancelled and not errors and generator_commands and not software._rtl_ready(
+                    Path(state.get("workdir", ".")).resolve(), yosys_input):
+                errors.append(f"AgentCfu Yosys RTL generation produced no Verilog under {yosys_input}")
+
+            if not cancelled and not errors:
+                yosys_argv = [
+                    "python3", "skills/cfu-designer/scripts/yosys_cost_report.py",
+                    yosys_input, "--top", yosys_top, "--out-dir", yosys_out, "--flatten",
+                ]
+                result = effects.run_command(
+                    state, toolbox, yosys_argv, stage="cost", rung="cost", timeout=1800, mutate=True)
+                results.append(result)
+                if result.get("cancelled"):
+                    cancelled = True
+                elif result.get("returncode") != 0:
+                    errors.append(
+                        f"Yosys pre-synthesis failed (returncode={result.get('returncode')}); Vivado was not started")
+                else:
+                    metrics = (result.get("parsed") or {}).get("cost") or {}
+                    yosys_evidence = {
+                        "status": "passed", "top": yosys_top, "metrics": dict(metrics),
+                        "summary_path": f"{yosys_out}/summary.json",
+                    }
+
+            # Expensive vendor implementation is strictly downstream of successful Yosys.
+            if not cancelled and not errors:
+                argv = vivado.build_command(state, snapshot["root"], vivado_out)
+                result = effects.run_command(
+                    state, toolbox, argv, stage="cost", rung="cost", command_id="vivado_cost",
+                    timeout=int(state.get("eda_timeout", 3600)) + 30, mutate=True)
+                results.append(result)
+                if result.get("cancelled"):
+                    cancelled = True
+                else:
+                    try:
+                        ppa = vivado.load_summary(Path(state.get("workdir", ".")), vivado_out)
+                    except (OSError, ValueError) as exc:
+                        errors.append(f"Vivado produced no valid PPA summary: {exc}")
+                    if result.get("returncode") != 0:
+                        errors.append(f"Vivado FPGA evaluation failed (returncode={result.get('returncode')})")
+                    if ppa and ppa.get("status") != "passed":
+                        blocking = [item for item in ppa.get("issues", [])
+                                    if not isinstance(item, dict) or item.get("severity", "error") == "error"]
+                        errors.extend((f"{item.get('code', 'fpga')}: {item.get('detail', '')}"
+                                       if isinstance(item, dict) else str(item))
+                                      for item in blocking or ["Vivado implementation/timing did not pass"])
         except (OSError, ValueError) as exc:
-            errors.append(f"Vivado evaluation precondition failed: {exc}")
-    cancelled = any(item.get("cancelled") for item in results)
+            errors.append(f"Cost evaluation precondition failed: {exc}")
+    cancelled = cancelled or any(item.get("cancelled") for item in results)
     if ppa:
+        ppa["yosys_precheck"] = yosys_evidence
         ppa["evidence"] = {"evaluation_id": evaluation_id, "input_sha256": cost_input,
                            "rtl_sha256": snapshot.get("sha256"),
-                           "summary_path": f"{out_dir}/summary.json"}
+                           "summary_path": f"{vivado_out}/summary.json"}
+        # A PPA summary is produced only after the Vivado command was appended.
         results[-1].setdefault("parsed", {})["ppa"] = ppa
     ok = not skipped and not cancelled and not errors and bool(ppa) and ppa.get("status") == "passed"
     if errors and not cancelled:
         if not transition:
             validation_parallel.command_failed()
-        # Include semantic/tool precondition failures even if Vivado exited 0.
         results.append(stage_services.gate_failure_result(state, "cost", "fpga_ppa", errors))
     for result in results:
         result["evaluation_id"] = evaluation_id
@@ -190,5 +251,5 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
                   reason=reason, cancelled=cancelled, backend="vivado", evaluation_id=evaluation_id,
                   ppa=ppa, input_sha256=cost_input,
                   round=int(state.get("optimization_round", 0) or 0),
-                  history="Evaluated whole-SoC FPGA PPA with Vivado (CFU hierarchy attribution).")}
+                  history="Passed Yosys pre-synthesis before whole-SoC Vivado PPA (CFU hierarchy attribution).")}
     return ladder._apply_transition(update, extra)

@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from agents.cfu_design_agent import prompts
-from agents.cfu_design_agent.benchmark import cfu_execution, embench, embench_integrity
+from agents.cfu_design_agent.benchmark import cfu_execution, embench, embench_integrity, embench_patchers
 from agents.cfu_design_agent.runtime import dependencies, stage_services
 from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.runtime.tools import RepoToolbox
@@ -39,7 +39,7 @@ class FairnessTransportTest(unittest.TestCase):
         self.state = {
             "workdir": str(self.root), "run_root": self.run,
             "benchmark_project": {"kind": "embench_benchmark", "benchmark": "demo",
-                "verification": "bench_verify", "measurement": {
+                "verification": "bench_verify", "patches": embench_patchers.patch_manifest("demo"), "measurement": {
                     "protocol": embench.MEASUREMENT_PROTOCOL, "local_scale_factor": 1,
                     "global_scale_factor": 1, "warmup": False,
                      "cfu_status_protocol": cfu_execution.PROTOCOL}},
@@ -185,6 +185,23 @@ class FairnessTransportTest(unittest.TestCase):
                 dependencies.completed_gate_inputs(state, resume=True)
         with self.validator([]):
             dependencies.completed_gate_inputs(state, resume=True)
+
+    def test_resume_refuses_missing_patch_identity_before_source_checks(self):
+        project = {**self.state["benchmark_project"], "integrity": {"version": 1}}
+        project.pop("patches")
+        with self.validator([]) as checked:
+            with self.assertRaisesRegex(ValueError, "start a new run"):
+                dependencies.completed_gate_inputs({**self.state, "benchmark_project": project}, resume=True)
+        checked.assert_not_called()
+
+    def test_patch_change_invalidates_sim_cost_fingerprints(self):
+        before = dependencies.input_fingerprints(self.state)
+        changed = {**self.state, "benchmark_project": {
+            **self.state["benchmark_project"], "patches": [{"id": "different"}]}}
+        after = dependencies.input_fingerprints(changed)
+        self.assertNotEqual(before["sim"], after["sim"])
+        self.assertNotEqual(before["cost"], after["cost"])
+        self.assertEqual(before["implementation_hw"], after["implementation_hw"])
 
     def test_measurement_change_invalidates_sim_cost_fingerprints(self):
         before = dependencies.input_fingerprints(self.state)

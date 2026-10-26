@@ -16,17 +16,17 @@ class Ledger(TypedDict, total=False):
     validation_results: Annotated[list[CommandResult], operator.add]
     cost_results: Annotated[list[CommandResult], operator.add]
     iteration_history: Annotated[list[str], operator.add]
-    # Validation-ladder bookkeeping. ``attempts`` counts repairs per rung (the
-    # simulation escalation reads ``attempts["sim"]``), ``repairs_used`` is the
-    # design-repair budget consumed, ``answer_repairs_used`` is the separate
-    # budget for answer-only repairs (malformed conformance oracle / ISA
-    # contract) so they cannot exhaust the design budget, and
-    # ``last_repair_target`` records the most recent repair for reporting.
+    # Validation accounting. ``verify_submissions`` counts candidates entering
+    # the verification ladder and is bounded by --max-iters. ``attempts`` counts
+    # repairs per rung; ``repairs_used`` is diagnostic design-repair accounting.
+    # Answer and pre-verification repairs have independent bounded pools.
     attempts: dict[str, int]
+    verify_submissions: int
     repairs_used: int
     answer_repairs_used: int
+    preverify_repairs_used: int
     # Corrective retries for deterministically rejected deliveries; these do
-    # not consume the design-repair budget (``repairs_used``).
+    # not consume a repair budget or verification-submission slot.
     delivery_retries: int
     last_repair_target: str
     # Historical command evidence before an upstream rewind is no longer current.

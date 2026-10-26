@@ -48,10 +48,21 @@ def lines(state: dict[str, Any]) -> list[str]:
     data = result["data"]
     if not data:
         return ["FPGA PPA: not measured."] if state.get("cost_backend") == "vivado" else []
-    rows = [f"- {result['reason']}; implementation status: {data.get('status', 'unknown')}",
-            f"- Vivado {(data.get('vivado') or {}).get('version')}; part {data.get('part')}; target {data.get('target_frequency_mhz')} MHz",
-            "", "| Scope (post-route) | LUT | FF | BRAM36 tiles | DSP | Dynamic W | Setup slack ns | Hold slack ns |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    rows = [f"- {result['reason']}; implementation status: {data.get('status', 'unknown')}"]
+    yosys = data.get("yosys_precheck") or {}
+    if yosys.get("status") == "passed":
+        metrics = yosys.get("metrics") or {}
+        rows.append(
+            f"- Yosys pre-synthesis passed ({yosys.get('top', 'unknown')}): "
+            f"cells={number(metrics.get('cells'))}, wire bits={number(metrics.get('wire_bits'))}, "
+            f"memories={number(metrics.get('memories'))}, memory bits={number(metrics.get('memory_bits'))}."
+        )
+    rows.extend([
+        f"- Vivado {(data.get('vivado') or {}).get('version')}; part {data.get('part')}; target {data.get('target_frequency_mhz')} MHz",
+        "",
+        "| Scope (post-route) | LUT | FF | BRAM36 tiles | DSP | Dynamic W | Setup slack ns | Hold slack ns |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
     for scope, label in (("soc", "Whole SoC"), ("cfu", "CFU hierarchy")):
         info = data.get(scope) or {}
         area = info.get("area") or {}

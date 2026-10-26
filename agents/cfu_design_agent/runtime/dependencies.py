@@ -93,7 +93,8 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
                                               "isa": state.get("isa_spec"),
                                               "benchmark": project.get("benchmark"),
                                                **({"measurement": project.get("measurement"),
-                                                   "benchmark_integrity": project.get("integrity")}
+                                                   "benchmark_integrity": project.get("integrity"),
+                                                    "benchmark_patches": project.get("patches")}
                                                   if project.get("kind") == "embench_benchmark" else {}),
                                               "flags": state.get("soc_flags")}})
     cost_input = measured
@@ -102,10 +103,14 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
                             "part": state.get("fpga_part", vivado.DEFAULT_PART),
                             "frequency_mhz": state.get("target_frequency_mhz", 100.0),
                             "rtl_sha256": (state.get("rtl_snapshot") or {}).get("sha256"),
-                             "vivado_threads": int(state.get("vivado_threads", 4)),
-                             "parser": _source_hash(root, "agents/cfu_design_agent/runtime/vivado.py"),
-                            "flow_schema": 1, "top": "MiCoSoc", "cfu": "AgentCfu",
-                            "runner": _source_hash(root, "skills/cfu-designer/scripts/vivado_ppa_report.py"),
+                            "vivado_threads": int(state.get("vivado_threads", 4)),
+                            "vivado_parser": _source_hash(root, "agents/cfu_design_agent/runtime/vivado.py"),
+                            "flow_schema": 2, "top": "MiCoSoc", "cfu": "AgentCfu",
+                            "yosys_precheck": "standalone-agent-cfu-or-selected-frozen-cfu-v1",
+                            "cost_stage": _source_hash(root, "agents/cfu_design_agent/stages/verify/cost.py"),
+                            "cost_commands": _source_hash(root, "agents/cfu_design_agent/runtime/commands.py"),
+                            "yosys_runner": _source_hash(root, "skills/cfu-designer/scripts/yosys_cost_report.py"),
+                            "vivado_runner": _source_hash(root, "skills/cfu-designer/scripts/vivado_ppa_report.py"),
                             "tcl": _source_hash(root, "skills/cfu-designer/scripts/vivado_ppa.tcl")})
     return {
         "analysis": analysis, "isa": isa, "implementation_hw": hw_input,
@@ -121,9 +126,10 @@ def completed_gate_inputs(state: dict[str, Any], *, resume: bool = False) -> Non
     """Refuse stale gates; resume additionally validates prepared workload protocol."""
     project = state.get("benchmark_project") or {}
     if resume and project.get("kind") == "embench_benchmark":
-        from ..benchmark import embench, embench_integrity
+        from ..benchmark import embench, embench_integrity, embench_patchers
         expected = embench.measurement_parameters()
         if (project.get("measurement") != expected
+                or project.get("patches") != embench_patchers.patch_manifest(str(project.get("benchmark", "")))
                 or (project.get("integrity") or {}).get("version") != embench_integrity.INTEGRITY_VERSION):
             raise ValueError("legacy Embench checkpoint measurement; start a new run")
         problems = embench_integrity.validate_candidate(

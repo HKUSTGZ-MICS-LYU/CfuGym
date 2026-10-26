@@ -14,7 +14,7 @@ REPAIR_ROUTE_SCHEMA: dict[str, Any] = {
         "name": "request_repair_route",
         "description": ("After a current repair diagnosis, choose analysis/contract to abandon "
                         "this transaction and rewind, or implement to keep fixing this contract. "
-                        "Upstream rewinds spend the existing design-repair budget."),
+                        "Rewinds reuse an already-paid design repair; otherwise they use the separate pre-VERIFY repair budget."),
         "parameters": {
             "type": "object", "additionalProperties": False,
             "properties": {

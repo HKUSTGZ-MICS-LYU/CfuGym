@@ -125,7 +125,7 @@ class SingleImplementationStageTest(unittest.TestCase):
         for rung in ("isa", "hw_build", "hw_conformance", "sw_build", "sim", "cost"):
             with self.subTest(rung=rung):
                 current = state(gates={rung: {"ok": False, "skipped": False}},
-                                repairs_used=0, max_iters=3)
+                                repairs_used=0, verify_submissions=1, max_iters=3)
                 extra, target = ladder._ladder_transition(
                     current, rung, ok=False, default="review_and_route",
                     repair_target="implement",
@@ -136,7 +136,8 @@ class SingleImplementationStageTest(unittest.TestCase):
     def test_a_failing_rung_without_budget_stops_instead(self) -> None:
         from agents.cfu_design_agent.flow import ladder
 
-        current = state(gates={"sim": {"ok": False}}, repairs_used=1, max_iters=2)
+        current = state(gates={"sim": {"ok": False}}, repairs_used=0,
+                        verify_submissions=2, max_iters=2)
         _extra, target = ladder._ladder_transition(
             current, "sim", ok=False, default="estimate_cost", repair_target="implement",
         )

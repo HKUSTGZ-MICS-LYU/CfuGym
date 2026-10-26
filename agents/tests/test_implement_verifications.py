@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agents.cfu_design_agent import prompts
 from agents.cfu_design_agent.runtime.implementation_tools import (
     ImplementationToolset,
     Verification,
@@ -177,6 +178,8 @@ class StageWiringTest(unittest.TestCase):
         from agents.cfu_design_agent.runtime.conformance_delivery import ConformanceDelivery
 
         captured = self._capture()
+        self.assertIn(prompts.GENERALITY_REVIEW, captured["user"])
+        self.assertEqual(captured["system"], prompts.SYSTEM_PROMPT)
         kwargs = captured["toolset_kwargs"]
         verifications = {v.name: v for v in kwargs["verifications"]}
         self.assertIsInstance(kwargs["verifications"], tuple)

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
+
+from langgraph.errors import NodeError
+from langgraph.types import Command
 
 from ..flow import gates, outcome
 from ..flow.gates import ANSWER_REPAIR_TARGETS, DELIVERY_RETRY_MAX, PREPARE_GATE
@@ -30,8 +33,14 @@ def _route_kind(state: CfuDesignState) -> tuple[str, str]:
 PREPARE_FAILURES = (PolicyError, ValueError, OSError)
 
 
-def prepare_failure_handler(state: CfuDesignState, error: Any) -> dict[str, Any]:
+def prepare_failure_handler(
+    state: CfuDesignState, error: NodeError,
+) -> Command[Literal["review_and_route"]]:
     """Node-level LangGraph error handler for the benchmark-preparation rungs.
+
+    ``NodeError`` is required for runtime parameter injection, not just typing.
+    The handler is a separate node and does not inherit the failed node's edges,
+    so its Command must explicitly route to review after updating the failed gate.
 
     Registered through ``add_node(..., error_handler=...)`` (see
     ``flow/policies.py``) instead of a ``try/except`` inside each node. The
@@ -43,7 +52,7 @@ def prepare_failure_handler(state: CfuDesignState, error: Any) -> dict[str, Any]
     if not isinstance(exc, PREPARE_FAILURES):
         raise exc
     node = str(getattr(error, "node", "") or PREPARE_GATE)
-    return _prepare_failure_update(state, node, exc)
+    return Command(update=_prepare_failure_update(state, node, exc), goto="review_and_route")
 
 
 def _prepare_failure_update(state: CfuDesignState, node: str, exc: Exception) -> dict[str, Any]:
@@ -144,53 +153,78 @@ def _ladder_transition(
     repair_target: str | Any,
     skipped: bool = False,
     repair_kind: str | None = None,
+    verification_submission: bool | None = None,
 ) -> tuple[dict, str]:
     """Decide a rung's successor and the bookkeeping that goes with it.
 
-    Conditional edges cannot update state, so the failing node records its own
-    repair/stop decision (``gates.<rung>.next``) and the router only reads it.
-
-    Repair budgets are split by target class: a repair of an answer artifact
-    (conformance oracle authored in Implement, ``design_contract``/``extend_isa`` spec) draws
-    from ``answer_repairs_used``/``--max-answer-repairs``; a repair of the actual
-    design draws from ``repairs_used``/``--max-iters``.
+    ``--max-iters`` counts candidate submissions to the verification ladder.
+    A failed verification rung may be repaired only if another submission slot
+    remains. Answer-only repairs and pre-verification implementation reroutes
+    have separate bounded pools.
     """
     if ok or skipped:
         return {}, default
     target = repair_target(state) if callable(repair_target) else repair_target
-    if repair_kind not in (None, "answer", "design"):
-        raise ValueError("repair_kind must be answer or design")
+    if repair_kind not in (None, "answer", "design", "preverify"):
+        raise ValueError("repair_kind must be answer, design, or preverify")
     answer_repair = repair_kind == "answer" or (repair_kind is None and target in ANSWER_REPAIR_TARGETS)
-    budget_left = gates._answer_repairs_left(state) if answer_repair else gates._repairs_left(state)
+    verify_rung = (rung in gates.LADDER_RUNGS) if verification_submission is None else verification_submission
+
+    if answer_repair:
+        budget_kind = "answer"
+        budget_left = gates._answer_repairs_left(state)
+        if verify_rung:
+            budget_left = budget_left and gates._verify_submissions_left(state)
+    elif verify_rung:
+        budget_kind = "design"
+        budget_left = gates._verify_submissions_left(state)
+    else:
+        budget_kind = "preverify"
+        budget_left = gates._preverify_repairs_left(state)
+
+    counter_key, cap = {
+        "answer": ("answer_repairs_used", gates.answer_repairs_max(state)),
+        "design": ("repairs_used", gates.max_repairs(state)),
+        "preverify": ("preverify_repairs_used", gates.preverify_repairs_max(state)),
+    }[budget_kind]
     if budget_left:
-        consumed = int(state.get("answer_repairs_used" if answer_repair else "repairs_used", 0) or 0)
-        cap = gates.answer_repairs_max(state) if answer_repair else gates.max_repairs(state)
-        note = (
-            f"{rung} failed; repairing {target} "
-            f"(repair {consumed + 1}/{cap})."
-        )
+        consumed = int(state.get(counter_key, 0) or 0)
+        note = f"{rung} failed; repairing {target} (repair {consumed + 1}/{cap})."
+        if verify_rung:
+            note = (
+                f"{rung} failed after verification submission "
+                f"{int(state.get('verify_submissions', 0) or 0)}/"
+                f"{gates.max_verify_submissions(state)}; repairing {target}."
+            )
         attempts = dict(state.get("attempts", {}) or {})
         attempts[rung] = int(attempts.get(rung, 0)) + 1
         return {
             "attempts": attempts,
-            ("answer_repairs_used" if answer_repair else "repairs_used"): consumed + 1,
+            counter_key: consumed + 1,
             "iteration": int(state.get("iteration", 0) or 0) + 1,
             "last_repair_target": target,
             "stage_jobs": target,
-            "repair_entry": {"kind": "answer" if answer_repair else "design", "target": target,
+            "repair_entry": {"kind": budget_kind, "target": target,
                              "iteration": int(state.get("iteration", 0) or 0) + 1, "route_used": False},
             "errors": [note],
             "iteration_history": state_mod.append_history(state, note),
         }, target
-    note = (
-        f"{rung} failed and no repair budget remains "
-        f"(--max-iters {state.get('max_iters', 2)}); stopping the run."
-        if not answer_repair
-        else (
+
+    if verify_rung and not gates._verify_submissions_left(state):
+        note = (
+            f"{rung} failed and the verification-submission budget is exhausted "
+            f"(--max-iters {gates.max_verify_submissions(state)}); stopping the run."
+        )
+    elif budget_kind == "answer":
+        note = (
             f"{rung} failed and the answer-repair budget is exhausted "
             f"(--max-answer-repairs {gates.answer_repairs_max(state)}); stopping the run."
         )
-    )
+    else:
+        note = (
+            f"{rung} failed and the pre-verification repair budget is exhausted "
+            f"(--max-preverify-repairs {gates.preverify_repairs_max(state)}); stopping the run."
+        )
     return {
         "stopped_at": rung,
         "stage_jobs": "review",
@@ -239,10 +273,11 @@ def repair_route_transition(state: CfuDesignState, route: dict) -> dict:
     else:
         extra, next_node = _ladder_transition(
             state, "implementation_route", ok=False, default="generate_soc",
-            repair_target=target, repair_kind="design")
+            repair_target=target, repair_kind="preverify")
     update = {"repair_route": dict(route), **extra}
     if next_node == target:
-        update["repair_entry"] = {"kind": "design", "target": target, "route_used": True,
+        update["repair_entry"] = {"kind": "design" if paid_entry else "preverify",
+                                  "target": target, "route_used": True,
                                   "iteration": extra.get("iteration", state.get("iteration", 0))}
         preserved = {"load_context", "workload_spec", "prepare_benchmark", "profile", "hotspot", "ir"}
         if route["target"] == "contract":

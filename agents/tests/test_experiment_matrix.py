@@ -43,7 +43,10 @@ Run root: agents/generated/runs/x
 ## Validation Ladder
 - isa: pass
 - sim: pass
+- verify submissions: 2/5
+- answer repairs used: 0/2
 - repairs used: 2/4 (iteration=2)
+- pre-verify repairs used: 0/2
 """
 
 RUN_YAML_PASS = """status: complete
@@ -569,7 +572,13 @@ class CollectTest(unittest.TestCase):
             )
             self.assertEqual(record["status"], "complete")
             self.assertEqual(record["repairs_used"], 2)
-            self.assertEqual(record["attempt_index"], 3)  # repairs_used + 1
+            self.assertEqual(record["verify_submissions"], 2)
+            self.assertEqual(record["max_verify_submissions"], 5)
+            self.assertEqual(record["answer_repairs_used"], 0)
+            self.assertEqual(record["max_answer_repairs"], 2)
+            self.assertEqual(record["preverify_repairs_used"], 0)
+            self.assertEqual(record["max_preverify_repairs"], 2)
+            self.assertEqual(record["attempt_index"], 2)
             self.assertEqual(record["speedup_x100"], 105)
             self.assertEqual(record["token_total"], 300)
             self.assertEqual(record["wall_seconds"], 12.5)
@@ -581,10 +590,24 @@ class CollectTest(unittest.TestCase):
             self.assertEqual(record["parse_warnings"], "")
             self.assertFalse(record["infra"]["infra"])
 
+    def test_collect_legacy_report_falls_back_to_repair_attempt_index(self) -> None:
+        report = REPORT_PASS.replace("- verify submissions: 2/5\n", "")
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            run_dir, fw = self._fixture(tmp, STDOUT_PASS, report, RUN_YAML_PASS, EMBENCH_PASS)
+            record = rm.collect_record(
+                "pk5-test", {"model": "glm-5.2", "benchmark": "crc32", "repeat": 1,
+                             "max_iters": 5, "infra_retry": 0},
+                "legacy-run", run_dir, fw, {"exit_code": 0, "wall_seconds": 5},
+            )
+            self.assertIsNone(record["verify_submissions"])
+            self.assertEqual(record["attempt_index"], 3)
+
     def test_collect_failing_run_writes_flags(self) -> None:
         report = REPORT_PASS.replace("Status: complete", "Status: failed").replace(
             "- sim: {'ok': True", "- sim: {'ok': False"
-        ).replace("repairs used: 2/4 (iteration=2)", "repairs used: 4/4 (iteration=4)")
+        ).replace("verify submissions: 2/5", "verify submissions: 5/5").replace(
+            "repairs used: 2/4 (iteration=2)", "repairs used: 4/4 (iteration=4)")
         stdout = STDOUT_PASS.replace("status=complete", "status=failed").replace("stopped", "stopped")
         stdout = "status=failed\nstopped_at=sim\n" + stdout.split("\n", 1)[1]
         embench = EMBENCH_PASS.replace("status: passed", "status: failed").replace(
@@ -604,6 +627,7 @@ class CollectTest(unittest.TestCase):
             payload = json.loads(path.read_text())
             self.assertEqual(payload["terminal"]["failure_class"], "sim_correctness")
             self.assertEqual(payload["terminal"]["stopped_at"], "sim")
+            self.assertEqual(payload["terminal"]["verify_submissions"], 5)
 
 
 class VerifyStatsTest(unittest.TestCase):

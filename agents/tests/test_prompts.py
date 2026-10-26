@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from agents.cfu_design_agent import prompts
 from agents.cfu_design_agent.stages.contract import _isa_from_template
 from agents.cfu_design_agent.stages.fallbacks import deterministic_roofline_analysis
 from agents.cfu_design_agent.isa import render_isa_markdown
@@ -174,12 +175,13 @@ class RooflinePromptTest(unittest.TestCase):
                 {"storage": "cpu", "access": "write", "role": "rd"},
             ])
 
-    def test_contract_prompt_forbids_wrapping_the_contract(self) -> None:
-        # GLM wrapped the contract in {"analysis", "roofline", "isa_contract": "<yaml>"}
-        # and the rung could not recover, so the prompt must forbid it explicitly.
+    def test_contract_prompt_forbids_wrapping_and_abstaining(self) -> None:
+        # GLM wrapped the contract in an envelope; the ISA rung also no longer
+        # accepts an abstention as a terminal model choice.
         prompt = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
         for term in ("must BE the top level", "isa_contract", "as a string",
-                     "thoughts/analysis/reasoning"):
+                     "thoughts/analysis/reasoning", "Do not return `ABSTAIN`",
+                     "still return the smallest useful contract"):
             self.assertIn(term, prompt)
 
     def test_conformance_prompt_mentions_json_for_json_mode(self) -> None:
@@ -429,6 +431,54 @@ def _stage_prompts(agent_tools: bool) -> dict[str, str]:
             artifact_paths=[(f"{run}/10_validation/embench.yaml", "validation")],
         ),
     }
+
+
+class GeneralityPromptTest(unittest.TestCase):
+    """Prompt-only policy coverage, not evidence that a CFU generalizes."""
+
+    def test_system_requires_workload_generality_without_banning_exact_tables(self) -> None:
+        for rule in (
+            "reusable algorithm-specific CFU", "all legal runtime values and data patterns",
+            "Agent-authored ISA", "sample identity", "random seed", "invocation number",
+            "known input address", "recognized input patterns", "exact algorithmic lookup tables",
+            "fixed-shape specialization", "fixture's static array", "all remaining legal inputs",
+            "mostly scalar fallback", "reset/state effects", "universal processor",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, prompts.SYSTEM_PROMPT)
+        self.assertNotIn("and declared fixed-shape specialization are allowed", prompts.SYSTEM_PROMPT)
+
+    def test_analysis_and_contract_cover_unseen_inputs_in_both_tool_modes(self) -> None:
+        for tools in (False, True):
+            stage_prompts = _stage_prompts(tools)
+            for stage in ("analysis", "contract"):
+                with self.subTest(tools=tools, stage=stage):
+                    self.assertIn("runtime input domain", stage_prompts[stage])
+                    self.assertIn("unseen-input counterexamples", stage_prompts[stage])
+            self.assertIn("incidental benchmark data", stage_prompts["analysis"])
+            self.assertIn("validation.requirements", stage_prompts["contract"])
+            self.assertIn("Do not add new", stage_prompts["contract"])
+
+    def test_delivery_self_review_is_bounded_and_does_not_require_simulation(self) -> None:
+        for tools in (False, True):
+            stage_prompts = _stage_prompts(tools)
+            for stage in ("hardware", "software"):
+                with self.subTest(tools=tools, stage=stage):
+                    self.assertIn(prompts.GENERALITY_REVIEW, stage_prompts[stage])
+            self.assertIn("reject sample- or pattern-specific shortcuts", stage_prompts["optimize"])
+        for rule in ("2-3", "not executed tests", "do not claim generalization",
+                     "extra simulations", "existing delivery format and tool budget"):
+            self.assertIn(rule, prompts.GENERALITY_REVIEW)
+
+    def test_contract_free_deliveries_keep_generality_self_review(self) -> None:
+        context = _prompt_context()
+        spec = {"name": "w", "operation": "crc32", "unknowns": []}
+        for tools in (False, True):
+            for builder in (hardware_prompt, software_prompt):
+                with self.subTest(tools=tools, builder=builder.__name__):
+                    prompt = builder("t", spec, "analysis", "", context,
+                                     agent_tools=tools, contract_free=True)
+                    self.assertIn(prompts.GENERALITY_REVIEW, prompt)
 
 
 class PromptBudgetTest(unittest.TestCase):

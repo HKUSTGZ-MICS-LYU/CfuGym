@@ -51,7 +51,7 @@ def _isa_step(state, client, tools_enabled, stage, label, prompt, fallback):
             fallback=fallback,
             client=client,
             response_format={"type": "json_object"},
-            deliverable_hint="one YAML mapping (or exactly ABSTAIN when there is no CFU opportunity)",
+            deliverable_hint="one evidence-based YAML mapping; ABSTAIN is not accepted",
         )
         return result, raw
     return llm_step._complete_llm(
@@ -117,19 +117,17 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
         state, client, tools_enabled, "design_contract", "isa", prompt, fallback_text
     )
     if result.text.strip().upper() == "ABSTAIN":
-        stage_services._write_isa_artifact(state, {}, ["agent abstained: no worthwhile CFU opportunity"])
-        return {
-            "isa_spec": {}, "isa_spec_text": "", "design_contract": result.text,
-            "isa_spec_errors": [], "llm_raw_outputs": [raw_output],
-            "status": "blocked", "termination_reason": "ABSTAIN", "stage_jobs": "review",
-            **outcome.stage_result(state, rung="isa", ok=False, abstain=True,
-                                   reason="agent selected ABSTAIN", next="review_and_route",
-                                   history="Agent abstained from CFU design."),
-        }
-    try:
-        isa_spec, problems = isa.validate_isa_text(result.text)
-    except IsaLintError as exc:
-        isa_spec, problems = {}, [f"ISA output is invalid: {exc}"]
+        # ABSTAIN used to be a terminal model choice. Treat it as a rejected
+        # contract instead, so the normal ISA repair budget gets another chance.
+        isa_spec, problems = {}, [
+            "ABSTAIN is not accepted; return a minimal evidence-based CFU contract "
+            "and record uncertainty in assumptions/unknowns."
+        ]
+    else:
+        try:
+            isa_spec, problems = isa.validate_isa_text(result.text)
+        except IsaLintError as exc:
+            isa_spec, problems = {}, [f"ISA output is invalid: {exc}"]
     if not problems and not _has_isaable_commands(isa_spec):
         problems = ["no usable commands after ISA extraction"]
     if problems:

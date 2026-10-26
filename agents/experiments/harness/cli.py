@@ -92,7 +92,7 @@ def build_parser(
                              + ("(no ablation flags)" if default_layers == "full"
                                 else "(the full capability ladder)")
                              + ". Aliases: none, isa, conf, llvm-ir.")
-    parser.add_argument("--max-iters", type=int, default=5, help="Agent repair budget; K = attempt budget for pass@K (default: 5).")
+    parser.add_argument("--max-iters", type=int, default=5, help="Maximum candidate submissions to verification; K = attempt budget for pass@K (default: 5).")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature forced into the experiment configs (default: 0.7).")
     parser.add_argument("--conda-env", default=DEFAULT_CONDA_ENV,
                         help=f"Conda environment every launched command runs in (default: {DEFAULT_CONDA_ENV!r}; empty disables conda).")

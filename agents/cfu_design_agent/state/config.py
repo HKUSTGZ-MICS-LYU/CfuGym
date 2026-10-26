@@ -57,6 +57,8 @@ class RunConfig(TypedDict, total=False):
     require_conformance: bool
     isa_contract: bool
     max_iters: int
+    max_answer_repairs: int
+    max_preverify_repairs: int
     run_id: str
     run_root: str
     agent_cfu: bool

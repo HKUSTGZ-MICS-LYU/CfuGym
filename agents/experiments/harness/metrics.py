@@ -11,7 +11,7 @@ from agents.experiments.harness import classification
 PASS_AT_K = (1, 3, 5)
 
 ESTIMAND_HELP = (
-    "attempt_index = repairs_used + 1 (one --max-iters K run = K attempts). "
+    "attempt_index = verify_submissions (one --max-iters K run allows K candidate submissions to verification). "
     "pass@k_budget = mean over R repeats of 1[complete and attempt_index <= k]; "
     "pass@k_sample = 1 - C(R-c,k)/C(R,k) with c complete runs (i.i.d. estimator)."
 )

@@ -300,6 +300,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         + "\nSoftware targets (edit with `edit_software`): "
         + ", ".join(sorted(software_targets))
         + schedule_line
+        + "\n\n" + prompts.GENERALITY_REVIEW
         + "\nCurrent failure evidence:\n" + feedback
         + scope_line
         + (feedback_mod.repair_route_guidance(tool_mode=True) if feedback else "")

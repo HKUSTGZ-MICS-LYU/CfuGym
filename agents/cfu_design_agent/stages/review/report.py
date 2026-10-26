@@ -37,8 +37,20 @@ def render_ladder(state: CfuDesignState) -> str:
     if stopped:
         lines.append(f"- stopped at: {stopped}")
     lines.append(
+        f"- verify submissions: {state.get('verify_submissions', 0)}/"
+        f"{gates_mod.max_verify_submissions(state)}"
+    )
+    lines.append(
+        f"- answer repairs used: {state.get('answer_repairs_used', 0)}/"
+        f"{gates_mod.answer_repairs_max(state)}"
+    )
+    lines.append(
         f"- repairs used: {state.get('repairs_used', 0)}/{gates_mod.max_repairs(state)} "
         f"(iteration={state.get('iteration', 0)})"
+    )
+    lines.append(
+        f"- pre-verify repairs used: {state.get('preverify_repairs_used', 0)}/"
+        f"{gates_mod.preverify_repairs_max(state)}"
     )
     return "\n".join(lines)
 

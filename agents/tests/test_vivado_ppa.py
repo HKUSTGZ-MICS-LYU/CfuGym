@@ -52,6 +52,23 @@ POWER = '''
 |     agentCfu        | <0.001 |
 '''
 
+# Shape copied from Vivado 2025.2 CRC32 post-route power.rpt: the SoC total
+# exists, but the leaf AgentCfu hierarchy is omitted from the table.
+POWER_NO_CFU_HIERARCHY = '''
+| Dynamic (W) | 0.064 |
+| Device Static (W) | 0.474 |
+| Confidence Level | Medium |
+3.1 By Hierarchy
+----------------
+| Name | Power (W) |
+| MiCoSoc | 0.064 |
+|   socCtrl_systemClk_IBUF_inst | 0.002 |
+|   system_cpu_logic_core | 0.014 |
+|   system_mainBus_arbiter_core | 0.003 |
+|   system_peripheral_uart_logic_core | 0.001 |
+|   system_ram_thread_logic | 0.040 |
+'''
+
 
 def metrics_fixture() -> dict[str, str]:
     result = {'vivado.version': '2025.2', 'part': vivado.DEFAULT_PART,
@@ -71,7 +88,8 @@ def metrics_fixture() -> dict[str, str]:
 
 
 def make_summary(metrics: dict[str, str] | None = None, **kwargs):
-    return vivado.make_summary(metrics or metrics_fixture(), AREA, AREA, POWER,
+    power_text = kwargs.pop('power', POWER)
+    return vivado.make_summary(metrics or metrics_fixture(), AREA, AREA, power_text,
                                 returncode=kwargs.pop('returncode', 0),
                                 soc_synthesis_area=AREA, cfu_synthesis_area=AREA, **kwargs)
 
@@ -127,6 +145,23 @@ class VivadoParsingTest(unittest.TestCase):
         self.assertIsNone(vivado.parse_power(POWER, 'agentCfu')['cfu_dynamic']['upper_bound'])
         duplicate = POWER + '|     agentCfu | 0.005 |\n'
         self.assertIsNone(vivado.parse_power(duplicate, 'container/agentCfu')['cfu_dynamic']['value'])
+
+    def test_omitted_cfu_leaf_uses_only_conservative_soc_dynamic_upper_bound(self):
+        result = make_summary(power=POWER_NO_CFU_HIERARCHY)
+        cfu_power = result['cfu']['power']
+        self.assertEqual(result['status'], 'passed', result['issues'])
+        self.assertIsNone(cfu_power['dynamic']['value'])
+        self.assertEqual(cfu_power['dynamic']['upper_bound'], 0.064)
+        self.assertEqual(cfu_power['dynamic']['reported'], '<= SoC dynamic total (0.064 W)')
+        self.assertEqual(cfu_power['method'], 'whole_soc_dynamic_power_upper_bound')
+        markdown = vivado.render_markdown(result)
+        self.assertIn('≤0.064', markdown)
+        self.assertIn('not a CFU point estimate', markdown)
+
+    def test_missing_soc_dynamic_does_not_fabricate_cfu_bound(self):
+        result = make_summary(power='3.1 By Hierarchy\n| Name | Power (W) |\n| MiCoSoc | 0.01 |')
+        self.assertIsNone(result['cfu']['power']['dynamic']['upper_bound'])
+        self.assertIn('missing_dynamic_power', [issue['code'] for issue in result['issues']])
 
     def test_machine_tsv_strict_and_phase_progress(self):
         self.assertEqual(vivado.parse_metrics_tsv('phase\tpost_synth\nphase\tpost_route\n'),

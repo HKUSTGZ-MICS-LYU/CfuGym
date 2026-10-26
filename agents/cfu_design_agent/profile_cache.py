@@ -27,7 +27,7 @@ from typing import Any
 CACHE_SUBDIR = "agents/generated/cache/embench_profile"
 SCHEMA_VERSION = "1"
 # Bump when the key composition changes so old entries cannot be reused.
-KEY_VERSION = "7"  # measurement protocol is explicit; old measurements cannot be reused
+KEY_VERSION = "8"  # versioned workload patches and protected semantic harness inputs
 # The reference build's disassembly, stored beside the entry under the same key:
 # a reused measurement has no build outputs of its own, and the analysis reads
 # this file as the ASM candidate for a measured loop.
@@ -189,6 +189,9 @@ def build_key(
             name: tree_hash(workdir / name) for name in (
                 "agents/cfu_design_agent/benchmark/generic.py",
                 "agents/cfu_design_agent/benchmark/embench.py",
+                "agents/cfu_design_agent/benchmark/embench_patchers.py",
+                "agents/cfu_design_agent/benchmark/patches",
+                "agents/cfu_design_agent/benchmark/embench_integrity.py",
                 "agents/cfu_design_agent/benchmark/cfu_execution.py",
                 "agents/cfu_design_agent/benchmark/embench_instrument.py",
                 "agents/cfu_design_agent/benchmark/embench_loops.py",

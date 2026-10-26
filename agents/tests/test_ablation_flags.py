@@ -108,7 +108,8 @@ class ContractShortCircuitTest(unittest.TestCase):
             update = contract_mod.design_contract(state)
         step.assert_called_once()
         self.assertIsNone(update["gates"]["isa"].get("disabled"))
-        self.assertTrue(update["gates"]["isa"].get("abstain"))
+        self.assertFalse(update["gates"]["isa"].get("abstain", False))
+        self.assertEqual(update["gates"]["isa"].get("next"), "design_contract")
 
 
 class ConformanceDisabledTest(unittest.TestCase):

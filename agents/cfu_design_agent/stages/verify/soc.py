@@ -30,13 +30,16 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
                                    history=f"Skipped SoC generation ({reason})."),
         }
 
+    impl_gate = gates_mod._rung_gate(state, "implementation_hw")
+    submitted_candidate = not (impl_gate and not impl_gate.get("ok", False))
+    verify_submissions = int(state.get("verify_submissions", 0) or 0) + int(submitted_candidate)
+    validation_state = {**state, "verify_submissions": verify_submissions}
     toolbox = stage_services._toolbox_for_stage(state, "validation")
     isa_spec = state.get("isa_spec", {}) or {}
     commands = commands_mod.agent_cfu_overlay_commands(state, isa_spec) or commands_mod._legacy_ladder_commands(state, toolbox)["generate"]
     results: list[dict] = []
     integrity_checked = False
     encoding_evidence: dict = {}
-    impl_gate = gates_mod._rung_gate(state, "implementation_hw")
     if impl_gate and not impl_gate.get("ok", False):
         # The hardware rung produced no applied design, so the workspace still
         # holds the seeded scaffold. Compiling that would "pass" while validating
@@ -112,12 +115,14 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
         extra, next_node = retry
     else:
         extra, next_node = ladder._ladder_transition(
-            state,
+            validation_state,
             rung,
             ok=ok,
             # The conformance micro-test runs before any software decision is final.
             default="check_conformance",
             repair_target="implement",
+            repair_kind=None if submitted_candidate else "preverify",
+            verification_submission=submitted_candidate,
         )
     gates = {
         **state.get("gates", {}),
@@ -134,6 +139,7 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
     extra["iteration_history"] = [*(extra.get("iteration_history") or []), *history]
     update = {
         "validation_results": results,
+        "verify_submissions": verify_submissions,
         **({"rtl_snapshot": snapshot} if snapshot else {}),
         "stage_jobs": "validation",
         "errors": errors,

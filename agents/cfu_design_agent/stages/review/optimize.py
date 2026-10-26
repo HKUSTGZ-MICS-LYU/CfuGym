@@ -117,7 +117,7 @@ def _choose_optimization(
     """
     if not bool(state.get("loop_optimize", False)):
         return "", {}, ""
-    remaining = gates.max_repairs(state) - int(state.get("repairs_used", 0) or 0)
+    remaining = gates.max_verify_submissions(state) - int(state.get("verify_submissions", 0) or 0)
     if remaining <= 0:
         return "", {
             "continue": False,

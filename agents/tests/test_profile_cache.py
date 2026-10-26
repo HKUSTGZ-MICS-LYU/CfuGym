@@ -332,7 +332,7 @@ class ProfileCacheProtocolTest(unittest.TestCase):
             default = self._key()
         explicit = self._key(measurement_protocol="cold_single_invocation_v1")
         self.assertEqual(default, explicit)
-        self.assertEqual(default["inputs"]["key_version"], "7")
+        self.assertEqual(default["inputs"]["key_version"], "8")
         self.assertEqual(default["inputs"]["measurement_protocol"], "cold_single_invocation_v1")
         self.assertNotEqual(default["key"], self._key(measurement_protocol="legacy")["key"])
         self.assertNotEqual(default["key"], self._key(measurement_protocol="future_v2")["key"])
@@ -344,6 +344,32 @@ class ProfileCacheProtocolTest(unittest.TestCase):
         self.assertNotEqual(base["key"], changed["key"])
         self.preparation.write_text("void initialise_benchmark(void) { prepare(); }\n")
         self.assertNotEqual(changed["key"], self._key(measurement_protocol="cold_single_invocation_v1")["key"])
+
+    def test_patcher_code_and_assets_invalidate_key(self) -> None:
+        paths = ("embench_patchers.py", "embench_integrity.py",
+                 "patches/huffbench_harness.c", "patches/huffbench.h")
+        for relative in paths:
+            with self.subTest(input=relative):
+                path = self.workdir / "agents/cfu_design_agent/benchmark" / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("version one\n")
+                before = self._key()
+                path.write_text("version two\n")
+                self.assertNotEqual(before["key"], self._key()["key"])
+
+    def test_version_seven_entry_cannot_match_current_key(self) -> None:
+        import hashlib
+        import json
+
+        current = self._key()
+        old_inputs = dict(current["inputs"], key_version="7")
+        canonical = json.dumps(old_inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        old_key = hashlib.sha256(canonical.encode()).hexdigest()
+        old_entry = profile_cache.serialize(
+            old_key, benchmark="crc32", configs=["reference"],
+            profiles={"reference": {"crc32": {"cycles": 100}}}, observation={}, inputs=old_inputs,
+        )
+        self.assertIsNone(profile_cache.parse(old_entry, current["key"]))
 
     def test_version_six_entry_cannot_match_current_key(self) -> None:
         import hashlib

@@ -46,12 +46,26 @@ Hard rules:
 - The accelerated (CFU) build must actually execute CFU instructions for the hot operation. Calling cfu_enable() and then running the scalar loop, or calling an intrinsic and discarding both its CPU result and its declared vector/memory effects, is not acceleration and is rejected.
 - Only files your visibility tier exposes are readable; a denied reference returns a policy error. Never assume or fabricate the contents of a document you were not shown.
 - verify_benchmark is Host-owned: its signature is visible but its implementation is hidden in Agent source views. Hidden-body markers are not file bytes. Never edit that function, copy a marker into source, or replace a whole file using a redacted view; target only visible kernel/algorithm regions.
-- Correctness means equivalence over the frozen contract's valid input domain, not merely passing the observed benchmark input. Do not prestore benchmark answers, approximate the promised algorithm, cancel operands, or add decorative operand/LSU reads to disguise fixed answers. Algorithm constants, exact algorithmic lookup tables, and declared fixed-shape specialization are allowed; input dependence alone is not proof of equivalence.
+- Correctness means equivalence over the required workload's valid input domain, not merely passing the observed benchmark input. Derive that domain from the task and scalar algorithm/interface, never from the few values or patterns in a benchmark fixture. An Agent-authored ISA or assumption must not silently shrink the required workload semantics.
+- Design a reusable algorithm-specific CFU, not a benchmark-instance recognizer. Handle all legal runtime values and data patterns for the selected operation, including unseen combinations. You need not build a universal processor or support unrelated algorithms or parameters outside the required domain.
+- Do not prestore benchmark answers, approximate the promised algorithm, cancel operands, or add decorative operand/LSU reads to disguise fixed answers. Never select incomplete or prestored results by sample identity, random seed, invocation number, known input address, or a few recognized input patterns. A variable-looking expression or an input read does not establish algorithmic correctness.
+- Algorithm constants and exact algorithmic lookup tables are allowed. A fixed-shape specialization needs an explicit task requirement or a constraint of the scalar algorithm/interface; a fixture's static array, observed shape, value range, or lack of negative cases alone is not justification. Do not invent assumptions merely to fit a partial implementation; disclose ambiguous scope instead of assuming it away.
+- Data-dependent fast paths must be exact and have complete behavior for all remaining legal inputs. Preserve required widths, signedness, rounding/overflow semantics, rounds, tails, channels, outputs and reset/state effects. Do not present a few accelerated patterns with mostly scalar fallback as general CFU acceleration.
 - A fixed zero may be a legitimate success status only when the contracted computation and all declared vector/memory effects actually complete. Conditional Boolean results are legitimate computations; do not confuse them with unconditional fixed answers.
 - Match every Instruction function id AND subop to the generated intrinsics. Do not rely on an unchecked default subop, ignore unsupported/error CFU responses, clear error status inside the kernel to hide failures, or claim acceleration for a datapath that software never selects.
 - Include a concise command coverage table in the implementation delivery: map each frozen command to its actual function/subop, effective enable condition, operand/data route, completion and declared result/memory effects; disclose unchecked or omitted semantics. This table is a claim, not a substitute for Host evidence.
-- If the complete contract cannot be implemented, state the missing semantics and request analysis/contract repair when those routes are offered; otherwise report the limitation or abstain. Never silently narrow the contract or patch only the observed answer. For a repair, explain why implement is sufficient or why an upstream route is necessary.
+- Do not abstain from CFU design. If the opportunity is uncertain or difficult, state the uncertainty in assumptions/unknowns and still return the strongest minimal, testable CFU contract supported by evidence. Never silently narrow the contract or patch only the observed answer. For a repair, explain why implement is sufficient or why an upstream route is necessary.
 - Return concise, implementable text. Do not invent performance results."""
+
+
+GENERALITY_REVIEW = """Generality self-review: in the existing delivery/summary, briefly state the
+required runtime input domain, task/interface-justified fixed parameters, and
+complete behavior beyond any special fast path. Give 2-3 applicable unseen-input
+counterexamples (such as changed values, high/sign bits, tails, another branch or
+state sequence) and explain why the actual HW/SW handles them. These are design
+checks, not executed tests: disclose untested cases and scalar fallback scope;
+do not claim generalization from one benchmark PASS or launch extra simulations
+solely for this review. Keep the existing delivery format and tool budget."""
 
 
 ROOFLINE_ANALYSIS_FIELDS = """A `roofline` mapping is useful but optional. Include whichever facts are
@@ -695,6 +709,10 @@ def workload_prompt(
 {feedback}
 
 Analyze the workload. Classify the acceleration pattern, identify hardware/software state, data movement, expected bottlenecks, and the minimum validation needed.
+Separate algorithm/interface invariants from incidental benchmark data. State the
+required runtime input domain and 2-3 unseen-input counterexamples that would
+expose a sample- or pattern-specific design; explain which semantics must remain
+complete. Do not infer a narrow value range or fixed shape from a fixture alone.
 When WorkloadSpec.hot_loop is present, use its measured loop id, source function and line to identify the kernel; nested region cycles are inclusive and must not be summed. Name the exact function and loop that should become the CFU kernel.
 Keep the analysis concise and factual. Preserve useful workload facts, design
 implications, evidence sources and unresolved unknowns; do not invent measurements.
@@ -740,8 +758,8 @@ def contract_prompt(
     brief = stage_brief(
         "CFU ISA contract",
         deliverable=(
-            "One YAML mapping, or exactly `ABSTAIN` when the measured workload has no "
-            f"meaningful CFU opportunity. The harness writes the contract to `{contract_path}`."
+            "One YAML mapping defining a minimal, evidence-based CFU contract. Do not "
+            f"abstain; record uncertainty in the contract. The harness writes it to `{contract_path}`."
         ),
         context=context,
         tool_names=("read_file", "list_dir", "search_text", "list_command_logs"),
@@ -757,9 +775,10 @@ def contract_prompt(
 
 {analysis_block}
 {ROOFLINE_DECISION_RULE}{feedback_block}
-This is the ISA-CONTRACT stage only. If the measured workload has no meaningful
-CFU opportunity, return exactly `ABSTAIN` with no contract; the run will end
-without a verified CFU. Otherwise the next node parses your response directly
+This is the ISA-CONTRACT stage only. Do not return `ABSTAIN` or decline the task.
+If acceleration opportunity is weak or uncertain, state that in `assumptions`,
+`unknowns`, and `roofline`, then still return the smallest useful contract that
+can be implemented and tested. The next node parses your response directly
 with a YAML parser. Return exactly one YAML mapping and nothing else. Do not return analysis, prose, Markdown fences,
 Scala, C, a patch, FILE_BEGIN/FILE_END blocks, or an implementation plan. Do not continue to
 hardware or software implementation. The contract object must BE the top level of the response:
@@ -771,6 +790,10 @@ The YAML must contain these top-level keys:
 `software`, `integration`, `validation`, `assumptions`, `unknowns`, and `roofline`.
 `assumptions` is a MAPPING of `name: text` (never a list of strings); `unknowns` is a
 LIST of strings.
+Use existing `assumptions` and `validation.requirements` to state the required
+runtime input domain, justify any fixed parameters from the task/scalar interface,
+and name 2-3 unseen-input counterexamples the design must handle. Do not add new
+top-level keys or redefine an operation to fit only observed data or patterns.
 Copy the Roofline conclusion into `roofline`, including the selected boundary, intensity,
 ceiling provenance, bottleneck, and the architecture rationale used by the contract.
 Include ISA function IDs, operand/result semantics, and the datapath parameters when they
@@ -1282,6 +1305,7 @@ This is the HARDWARE rung only. Design the SpinalHDL CFU datapath; the
 accelerated software is written in a later step and must not appear here.
 {design_block}
 {ROOFLINE_DECISION_RULE}
+{GENERALITY_REVIEW}
 Use the Roofline result to justify direct versus TileLink, vector width, RF
 residency, lane count, pipeline initiation interval, and command granularity.
 The implementation must state which modeled quantity it is intended to improve.
@@ -1383,6 +1407,10 @@ Workload specification (existing command encodings/semantics must remain compati
 {design_block}
 
 Decide whether another round is worth spending budget on, and where.
+A benchmark PASS is not evidence of generality. Preserve the required runtime
+input domain in every optimization; reject sample- or pattern-specific shortcuts.
+In `reason`, disclose any new restriction or scalar fallback instead of silently
+narrowing semantics to improve the measured score.
 
 - `implement` hands the round to the implementation stage, where you change
   whichever side the evidence points at — the AgentCfu datapath (lane count,
@@ -1618,6 +1646,7 @@ This is the SOFTWARE rung only. The hardware design is already fixed and
 already passed SoC generation; do not propose hardware changes here.
 {abi_block}
 {ROOFLINE_DECISION_RULE}
+{GENERALITY_REVIEW}
 {intrinsic_rule}
 for the hot operation and derive its result from them. A branch that only calls
 cfu_enable() and then computes with the scalar loop, or that calls an intrinsic

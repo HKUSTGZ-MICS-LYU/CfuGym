@@ -190,7 +190,12 @@ def collect_record(
     repairs_used = report.get("repairs_used")
     if repairs_used is None:
         warnings.append("repairs_used not found in report.md")
-    attempt_index = (int(repairs_used) + 1) if isinstance(repairs_used, int) else None
+    verify_submissions = report.get("verify_submissions")
+    # Historical reports predate explicit verification-submission accounting.
+    attempt_index = (
+        int(verify_submissions) if isinstance(verify_submissions, int)
+        else (int(repairs_used) + 1) if isinstance(repairs_used, int) else None
+    )
 
     # Ablation bookkeeping: the layer this run was supposed to execute versus
     # what the framework actually recorded in the report's "## Ablation"
@@ -281,6 +286,12 @@ def collect_record(
         "stopped_at": stopped_at,
         "repairs_used": repairs_used,
         "max_repairs": report.get("max_repairs"),
+        "verify_submissions": verify_submissions,
+        "max_verify_submissions": report.get("max_verify_submissions"),
+        "answer_repairs_used": report.get("answer_repairs_used"),
+        "max_answer_repairs": report.get("max_answer_repairs"),
+        "preverify_repairs_used": report.get("preverify_repairs_used"),
+        "max_preverify_repairs": report.get("max_preverify_repairs"),
         "attempt_index": attempt_index,
         "sim_ok": (sim_gate.get("ok") if sim_gate else None),
         "sim_attempts": len(sim_attempts),
@@ -477,7 +488,12 @@ def write_failure_json(record: dict, run_dir: Path) -> Path | None:
             "status": record.get("status"),
             "stopped_at": record.get("stopped_at"),
             "budget_exhausted": failure.get("budget_exhausted"),
+            "verify_submissions": record.get("verify_submissions"),
+            "max_verify_submissions": record.get("max_verify_submissions"),
+            "attempt_index": record.get("attempt_index"),
             "repairs_used": record.get("repairs_used"),
+            "answer_repairs_used": record.get("answer_repairs_used"),
+            "preverify_repairs_used": record.get("preverify_repairs_used"),
             "failure_class": failure.get("failure_class"),
             "failure_rung": failure.get("failure_rung"),
             "failure_detail": failure.get("failure_detail"),

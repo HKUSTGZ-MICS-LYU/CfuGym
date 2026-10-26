@@ -343,7 +343,7 @@ def agent_cfu_check_commands(state: CfuDesignState, check_index: int = 0) -> lis
     return [["sbt", *settings, run_main]]
 
 
-def agent_cfu_cost_commands(state: CfuDesignState) -> list[list[str]]:
+def agent_cfu_cost_commands(state: CfuDesignState, *, out_dir: str = "") -> list[list[str]]:
     """sbt command that elaborates the standalone CFU Verilog for the cost rung.
 
     Unlike the SoC build this does not need the CPU: GenAgentCfu elaborates only
@@ -355,7 +355,8 @@ def agent_cfu_cost_commands(state: CfuDesignState) -> list[list[str]]:
     simulated, or a design's parameter checks fail here after passing everywhere
     else (observed 2026-09-28: this function took the WORKLOAD spec, emitted no
     datapath flags at all, and GenAgentCfu fell back to vlen=256 against a
-    design that required 512).
+    design that required 512). An optional output directory keeps per-evaluation
+    Yosys inputs isolated; callers that omit it retain the legacy cost path.
     """
     run_root = state.get("run_root", "")
     if not run_root or not gates.is_agent_cfu_run(state):
@@ -364,7 +365,7 @@ def agent_cfu_cost_commands(state: CfuDesignState) -> list[list[str]]:
     if not settings:
         return []
     isa_spec = state.get("isa_spec", {}) or {}
-    out_dir = f"{run_root}/11_cost/cfu_rtl"
+    out_dir = out_dir or f"{run_root}/11_cost/cfu_rtl"
     flags = agent_cfu_datapath_flags(isa_spec)
     run_main = " ".join(
         ["runMain vexiiriscv.soc.mico.GenAgentCfu", "--out-dir", out_dir, *flags]

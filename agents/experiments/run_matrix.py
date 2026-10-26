@@ -13,9 +13,9 @@ One harness run drives a full matrix of ``--run-cfu-agent`` runs:
 
     <exp_id>-<model>-<benchmark>-r<RR>-mi<K>            e.g. pk5-20260212-glm52-crc32-r01-mi5
 
-Each cell (model x benchmark) is repeated R times with ``--max-iters K`` (= K
-attempts: 1 first try + K-1 repairs).  A run that completed after ``repairs_used``
-repairs has ``attempt_index = repairs_used + 1`` and therefore contributes
+Each cell (model x benchmark) is repeated R times with ``--max-iters K`` (= at most
+K candidate submissions to the verification ladder, including the first). A run's
+``attempt_index`` is its number of verification submissions and therefore contributes
 
     pass@k = 1  iff the run is ``complete`` and attempt_index <= k        (k = 1, 3, 5)
 

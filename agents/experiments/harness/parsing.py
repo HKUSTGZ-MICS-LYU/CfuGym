@@ -70,11 +70,23 @@ def parse_cli_stdout(text: str) -> dict:
 
 
 def parse_report(text: str, warnings: list[str]) -> dict:
-    """Parse report.md: Status, the ``## Gates`` dict dump, repairs used."""
+    """Parse report.md status, gate verdicts, and repair/submission counters."""
     out: dict = {}
     m = re.search(r"^Status: (\w+)", text, re.M)
     if m:
         out["status"] = m.group(1)
+    m = re.search(r"^- verify submissions: (\d+)/(\d+)", text, re.M)
+    if m:
+        out["verify_submissions"] = int(m.group(1))
+        out["max_verify_submissions"] = int(m.group(2))
+    m = re.search(r"^- answer repairs used: (\d+)/(\d+)", text, re.M)
+    if m:
+        out["answer_repairs_used"] = int(m.group(1))
+        out["max_answer_repairs"] = int(m.group(2))
+    m = re.search(r"^- pre-verify repairs used: (\d+)/(\d+)", text, re.M)
+    if m:
+        out["preverify_repairs_used"] = int(m.group(1))
+        out["max_preverify_repairs"] = int(m.group(2))
     m = re.search(r"^- repairs used: (\d+)/(\d+) \(iteration=(\d+)\)", text, re.M)
     if m:
         out["repairs_used"] = int(m.group(1))

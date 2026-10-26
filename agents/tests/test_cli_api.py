@@ -462,9 +462,11 @@ class LoopFlagTest(unittest.TestCase):
         with mock.patch.object(cli, "run_agent", _fake_run), \
                 mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
                 mock.patch.object(cli, "enable_progress", lambda: None):
-            cli.main(["--task", "x", "--loop", "--max-iters", "3"])
+            cli.main(["--task", "x", "--loop", "--max-iters", "3",
+                      "--max-preverify-repairs", "4"])
         self.assertTrue(captured.get("loop_optimize"))
         self.assertEqual(captured.get("max_iters"), 3)
+        self.assertEqual(captured.get("max_preverify_repairs"), 4)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ from pathlib import Path
 import unittest
 from unittest import mock
 
-from agents.cfu_design_agent import graph
 from agents.cfu_design_agent.runtime.llm import LlmResult
 from agents.cfu_design_agent.flow import gates
 from agents.cfu_design_agent.runtime import llm_step
@@ -27,7 +26,7 @@ class AbstainBudgetTest(unittest.TestCase):
                       "workload_spec": {}, "workload_analysis": "no candidate", "gates": {},
                       "max_iters": 2}
 
-    def test_explicit_abstain_skips_implementation(self) -> None:
+    def test_abstain_is_rejected_and_routed_through_isa_repair(self) -> None:
         class _Artifacts:
             def write_yaml(self, *args, **kwargs):
                 pass
@@ -37,12 +36,12 @@ class AbstainBudgetTest(unittest.TestCase):
              mock.patch.object(services, "_write_isa_artifact"), \
              mock.patch.object(services, "_artifacts_for_stage", return_value=_Artifacts()):
             update = contract.design_contract(self.state)
-            self.assertTrue(update["gates"]["isa"]["abstain"])
-            self.assertEqual(update["termination_reason"], "ABSTAIN")
-            self.assertEqual(graph._route_after_isa(update), "review_and_route")
-            reviewed = review.review_and_route({**self.state, **update, "max_evals": 1})
-        self.assertEqual(reviewed["termination_reason"], "ABSTAIN")
-        self.assertEqual(reviewed["gates"]["review"]["next"], "final_report")
+        self.assertFalse(update["gates"]["isa"].get("abstain", False))
+        self.assertEqual(update["stage_jobs"], "design_contract")
+        self.assertEqual(update["last_repair_target"], "design_contract")
+        self.assertEqual(update["answer_repairs_used"], 1)
+        self.assertTrue(any("ABSTAIN is not accepted" in problem
+                            for problem in update["gates"]["isa"]["problems"]))
 
     def test_eval_budget_stops_before_planner(self) -> None:
         gates = {name: {"ok": True} for name in gates_mod.REQUIRED_GATES}
