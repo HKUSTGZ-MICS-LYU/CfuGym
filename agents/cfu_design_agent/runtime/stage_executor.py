@@ -330,8 +330,10 @@ def _native_stage_loop(
     """
     from langgraph.graph import END, START, StateGraph
 
-    if not getattr(client, "available", False) or not callable(getattr(client, "_chat_round", None)):
-        raise failures.StageToolsUnavailable("native loop needs an available single-round chat client")
+    if not getattr(client, "available", False) or not (
+            callable(getattr(client, "model_round", None))
+            or callable(getattr(client, "_chat_round", None))):
+        raise failures.StageToolsUnavailable("native loop needs an available single-round model client")
     schemas = toolset.schemas()
     permitted = {str(item.get("function", {}).get("name", "")) for item in schemas}
     if "submit_stage" in permitted:
@@ -372,6 +374,10 @@ def _native_stage_loop(
     if sdk is None:
         from openai import OpenAI
         sdk = OpenAI(api_key=client.api_key, base_url=client.base_url, max_retries=0)
+    # One round through the client's endpoint policy (Responses when available,
+    # chat completions otherwise). Fakes that only expose ``_chat_round`` keep
+    # working unchanged.
+    round_fn = getattr(client, "model_round", None) or client._chat_round
 
     def decide(s: _LoopState) -> dict[str, Any]:
         if s["model_turns"] >= model_turn_limit:
@@ -418,7 +424,7 @@ def _native_stage_loop(
                 "This is your last tool round. Make any remaining changes with the "
                 "offered tools now; after this round only submit_stage is available."
             )})
-        round_ = client._chat_round(
+        round_ = round_fn(
             sdk, source_visibility.mask_model_payload(messages), allow_tools=True, tools=tools,
             response_format=None,
         )
@@ -649,8 +655,10 @@ def _native_stage_loop(
         total_tokens=result["total_tokens"],
         cached_input_tokens=(result["cached_input_tokens"] if result["cached_usage_reported"] else None),
         reasoning=last["reasoning"],
-        model=client.model, api_mode_used="chat+langgraph-tools",
+        model=client.model,
+        api_mode_used=f"{getattr(client, '_last_round_mode', 'chat') or 'chat'}+langgraph-tools",
         finish_reason=last["finish_reason"], reasoning_source=last["reasoning_source"],
         extra_keys=last["extra_keys"], tool_calls=tuple(result["transcript"]),
         tool_rounds=result["tool_rounds"],
+        context_compaction=dict(getattr(client, "_last_compaction", {}) or {}),
     ))

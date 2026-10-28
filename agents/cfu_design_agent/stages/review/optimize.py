@@ -169,6 +169,7 @@ def _choose_optimization(
                 run_root=run_root,
                 contract_free=not state.get("isa_contract", True),
                 artifact_paths=artifact_paths,
+                state=state,
             ),
             fallback,
             "optimize",
@@ -214,6 +215,7 @@ def _choose_optimization(
                     run_root=run_root,
                     contract_free=not state.get("isa_contract", True),
                     artifact_paths=artifact_paths,
+                    state=state,
                 ) + "\n=== RECONSIDER EARLY STOP ===\n"
                 + f"Previous recommendation: {result.text}\n"
                 + "The budget is not exhausted. Propose a distinct testable candidate, "

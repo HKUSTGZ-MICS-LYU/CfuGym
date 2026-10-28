@@ -12,7 +12,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, is_dataclass, replace
+from dataclasses import dataclass, field, is_dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -95,6 +95,41 @@ def _request_retry_delay(retry_index: int) -> int:
                LLM_REQUEST_RETRY_MAX_SECONDS)
 
 
+# A gateway may refuse the streaming options themselves. ``\bstream`` excludes
+# the very common "upstream error: <4xx/5xx>" wording, which is a different
+# failure: retrying it without stream= only spends a second rejected request.
+_STREAM_TOKEN = re.compile(r"\bstream(?:_options|ing)?\b", re.IGNORECASE)
+_STREAM_REFUSAL = re.compile(
+    r"\b(?:not\s+support(?:ed|s)?|unsupported|not\s+allowed|not\s+permitted|"
+    r"unknown|unrecognized|invalid|reject(?:ed|s)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _streaming_unsupported(exc: Exception) -> bool:
+    """True only when the error says the *streaming* request shape was refused."""
+    text = str(exc)
+    return bool(_STREAM_TOKEN.search(text) and _STREAM_REFUSAL.search(text))
+
+
+# Endpoints whose model group has no Responses route ("Not Found", or a model
+# that only serves chat completions). Remembered per process so every later
+# stage does not pay the same rejected probe before falling back.
+_RESPONSES_ROUTE_MISSING: set[tuple[str, str]] = set()
+_ROUTE_MISSING_TEXT = re.compile(
+    r"\b(?:not\s+found|no\s+route|does\s+not\s+exist|only\s+supports?\s+chat|"
+    r"supports?\s+chat\s+completions?)\b",
+    re.IGNORECASE,
+)
+
+
+def _responses_route_missing(exc: Exception) -> bool:
+    """True when the endpoint says Responses is not served for this model."""
+    if _request_status_code(exc) in {404, 405}:
+        return True
+    return bool(_ROUTE_MISSING_TEXT.search(str(exc)))
+
+
 def looks_like_tool_intent(text: str) -> bool:
     """True when a short answer only announces reading a file (no deliverable).
 
@@ -158,6 +193,8 @@ DEFAULT_STREAM = True
 _STREAM_EMIT_INTERVAL = 0.25
 # A stream callback receives {"stage", "phase", "chars", "tokens", "elapsed"}.
 _STREAM_CALLBACK: "Callable[[dict[str, Any]], None] | None" = None
+# A notice callback receives {"kind", "message", ...} for one-line CLI reminders.
+_NOTICE_CALLBACK: "Callable[[dict[str, Any]], None] | None" = None
 # Rough live token estimate for the progress line (the exact count arrives with
 # the provider's final usage chunk).
 _CHARS_PER_TOKEN = 4
@@ -191,6 +228,37 @@ def _emit_stream(
         pass
 
 
+def set_notice_callback(callback: "Callable[[dict[str, Any]], None] | None") -> None:
+    """Install the sink for one-line operator notices (None disables it).
+
+    Notices are things an operator must not have to dig through artifacts to
+    learn — today context compaction and a nearly full context window. Like the
+    stream callback, the sink is process-wide and installed by the CLI; library
+    callers and tests leave it unset, so nothing writes to stdout by accident.
+    """
+    global _NOTICE_CALLBACK
+    _NOTICE_CALLBACK = callback
+
+
+def _emit_notice(kind: str, message: str, **extra: Any) -> None:
+    callback = _NOTICE_CALLBACK
+    if callback is None:
+        return
+    try:
+        callback({"kind": kind, "message": message, **extra})
+    except Exception:  # pragma: no cover - a notice must never break a call
+        pass
+
+
+def _tokens_label(tokens: Any) -> str:
+    """Compact token count for a log line (121k rather than 121043)."""
+    try:
+        value = int(tokens)
+    except (TypeError, ValueError):
+        return "?"
+    return f"{value // 1000}k" if value >= 1000 else str(value)
+
+
 @dataclass
 class LlmResult:
     text: str
@@ -222,6 +290,10 @@ class LlmResult:
     # degraded to the fallback. This is an environment failure, never a design
     # defect, so a rung can report it without blaming the artifact.
     transport_error: str = ""
+    # Set when context compaction replaced completed tool batches before this
+    # call was sent. Reported so the stage line can show that the transcript the
+    # model saw is shorter than the run's history (and why).
+    context_compaction: dict[str, Any] = field(default_factory=dict)
 
 
 # --- Reasoning / thinking handling -----------------------------------------
@@ -464,6 +536,10 @@ def _object_value(value: Any, key: str) -> Any:
 def _reasoning_token_usage(usage: Any) -> int | None:
     details = _object_value(usage, "completion_tokens_details")
     value = _object_value(details, "reasoning_tokens")
+    if value is None:
+        # Responses reports the same count under output_tokens_details.
+        details = _object_value(usage, "output_tokens_details")
+        value = _object_value(details, "reasoning_tokens")
     return int(value) if value is not None else None
 
 
@@ -752,6 +828,296 @@ def _chat_round_from_stream(stream: Any) -> "_ChatRound":
     )
 
 
+def _message_text(content: Any) -> str:
+    """Flatten a transcript message's content to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "".join(_scalar_text(part) for part in content)
+    return str(content)
+
+
+def _responses_items(messages: Any) -> list[dict[str, Any]]:
+    """Translate the internal chat-format transcript into Responses input items.
+
+    The framework keeps exactly one transcript shape — assistant ``tool_calls``
+    plus ``role="tool"`` results — because budget compaction, source masking and
+    the request audit all operate on it. The Responses endpoint rejects that
+    shape (``Unknown parameter: 'input[N].tool_calls'``), so the wire form is
+    built here: assistant tool calls become native ``function_call`` items and
+    tool results become ``function_call_output`` items. Rotation is one-way; the
+    caller's messages are never mutated.
+    """
+    items: list[dict[str, Any]] = []
+    for index, message in enumerate(messages or []):
+        if not isinstance(message, dict):
+            raise context_budget.ContextBudgetError(f"message {index} is not an object")
+        role = str(message.get("role") or "")
+        if role in {"system", "developer", "user"}:
+            entry: dict[str, Any] = {"role": role, "content": _message_text(message.get("content"))}
+            # Chat-style name/priority hints are not part of the item schema.
+            if entry["content"]:
+                items.append(entry)
+        elif role == "assistant":
+            text = _message_text(message.get("content"))
+            if text:
+                items.append({"role": "assistant", "content": text})
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    raise context_budget.ContextBudgetError(f"invalid tool call at message {index}")
+                function = call.get("function") or {}
+                call_id = str(call.get("id") or "")
+                name = str(function.get("name") or "")
+                if not call_id or not name:
+                    raise context_budget.ContextBudgetError(
+                        f"incomplete tool call at message {index}: id and name are required")
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": str(function.get("arguments") or "{}"),
+                    }
+                )
+        elif role == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            if not call_id:
+                raise context_budget.ContextBudgetError(f"orphan tool result at message {index}")
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": _message_text(message.get("content")),
+                }
+            )
+        else:
+            raise context_budget.ContextBudgetError(
+                f"unsupported message role at message {index}: {role or '(none)'}")
+    return items
+
+
+def _responses_tools(tools: Any) -> list[dict[str, Any]]:
+    """Translate chat-format tool schemas into Responses tool definitions.
+
+    The two endpoints use different shapes: chat nests the function under
+    ``function``, while Responses wants ``{"type": "function", "name",
+    "description", "parameters"}``. Sending the chat shape to ``/responses`` is
+    rejected with HTTP 400 ("FunctionTool name: Field required") by providers
+    that validate strictly, even though some gateways normalize it.
+    """
+    converted: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if "function" not in tool:
+            converted.append(dict(tool))  # not a chat function tool
+            continue
+        function = tool.get("function") or {}
+        entry: dict[str, Any] = {"type": "function", "name": str(function.get("name") or "")}
+        if function.get("description"):
+            entry["description"] = function["description"]
+        if function.get("parameters") is not None:
+            entry["parameters"] = function["parameters"]
+        if function.get("strict") is not None:
+            entry["strict"] = function["strict"]
+        converted.append(entry)
+    return converted
+
+
+def _responses_function_calls(output_items: Any) -> list[Any]:
+    """Tool calls from a Responses ``output`` list, in emission order."""
+    calls = []
+    for item in output_items or []:
+        if str(getattr(item, "type", "") or "") != "function_call":
+            continue
+        calls.append(
+            SimpleNamespace(
+                id=str(getattr(item, "call_id", "") or getattr(item, "id", "") or ""),
+                type="function",
+                function=SimpleNamespace(
+                    name=str(getattr(item, "name", "") or ""),
+                    arguments=str(getattr(item, "arguments", "") or "{}"),
+                ),
+            )
+        )
+    return calls
+
+
+def _responses_text(output_items: Any) -> str:
+    """Answer text from a Responses ``output`` list (``output_text`` parts)."""
+    parts: list[str] = []
+    for item in output_items or []:
+        if str(getattr(item, "type", "") or "") != "message":
+            continue
+        for content in getattr(item, "content", None) or []:
+            if str(getattr(content, "type", "") or "") == "output_text":
+                parts.append(_scalar_text(content))
+    return "".join(parts)
+
+
+def _responses_round_from_response(response: Any) -> "_ChatRound":
+    """Shape a non-streamed Responses result like a chat round."""
+    output_items = getattr(response, "output", None) or []
+    text = _responses_text(output_items) or str(getattr(response, "output_text", "") or "")
+    calls = _responses_function_calls(output_items)
+    api_reasoning, api_source = _extract_responses_reasoning(response)
+    inp, out, total = _extract_usage(response, "responses")
+    usage = getattr(response, "usage", None)
+    message = SimpleNamespace(content=text or None, tool_calls=calls or None, reasoning_content=None)
+    return _ChatRound(
+        text=text,
+        reasoning=api_reasoning,
+        reasoning_source=_reasoning_source(api_source, ""),
+        finish_reason=str(getattr(response, "status", "") or ""),
+        extra_keys=_responses_item_types(response),
+        input_tokens=inp,
+        output_tokens=out,
+        total_tokens=total,
+        message=message,
+        cached_input_tokens=_cached_usage(usage, "responses"),
+        reasoning_tokens=_reasoning_token_usage(usage),
+    )
+
+
+def _responses_round_from_stream(stream: Any) -> "_ChatRound":
+    """Accumulate a Responses event stream into a ``_ChatRound``.
+
+    Text and reasoning arrive as deltas; a tool call arrives as an
+    ``output_item`` plus incremental ``function_call_arguments`` deltas, and its
+    complete arguments are normally repeated on ``output_item.done``. Both paths
+    are read so a gateway that omits either one still yields a usable call.
+    """
+    stage = current_stage()
+    started = time.monotonic()
+    _emit_stream(stage, "start", 0)
+    text_parts: list[str] = []
+    reason_parts: list[str] = []
+    calls: dict[str, dict[str, str]] = {}
+    call_order: list[str] = []
+    item_to_call: dict[str, str] = {}
+    delta_arguments: dict[str, list[str]] = {}
+    observed: set[str] = set()
+    usage = None
+    response = None
+    stream_error = ""
+    completed = False
+    last_emit = started
+
+    def slot(call_id: str, name: str = "") -> dict[str, str]:
+        if call_id not in calls:
+            calls[call_id] = {"name": name, "arguments": ""}
+            call_order.append(call_id)
+        elif name and not calls[call_id]["name"]:
+            calls[call_id]["name"] = name
+        return calls[call_id]
+
+    for event in stream:
+        etype = str(getattr(event, "type", "") or "")
+        if etype:
+            observed.add(etype)
+        if etype in ("error", "response.failed"):
+            detail = getattr(event, "message", "") or getattr(event, "error", "")
+            stream_error = str(detail or etype)
+        elif etype == "response.output_text.delta":
+            piece = getattr(event, "delta", "") or ""
+            if piece:
+                text_parts.append(str(piece))
+        elif etype in (
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        ):
+            piece = getattr(event, "delta", "") or ""
+            if piece:
+                reason_parts.append(str(piece))
+        elif etype in ("response.output_item.added", "response.output_item.done"):
+            item = getattr(event, "item", None)
+            if str(getattr(item, "type", "") or "") == "function_call":
+                call_id = str(getattr(item, "call_id", "") or "")
+                item_id = str(getattr(item, "id", "") or "")
+                if call_id:
+                    current = slot(call_id, str(getattr(item, "name", "") or ""))
+                    if item_id:
+                        item_to_call[item_id] = call_id
+                    arguments = str(getattr(item, "arguments", "") or "")
+                    if arguments:
+                        current["arguments"] = arguments
+        elif etype in (
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        ):
+            item_id = str(getattr(event, "item_id", "") or "")
+            piece = getattr(event, "delta", "") or getattr(event, "arguments", "") or ""
+            if item_id and piece:
+                delta_arguments.setdefault(item_id, []).append(str(piece))
+        elif etype in ("response.completed", "response.done", "response.incomplete"):
+            completed = True
+            response = getattr(event, "response", None)
+            if response is not None:
+                usage = getattr(response, "usage", None) or usage
+            else:
+                usage = getattr(event, "usage", None) or usage
+        now = time.monotonic()
+        if now - last_emit >= _STREAM_EMIT_INTERVAL:
+            last_emit = now
+            _emit_stream(
+                stage,
+                "content",
+                len("".join(text_parts)),
+                thinking_chars=len("".join(reason_parts)),
+            )
+
+    if stream_error:
+        raise RuntimeError(f"responses stream error: {stream_error}")
+    if not completed and not text_parts and not reason_parts and not call_order:
+        # Mirror the plain-text Responses path: an empty/error SSE stream lets
+        # api_mode=auto fall back to chat instead of returning a blank round.
+        raise RuntimeError("responses stream produced no content")
+
+    for call_id in call_order:
+        current = calls[call_id]
+        if current["arguments"]:
+            continue
+        for item_id, mapped in item_to_call.items():
+            if mapped == call_id and item_id in delta_arguments:
+                current["arguments"] = "".join(delta_arguments[item_id])
+                break
+        if not current["arguments"]:
+            current["arguments"] = "{}"
+
+    text = "".join(text_parts)
+    thinking = "".join(reason_parts).strip()
+    tool_calls = [
+        SimpleNamespace(
+            id=call_id,
+            type="function",
+            function=SimpleNamespace(
+                name=calls[call_id]["name"],
+                arguments=calls[call_id]["arguments"],
+            ),
+        )
+        for call_id in call_order
+    ]
+    message = SimpleNamespace(content=text or None, tool_calls=tool_calls or None,
+                              reasoning_content=None)
+    inp, out, total = _usage_counts(usage, "responses")
+    api_source = "responses.reasoning_summary.delta" if thinking else ""
+    return _ChatRound(
+        text=text,
+        reasoning=thinking,
+        reasoning_source=_reasoning_source(api_source, ""),
+        finish_reason=str(getattr(response, "status", "") or ""),
+        extra_keys=("stream",) + tuple(sorted(observed)),
+        input_tokens=inp,
+        output_tokens=out,
+        total_tokens=total,
+        message=message,
+        cached_input_tokens=_cached_usage(usage, "responses"),
+        reasoning_tokens=_reasoning_token_usage(usage),
+    )
+
+
 class OpenAiTextClient:
     """OpenAI-compatible text client.
 
@@ -780,11 +1146,22 @@ class OpenAiTextClient:
                               if cfg.get(key) is not None}
         self._window = None
         self._last_budget_metadata: dict[str, Any] = {}
+        # Compaction that applied to the most recent round, so a result can
+        # report that the model saw a shortened transcript.
+        self._last_compaction: dict[str, Any] = {}
+        # Emit the "nearly full" notice once per climb above 80%, not per round.
+        self._context_warned = False
         self._last_request_id: str | None = None
         self._request_attempt = 0
         self._previous_payload: str | None = None
         mode = cfg.get("api_mode") or os.environ.get("CFU_AGENT_LLM_API") or "auto"
         self.api_mode = str(mode).lower() if isinstance(mode, str) else "auto"
+        # Endpoint selection for tool rounds: ``auto`` prefers the Responses API
+        # and falls back to chat completions once, remembering the reason so a
+        # whole stage does not keep paying a rejected request every round.
+        self._responses_unsupported = False
+        self._responses_fallback_reason = ""
+        self._last_round_mode = "chat"
         # Thinking defaults to off: no reasoning parameter is sent unless the
         # config sets "thinking": true or an explicit effort (mirrors
         # resolve_config, so direct client construction behaves the same).
@@ -846,6 +1223,8 @@ class OpenAiTextClient:
 
     def _budget_messages(self, messages, *, tools=None, response_config=None, sdk=None):
         window = self._context_window(sdk)
+        # Only the round being sent now may claim a compaction.
+        self._last_compaction = {}
         status = context_budget.evaluate_budget(
             messages, tools=tools, response_config=response_config, window=window)
         self._last_budget_metadata = {
@@ -872,9 +1251,42 @@ class OpenAiTextClient:
                 level=status.level)
             request_audit.record_event("compaction", {
                 "stage": current_stage(), "model": self.model, **self._last_budget_metadata})
+            before_total = self._last_budget_metadata.get("before_total_tokens")
+            stage = current_stage()
+            self._last_compaction = {
+                "removed_batches": reduced.removed_batches,
+                "before_total_tokens": before_total,
+                "after_total_tokens": status.total_tokens,
+                "window_tokens": window.window_tokens,
+                "level": status.level,
+                "stage": stage,
+            }
+            # Back under the threshold: a later climb to 80% is a new warning.
+            self._context_warned = False
+            batches = reduced.removed_batches
+            _emit_notice(
+                "context.compaction",
+                f"context compacted: removed {batches} completed tool "
+                f"batch{'' if batches == 1 else 'es'}, est. "
+                f"{_tokens_label(before_total)} -> {_tokens_label(status.total_tokens)} tokens "
+                f"(level {status.level}, stage {stage or '?'})",
+                **self._last_compaction,
+            )
         elif status.level == "warning":
             request_audit.record_event("context_warning", {
                 "stage": current_stage(), "model": self.model, **self._last_budget_metadata})
+            if not self._context_warned:
+                self._context_warned = True
+                stage = current_stage() or "?"
+                _emit_notice(
+                    "context.warning",
+                    f"context {int(round(status.utilization * 100))}% full: est. "
+                    f"{_tokens_label(status.total_tokens)} / "
+                    f"{_tokens_label(window.window_tokens)} tokens "
+                    f"(compaction starts at 90%, stage {stage})",
+                    stage=stage, total_tokens=status.total_tokens,
+                    window_tokens=window.window_tokens, level=status.level,
+                )
         return messages, status
 
     def _chat_reasoning_kwargs(self) -> dict[str, Any]:
@@ -955,7 +1367,7 @@ class OpenAiTextClient:
         is_deliverable: Callable[[str], bool] | None = None,
         on_tool_call: Callable[[dict[str, Any]], None] | None = None,
     ) -> LlmResult:
-        """Run a bounded tool-calling loop over chat completions.
+        """Run a bounded tool-calling loop over the configured endpoint.
 
         The model may call ``tools`` for at most ``max_rounds`` rounds and
         ``max_total_calls`` calls overall (0 disables the total cap). Each round
@@ -965,9 +1377,12 @@ class OpenAiTextClient:
         explicit reminder to deliver, and is returned in ``LlmResult.text`` with
         the transcript in ``LlmResult.tool_calls``.
 
-        Implemented on the chat-completions path because that is what
-        OpenAI-compatible gateways expose. An endpoint that rejects the tools
-        payload fails explicitly rather than silently answering without tools.
+        Rounds follow ``api_mode`` through :meth:`model_round`: the Responses API
+        when available, chat completions otherwise. The transcript stays in
+        chat format throughout, so compaction, masking and the audit are shared by
+        both endpoints. An endpoint that rejects the tools payload fails
+        explicitly (or degrades to chat under ``auto``) rather than silently
+        answering without tools.
         """
         if not self.available:
             return LlmResult(fallback, used_llm=False)
@@ -1000,7 +1415,7 @@ class OpenAiTextClient:
                 # One explicit nudge before the forced final answer.
                 messages.append({"role": "user", "content": tool_budget_reminder(deliverable_hint)})
             try:
-                round_ = self._chat_round(
+                round_ = self.model_round(
                     client,
                     messages,
                     allow_tools=allow_tools,
@@ -1013,6 +1428,7 @@ class OpenAiTextClient:
                 raise RuntimeError(
                     f"tool-enabled model request failed: {type(exc).__name__}: {exc}"
                 ) from exc
+            mode = self._last_round_mode + ("+tools" if allow_tools else "")
 
             messages = list(getattr(self, "_prepared_messages", messages))
             inp, out, total = round_.input_tokens, round_.output_tokens, round_.total_tokens
@@ -1080,6 +1496,8 @@ class OpenAiTextClient:
                         extra_keys=round_.extra_keys,
                         tool_calls=tuple(transcript),
                         tool_rounds=tool_rounds,
+                        fallback_reason=self._responses_fallback_reason,
+                        context_compaction=dict(self._last_compaction),
                     )
                 )
 
@@ -1324,6 +1742,7 @@ class OpenAiTextClient:
             reasoning_source=_reasoning_source(api_source, inline),
             extra_keys=_responses_item_types(response),
             fallback_reason=fallback_reason,
+            context_compaction=dict(self._last_compaction),
         )
         return clean_llm_text(result)
 
@@ -1449,7 +1868,7 @@ class OpenAiTextClient:
                         raise
                     time.sleep(_request_retry_delay(retry_index))
                     continue
-                if "stream" not in str(exc).lower():
+                if not _streaming_unsupported(exc):
                     # Not a streaming compatibility problem (for example the
                     # tools payload was rejected); preserve the original error.
                     raise
@@ -1496,6 +1915,170 @@ class OpenAiTextClient:
             return round_
         raise AssertionError("unreachable: bounded chat stream retry loop exhausted")
 
+    def _responses_round(
+        self,
+        client,
+        messages: list[dict[str, Any]],
+        *,
+        allow_tools: bool,
+        tools: list[dict[str, Any]] | None,
+        response_format: dict[str, Any] | None = None,
+    ) -> "_ChatRound":
+        """One Responses round returned in the same shape as ``_chat_round``.
+
+        Keeps every framework invariant on the chat-format transcript: source
+        masking and context compaction still run on ``messages`` before the
+        one-way translation to Responses items.
+        """
+        kwargs: dict[str, Any] = {
+            "max_output_tokens": self._context_window(client).output_reserve_tokens,
+        }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.timeout:
+            kwargs["timeout"] = self.timeout
+        if allow_tools and tools:
+            # /responses uses the flat tool shape, not the chat ``function`` nesting.
+            kwargs["tools"] = _responses_tools(tools)
+            kwargs["tool_choice"] = "auto"
+        elif response_format is not None:
+            kwargs["text"] = {"format": response_format}
+        if self.thinking:
+            reasoning: dict[str, Any] = {}
+            if self.reasoning_effort:
+                reasoning["effort"] = self.reasoning_effort
+            if self.reasoning_summary:
+                reasoning["summary"] = self.reasoning_summary
+            kwargs["reasoning"] = reasoning or {"effort": DEFAULT_REASONING_EFFORT}
+        messages, budget = self._budget_messages(
+            source_visibility.mask_model_payload(messages),
+            tools=kwargs.get("tools"),
+            response_config={k: v for k, v in kwargs.items() if k not in {"tools", "timeout"}},
+            sdk=client,
+        )
+        self._prepared_messages = messages
+        body = {"model": self.model, "input": _responses_items(messages), **kwargs}
+        if not self.stream:
+            response, _ = self._sdk_request(client, "responses", body, budget=budget)
+            return _responses_round_from_response(response)
+        stream_body = {**body, "stream": True}
+        for retry_index in range(LLM_REQUEST_MAX_RETRIES + 1):
+            try:
+                stream, request_id = self._sdk_request(
+                    client, "responses", stream_body, budget=budget, max_retries=0)
+            except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
+                raise
+            except Exception as exc:
+                if _is_retryable_request_error(exc):
+                    if retry_index >= LLM_REQUEST_MAX_RETRIES:
+                        raise
+                    time.sleep(_request_retry_delay(retry_index))
+                    continue
+                if not _streaming_unsupported(exc):
+                    # Not a streaming-compatibility problem (for example the
+                    # tools payload was rejected); preserve the original error
+                    # so api_mode=auto can decide whether to fall back.
+                    raise
+                response, _ = self._sdk_request(client, "responses", body, budget=budget)
+                round_ = _responses_round_from_response(response)
+                round_.fallback_reason = f"streaming unavailable: {type(exc).__name__}: {exc}"
+                return round_
+            if hasattr(stream, "output") or hasattr(stream, "output_text"):
+                # Some gateways ignore stream=True and return the whole response.
+                round_ = _responses_round_from_response(stream)
+                round_.fallback_reason = "streaming ignored by the endpoint"
+                return round_
+            try:
+                round_ = _responses_round_from_stream(stream)
+            except Exception as exc:
+                if "produced no content" in str(exc):
+                    # A gateway can answer a streaming request with a single SSE
+                    # error object that the SDK's typed parser drops, leaving an
+                    # empty stream. One non-streaming attempt recovers the real
+                    # status/message (for example the 404 that says this model
+                    # group has no /responses route) instead of reporting only
+                    # "no content".
+                    response, _ = self._sdk_request(client, "responses", body, budget=budget)
+                    return _responses_round_from_response(response)
+                retry = (retry_index < LLM_REQUEST_MAX_RETRIES
+                         and _is_retryable_request_error(exc))
+                error = {"type": type(exc).__name__}
+                status = _request_status_code(exc)
+                if status is not None:
+                    error["status_code"] = status
+                if retry:
+                    delay = _request_retry_delay(retry_index)
+                    error.update(retry_number=retry_index + 1, retry_delay_seconds=delay)
+                request_audit.record_result(request_id, error=error)
+                if not retry:
+                    raise
+                time.sleep(delay)
+                continue
+            request_audit.record_result(
+                request_id,
+                result={"status": "completed", "input_tokens": round_.input_tokens,
+                        "output_tokens": round_.output_tokens,
+                        "cached_input_tokens": round_.cached_input_tokens},
+                metadata={"reasoning_chars": len(round_.reasoning),
+                          "reasoning_source": round_.reasoning_source,
+                          "reasoning_tokens": round_.reasoning_tokens,
+                          "response_extra_keys": list(round_.extra_keys)},
+            )
+            return round_
+        raise AssertionError("unreachable: bounded responses stream retry loop exhausted")
+
+    def model_round(
+        self,
+        client,
+        messages: list[dict[str, Any]],
+        *,
+        allow_tools: bool,
+        tools: list[dict[str, Any]] | None,
+        response_format: dict[str, Any] | None = None,
+    ) -> "_ChatRound":
+        """One model round on the configured endpoint, for any tool loop.
+
+        ``api_mode`` means what it means for :meth:`complete`: ``responses``
+        pins the Responses API, ``chat`` pins chat completions, and ``auto``
+        prefers Responses, falling back to chat completions once when the
+        endpoint or model rejects the Responses request. The fallback is
+        remembered on the client, so later rounds go straight to chat instead
+        of spending a rejected request each turn.
+        """
+        if self.api_mode == "chat" or self._responses_unsupported or (
+                (self.base_url or "", self.model) in _RESPONSES_ROUTE_MISSING):
+            round_ = self._chat_round(
+                client, messages, allow_tools=allow_tools, tools=tools,
+                response_format=response_format,
+            )
+            self._last_round_mode = "chat"
+            return round_
+        try:
+            round_ = self._responses_round(
+                client, messages, allow_tools=allow_tools, tools=tools,
+                response_format=response_format,
+            )
+            self._last_round_mode = "responses"
+            return round_
+        except (context_budget.ContextBudgetError, request_audit.RequestAuditError):
+            raise
+        except Exception as exc:
+            if self.api_mode != "auto" or _is_retryable_request_error(exc):
+                raise
+            self._responses_unsupported = True
+            self._responses_fallback_reason = (
+                f"responses unavailable: {type(exc).__name__}: {exc}"
+            )
+            if _responses_route_missing(exc):
+                # Not a per-call accident: this model group has no route.
+                _RESPONSES_ROUTE_MISSING.add((self.base_url or "", self.model))
+            round_ = self._chat_round(
+                client, messages, allow_tools=allow_tools, tools=tools,
+                response_format=response_format,
+            )
+            self._last_round_mode = "chat"
+            return round_
+
     def _chat(
         self,
         client,
@@ -1527,5 +2110,6 @@ class OpenAiTextClient:
             reasoning_source=round_.reasoning_source,
             extra_keys=round_.extra_keys,
             fallback_reason=round_.fallback_reason,
+            context_compaction=dict(self._last_compaction),
         )
         return clean_llm_text(result)

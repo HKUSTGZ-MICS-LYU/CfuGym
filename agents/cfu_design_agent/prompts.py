@@ -21,7 +21,7 @@ from typing import Any, Iterable, Mapping
 
 import yaml
 
-from .runtime import source_visibility
+from .runtime import cost_budget, source_visibility
 from .runtime.llm import DEFAULT_MAX_TOOL_CALLS_PER_ROUND
 from .runtime.tools import RUN_DIR_TOKEN, virtualize_run_paths
 from .state import RepoContext, WorkloadSpec
@@ -442,6 +442,23 @@ def working_directory_block(
     return "## Where you are\n" + "\n".join(lines)
 
 
+def cost_wall_guidance(state: Mapping[str, Any] | None = None) -> str:
+    """State-aware design reminder, kept after the cache-stable shared prefix."""
+    cap = cost_budget.max_cells(state or {})
+    return (
+        "## Cost Wall\n"
+        f"The active budget is at most {cap} mapped Yosys generic cells "
+        "(`max_yosys_cells`). This generic mapped-cell budget is not an FPGA LUT "
+        "count or device capacity; do not equate them. Plan for it now: keep the "
+        "datapath compact, limit parallel lane count and unrolling, and use multicycle "
+        "resource sharing instead of replicating expensive arithmetic or large muxes. "
+        "Preserve the required semantic input domain and exact correctness, including "
+        "widths, signedness, overflow, tails and state effects. Never meet the cap by "
+        "narrowing semantics or using fixture-specific shortcuts. An estimate or "
+        "design plan is not measured synthesis evidence."
+    )
+
+
 def stage_brief(
     stage: str,
     *,
@@ -458,6 +475,7 @@ def stage_brief(
     resolved_failure_ids: list[str] | None = None,
     tools_note: str = "",
     shared: str = "",
+    design_guidance: str = "",
     tool_usage: dict[str, str] | None = None,
 ) -> str:
     """The stage brief, ordered stable-first so the provider can cache the head.
@@ -469,7 +487,7 @@ def stage_brief(
        skips or artifacts);
     3. ``shared`` — digests every design stage renders byte-identically
        (``workload_digest_block``);
-    4. the stage block proper: ``## Stage``, tools, ``## Deliverable``, this
+    4. the stage block proper: ``## Stage``, design guidance, tools, ``## Deliverable``, this
        stage's artifact paths, notes, and (without a tool loop) the file bodies.
 
     Prefix caching compares the serialized request from its first byte, so a
@@ -489,6 +507,8 @@ def stage_brief(
     if shared.strip():
         parts.append(shared.strip())
     parts.append(f"## Stage: {stage}")
+    if design_guidance.strip():
+        parts.append(design_guidance.strip())
     if agent_tools:
         tools = tool_list_block(
             tool_names,
@@ -625,6 +645,7 @@ def workload_prompt(
     ir_views: bool = True,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
     feedback: str = "",
+    state: Mapping[str, Any] | None = None,
 ) -> str:
     run_root = str((context or {}).get("run_root", "") or "")
     # Analysis is advisory evidence, not a source-generation contract. Prefer a
@@ -687,6 +708,7 @@ def workload_prompt(
         )
     brief = stage_brief(
         "workload analysis",
+        design_guidance=cost_wall_guidance(state),
         deliverable=deliverable,
         context=context,
         tool_names=tool_names,
@@ -731,6 +753,7 @@ def contract_prompt(
     agent_tools: bool = False,
     tool_rounds: int = 0,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
+    state: Mapping[str, Any] | None = None,
 ) -> str:
     analysis = source_visibility.mask_model_payload(analysis)
     run_root = str((context or {}).get("run_root", "") or "").rstrip("/")
@@ -757,6 +780,7 @@ def contract_prompt(
         )
     brief = stage_brief(
         "CFU ISA contract",
+        design_guidance=cost_wall_guidance(state),
         deliverable=(
             "One YAML mapping defining a minimal, evidence-based CFU contract. Do not "
             f"abstain; record uncertainty in the contract. The harness writes it to `{contract_path}`."
@@ -1093,6 +1117,7 @@ def hardware_prompt(
     diagnosis_required: bool = False,
     contract_free: bool = False,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
+    state: Mapping[str, Any] | None = None,
 ) -> str:
     """Prompt for the hardware rung: AgentCfu.scala / AgentCfuFiber.scala only."""
     analysis = source_visibility.mask_model_payload(analysis)
@@ -1122,6 +1147,7 @@ def hardware_prompt(
             tools_note += " In repair mode, submit the repair diagnosis before the first edit."
     brief = stage_brief(
         "hardware design",
+        design_guidance=cost_wall_guidance(state),
         deliverable=deliverable,
         context=context,
         tool_names=tool_names,
@@ -1341,6 +1367,7 @@ def optimization_prompt(
     run_root: str = "",
     contract_free: bool = False,
     artifact_paths: Iterable[str | tuple[str, str]] = (),
+    state: Mapping[str, Any] | None = None,
 ) -> str:
     """Ask whether another round should improve speed or hardware cost (PPA).
 
@@ -1367,6 +1394,7 @@ def optimization_prompt(
         )
     brief = stage_brief(
         "optimization decision",
+        design_guidance=cost_wall_guidance(state),
         deliverable="One JSON object with the continue/target/focus/reason decision.",
         workdir=workdir,
         run_root=run_root,

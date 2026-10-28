@@ -5,10 +5,32 @@ from __future__ import annotations
 from pathlib import Path
 
 from ...flow import gates, ladder, outcome
-from ...runtime import effects, commands, dependencies, rtl_snapshot, stage_services, validation_parallel
+from ...runtime import cost_budget, effects, commands, dependencies, rtl_snapshot, stage_services, validation_parallel
 from ...runtime.tools import SOC_WORKSPACE_SUBDIR
 from ...stages.verify import software
 from ...state import CfuDesignState
+
+
+def _check_cost_wall(state: CfuDesignState, result: dict, *, top: str,
+                     summary_path: str) -> dict:
+    parsed = result.get("parsed")
+    if not isinstance(parsed, dict):
+        parsed = {}
+    wall = cost_budget.check(state, parsed.get("cost"), top=top, summary_path=summary_path)
+    parsed["cost_wall"] = wall
+    result["parsed"] = parsed
+    return wall
+
+
+def _cost_wall_failure(state: CfuDesignState, wall: dict, errors: list[str]) -> dict:
+    result = stage_services.gate_failure_result(
+        state, "cost", wall["code"], errors, category=wall["code"])
+    result["parsed"] = {"cost_wall": wall}
+    # The authoritative record is the cost artifact, not a nonexistent validation file.
+    result["log_path"] = f"{state.get('run_root', '')}/11_cost/result.yaml"
+    if result.get("failure_observation"):
+        result["failure_observation"]["log_path"] = result["log_path"]
+    return result
 
 
 def estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesignState:
@@ -66,6 +88,8 @@ def estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesig
 
     results: list[dict] = []
     errors: list[str] = []
+    wall: dict = {}
+    cancelled = False
     if not execute:
         for argv in [*generator_commands, yosys_command]:
             results.append(toolbox.run_command(argv, execute=False))
@@ -76,37 +100,50 @@ def estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesig
         for argv in generator_commands:
             result = effects.run_command(state, toolbox, argv, stage="cost", rung="cost", timeout=1800, mutate=True)
             results.append(result)
+            if result.get("cancelled"):
+                cancelled = True
+                break
             if result.get("returncode") not in (0, None):
                 errors.append(f"CFU generation failed: {' '.join(argv)[:200]}")
                 break
-        if not errors and generator_commands and not software._rtl_ready(workdir, rtl):
+        if not cancelled and not errors and generator_commands and not software._rtl_ready(workdir, rtl):
             errors.append(f"CFU generation produced no Verilog under {rtl}")
-        if not errors:
+        if not cancelled and not errors:
             result = effects.run_command(state, toolbox, yosys_command, stage="cost", rung="cost", timeout=1800, mutate=True)
             results.append(result)
-            if result.get("returncode") not in (0, None):
+            if result.get("cancelled"):
+                cancelled = True
+            elif result.get("returncode") not in (0, None):
                 errors.append(f"Yosys cost estimation failed: {' '.join(yosys_command)[:200]}")
-        ok = not errors and bool(results) and all(item.get("returncode") == 0 for item in results)
+            elif result.get("returncode") == 0:
+                wall = _check_cost_wall(
+                    state, result, top=commands.cost_top_for_spec(spec, task, agent_cfu=agent_cfu),
+                    summary_path=f"{out_dir}/summary.json")
+                if not wall["ok"]:
+                    errors.append(wall["reason"])
+                    results.append(_cost_wall_failure(state, wall, errors))
+        ok = not cancelled and not errors and bool(results) and all(item.get("returncode") == 0 for item in results)
 
-    if not ok and execute and not transition:
+    if not ok and execute and not cancelled and not transition:
         validation_parallel.command_failed()
-    reason = "; ".join(errors)[:400] if errors else ""
+    reason = "; ".join(errors)[:800] if errors else ""
     stage_services._write_cost_artifact(
-        state, results, "passed" if ok else ("planned" if not execute else "failed"), reason
+        state, results, "cancelled" if cancelled else "passed" if ok else ("planned" if not execute else "failed"), reason
     )
     extra, next_node = ({}, None)
     if transition:
         extra, next_node = ladder._ladder_transition(
             state, "cost", ok=ok, default="review_and_route",
-            repair_target="implement", skipped=not execute,
+            repair_target="implement", skipped=not execute or cancelled,
         )
     update = {
         "cost_results": results,
         "stage_jobs": "review",
-        "errors": errors,
+        "errors": errors if not cancelled else [],
         **outcome.stage_result(
             state, rung="cost", ok=ok, skipped=not execute, next=next_node,
             reason=reason or ("" if execute else "execution-disabled"),
+            cancelled=cancelled, cost_wall=wall,
             rtl=rtl, round=int(state.get("optimization_round", 0) or 0),
             history="Ran Yosys cost estimation.",
         ),
@@ -127,6 +164,7 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
     errors: list[str] = []
     ppa: dict = {}
     yosys_evidence: dict = {}
+    wall: dict = {}
     cancelled = False
     run = str(state.get("run_root") or "")
     evaluation_id = str(state.get("evaluation_id") or f"cost-{uuid.uuid4().hex}")
@@ -192,13 +230,18 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
                     errors.append(
                         f"Yosys pre-synthesis failed (returncode={result.get('returncode')}); Vivado was not started")
                 else:
-                    metrics = (result.get("parsed") or {}).get("cost") or {}
+                    wall = _check_cost_wall(
+                        state, result, top=yosys_top, summary_path=f"{yosys_out}/summary.json")
+                    metrics = result["parsed"].get("cost")
                     yosys_evidence = {
-                        "status": "passed", "top": yosys_top, "metrics": dict(metrics),
-                        "summary_path": f"{yosys_out}/summary.json",
+                        "status": "passed", "top": yosys_top,
+                        "metrics": dict(metrics) if isinstance(metrics, dict) else {},
+                        "summary_path": f"{yosys_out}/summary.json", "cost_wall": wall,
                     }
+                    if not wall["ok"]:
+                        errors.append(f"{wall['reason']} Vivado was not started.")
 
-            # Expensive vendor implementation is strictly downstream of successful Yosys.
+            # Expensive vendor implementation requires both successful Yosys and a passing Cost Wall.
             if not cancelled and not errors:
                 argv = vivado.build_command(state, snapshot["root"], vivado_out)
                 result = effects.run_command(
@@ -234,7 +277,8 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
     if errors and not cancelled:
         if not transition:
             validation_parallel.command_failed()
-        results.append(stage_services.gate_failure_result(state, "cost", "fpga_ppa", errors))
+        results.append(_cost_wall_failure(state, wall, errors) if wall and not wall["ok"]
+                       else stage_services.gate_failure_result(state, "cost", "fpga_ppa", errors))
     for result in results:
         result["evaluation_id"] = evaluation_id
     reason = "; ".join(errors)[:800] if errors else reason
@@ -249,7 +293,8 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
               **outcome.stage_result(
                   state, rung="cost", ok=ok, skipped=skipped, next=next_node,
                   reason=reason, cancelled=cancelled, backend="vivado", evaluation_id=evaluation_id,
-                  ppa=ppa, input_sha256=cost_input,
+                  ppa=ppa, input_sha256=cost_input, cost_wall=wall, yosys_precheck=yosys_evidence,
                   round=int(state.get("optimization_round", 0) or 0),
-                  history="Passed Yosys pre-synthesis before whole-SoC Vivado PPA (CFU hierarchy attribution).")}
+                  history=("Passed Yosys pre-synthesis and Cost Wall before whole-SoC Vivado PPA."
+                            if ok else "Vivado cost evaluation did not pass; see cost gate evidence."))}
     return ladder._apply_transition(update, extra)

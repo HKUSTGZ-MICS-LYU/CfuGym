@@ -17,7 +17,7 @@ from .flow import instrument, policies, wiring
 from .flow.instrument import STAGE_ORDER, disable_progress, enable_progress, progress
 from .flow.ladder import _route_after_analysis, _route_after_cost, _route_after_hw_build, _route_after_hw_conformance, _route_after_implement, _route_after_isa, _route_after_prepare, _route_after_profile, _route_after_review, _route_after_sim, _route_after_sw_build, _route_after_validation, _route_input_target
 from .flow.wiring import NODE_NAMES, ROUTER_NAMES, ROUTE_TARGETS, SUCCESSORS as FLOW_SUCCESSORS
-from .runtime import dependencies, failures, llm, persistence, tools
+from .runtime import cost_budget, dependencies, failures, llm, persistence, tools
 from .runtime.llm import LlmResult
 from .runtime.persistence import PersistenceRiskError
 from .runtime.policy import PolicyError
@@ -72,6 +72,7 @@ def run_agent(
     journal and refuses uncertain effects rather than reapplying them blindly.
     """
     llm.reset_usage_log()
+    initial_state = dict(initial_state, max_yosys_cells=cost_budget.max_cells(initial_state))
     if resume and not checkpoint:
         raise ValueError("resume requires persistent checkpointing")
     run_id = str(initial_state.get("run_id", "") or "")
@@ -93,7 +94,8 @@ def run_agent(
                 # Historical defaults interpret missing checkpoint fields; never
                 # retarget an old run when the default for new runs changes.
                 defaults = {"cost_backend": "yosys", "fpga_part": "xc7a200tsbg484-1", "target_frequency_mhz": 100.0,
-                            "eda_timeout": 3600, "vivado_threads": 4, "validation_mode": "serial"}
+                            "eda_timeout": 3600, "vivado_threads": 4, "validation_mode": "serial",
+                            "max_yosys_cells": cost_budget.DEFAULT_MAX_CELLS}
                 for key, value in (initial_state.get("resume_eda_options") or {}).items():
                     if value != previous.get(key, defaults.get(key)):
                         raise PersistenceRiskError(f"resume cannot change recorded EDA configuration: {key}")
@@ -113,9 +115,14 @@ def run_agent(
                         "manual reconciliation is required before resume"
                     )
                 try:
+                    resumed_max_cells = cost_budget.max_cells(previous)
                     dependencies.completed_gate_inputs(previous, resume=True)
                 except ValueError as exc:
                     raise PersistenceRiskError(str(exc)) from exc
+                if "max_yosys_cells" not in previous:
+                    # Native state update records the legacy default without
+                    # replaying nodes or grandfathering pre-wall cost evidence.
+                    app.update_state(persisted.config, {"max_yosys_cells": resumed_max_cells})
                 graph_input = None
                 max_iters = int(previous.get("max_iters", 2) or 2)
             else:

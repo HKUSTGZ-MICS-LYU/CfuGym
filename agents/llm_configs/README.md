@@ -80,9 +80,9 @@ behaves exactly as before. Opt in per config:
   Responses API returns only a summary, and only when `reasoning.summary` is set;
   that is why `reasoning_summary` defaults to `auto`. With `summary` unset the
   provider returns empty reasoning items, so no thinking can be captured. The
-  chat-completions path on Azure returns no reasoning at all, so tool-using
-  stages, which run on chat, have no thinking to record with that provider; use a
-  provider that returns `reasoning_content` in chat if you need it there.
+  chat-completions path on Azure returns no reasoning at all. Tool-using stages
+  follow `api_mode`, so pick a config whose active route returns reasoning (or a
+  provider that returns `reasoning_content` in chat) when you need thinking there.
 - `api_mode: auto` tries Responses first and falls back to chat when that route
   is unavailable (some gateway model groups have no `/responses`, e.g.
   `DeepSeek-V4-Flash` returns 404, or returns an empty event stream). The reason
@@ -136,3 +136,15 @@ the file is tracked, so inline keys would be committed.
 - `chat`: `client.chat.completions.create` (OpenAI-compatible chat endpoints).
 - `auto`: try `responses`, then fall back to `chat` if the endpoint does not
   support it.
+
+The setting governs plain completions *and* tool-using rounds. Tool rounds keep
+the framework's chat-format transcript internally and translate it to Responses
+items (`function_call` / `function_call_output`) at the wire boundary, so budget
+compaction, source masking and the request audit behave the same on both
+endpoints. `auto` also covers models that refuse function tools on chat
+completions ("Function tools with reasoning_effort are not supported ... use
+/v1/responses or set reasoning_effort to 'none'"): the round moves to the
+Responses route, and a genuinely unsupported route is remembered for the rest of
+the run and reported as `fallback_reason`. Pin `chat` when a model's Responses
+route is worse (see the GLM/Kimi note above); pin `responses` to surface a
+rejection instead of degrading to chat.

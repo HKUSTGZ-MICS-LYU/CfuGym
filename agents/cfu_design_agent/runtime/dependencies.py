@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .tools import design_workspace_paths
-from . import vivado
+from . import cost_budget, vivado
 
 
 DOWNSTREAM = {
@@ -112,6 +112,12 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
                             "yosys_runner": _source_hash(root, "skills/cfu-designer/scripts/yosys_cost_report.py"),
                             "vivado_runner": _source_hash(root, "skills/cfu-designer/scripts/vivado_ppa_report.py"),
                             "tcl": _source_hash(root, "skills/cfu-designer/scripts/vivado_ppa.tcl")})
+    # Budget policy affects cost acceptance only, never HW/simulation evidence.
+    # Wrap both backends, including legacy/missing state defaults, so a pre-wall
+    # cost pass cannot satisfy the current Cost Wall without revalidation.
+    cost_input = _hash({"cost": cost_input,
+                        "max_yosys_cells": cost_budget.max_cells(state),
+                        "cost_wall_version": cost_budget.VERSION})
     return {
         "analysis": analysis, "isa": isa, "implementation_hw": hw_input,
         "hw_build": hw_input, "hw_conformance": checked,

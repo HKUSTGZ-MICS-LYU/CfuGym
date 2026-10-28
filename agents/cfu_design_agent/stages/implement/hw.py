@@ -154,6 +154,7 @@ def implement_hw(state: CfuDesignState) -> CfuDesignState:
         diagnosis_required=bool(feedback),
         contract_free=not state.get("isa_contract", True),
         artifact_paths=_hardware_evidence_paths(state),
+        state=state,
     )
     fallback = fallbacks.deterministic_hardware_plan(state["task"], state.get("design_contract", ""))
     result, raw_output, tool_calls = llm_step._run_agent_step(

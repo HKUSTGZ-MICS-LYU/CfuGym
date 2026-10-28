@@ -80,6 +80,7 @@ def analyze_workload(state: CfuDesignState) -> CfuDesignState:
         observation_index=observation_index,
         ir_views=ir_views,
         artifact_paths=_evidence_paths(state),
+        state=state,
         feedback=_repair_feedback(state) + feedback_mod.upstream_repair_feedback(state),
     )
     result, raw_output, tool_calls = llm_step._run_agent_step(

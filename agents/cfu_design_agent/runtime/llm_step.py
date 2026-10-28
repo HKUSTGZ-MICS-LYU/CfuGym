@@ -22,6 +22,22 @@ from ..state import CfuDesignState
 _PROMPT_WARN_CHARS = 40_000
 
 
+def _fallback_note(reason: str) -> str:
+    """One short suffix for the per-call line, naming *what* degraded.
+
+    Two different fallbacks share ``fallback_reason``: an endpoint switch
+    (Responses refused, chat used instead) and a streaming downgrade. Reporting
+    both as "streaming fell back" hid a rejected endpoint probe behind a
+    transport detail, so name the actual one.
+    """
+    text = str(reason or "")
+    if not text:
+        return ""
+    if "responses unavailable" in text:
+        return " (endpoint fell back to chat)"
+    return " (streaming fell back)"
+
+
 def _llm(state: CfuDesignState) -> OpenAiTextClient:
     workdir = Path(state.get("workdir", ".")).resolve()
     config_name = state.get("llm_config") or os.environ.get("CFU_AGENT_LLM_CONFIG") or "default"
@@ -121,6 +137,9 @@ def _record_llm_output(
         # Non-empty when api_mode=auto fell back from responses to chat.
         "fallback_reason": str(getattr(result, "fallback_reason", "") or ""),
         "tool_rounds": int(getattr(result, "tool_rounds", 0) or 0),
+        # Non-empty when budget compaction shortened the transcript the model
+        # saw before this call (removed completed tool batches).
+        "context_compaction": dict(getattr(result, "context_compaction", {}) or {}),
     }
     prompt_text = ""
     if system or user:
@@ -175,11 +194,15 @@ def _record_llm_output(
             pass  # Advisory history cannot turn a valid delivery into a failure.
     if instrument._PROGRESS is not None:
         instrument._LIVE_LINE.clear()
-        note = ""
-        if metadata["fallback_reason"]:
-            note = " (streaming fell back)"
-        elif metadata["degraded_reason"]:
+        note = _fallback_note(metadata["fallback_reason"])
+        if not note and metadata["degraded_reason"]:
             note = " (tools degraded)"
+        # Keep the compaction reminder on the per-call line as well: a redirected
+        # log keeps both, and this one is adjacent to the token counts that show
+        # why the transcript no longer fits.
+        removed = int(metadata["context_compaction"].get("removed_batches", 0) or 0)
+        if removed:
+            note += f" [context compacted -{removed} batch{'es' if removed != 1 else ''}]"
         print(
             f"    [llm] {label} -> in={metadata['input_tokens']} "
             f"out={metadata['output_tokens']} tok"

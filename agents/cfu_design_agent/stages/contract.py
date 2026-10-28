@@ -112,6 +112,7 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
         agent_tools=tools_enabled,
         tool_rounds=_tool_rounds(state),
         artifact_paths=_contract_evidence_paths(state),
+        state=state,
     )
     result, raw_output = _isa_step(
         state, client, tools_enabled, "design_contract", "isa", prompt, fallback_text
@@ -184,6 +185,7 @@ def extend_isa(state: CfuDesignState) -> CfuDesignState:
         agent_tools=tools_enabled,
         tool_rounds=_tool_rounds(state),
         artifact_paths=_contract_evidence_paths(state),
+        state=state,
     ) + (
         "\n=== APPEND-ONLY ISA EXTENSION ===\n"
         "Return the COMPLETE candidate contract, preserving every existing command, "

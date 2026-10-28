@@ -994,6 +994,18 @@ Each stage emits a live line as it runs and a second line when it finishes, e.g.
   ```
       [llm] hardware -> 1051 output tok (chat, stop)
   ```
+- Context compaction is announced explicitly, because it changes what the model
+  can see: once the estimated budget reaches 90% of the window, completed
+  historical tool batches are replaced by a memo and the run prints a durable
+  line (a real line, not the in-place progress line, so it survives `tee`/CI):
+  ```
+      [context] context compacted: removed 3 completed tool batches, est. 121k -> 78k tokens (level ok, stage analyze_workload)
+  ```
+  The same count is appended to that call's token line
+  (`[context compacted -3 batches]`), stored in the raw-output metadata as
+  `context_compaction`, and recorded as a `compaction` event in
+  `request_audit.jsonl`. Crossing 80% prints one `[context] context N% full`
+  warning per climb, so an imminent compaction is visible before it happens.
 - Because the HTTP read timeout applies per streamed chunk instead of to the whole body, a generation that would exceed `timeout` no longer fails. Measured example: a GLM-5.2 call produced 2171 output tokens over 118.6 s with the config's `timeout: 120` and completed, with 264 live progress updates and 4406 characters of thinking captured from the stream.
 - Tool calls stream too: content, `reasoning_content` and `tool_calls` fragments are accumulated, and the provider's final usage chunk gives the exact counts.
 - If an endpoint ignores or rejects `stream`/`stream_options`, the call retries without streaming and records `fallback_reason` ("streaming unavailable …" / "streaming ignored by the endpoint") in the raw-output metadata and the `[llm]` line.
@@ -1171,6 +1183,8 @@ python3 agents/run_cfu_agent.py --test-api --llm-config deepseek
 
 Each config may set `model`, `base_url`, `api_mode` (`auto`/`responses`/`chat`), `temperature`, `timeout`, thinking (`thinking`, `reasoning_effort`, `reasoning_summary`, optional `thinking_body`; **off by default**), the request-size planning values (`context_window_tokens`, `output_reserve_tokens`), and an inline `api_key` or an `api_key_env` variable name. Model resolution order (highest wins) is: explicit `--model` > config `model` > `CFU_AGENT_MODEL` > built-in `gpt-5`. A config can leave `model`/`base_url` empty and still pick up `CFU_AGENT_MODEL`/`OPENAI_BASE_URL`. Prefer `api_key_env` to keep keys out of the tracked JSON. `default.json` is optional: if missing, the framework builds an environment-only config. See `agents/llm_configs/README.md`.
 
+`api_mode` governs the tool-using rounds as well as plain completions. The agent keeps one chat-format transcript (budget compaction, source masking and the request audit all depend on it) and translates it to Responses `function_call`/`function_call_output` items only on the wire, so a stage behaves the same on either endpoint. `auto` prefers Responses and falls back to chat completions once when the route is missing or the model refuses function tools there; the reason is kept in `fallback_reason`. Models that only accept tools on chat completions (`Kimi-K3`) should pin `api_mode: chat`; pinning `responses` surfaces a rejection instead of silently degrading.
+
 ### Environment
 
 Run the agent and its tests from `conda run -n mico_env` (or an activated `mico_env`): the environment must provide LangGraph, `langgraph-checkpoint-sqlite` (3.1.1 for persistent runs), and the configured HW/SW tools. Missing core dependencies are errors, not a switch to another runner. `--checkpoint --run-id <unique_id>` writes run-scoped SQLite checkpoints; `--resume <id>` verifies the run manifest, artifact hashes and operation journal before resuming an unfinished checkpoint. Graph nodes are journaled as replay units, and RepoToolbox workspace writes/commands also have operation records: a crash mid-node leaves an uncertain pending record and blocks automatic resume until reconciled. Other direct external effects still need explicit review before claiming crash-safe recovery. Checkpoints are not exactly-once transactions; do not use the same run ID concurrently.
@@ -1233,6 +1247,21 @@ selects real whole-SoC FPGA synthesis and PnR, with CFU hierarchy PPA attributio
 FFVB676, speed grade -2, extended temperature (`xcau25p-ffvb676-2-e`) at 100 MHz.
 An explicit `--fpga-part` overrides this choice; existing checkpoints are not
 retargeted. Yosys remains the default fast cost proxy.
+
+**Cost Wall:** both backends enforce `--max-yosys-cells N` (positive integer,
+default **100000**) after the fixed generic Yosys mapping/ABC flow. Agent runs
+measure standalone `AgentCfu`; this is a mapped generic-cell engineering budget,
+**not FPGA LUT count or device capacity**. Equality passes. An over-budget design
+fails with `cost_budget_exceeded` **before Vivado starts**, records the measured
+cells/limit/report path, and returns through the existing bounded implementation
+repair path with instructions to reduce lanes/unrolling and share arithmetic
+across cycles without weakening correctness. Missing/invalid cell statistics fail
+closed as `cost_metrics_invalid`. Analysis, ISA, hardware/unified implementation
+and optimization prompts carry the actual run limit before design work begins.
+Dry runs and explicit cost skips do not claim a budget pass. The limit is recorded
+in run/checkpoint state and cost fingerprints; resume cannot change it or reuse
+pre-wall/stale cost evidence. Start a fresh run to change a recorded budget.
+
 New CLI runs execute simulation and EDA with `--validation-mode parallel` by
 default: first command/semantic failure cancels the sibling process tree and
 spends at most one repair slot. `--validation-mode serial` is available for

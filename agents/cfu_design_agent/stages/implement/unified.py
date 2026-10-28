@@ -233,6 +233,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
     )
     brief = prompts.stage_brief(
         "implementation (hardware + software)",
+        design_guidance=prompts.cost_wall_guidance(state),
         deliverable=(
             "Apply the change to the workspace files with the editing tools, then call "
             "`submit_stage` with a short summary.\n"

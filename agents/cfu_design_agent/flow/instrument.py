@@ -30,6 +30,7 @@ def enable_progress(stages: list[str] | None = None) -> None:
     llm.reset_usage_log()
     _PROGRESS = StageProgress(list(stages) if stages else list(STAGE_ORDER))
     llm.set_stream_callback(_log_stream_progress)
+    llm.set_notice_callback(_log_notice)
 
 
 def disable_progress() -> None:
@@ -37,6 +38,7 @@ def disable_progress() -> None:
     _LIVE_LINE.clear()
     _PROGRESS = None
     llm.set_stream_callback(None)
+    llm.set_notice_callback(None)
 
 
 def progress() -> StageProgress | None:
@@ -358,3 +360,20 @@ def _log_stream_progress(payload: dict[str, Any]) -> None:
     else:
         detail = f"{chars} chars (~{tokens} tok)"
     _LIVE_LINE.update(f"    [llm] {stage} streaming ... {detail}")
+
+
+def _log_notice(payload: dict[str, Any]) -> None:
+    """Print one durable notice line, deliberately not an in-place live line.
+
+    Context compaction is exactly the kind of event an operator must still see
+    in a redirected log (CI, ``tee``), so it is written as a real line instead of
+    updating the ephemeral streaming line. The live line is cleared first so a
+    TTY does not leave half a progress line above the notice.
+    """
+    if _PROGRESS is None:
+        return
+    message = str(payload.get("message", "") or "").strip()
+    if not message:
+        return
+    _LIVE_LINE.clear()
+    print(f"    [context] {message}", flush=True)

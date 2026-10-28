@@ -45,6 +45,7 @@ class RunConfig(TypedDict, total=False):
     skip_yosys: bool
     skip_cost: bool
     cost_backend: Literal["yosys", "vivado"]
+    max_yosys_cells: int
     fpga_part: str
     target_frequency_mhz: float
     eda_timeout: int

@@ -14,7 +14,7 @@ from .runtime.llm import (
 )
 from .runtime.llm_config import LlmConfigError, effective_config, list_configs
 from .flow import optimize as flow_optimize
-from .runtime import provenance, ppa, vivado
+from .runtime import cost_budget, provenance, ppa, vivado
 from .stages.review import report as report_mod
 from .state import CfuDesignState
 
@@ -32,6 +32,13 @@ def _stream_default() -> bool | None:
 def _flag_env(name: str) -> bool:
     """Optional boolean default for a store_true flag."""
     return os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _max_yosys_cells(value: str) -> int:
+    try:
+        return cost_budget.max_cells({"max_yosys_cells": int(value)})
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -142,6 +149,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-cost", action="store_true", help="Skip the selected EDA cost backend.")
     parser.add_argument("--cost-backend", choices=("yosys", "vivado"), default="yosys",
                         help="Cost backend: Yosys proxy (default) or real Vivado FPGA implementation.")
+    parser.add_argument("--max-yosys-cells", type=_max_yosys_cells,
+                        default=cost_budget.DEFAULT_MAX_CELLS,
+                        help=f"Positive Yosys cell limit for either cost backend (default: {cost_budget.DEFAULT_MAX_CELLS}).")
     parser.add_argument("--fpga-part", default=vivado.DEFAULT_PART,
                         help=f"Vivado part (default: {vivado.DEFAULT_PART}, Artix UltraScale+ AU25P).")
     parser.add_argument("--target-frequency-mhz", type=float, default=100.0)
@@ -334,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
         "skip_yosys": args.skip_yosys,
         "skip_cost": args.skip_cost,
         "cost_backend": args.cost_backend,
+        "max_yosys_cells": args.max_yosys_cells,
         "fpga_part": args.fpga_part,
         "target_frequency_mhz": args.target_frequency_mhz,
         "eda_timeout": args.eda_timeout,
@@ -352,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.resume:
         explicit = argv if argv is not None else sys.argv[1:]
-        names = ("cost_backend", "fpga_part", "target_frequency_mhz", "eda_timeout", "vivado_threads", "validation_mode")
+        names = ("cost_backend", "max_yosys_cells", "fpga_part", "target_frequency_mhz", "eda_timeout", "vivado_threads", "validation_mode")
         state["resume_eda_options"] = {
             name: getattr(args, name) for name in names
             if any(token == "--" + name.replace("_", "-") or token.startswith("--" + name.replace("_", "-") + "=")
