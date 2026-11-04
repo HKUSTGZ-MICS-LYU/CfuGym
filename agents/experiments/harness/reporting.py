@@ -12,7 +12,9 @@ from agents.cfu_design_agent.runtime import provenance
 
 RUNS_COLUMNS = [
     "exp_id", "run_name", "run_id", "model_config", "model", "benchmark", "suite",
-    "layer", "ablation_flags", "ablation_observed",
+    "layer", "ablation_scheme", "ablation_flags", "ablation_observed",
+    "conformance_mode", "conformance_promote", "max_conformance_runs",
+    "conformance_mode_observed", "conformance_promote_observed", "max_conformance_runs_observed",
     "repeat", "max_iters", "verify_submissions", "max_verify_submissions",
     "answer_repairs_used", "max_answer_repairs", "preverify_repairs_used", "max_preverify_repairs",
     "status", "exit_code", "stopped_at",
@@ -21,6 +23,9 @@ RUNS_COLUMNS = [
     "sim_ok", "sim_attempts", "verify_failures", "reference_cycles", "cfu_cycles", "speedup_x100",
     "sim_terminal_reason", "correctness_ok", "timing_ok", "performance_valid", "observed_speedup_x100",
     "measurement_protocol", "measurement", "benchmark_integrity", "measurement_notice",
+    "speedup_ratio_x", "cost_backend", "cost_status", "resource_valid", "resource_status",
+    "resource_part", "resource_phase", "resource_provenance", "resource_warning",
+    *metrics.RESOURCE_FIELDS,
     "yosys_cells", "yosys_wire_bits",
     "token_calls", "token_in", "token_out", "token_total", "token_cached_in",
     "token_usage_source", "token_usage_complete", "token_usage_warnings", "current_performance", "last_observed_valid_performance",
@@ -44,7 +49,12 @@ PASS_AT_K_COLUMNS = [
     "calls_mean", "tokens_mean", "verify_failures_mean", "usage_missing_runs",
     "infra_cost_calls", "infra_cost_known_tokens",
     "tokens_per_complete_mean", "wall_h_per_complete_mean",
-    "speedup_x100_median", "measurement_protocols", "speedup_warning",
+    "speedup_samples", "speedup_valid_runs",
+    *[f"speedup_ratio_x_{stat}" for stat in metrics.STAT_NAMES],
+    *[f"speedup_x100_{stat}" for stat in metrics.STAT_NAMES],
+    "measurement_protocols", "speedup_warning",
+    "cost_backends", "resource_samples", "resource_warning",
+    *[f"{field}_{stat}" for field in metrics.RESOURCE_FIELDS for stat in ("samples", *metrics.STAT_NAMES)],
     "yosys_cells_median", "failure_classes",
 ]
 
@@ -89,7 +99,8 @@ def write_runs_csv(records: list[dict], path: Path) -> None:
         for record in records:
             row = {key: metrics._fmt(record.get(key)) for key in RUNS_COLUMNS}
             row["measurement_protocol"] = str(record.get("measurement_protocol") or "legacy")
-            for key in ("measurement", "benchmark_integrity", "current_performance", "last_observed_valid_performance"):
+            row["speedup_ratio_x"] = metrics._fmt(metrics.speedup_ratio(record))
+            for key in ("measurement", "benchmark_integrity", "current_performance", "last_observed_valid_performance", "resource_provenance"):
                 if isinstance(record.get(key), dict):
                     row[key] = json.dumps(record[key], sort_keys=True)
             writer.writerow(row)
@@ -144,20 +155,49 @@ def write_pass_at_k_csv(cells: list[tuple[str, str, str, dict]], path: Path) -> 
             writer.writerow({key: metrics._fmt(row.get(key)) for key in PASS_AT_K_COLUMNS})
 
 
-def _ablation_summary_lines(cells: list[tuple[str, str, str, dict]]) -> list[str]:
-    """The capability-ladder section: what each layer adds, compared side by side."""
-    layers_present = [name for name in layers.ABLATION_LADDER if any(c[0] == name for c in cells)]
-    layers_present += sorted({str(c[0]) for c in cells} - set(layers.ABLATION_LADDER))
+def _ablation_summary_lines(cells: list[tuple[str, str, str, dict]], meta: dict | None = None) -> list[str]:
+    """Use archived definitions: old experiments must not acquire new semantics."""
+    meta = meta or {}
+    stored = meta.get("layers") or {}
+    seen = {str(c[0]) for c in cells}
+    scheme = meta.get("ablation_scheme")
+    if scheme == layers.V2_ABLATION_SCHEME:
+        version = 2
+    elif scheme == layers.ABLATION_SCHEME:
+        version = 3
+    else:
+        version = 3 if seen & {"l3-devconf", "l4-ir"} else 2 if seen & {"l2-vis", "l3-ir"} else 1
+    vocabulary = (layers.ABLATION_LAYERS if version == 3 else layers.V2_ABLATION_LAYERS
+                  if version == 2 else layers.LEGACY_ABLATION_LAYERS)
+    order = list(stored) or list(vocabulary)
+    layers_present = [name for name in order if name in seen]
+    layers_present += sorted(seen - set(layers_present))
     lines = ["## Ablation ladder", ""]
-    lines.append("Layers add exactly one capability each, in the order "
-                 "ISA Contract -> Conformance -> LLVM IR.")
+    if version == 3:
+        lines.append("Layers add ISA Contract -> visibility (basic -> extended) -> dev conformance -> LLVM IR; "
+                     "L0-2 use conformance off, L3-4 use dev evidence only, with no promotion. "
+                     "The v3 stage-local conformance budget is 2 runs; archived values below take precedence. "
+                     "This cumulative ladder is not a full factorial design.")
+    elif version == 2:
+        lines.append("Layers add ISA Contract -> visibility (basic -> extended) -> LLVM IR; "
+                     "conformance is OFF throughout (historical v2). This cumulative ladder is not a full factorial design.")
+    else:
+        lines.append("Historical v1 ladder: ISA Contract -> Conformance -> LLVM IR; "
+                     "Conformance means the legacy required YAML-oracle gate, not dev evidence. "
+                     "Definitions below are taken from the archived experiment when available.")
+    if version in (2, 3):
+        lines.append("Visibility-none means basic (workload/interface/scaffolds remain readable), not zero context.")
     lines.append("")
-    lines.append("| layer | adds | agent flags |")
-    lines.append("| --- | --- | --- |")
+    lines.append("| layer | adds | visibility | conformance mode | promote | max conformance runs | agent flags |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     for layer in layers_present:
-        entry = layers.ABLATION_LAYERS.get(layer, {})
+        entry = {**vocabulary.get(layer, {}), **stored.get(layer, {})}
         flags = " ".join(entry.get("flags", ())) or "(none)"
-        lines.append(f"| {layer} | {entry.get('adds', '?')} | `{flags}` |")
+        visibility = entry.get("visibility") or meta.get("visibility") or "not recorded"
+        mode = entry.get("conformance_mode", "off" if version == 2 else "legacy gate" if layer in {"l2-conf", "full"} and version == 1 else "unknown")
+        promote = entry.get("conformance_promote", "unknown")
+        budget = entry.get("max_conformance_runs", "unknown")
+        lines.append(f"| {layer} | {entry.get('adds', '?')} | {visibility} | {mode} | {promote} | {budget} | `{flags}` |")
     lines.append("")
     lines.append("### Layer comparison (pass@k budget, k=1/3/5; complete/runs)")
     lines.append("")
@@ -214,7 +254,7 @@ def write_summary_md(exp_dir: Path, meta: dict, records: list[dict], cells: list
         lines.append("")
 
     if show_layer:
-        lines.extend(_ablation_summary_lines(cells))
+        lines.extend(_ablation_summary_lines(cells, meta))
 
     lines.append("## Failure breakdown (failure_class)")
     lines.append("")
@@ -231,7 +271,7 @@ def write_summary_md(exp_dir: Path, meta: dict, records: list[dict], cells: list
         "scale factors 1. Timing includes original preparation, memory and CFU configuration; "
         "it is not pure math-kernel latency. Missing protocol evidence is labelled `legacy`.",
         "New and legacy measurements are not comparable. A mixed-protocol cell has no speedup "
-        "median; pass@k, effort and cost statistics are unaffected. Integrity gate status is "
+        "statistics; pass@k, effort and cost statistics are unaffected. Integrity gate status is "
         "not proof of true operation equivalence or an arbitrary semantic anti-cheat guarantee.",
         "", "| model | benchmark | layer | complete-run protocols | notice |",
         "| --- | --- | --- | --- | --- |",
@@ -244,15 +284,51 @@ def write_summary_md(exp_dir: Path, meta: dict, records: list[dict], cells: list
     lines.append("## Cost of successful runs")
     lines.append("")
     lines.append("| model | benchmark | " + ("layer | " if show_layer else "")
-                 + "tokens/run | wall h/run | speedup_x100 | yosys cells |")
+                 + "tokens/run | wall h/run | speedup median (ratio×) | yosys cells (generic, not FPGA LUTs) |")
     lines.append("| --- | --- | " + ("--- | " if show_layer else "") + "--- | --- | --- | --- |")
     for layer, model, benchmark, m in cells:
         row = f"| {model} | {benchmark} | " + (f"{layer} | " if show_layer else "")
         lines.append(
             row + f"{metrics._fmt(m.get('tokens_per_complete_mean'))} "
-            f"| {metrics._fmt(m.get('wall_h_per_complete_mean'))} | {metrics._fmt(m.get('speedup_x100_median'))} "
+            f"| {metrics._fmt(m.get('wall_h_per_complete_mean'))} | {metrics._fmt(m.get('speedup_ratio_x_median'))} "
             f"| {metrics._fmt(m.get('yosys_cells_median'))} |"
         )
+    lines.append("")
+
+    lines.extend([
+        "## Speed Up of valid successful runs (ratio×)", "",
+        "Ratios are stored speedup_x100 / 100 (105 means 1.05×), not percentages. "
+        "Only complete, non-infrastructure runs with valid current performance contribute. "
+        "Empty groups stay blank; a single sample has identical min/max/mean/median. "
+        "Mixed measurement protocols are not pooled (valid runs and pooled samples are reported separately).",
+        "", "| model | benchmark | layer | samples | valid runs | min (ratio×) | max (ratio×) | mean (ratio×) | median (ratio×) |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ])
+    for layer, model, benchmark, m in cells:
+        values = " | ".join(metrics._fmt(m.get(f"speedup_ratio_x_{stat}")) for stat in metrics.STAT_NAMES)
+        lines.append(f"| {model} | {benchmark} | {layer} | {m.get('speedup_samples', 0)} | {m.get('speedup_valid_runs', 0)} | {values} |")
+    lines.extend([
+        "", "## Vivado resources of successful runs (post-route)", "",
+        "Only successful current-candidate Vivado cost evidence with matching input/evaluation provenance contributes. "
+        "SoC and CFU hierarchy are separate scopes. BRAM is in 36k tiles (fractional values allowed); "
+        "LUT/FF/DSP are counts. Entries show mean (available sample count). "
+        "Missing/unsupported resources stay blank, never zero-filled or inferred from Yosys generic cells. "
+        "Per-metric min/max/mean/median are retained in pass_at_k.csv.",
+        "", "| model | benchmark | layer | backend | scope | valid resource runs | LUT mean (n) | FF mean (n) | BRAM36 mean (n) | DSP mean (n) | notice |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ])
+    for layer, model, benchmark, m in cells:
+        for scope in ("soc", "cfu"):
+            values = []
+            for name in ("lut", "ff", "bram_36k", "dsp"):
+                field = f"vivado_{scope}_{name}"
+                mean = m.get(f"{field}_mean")
+                values.append(f"{metrics._fmt(mean)} ({m.get(f'{field}_samples', 0)})" if mean is not None else "")
+            notice = str(m.get("resource_warning") or "").replace("|", "/").replace("\n", " ")
+            if not m.get("resource_samples") and not notice:
+                notice = "unsupported/unavailable: no matching successful Vivado resource evidence"
+            lines.append(f"| {model} | {benchmark} | {layer} | {m.get('cost_backends', 'unknown')} | {scope} | {m.get('resource_samples', 0)} | "
+                         + " | ".join(values) + f" | {notice} |")
     lines.append("")
 
     lines.append("## Request usage completeness")

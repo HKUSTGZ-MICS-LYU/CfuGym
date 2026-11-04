@@ -60,11 +60,41 @@ FAILURE_CLASSES = (
     "unknown",
 )
 
+# Provider throttling can arrive as APIError text without an HTTP 429 status.
+# Keep numeric matches contextual: a local token budget of 429 is not throttling.
+_RATE_LIMIT_RE = re.compile(
+    r"\b(?:upstream error|HTTP(?: Error| status)?)\s*[:=]?\s*429\b|"
+    r"\b429\s+Too Many Requests\b|\bRateLimitError\b|"
+    r"\bexceeded\s+(?:token|request)s?\s+rate[ _-]?limit\b|"
+    r"\brate[ _-]?limit[ _-]+(?:reached|exceeded)\b|\bToo Many Requests\b", re.I,
+)
+_NON_RETRYABLE_QUOTA_RE = re.compile(
+    r"\binsufficient_quota\b|\bbilling_hard_limit_reached\b|"
+    r"\bexceeded your current quota\b", re.I,
+)
+_TRANSFER_ERROR_RE = re.compile(
+    r"\bTransferEncodingError\b|\bResponse payload is not completed\b|"
+    r"\bNot enough data to satisfy transfer length header\b", re.I,
+)
+
+
+def _infra_kind(text: str) -> str:
+    if _NON_RETRYABLE_QUOTA_RE.search(text):
+        return "infra_error"
+    if _RATE_LIMIT_RE.search(text):
+        return "infra_rate_limit"
+    if re.search(r"timed? out|timeout", text, re.I):
+        return "infra_timeout"
+    return "infra_error"
+
+
 # Harness-level (non-model) failure signatures: API transport problems and
 # missing toolchain executables.  A crashed framework is detected differently
 # (see detect_infra): a bare "Traceback" is too noisy because benchmark build
 # logs (Python-based) legitimately contain tracebacks.
 INFRA_PATTERNS = (
+    _RATE_LIMIT_RE,
+    _TRANSFER_ERROR_RE,
     re.compile(r"api-key-missing"),
     re.compile(r"api-error:"),
     re.compile(r"urlopen error", re.I),
@@ -182,6 +212,8 @@ def classify_failure(record: dict) -> dict | None:
 
     failure_class, detail = _classify_rung(failing_rung, failing_gate, detail_text, record, status)
     infra = record.get("infra") or {}
+    if not infra and typed.get("kind") in {"infrastructure", "runtime_exception"}:
+        infra = detect_infra("", "", False, 1, termination=typed)
     if infra.get("infra"):
         failure_class = infra.get("infra_kind") or "infra_error"
         detail = infra.get("infra_reason") or detail
@@ -372,12 +404,11 @@ def detect_infra(
     if typed.get("kind") in {"model_delivery_failure", "precondition"}:
         return {"infra": False, "infra_kind": "", "infra_reason": typed.get("reason") or typed["kind"]}
     if typed.get("kind") in {"infrastructure", "runtime_exception"}:
-        detail = str(typed.get("reason") or "")
-        kind = ("infra_rate_limit" if re.search(r"\b429\b|rate.?limit", detail, re.I) else
-                "infra_timeout" if re.search(r"timed? out|timeout", detail, re.I) or typed.get("exception_type") in {"TimeoutError", "APITimeoutError"}
-                else "infra_error")
-        return {"infra": True, "infra_kind": kind,
-                "infra_reason": f"{typed.get('exception_type') or typed['kind']}: {detail}"}
+        detail = f"{typed.get('exception_type') or typed['kind']}: {typed.get('reason') or ''}"
+        cause = typed.get("cause")
+        if isinstance(cause, dict):
+            detail += f"; caused by {cause.get('exception_type') or 'exception'}: {cause.get('reason') or ''}"
+        return {"infra": True, "infra_kind": _infra_kind(detail), "infra_reason": detail}
     # Current typed simulation/probe evidence wins over historical design logs.
     for rung, gate in (gates or {}).items():
         if stopped_at and rung != stopped_at:
@@ -406,24 +437,18 @@ def detect_infra(
             r"\b(?:LLM|API|endpoint|gateway|upstream)\b.{0,80}\b(?:timed? out|timeout|(?:HTTP\s*)?500)\b|"
             r"\bHTTP Error 500\b", detail, re.I,
         )
-        if endpoint_error or conformance.get("transport_error") or conformance.get("failure_kind") == "infrastructure":
-            kind = "infra_timeout" if re.search(r"timed? out|timeout", detail, re.I) else "infra_error"
-            return {"infra": True, "infra_kind": kind,
+        if (endpoint_error or _RATE_LIMIT_RE.search(detail) or _TRANSFER_ERROR_RE.search(detail)
+                or conformance.get("transport_error") or conformance.get("failure_kind") == "infrastructure"):
+            return {"infra": True, "infra_kind": _infra_kind(detail),
                     "infra_reason": f"conformance oracle endpoint: {detail or 'no model answer'}"}
     text = f"{stdout}\n{stderr}"
     for pattern in INFRA_PATTERNS:
         m = pattern.search(text)
         if m:
             matched = m.group(0)[:120]
-            if re.search(r"\b429\b|Too Many Requests", matched, re.I):
-                kind = "infra_rate_limit"
-            elif re.search(r"timed? out|timeout", matched, re.I):
-                kind = "infra_timeout"
-            else:
-                kind = "infra_error"
             return {
                 "infra": True,
-                "infra_kind": kind,
+                "infra_kind": _infra_kind(text),
                 "infra_reason": f"matched {pattern.pattern!r}: {matched}",
             }
     if exit_code is None:

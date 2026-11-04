@@ -200,16 +200,22 @@ class StageWiringTest(unittest.TestCase):
             self.assertNotIn(forbidden, tools)
             self.assertNotIn(forbidden, captured["user"])
 
-    def test_old_simulation_tools_are_forbidden_and_execute_no_commands(self) -> None:
+    def test_simulation_tools_never_execute_without_a_dev_test_harness(self) -> None:
+        """Simulation stays out of Implement except through a registered dev test.
+
+        ``run_simulation`` is never a tool. ``run_conformance`` is not a bare
+        command either: it exists only when the graph registers a budgeted
+        Verification over agent-authored dev tests (``--conformance-mode dev``),
+        so a toolset built without ``dev_tests`` must refuse it and run nothing.
+        """
         from unittest import mock
         from agents.cfu_design_agent.runtime import effects
 
         tool = self._tool(self._capture())
         with mock.patch.object(effects, "run_command") as execute:
-            for forbidden in ("run_conformance", "run_simulation"):
-                with self.subTest(tool=forbidden):
-                    self.assertEqual(tool.run(forbidden, {}),
-                                     "error: simulation is available only in Verify")
+            self.assertEqual(tool.run("run_simulation", {}),
+                             "error: simulation is available only in Verify")
+            self.assertIn("needs agent-authored dev tests", tool.run("run_conformance", {}))
             execute.assert_not_called()
 
     def test_edit_hardware_accepts_the_run_dir_token(self) -> None:

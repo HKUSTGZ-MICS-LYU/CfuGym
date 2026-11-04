@@ -51,8 +51,8 @@ object AgentCfuFiber {
     // safe: the master simply never emits that opcode. withLoad/withStore still
     // gate the CfuLsu FSM states and the instruction table, so a disabled store
     // builds no store logic -- only the unused A-channel wires remain.
-    val get = tilelink.SizeRange(1, p.beatBytes)
-    val putFull = tilelink.SizeRange(1, p.beatBytes)
+    val get = tilelink.SizeRange(1, p.transferBytes)
+    val putFull = tilelink.SizeRange(1, p.transferBytes)
     tilelink.M2sParameters(
       addressWidth = p.addressWidth,
       dataWidth = p.xlen,
@@ -75,7 +75,7 @@ object AgentCfuFiber {
   def dummyBusParameter(p: AgentCfuParameter): BusParameter = BusParameter.simple(
     addressWidth = p.addressWidth,
     dataWidth = p.xlen,
-    sizeBytes = p.beatBytes,
+    sizeBytes = p.transferBytes,
     sourceWidth = log2Up(p.pendingSize) max 1
   )
 }

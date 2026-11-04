@@ -90,14 +90,14 @@ class LlmRequestAuditTest(unittest.TestCase):
                 result = self._client()._chat(sdk, "s", "u")
 
         self.assertEqual(result.text, "ok")
-        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
+        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(120)])
         events = self._events()
         self.assertEqual([event["event"] for event in events], [
             "request", "error", "request", "error", "request", "result",
         ])
         errors = [event["error"] for event in events if event["event"] == "error"]
         self.assertEqual([error["status_code"] for error in errors], [500, 429])
-        self.assertEqual([error["retry_delay_seconds"] for error in errors], [5, 10])
+        self.assertEqual([error["retry_delay_seconds"] for error in errors], [5, 120])
         requests = [event for event in events if event["event"] == "request"]
         self.assertEqual([event["metadata"]["attempt"] for event in requests], [1, 2, 3])
 
@@ -123,13 +123,13 @@ class LlmRequestAuditTest(unittest.TestCase):
 
         self.assertEqual(result.text, "recovered")
         self.assertEqual(len(completions.calls), 2)
-        self.assertEqual(sleep.call_args_list, [mock.call(5)])
+        self.assertEqual(sleep.call_args_list, [mock.call(60)])
         events = self._events()
         self.assertEqual([event["event"] for event in events], [
             "request", "error", "request", "result",
         ])
         self.assertEqual(events[1]["error"]["status_code"], 429)
-        self.assertEqual(events[1]["error"]["retry_delay_seconds"], 5)
+        self.assertEqual(events[1]["error"]["retry_delay_seconds"], 60)
 
     def test_streaming_upstream_429_stops_after_ten_retries(self) -> None:
         from unittest import mock
@@ -148,8 +148,8 @@ class LlmRequestAuditTest(unittest.TestCase):
 
         self.assertEqual(len(completions.calls), 11)
         self.assertEqual(sleep.call_args_list, [
-            mock.call(5), mock.call(10), mock.call(20), mock.call(40),
-            *[mock.call(60) for _ in range(6)],
+            mock.call(60), mock.call(120), mock.call(240),
+            *[mock.call(300) for _ in range(7)],
         ])
         events = self._events()
         self.assertEqual(sum(event["event"] == "request" for event in events), 11)
@@ -191,13 +191,13 @@ class LlmRequestAuditTest(unittest.TestCase):
 
         self.assertEqual(result.text, "recovered")
         self.assertEqual(responses.calls, 2)
-        self.assertEqual(sleep.call_args_list, [mock.call(5)])
+        self.assertEqual(sleep.call_args_list, [mock.call(60)])
         events = self._events()
         self.assertEqual([event["event"] for event in events], [
             "request", "error", "request", "result",
         ])
         self.assertEqual(events[1]["error"]["status_code"], 429)
-        self.assertEqual(events[1]["error"]["retry_delay_seconds"], 5)
+        self.assertEqual(events[1]["error"]["retry_delay_seconds"], 60)
 
     def test_auto_mode_does_not_fallback_after_transient_retries_exhaust(self) -> None:
         from unittest import mock

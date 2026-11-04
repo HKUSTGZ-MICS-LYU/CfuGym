@@ -9,6 +9,29 @@ import statistics
 from agents.experiments.harness import classification
 
 PASS_AT_K = (1, 3, 5)
+RESOURCE_FIELDS = tuple(f"vivado_{scope}_{name}" for scope in ("soc", "cfu")
+                        for name in ("lut", "ff", "bram_36k", "dsp"))
+STAT_NAMES = ("min", "max", "mean", "median")
+
+
+def _number(value, *, positive: bool = False) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and (value > 0 if positive else value >= 0))
+
+
+def speedup_ratio(record: dict) -> float | None:
+    """Keep the stored x100 unit, expose a ratio only for valid performance."""
+    value = record.get("speedup_x100")
+    if (record.get("status") == "complete" and not (record.get("infra") or {}).get("infra")
+            and classification.performance_is_valid(record) and _number(value, positive=True)):
+        return value / 100.0
+    return None
+
+
+def _statistics(values: list) -> dict:
+    return {"min": min(values) if values else None, "max": max(values) if values else None,
+            "mean": statistics.mean(values) if values else None,
+            "median": statistics.median(values) if values else None}
 
 ESTIMAND_HELP = (
     "attempt_index = verify_submissions (one --max-iters K run allows K candidate submissions to verification). "
@@ -90,13 +113,18 @@ def cell_metrics(records: list[dict], bootstrap_iters: int = 10000) -> dict:
         cls = failure.get("failure_class")
         if cls:
             failure_tally[cls] = failure_tally.get(cls, 0) + 1
+    speed_records = [r for r in complete if speedup_ratio(r) is not None]
     protocols = sorted({str(r.get("measurement_protocol") or "legacy") for r in complete})
     mixed_protocols = len(protocols) > 1
     speedup_warning = (
-        "Speedup median unavailable: complete runs use different measurement protocols "
+        "Speedup median unavailable (all speedup statistics unavailable): complete runs use different measurement protocols "
         f"({', '.join(protocols)}); new and legacy measurements are not comparable."
         if mixed_protocols else ""
     )
+    speedups = [] if mixed_protocols else [speedup_ratio(r) for r in speed_records]
+    resource_records = [r for r in complete if r.get("cost_backend") == "vivado"
+                        and r.get("resource_valid") is True]
+    resource_warnings = sorted({str(r["resource_warning"]) for r in records if r.get("resource_warning")})
     row: dict = {
         "runs": n,
         "complete_runs": len(complete),
@@ -119,13 +147,22 @@ def cell_metrics(records: list[dict], bootstrap_iters: int = 10000) -> dict:
         ),
         "measurement_protocols": ", ".join(protocols),
         "speedup_warning": speedup_warning,
-        "speedup_x100_median": (
-            None if mixed_protocols else _median([r.get("speedup_x100") for r in complete
-                                                   if classification.performance_is_valid(r)])
-        ),
+        "speedup_samples": len(speedups),
+        "speedup_valid_runs": len(speed_records),
+        "cost_backends": ", ".join(sorted({str(r.get("cost_backend") or "unknown") for r in records})),
+        "resource_samples": len(resource_records),
+        "resource_warning": "; ".join(resource_warnings),
         "yosys_cells_median": _median([r.get("yosys_cells") for r in complete]),
         "failure_classes": ", ".join(f"{k}:{v}" for k, v in sorted(failure_tally.items())),
     }
+    for stat, value in _statistics(speedups).items():
+        row[f"speedup_ratio_x_{stat}"] = value
+        row[f"speedup_x100_{stat}"] = value * 100.0 if value is not None else None
+    for field in RESOURCE_FIELDS:
+        values = [r[field] for r in resource_records if _number(r.get(field))]
+        row[f"{field}_samples"] = len(values)
+        for stat, value in _statistics(values).items():
+            row[f"{field}_{stat}"] = value
     for k in PASS_AT_K:
         row[f"pass_at_{k}_budget"] = budget_pass_at_k(records, k)
         row[f"pass_at_{k}_sample"] = sample_pass_at_k(records, k)

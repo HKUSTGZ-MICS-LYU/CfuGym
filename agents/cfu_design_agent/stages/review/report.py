@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ...benchmark import embench
 from ...flow import gates as gates_mod, optimize
-from ...runtime import failures, llm, ppa, provenance, request_usage, stage_services
+from ...runtime import dev_tests as dev_tests_mod, failures, llm, ppa, provenance, request_usage, stage_services
 from ...state import CfuDesignState
 
 
@@ -20,6 +20,11 @@ def render_ladder(state: CfuDesignState) -> str:
     for rung in rungs:
         gate = gates.get(rung)
         if not isinstance(gate, dict):
+            if rung == "hw_conformance" and gates_mod.conformance_mode(state) == "dev":
+                lines.append(
+                    "- hw_conformance: not required in `dev` mode "
+                    "(dev tests are evidence; `sim` owns the verdict)")
+                continue
             lines.append(f"- {rung}: not reached")
             continue
         if gate.get("disabled"):
@@ -69,8 +74,9 @@ def ablation_lines(state: CfuDesignState) -> list[str]:
         )
     if not state.get("require_conformance", True):
         active.append(
-            "- `--no-conformance`: conformance requirement dropped (hw_conformance "
-            "rung recorded as disabled, never validated)"
+            "- `--conformance-mode off` (`--no-conformance`): the conformance "
+            "requirement is dropped (hw_conformance rung recorded as disabled, "
+            "never validated)"
         )
     if not state.get("isa_contract", True):
         active.append(
@@ -78,6 +84,76 @@ def ablation_lines(state: CfuDesignState) -> list[str]:
             "`cfu_intrinsics.h` itself from the intrinsic template (encodings free)"
         )
     return active
+
+
+def conformance_lines(state: CfuDesignState) -> list[str]:
+    """What conformance this run had, what it cost and what it can claim.
+
+    Dev tests are evidence, not a verdict, so this section always states which
+    one applies. ``ever_failed`` separates a test that once observed a real
+    mismatch from one that has only ever passed (weaker evidence, not an error).
+    """
+    mode = gates_mod.conformance_mode(state)
+    if mode == "off" and not state.get("conformance_tests") and not state.get("conformance_runs"):
+        return []
+    lines = [f"- mode: {mode}"]
+    if mode == "dev":
+        lines.append(
+            "- delivery: agent-authored tests under `workspace/dev_tests/`; the host "
+            "owns main(), the data sweep and the verdict line"
+        )
+        lines.append(
+            "- authority: EVIDENCE only — `sim` owns the correctness verdict"
+            + (" (promotion enabled: the rung also runs as a gate)"
+               if state.get("conformance_promote") else "")
+        )
+    elif mode == "gate":
+        lines.append(
+            "- delivery: legacy host-rendered YAML oracle; hw_conformance is a required gate"
+        )
+    gate = (state.get("gates") or {}).get("hw_conformance") or {}
+    if gate:
+        if gate.get("evidence_only"):
+            lines.append(
+                f"- checks: {gate.get('verdict', 'unknown')} (evidence only, not a verdict)")
+        else:
+            lines.append(f"- gate: ok={gate.get('ok')} status={gate.get('verdict', '')}")
+    # Older runs appended the whole directory every round; a name is still one
+    # test, so render by name and keep first-seen order.
+    unique_tests: dict[str, dict] = {}
+    for item in state.get("conformance_tests") or []:
+        if isinstance(item, dict) and item.get("name"):
+            unique_tests.setdefault(str(item["name"]), item)
+    tests = list(unique_tests.values())
+    runs = list(state.get("conformance_runs") or [])
+    if tests:
+        lines.append("- tests: " + ", ".join(
+            str(item.get("name", "")) for item in tests if item.get("name")))
+    stale = dev_tests_mod.stale_tests_from_state(state)
+    for name, missing in stale.items():
+        preview = ", ".join(missing[:3]) + ("..." if len(missing) > 3 else "")
+        lines.append(
+            f"- stale: `{name}` references {len(missing)} intrinsic(s) the delivered ISA "
+            f"no longer provides ({preview}) — it cannot run against this candidate")
+    if stale and tests and all(str(t.get("name")) in stale for t in tests):
+        lines.append(
+            "- no runnable dev test covers the delivered ISA: the runs below describe "
+            "an earlier revision, not this candidate")
+    if runs:
+        passed = sum(1 for run in runs if (run.get("verdict") or {}).get("ok"))
+        failed = len(runs) - passed
+        lines.append(f"- runs: {len(runs)} ({passed} pass, {failed} fail)")
+        lines.append(
+            "- a test that only ever passed is weaker evidence than one that caught "
+            "a real mismatch; it is not by itself proof of correctness"
+        )
+        for run in runs[-4:]:
+            verdict = run.get("verdict") or {}
+            lines.append(
+                f"  - {run.get('test', '')}: {verdict.get('status', 'not_run')} "
+                f"cases={verdict.get('cases', 0)} failed={verdict.get('failed', 0)}"
+            )
+    return lines
 
 
 def measurement_lines(state: CfuDesignState) -> list[str]:
@@ -172,6 +248,11 @@ def render_report(state: CfuDesignState) -> str:
     if ablation:
         lines.append("## Ablation")
         lines.extend(ablation)
+        lines.append("")
+    conformance = conformance_lines(state)
+    if conformance:
+        lines.append("## Conformance")
+        lines.extend(conformance)
         lines.append("")
     if state.get("termination"):
         lines.extend(["## Typed Termination", f"- termination: {state['termination']}", ""])

@@ -6,6 +6,11 @@ import spinal.lib.bus.tilelink
 import spinal.lib.bus.tilelink._
 import spinal.lib.fsm._
 
+case class CfuLsuLoadBeat(dataWidth: Int, indexWidth: Int) extends Bundle {
+  val data = Bits(dataWidth bits)
+  val index = UInt(indexWidth bits)
+}
+
 case class CfuLsuParameter(
   dataWidth: Int,
   vectorBytes: Int,
@@ -36,13 +41,17 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
 
   val beatIndexWidth = log2Up(p.beatCount) max 1
   val beatShift = log2Up(p.beatBytes)
+  val fullLastBeat = U(p.beatCount - 1, beatIndexWidth bits)
 
   val cmd = new Area {
     val load = Bool()
     val store = Bool()
     val address = UInt(p.addressWidth bits)
+    /** Zero-based index of the final beat to transfer (0 = single word, beatCount-1 = full vector). */
+    val lastBeat = UInt(beatIndexWidth bits)
     val ready = Bool()
 
+    lastBeat := fullLastBeat
   }
 
   val store = new Area {
@@ -56,10 +65,16 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
     val valid = Bool()
     val index = UInt(beatIndexWidth bits)
     val data = Bits(p.dataWidth bits)
+    val firstDataReg = Reg(Bits(p.dataWidth bits)) init(0)
+    val lastDataReg = Reg(Bits(p.dataWidth bits)) init(0)
+    val firstData = Bits(p.dataWidth bits)
+    val lastData = Bits(p.dataWidth bits)
 
     valid := False
     index := 0
     if(dBus.d.data != null) data := dBus.d.data else data := 0
+    firstData := (valid && index === 0).mux(data, firstDataReg)
+    lastData := valid.mux(data, lastDataReg)
   }
 
   val done = Bool()
@@ -69,7 +84,22 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
   done := False
   error := False
 
+  /** Streaming view of incoming load beats with explicit Fragment.last semantics. */
+  val loadFlow = Flow(Fragment(CfuLsuLoadBeat(p.dataWidth, beatIndexWidth)))
+  loadFlow.valid := load.valid
+  loadFlow.fragment.data := load.data
+  loadFlow.fragment.index := load.index
+  loadFlow.last := done && !error
+
+  when(load.valid) {
+    load.lastDataReg := load.data
+    when(load.index === 0) {
+      load.firstDataReg := load.data
+    }
+  }
+
   val baseAddr = Reg(UInt(p.addressWidth bits)) init(0)
+  val activeLastBeat = Reg(UInt(beatIndexWidth bits)) init(p.beatCount - 1)
   val beatIndex = Reg(UInt(beatIndexWidth bits)) init(0)
   val issueIndex = Reg(UInt(beatIndexWidth bits)) init(0)
   val issueValid = RegInit(False)
@@ -77,9 +107,9 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
   val memError = RegInit(False)
   val rspHits = Vec.fill(p.beatCount)(RegInit(False))
   val rspCount = rspHits.sCount(True)
-  val rspLast = rspCount === U(p.beatCount - 1, widthOf(rspCount) bits)
-  val lastBeat = beatIndex === U(p.beatCount - 1, beatIndexWidth bits)
-  val lastIssue = issueIndex === U(p.beatCount - 1, beatIndexWidth bits)
+  val rspLast = rspCount === activeLastBeat.resize(widthOf(rspCount))
+  val lastBeat = beatIndex === activeLastBeat
+  val lastIssue = issueIndex === activeLastBeat
   val requestIndex = if(p.advancedMem && !p.burstMem) issueIndex else beatIndex
   val accessAddr = baseAddr + ((requestIndex.resize(p.addressWidth) << beatShift).resize(p.addressWidth))
   val mask = B(p.beatBytes bits, default -> True)
@@ -111,6 +141,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
 
     def startLoad(): Unit = {
       baseAddr := cmd.address
+      activeLastBeat := cmd.lastBeat
       beatIndex := 0
       issueIndex := 0
       issueValid := True
@@ -118,7 +149,11 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
       memError := False
       rspHits.foreach(_ := False)
       if(p.burstMem) {
-        goto(LOAD_BURST)
+        when(cmd.lastBeat === fullLastBeat) {
+          goto(LOAD_BURST)
+        } otherwise {
+          if(p.advancedMem) goto(LOAD_ADVANCED) else goto(LOAD_SEND)
+        }
       } else if(p.advancedMem) {
         goto(LOAD_ADVANCED)
       } else {
@@ -128,6 +163,7 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
 
     def startStore(): Unit = {
       baseAddr := cmd.address
+      activeLastBeat := cmd.lastBeat
       beatIndex := 0
       issueIndex := 0
       issueValid := True
@@ -135,7 +171,11 @@ class CfuLsu(dBus: tilelink.Bus, p: CfuLsuParameter) extends Area {
       memError := False
       rspHits.foreach(_ := False)
       if(p.burstMem) {
-        goto(STORE_BURST)
+        when(cmd.lastBeat === fullLastBeat) {
+          goto(STORE_BURST)
+        } otherwise {
+          if(p.advancedMem) goto(STORE_ADVANCED) else goto(STORE_SEND)
+        }
       } else if(p.advancedMem) {
         goto(STORE_ADVANCED)
       } else {

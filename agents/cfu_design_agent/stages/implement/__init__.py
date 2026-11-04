@@ -1,8 +1,8 @@
 """The Implement stage: one entry point, two ways to work.
 
 The stage is where the agent is free: it decides the order of editing hardware,
-editing software, writing the conformance oracle, and optional compile/syntax
-checks. Simulation runs only in Verify, never in the implementation tool loop. The
+editing software, authoring conformance (free-form dev tests in `dev` mode, the
+YAML oracle in `gate` mode), and optional compile/syntax checks. Simulation runs only in Verify, never in the implementation tool loop. The
 ladder afterwards reruns every check independently and owns the verdict — the
 model cannot certify its own design.
 
@@ -35,6 +35,12 @@ def implement(state: CfuDesignState) -> CfuDesignState:
         baseline = intrinsics._initial_design_baseline(state, toolbox)
         state = {**state, "design_baseline": baseline}
     update = _implement(state)
+    # The validation pair's evaluation id belongs to that pair. Leaving it in
+    # state files every later command log (a repair build, a dev-test run) under
+    # `10_validation/evaluations/<old id>/`, so one round's evidence is scattered
+    # across an evaluation it did not run in.
+    if state.get("evaluation_id"):
+        update = {**update, "evaluation_id": ""}
     if intrinsics._valid_design_baseline(baseline):
         return {**update, "design_baseline": baseline}
     return update
@@ -110,7 +116,9 @@ def _implement(state: CfuDesignState) -> CfuDesignState:
                     }),
                 })
                 return _rollback(update, state, transaction)
-        if state.get("require_conformance", True):
+        if gates.conformance_mode(state) == "gate":
+            # Only the legacy YAML-oracle path authors an oracle here. Dev tests
+            # live in the run workspace and are written by the agent's own tools.
             oracle_update = oracle_author.write_conformance(outcome.merge_updates(state, update))
             update = outcome.merge_updates(update, oracle_update)
             if oracle_update.get("errors"):

@@ -1,4 +1,10 @@
-"""Templated differential micro-test for a freshly designed CFU.
+"""Templated differential micro-test for a freshly designed CFU (``gate`` mode).
+
+Used by ``--conformance-mode gate`` only. The default ``dev`` mode runs
+agent-authored free-form tests instead (``runtime/dev_tests.py`` +
+``conformance_dev_runner.py``), so the YAML oracle, its validator and the
+``conformance_data`` generator below are the legacy path kept for reproduction.
+
 
 The ``hw_conformance`` rung sits between the SoC build and the software rung. It
 runs the smallest possible program that exercises each declared instruction and

@@ -1,10 +1,12 @@
 """Stage 3's single, bounded HW/SW coding capability (not a validation Gate).
 
 The graph owns target discovery, command construction, and final acceptance. Neither
-model arguments nor this facade can choose a command, cwd or gate verdict. Oracle
-content is delivered only through the dedicated validated write_conformance tool.
-Call ``commit`` only after accepting the whole Stage 3 delivery; otherwise call
-``rollback`` (also on provider/tool failures). Checks may precede *either* edit.
+model arguments nor this facade can choose a command, cwd or gate verdict. Test
+content has two sanctioned routes and no others: agent-authored dev tests
+(``add_conformance_test`` / ``edit_conformance_test`` under ``workspace/dev_tests``)
+in ``dev`` mode, or the legacy validated ``write_conformance`` oracle in ``gate``
+mode. Call ``commit`` only after accepting the whole Stage 3 delivery; otherwise
+call ``rollback`` (also on provider/tool failures). Checks may precede *either* edit.
 """
 
 from __future__ import annotations
@@ -36,6 +38,52 @@ def verification_schema(name: str, description: str,
     return {"type": "function", "function": {
         "name": name, "description": description,
         "parameters": parameters or {"type": "object", "properties": {}, "required": []}}}
+
+
+#: Dev tests are the free-form replacement for the YAML oracle. The model names
+#: a file and fills two functions; the host supplies the entry point, the data
+#: sweep and the verdict (see ``runtime/dev_tests.py``). Neither tool accepts a
+#: path, so the model cannot name a file outside ``workspace/dev_tests/``.
+ADD_DEV_TEST_SCHEMA: dict[str, Any] = {
+    "type": "function", "function": {
+        "name": "add_conformance_test",
+        "description": (
+            "Create an agent-authored development test under `workspace/dev_tests/` "
+            "from the host template. It is EVIDENCE, not a gate: the host runner owns "
+            "main(), the harness data, the sweep and the verdict line, so the test "
+            "cannot certify itself. Fill `cfu_conformance_dut()` (call the generated "
+            "cfu_* intrinsics, in any order and any number of times) and "
+            "`cfu_conformance_ref()` (an independent scalar reference; no cfu_* call). "
+            "The host calls both once per case and compares their uint32_t results; "
+            "fold memory or register-file observations into the returned value on both "
+            "sides. Each invocation must start from a defined state."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "name": {
+                "type": "string",
+                "description": "test name: 1-32 chars, starts with a letter, then letters/digits/_/-",
+            },
+        }, "required": ["name"]},
+    },
+}
+
+EDIT_DEV_TEST_SCHEMA: dict[str, Any] = {
+    "type": "function", "function": {
+        "name": "edit_conformance_test",
+        "description": (
+            "Apply one exact SEARCH/REPLACE edit to a dev test created with "
+            "`add_conformance_test`. Only the marked MODEL REGION may change: the "
+            "host-owned header, the region markers and `main()` are rejected. A "
+            "rejected edit restores the previous bytes, so the file is never left "
+            "half-edited."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "existing test name"},
+            "search": {"type": "string", "description": "exact existing text, must match once"},
+            "replace": {"type": "string", "description": "replacement text"},
+        }, "required": ["name", "search", "replace"]},
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -86,6 +134,9 @@ class ImplementationToolset:
     check_elaboration: Callable[[], dict[str, Any]] | None = None
     check_compile: Callable[[], dict[str, Any]] | None = None
     conformance_session: Any = None
+    #: ``runtime.dev_tests.DevTestWorkspace`` when the run uses agent-authored
+    #: dev tests instead of the legacy YAML oracle; ``None`` otherwise.
+    dev_tests: Any = None
     check_conformance_syntax: Callable[[], dict[str, Any]] | None = None
     #: Verifications the agent schedules itself (build the SoC, build the software,
     #: simulate the workload). Unlike the post-edit checks below, these do not
@@ -151,6 +202,14 @@ class ImplementationToolset:
         clash = reserved.intersection(names)
         if clash:
             raise ValueError(f"verification name shadows a reserved tool: {sorted(clash)}")
+        if self.dev_tests is not None:
+            root = str(getattr(self.dev_tests, "root", "") or "")
+            if not root.startswith(run_root + "/workspace/"):
+                raise ValueError("dev tests must live inside the run workspace")
+            if not self.toolbox.is_write_allowed(f"{root}/_probe.c"):
+                raise ValueError(
+                    f"dev-test directory is not writable by the implementation stage: {root}"
+                )
         if self.failure_index is None:
             self.failure_index = {"failures": {}}
         self.readonly = ReadOnlyToolset(self.toolbox, failure_index=self.failure_index)
@@ -181,19 +240,27 @@ class ImplementationToolset:
 
     def commit(self) -> None:
         if (any(session.rolled_back for session in self.sessions)
-                or (self.conformance_session is not None and self.conformance_session.rolled_back)):
+                or (self.conformance_session is not None and self.conformance_session.rolled_back)
+                or (self.dev_tests is not None and self.dev_tests.rolled_back)):
             raise RuntimeError("cannot commit a rolled-back Stage 3 attempt")
         if self.conformance_session is not None:
             self.conformance_session.commit()
+        if self.dev_tests is not None:
+            self.dev_tests.commit()
         for session in self.sessions:
             session.commit()
 
     def rollback(self) -> None:
         if (any(session.committed for session in self.sessions)
-                or (self.conformance_session is not None and self.conformance_session.committed)):
+                or (self.conformance_session is not None and self.conformance_session.committed)
+                or (self.dev_tests is not None and self.dev_tests.committed)):
             raise RuntimeError("cannot roll back a committed Stage 3 attempt")
         errors = []
-        participants = (*self.sessions, *((self.conformance_session,) if self.conformance_session is not None else ()))
+        participants = list(self.sessions)
+        if self.conformance_session is not None:
+            participants.append(self.conformance_session)
+        if self.dev_tests is not None:
+            participants.append(self.dev_tests)
         for session in participants:
             try:
                 session.rollback()
@@ -216,6 +283,11 @@ class ImplementationToolset:
         if self.diagnosis_required:
             schemas.append(DIAGNOSIS_SCHEMA)
             schemas.append(coding_tools.REPAIR_ROUTE_SCHEMA)
+        if self.dev_tests is not None:
+            # Dev tests replace the YAML oracle: the model owns the scenario code,
+            # the host owns the data, the entry point and the verdict.
+            schemas.append(ADD_DEV_TEST_SCHEMA)
+            schemas.append(EDIT_DEV_TEST_SCHEMA)
         if self.hardware_targets:
             schemas.append(EDIT_HARDWARE_SCHEMA)
         if self.software_targets:
@@ -271,8 +343,37 @@ class ImplementationToolset:
                 if self.conformance_session is not None:
                     self.conformance_session.diagnosis = dict(self.hardware_session.diagnosis or {})
             return answer
-        if name in {"run_conformance", "run_simulation"}:
+        if name in {"add_conformance_test", "edit_conformance_test"}:
+            if self.dev_tests is None:
+                return (
+                    "error: this run uses the legacy conformance oracle, not dev tests; "
+                    "deliver it with write_conformance"
+                )
+            if name == "add_conformance_test":
+                if set(args) != {"name"}:
+                    return "usage error: add_conformance_test requires only a name"
+                return self.dev_tests.create(args.get("name"))
+            if set(args) != {"name", "search", "replace"}:
+                return (
+                    "usage error: edit_conformance_test requires name, search and replace"
+                )
+            return self.dev_tests.edit(args.get("name"), args.get("search"), args.get("replace"))
+        if (name == "run_conformance" and self.dev_tests is None
+                and not any(v.name == name for v in self.verifications)):
+            return (
+                "error: run_conformance needs agent-authored dev tests; this run uses "
+                "the legacy conformance oracle (--conformance-mode gate) or no "
+                "conformance at all"
+            )
+        if name == "run_simulation":
             return "error: simulation is available only in Verify"
+        if name == "write_conformance" and self.conformance_session is None:
+            if self.dev_tests is not None:
+                return (
+                    "error: this run uses agent-authored dev tests, not a YAML oracle; "
+                    "call add_conformance_test / edit_conformance_test"
+                )
+            return "error: conformance is disabled in this run"
         if name == "write_conformance" and self.conformance_session is not None:
             if set(args) != {"oracle"} or not isinstance(args.get("oracle"), str):
                 return "usage error: write_conformance requires only an oracle string"

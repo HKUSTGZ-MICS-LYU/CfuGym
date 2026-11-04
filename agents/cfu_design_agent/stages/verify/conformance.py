@@ -1,14 +1,110 @@
-"""Deterministic formal conformance verification of implementation deliveries."""
+"""The ``hw_conformance`` rung: a host-run check of the agent's own evidence.
+
+Two modes share this rung. ``gate`` builds and simulates the host-rendered C that
+a YAML oracle describes, before the software build. ``dev`` re-runs the agent's
+free-form dev tests under a fresh nonce; it is only reached when the run promotes
+them to a gate (``--conformance-promote``), because otherwise ``sim`` owns the
+verdict and this rung stays off the happy path.
+"""
 
 from __future__ import annotations
 
 from ... import conformance, isa, state as state_mod
-from ...flow import ladder, outcome
-from ...runtime import conformance_delivery, effects, commands, stage_services
+from ...flow import gates, ladder, outcome
+from ...runtime import conformance_delivery, dev_tests, effects, commands, stage_services
 from ...runtime.commands import CONFORMANCE_SUBDIR
 from ...runtime.policy import PolicyError
 from ...stages import feedback
 from ...state import CfuDesignState
+
+
+def _check_dev_tests(state: CfuDesignState, rung: str) -> CfuDesignState:
+    """Promote agent-authored dev tests to the ``hw_conformance`` gate.
+
+    Only reachable when a run explicitly asks for it (``--conformance-promote``,
+    or the legacy ``gate`` mode is off). The tests are the model's, but this rung
+    is not: the host regenerates the runner, uses a fresh nonce, compiles and
+    simulates each test itself, and decides from its own verdict lines.
+    """
+    write_toolbox = stage_services._toolbox_for_stage(state, "implementation")
+    run_toolbox = stage_services._toolbox_for_stage(state, "conformance")
+    root = dev_tests.root_for(state)
+    workspace = dev_tests.DevTestWorkspace(write_toolbox, root)
+    names = workspace.names()
+    header_path = str(
+        ((state.get("gates") or {}).get("implementation_sw") or {}).get("intrinsics_header") or ""
+    )
+    verdicts: dict[str, dict] = {}
+    results: list[dict] = []
+    errors: list[str] = []
+    if not names:
+        errors.append(
+            "conformance promotion found no dev test: create one with "
+            f"add_conformance_test (searched {root or 'workspace/dev_tests'})"
+        )
+    elif not header_path:
+        errors.append("the delivered CFU intrinsics header path is unavailable")
+    else:
+        for name in names:
+            result = dev_tests.run_one(state, workspace, name, header_path, run_toolbox)
+            results.append(result)
+            verdict = (result.get("parsed") or {}).get("dev_conformance") or {}
+            verdicts[name] = verdict
+            if not verdict.get("ok"):
+                errors.append(
+                    f"dev test {name}: {verdict.get('status')} "
+                    f"({verdict.get('failed')}/{verdict.get('cases')} cases failed)"
+                    + (f" — {verdict['reason']}" if verdict.get("reason") else "")
+                )
+                break
+    # A dev test is evidence. Only an explicit promotion makes this rung a
+    # verdict; if a run reaches it without one (a resumed checkpoint, or a gate
+    # recorded before this decision), the checks are still recorded but the run
+    # is never stopped or charged for them.
+    gating = gates.conformance_gates(state)
+    checks_ok = not errors and bool(results)
+    ok = checks_ok if gating else True
+    recorded_errors = errors if gating else []
+    artifacts = stage_services._artifacts_for_stage(state, "implementation")
+    artifacts.write_yaml(
+        "implementation", f"{CONFORMANCE_SUBDIR}/dev_tests.yaml",
+        {"ok": checks_ok, "evidence_only": not gating, "promoted": bool(names),
+         "tests": verdicts, "runs": list(workspace.runs), "errors": errors},
+        status="passed" if checks_ok else "failed",
+    )
+    stage_services._write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "")
+    if gating:
+        extra, next_node = ladder._ladder_transition(
+            state, rung, ok=ok, default="build_sw", repair_target="implement",
+        )
+        if not ok:
+            extra["repair_scope"] = "conformance"
+    else:
+        extra, next_node = {}, "build_sw"
+    return ladder._apply_transition({
+        "validation_results": results,
+        "stage_jobs": "validation",
+        "errors": recorded_errors,
+        "conformance_verdict": {
+            "status": "pass" if checks_ok else "fail",
+            "ok": checks_ok,
+            "evidence_only": not gating,
+            "tests": len(names),
+            "details": errors,
+        },
+        "conformance_runs": list(workspace.runs),
+        **outcome.stage_result(
+            state, rung=rung, ok=ok, next=next_node, errors=recorded_errors,
+            repair_target="implement" if (gating and not ok) else None,
+            repairable=bool(gating and not ok), dev_tests=dev_tests.tree_digest(workspace),
+            verdict="pass" if checks_ok else "fail", evidence_only=not gating,
+            history=(
+                f"Dev-test {'checks' if not gating else 'promotion'} "
+                f"{'passed' if checks_ok else 'failed'} ({len(names)} test(s))"
+                + ("; evidence only." if not gating else ".")
+            ),
+        ),
+    }, extra)
 
 
 def check_conformance(state: CfuDesignState) -> CfuDesignState:
@@ -19,11 +115,17 @@ def check_conformance(state: CfuDesignState) -> CfuDesignState:
     a missing or stale answer returns to Implement under the answer budget.
     """
     rung = "hw_conformance"
-    if not state.get("require_conformance", True):
+    mode = gates.conformance_mode(state)
+    if mode == "dev":
+        # Agent-authored dev tests are evidence the model runs itself. This rung
+        # exists only when the run promotes them to a gate; otherwise the ladder
+        # routes straight from the SoC build to the software build.
+        return _check_dev_tests(state, rung)
+    if mode == "off":
         # Ablation (--no-conformance): the rung is out of scope, not skipped for
         # want of execution. It is recorded as disabled (never verified) and the
         # gate machinery excludes it from the completeness requirement.
-        reason = "disabled by --no-conformance (ablation)"
+        reason = "disabled by --conformance-mode off / --no-conformance (ablation)"
         result = stage_services._skipped_result("make cfu_conformance + MiCoSocSim", state, reason)
         result["rung"] = rung
         stage_services._write_ladder_artifact(state, rung, [result], "disabled", reason)

@@ -161,8 +161,8 @@ def execute_one(job: dict, opts, exp_dir: Path, configs: dict, shim_dir: Path | 
         config_name = configs[job["model"]]["config"]
         argv = build_argv(
             opts.python, opts.conda_env, shim_dir, config_name, job["benchmark"], run_name,
-            opts.max_iters, opts.visibility, opts.profile_cache,
-            layers.job_layer_flags(job),
+            opts.max_iters, layers.job_visibility(job, opts.visibility), opts.profile_cache,
+            layers.job_run_flags(job),
             getattr(opts, "agent_forward", ()),
         )
         (run_dir / "cmd.txt").write_text(shlex.join(argv) + "\n")

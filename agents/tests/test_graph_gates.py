@@ -1572,11 +1572,15 @@ class AgentCfuCostParityTest(unittest.TestCase):
         self.assertIn("--agent-cfu-no-tilelink", flags)
         # A contract with load but no store must not lose the bus.
         flags = commands.agent_cfu_datapath_flags(
-            {"datapath": {"vlen": 128, "xlen": 32, "regDepth": 2},
-             "memory": {"load": True, "store": False}}
+            {"datapath": {"vlen": 128, "xlen": 32, "regDepth": 2, "scalarRegDepth": 6},
+             "memory": {"load": True, "store": False, "burst": True, "outstanding": True}}
         )
         self.assertIn("--agent-cfu-no-store", flags)
         self.assertNotIn("--agent-cfu-no-tilelink", flags)
+        self.assertIn("--agent-cfu-scalar-depth", flags)
+        self.assertIn("6", flags)
+        self.assertIn("--agent-cfu-burst-mem", flags)
+        self.assertIn("--agent-cfu-advanced-mem", flags)
 
     def test_soc_and_cost_stay_in_lockstep_for_a_plain_contract(self) -> None:
         isa = {"datapath": {"vlen": 256, "xlen": 32, "regDepth": 2}}

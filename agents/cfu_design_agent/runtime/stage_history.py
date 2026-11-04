@@ -51,7 +51,8 @@ def _identity(state: Mapping[str, Any], toolbox: RepoToolbox) -> dict | None:
     if identity is None:
         return None
     task = {key: state.get(key) for key in
-            ("task", "workload_spec", "benchmark_name", "isa_contract", "require_conformance")}
+            ("task", "workload_spec", "benchmark_name", "isa_contract", "require_conformance",
+             "conformance_mode", "conformance_promote")}
     try:
         return {**identity, "version": VERSION, "task_sha256": flow_memory._digest(task)}
     except (TypeError, ValueError):

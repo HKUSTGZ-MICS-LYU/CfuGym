@@ -177,7 +177,7 @@ stages:
       - "agents/generated/runs/**/09_implementation/conformance/result.yaml"
       - "agents/generated/runs/**/09_implementation/conformance/versions/result.yaml.*"
       - "agents/generated/runs/**/run.yaml"
-    commands: [conformance_build, soc_sim]
+    commands: [conformance_build, dev_conformance_build, soc_sim]
   validation:
     write:
       - "agents/generated/runs/**/10_validation/**"
@@ -221,6 +221,15 @@ commands:
     required_tokens: [TARGET=vexii_soc]
     required_substrings: ["cfu_conformance"]
     priority: 10
+  # Agent-authored dev tests: the test name is the model's choice, so the
+  # identity of the command comes from the dev-test directory, never from a
+  # name the model happened to pick. Requiring the old fixed `cfu_conformance`
+  # bin here rejected every test named anything else before it compiled.
+  dev_conformance_build:
+    executable: make
+    required_tokens: [TARGET=vexii_soc]
+    required_substrings: ["workspace/dev_tests/", "compile"]
+    priority: 11
   soc_generate:
     executable: sbt
     required_substring: "runMain vexiiriscv.soc.mico.MiCoSocGen"

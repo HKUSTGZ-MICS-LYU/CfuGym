@@ -15,7 +15,19 @@ from . import commands
 
 VERSION = 1
 _LEX = re.compile(r'""".*?"""|/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', re.S)
-_FIELDS = ('name', 'function', 'subop', 'enabled', 'ready', 'start', 'tick', 'resources')
+_FIELDS = ('name', 'function', 'subop', 'enabled', 'ready', 'start', 'tick', 'resources', 'elaborate')
+_FIELDS_BY_KIND = {
+    'Instruction': ('name', 'function', 'subop', 'enabled', 'ready', 'start', 'tick', 'resources', 'elaborate'),
+    'PipedInstruction': ('name', 'function', 'subop', 'stages', 'enabled', 'ready', 'resources'),
+    'FsmInstruction': ('name', 'function', 'subop', 'enabled', 'ready', 'resources'),
+}
+_ALLOWED_FIELDS = frozenset(_FIELDS) | {'stages'}
+_DECL_RE = re.compile(r'\b(Instruction|PipedInstruction|FsmInstruction)\s*\(')
+_MEMBER_RE = re.compile(r'^(Instruction|PipedInstruction|FsmInstruction)\s*\(')
+_LSU_OPS = {
+    'load': re.compile(r'(?:\blsu\.cmd\.load\s*:=\s*True\b|\blsuStart(?:Vector|Stream|Scalar)Load\s*\()'),
+    'store': re.compile(r'(?:\blsu\.cmd\.store\s*:=\s*True\b|\blsuStart(?:Vector|Scalar)Store\s*\()'),
+}
 
 
 def code(text: str, *, strings: bool = False) -> str:
@@ -94,33 +106,51 @@ def declarations(source: str, *, snippets: bool = False) -> tuple[list[dict], li
             members, finish = balanced(clean, terminal)
             start, end = terminal, finish
             for member in arguments(members):
-                match = re.match(r'^Instruction\s*\(', code(member, strings=True))
+                vis_member = code(member, strings=True)
+                match = _MEMBER_RE.match(vis_member)
                 if member and not match:
                     unchecked.append('instructionTable: external/nonliteral member')
                 elif match:
                     _, finish = balanced(member, match.end() - 1)
+                    if match.group(1) in ('PipedInstruction', 'FsmInstruction'):
+                        tail = re.match(r'\s*([({])', vis_member[finish:])
+                        if tail:
+                            _, finish = balanced(member, finish + tail.end() - 1)
                     if member[finish:].strip(): unchecked.append('instructionTable: modified/nonliteral member')
     entries, consumed = [], start
-    for match in re.finditer(r'\bInstruction\s*\(', visible[start:end]):
+    for match in _DECL_RE.finditer(visible[start:end]):
         offset = start + match.start()
         if offset < consumed: continue
         if re.search(r'\b(?:class|def)\s*$', visible[max(start, offset - 30):offset]):
             continue
+        kind = match.group(1)
         opening = start + match.end() - 1
         body, finish = balanced(clean, opening)
         if finish == opening:
-            unchecked.append('Instruction: unbalanced declaration')
+            unchecked.append(f'{kind}: unbalanced declaration')
             continue
+        full_body = body
+        if kind in ('PipedInstruction', 'FsmInstruction'):
+            tail = re.match(r'\s*([({])', visible[finish:end])
+            if tail:
+                curried_open = finish + tail.end() - 1
+                curried_body, finish2 = balanced(clean, curried_open)
+                if finish2 == curried_open:
+                    unchecked.append(f'{kind}: unbalanced curried handler')
+                    continue
+                full_body = body + '\n' + curried_body
+                finish = finish2
         consumed = finish
+        field_order = _FIELDS_BY_KIND[kind]
         fields, positional = {}, 0
         for arg in arguments(body):
             named = re.match(r'^([A-Za-z_]\w*)\s*=\s*(?!=|>)', arg)
             if named:
                 fields[named.group(1)] = arg[named.end():].strip()
-            elif positional < len(_FIELDS):
-                fields[_FIELDS[positional]] = arg
+            elif positional < len(field_order):
+                fields[field_order[positional]] = arg
                 positional += 1
-        entries.append({'fields': fields, 'body': body, 'offset': offset,
+        entries.append({'kind': kind, 'fields': fields, 'body': full_body, 'offset': offset,
                         'line': source[:offset].count('\n') + 1})
     if not entries and visible[start + 1:end - 1].strip() and not re.search(r'\b(?:Seq|List|Vector)\s*(?:\.empty|\(\s*\))', visible[start:end]):
         unchecked.append('instructionTable: no statically extractable declarations')
@@ -142,6 +172,8 @@ def configuration(spec: dict) -> dict:
     result = {'withTilelink': '--agent-cfu-no-tilelink' not in flags,
               'withLoad': '--agent-cfu-no-load' not in flags,
               'withStore': '--agent-cfu-no-store' not in flags,
+              'advancedMem': '--agent-cfu-advanced-mem' in flags,
+              'burstMem': '--agent-cfu-burst-mem' in flags,
               'flags': flags}
     return result
 
@@ -232,11 +264,11 @@ def validate_sources(sources: dict[str, str], spec: dict, *, config: dict | None
                 problems.append(f'{path}:{item["line"]}: hardware_integrity/encoding_range: {label}')
             if enabled is not False:
                 body = code(item['body'], strings=True)
-                for operation in ('load', 'store'):
-                    if re.search(r'\blsu\.cmd\.' + operation + r'\s*:=\s*True\b', body):
+                for operation, op_re in _LSU_OPS.items():
+                    if op_re.search(body):
                         if not config.get('withTilelink') or not config.get('with' + operation.title()):
                             problems.append(f'{path}:{item["line"]}: hardware_integrity/disabled_path: {label} uses disabled LSU {operation}')
-            for field in fields.keys() - set(_FIELDS):
+            for field in fields.keys() - _ALLOWED_FIELDS:
                 unchecked.append(f'{label}.{field}: unsupported Instruction field')
     known = [(e['function_id'], e['subfunction_id']) for e in entries
              if e['function_id'] is not None and e['subfunction_id'] is not None]

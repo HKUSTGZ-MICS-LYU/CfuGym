@@ -101,7 +101,10 @@ class MiCoSoc(p : MiCoSocParam) extends Component {
       regDepth = p.AgentCfuRegDepth,
       withTilelink = p.AgentCfuTilelink,
       withLoad = p.AgentCfuTilelink && p.AgentCfuLoad,
-      withStore = p.AgentCfuTilelink && p.AgentCfuStore)
+      withStore = p.AgentCfuTilelink && p.AgentCfuStore,
+      advancedMem = p.AgentCfuTilelink && p.AgentCfuAdvancedMem,
+      burstMem = p.AgentCfuTilelink && p.AgentCfuBurstMem,
+      scalarRegDepth = p.AgentCfuScalarDepth)
 
     val cfu = p.useMiCoVpu generate new TilelinkVpuCfuFiber(vpuParam, p.vexii.xlen) {
       mainBus << bus

@@ -415,15 +415,18 @@ def agent_cfu_datapath_flags(spec: dict) -> list[str]:
     vlen = datapath.get("vlen")
     xlen = datapath.get("xlen")
     reg_depth = datapath.get("regDepth")
-    if isinstance(vlen, int) and vlen > 0:
+    scalar_depth = datapath.get("scalarRegDepth")
+    if isinstance(vlen, int) and not isinstance(vlen, bool) and vlen > 0:
         flags += ["--agent-cfu-vlen", str(vlen)]
-    if isinstance(xlen, int) and xlen > 0:
+    if isinstance(xlen, int) and not isinstance(xlen, bool) and xlen > 0:
         flags += ["--agent-cfu-bus-width", str(xlen)]
-    if isinstance(reg_depth, int) and reg_depth > 0:
+    if isinstance(reg_depth, int) and not isinstance(reg_depth, bool) and reg_depth > 0:
         flags += ["--agent-cfu-reg-depth", str(reg_depth)]
-    # Memory options map 1:1 onto AgentCfuParameter's withLoad/withStore/withTilelink.
-    # Forwarding them keeps every rung on the same configuration; dropping them
-    # silently rebuilt a CFU with load/store hardware the contract had disabled.
+    if isinstance(scalar_depth, int) and not isinstance(scalar_depth, bool) and scalar_depth > 0:
+        flags += ["--agent-cfu-scalar-depth", str(scalar_depth)]
+    # Memory options map 1:1 onto AgentCfuParameter's withLoad/withStore/withTilelink/
+    # advancedMem/burstMem. Forwarding them keeps every rung on the same configuration;
+    # dropping them silently rebuilt a CFU with serial or unwanted load/store hardware.
     load = memory.get("load")
     store = memory.get("store")
     if load is False:
@@ -432,6 +435,11 @@ def agent_cfu_datapath_flags(spec: dict) -> list[str]:
         flags += ["--agent-cfu-no-store"]
     if load is False and store is False:
         flags += ["--agent-cfu-no-tilelink"]
+    else:
+        if memory.get("outstanding") is True or memory.get("advanced") is True:
+            flags += ["--agent-cfu-advanced-mem"]
+        if memory.get("burst") is True:
+            flags += ["--agent-cfu-burst-mem"]
     return flags
 
 

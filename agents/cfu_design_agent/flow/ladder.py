@@ -307,7 +307,12 @@ def repair_route_transition(state: CfuDesignState, route: dict) -> dict:
 
 
 def _route_after_hw_build(state: CfuDesignState) -> str:
-    return gates._rung_next(state, "hw_build", "check_conformance")
+    # In `dev` mode the conformance rung is off the happy path: agent-authored
+    # tests are evidence the model runs itself, and the `sim` rung owns the
+    # verdict. `--conformance-promote` (and the legacy `gate` mode) put the rung
+    # back in front of the software build.
+    default = "check_conformance" if gates.conformance_gates(state) else "build_sw"
+    return gates._rung_next(state, "hw_build", default)
 
 
 def _route_after_hw_conformance(state: CfuDesignState) -> str:

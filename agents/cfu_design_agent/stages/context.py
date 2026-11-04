@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .. import spec as spec_mod, state as state_mod
 from ..benchmark import embench, generic
-from ..flow import ladder, outcome
+from ..flow import gates, ladder, outcome
 from ..runtime import llm_step, stage_services
 from ..runtime.llm import DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND, DEFAULT_MAX_TOOL_ROUNDS, LlmResult
 from ..runtime.policy import PolicyError
@@ -81,6 +81,17 @@ def load_context(state: CfuDesignState) -> CfuDesignState:
         "load_context",
         "visibility",
         {"level": policy.visibility, "withheld": withheld},
+    )
+    artifacts.set_manifest_metadata(
+        "load_context",
+        "conformance",
+        {
+            # Recorded once, so a run's report and its manifest cannot disagree
+            # about whether conformance was a verdict or only evidence.
+            "mode": gates.conformance_mode(state),
+            "promote": bool(state.get("conformance_promote", False)),
+            "max_runs": int(state.get("max_conformance_runs", 0) or 0),
+        },
     )
     artifacts.set_manifest_metadata(
         "load_context",

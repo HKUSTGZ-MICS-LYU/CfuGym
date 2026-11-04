@@ -831,12 +831,15 @@ Every NEW command must declare a `resources` list matching hardware CfuResource:
 CPU reads: {{storage: cpu, access: read, role: rs1|rs2}}; CPU write:
 {{storage: cpu, access: write, role: rd}}; vector reads: {{storage: vector,
 access: read, role: vs1|vs2, index: {{source: cpu_value, register: rs1|rs2}}}};
-vector write: same vector/index structure with access: write, role: vd.
-Index may instead be {{source: constant, value: N}}. `cpu_value` means the CPU
+vector write: same vector/index structure with access: write, role: vd; local
+scalar RF reads/writes: {{storage: scalar, access: read, role: ss1|ss2, index: ...}}
+and {{storage: scalar, access: write, role: sd, index: ...}}.
+Index may instead be {{source: constant, value: N}}, {{source: bit_slice,
+register: rs1|rs2, hi: H, lo: L}}, or {{source: csr_state}}. `cpu_value` means the CPU
 register CONTENT is a vector slot index; it is never the raw register NUMBER.
 Compatibility-only index {{source: legacy_register_number, register: rs1|rs2}}
 uses the instruction's register number and legacy truncation; do not choose it
-for new designs. At most one data write is supported (CPU rd OR vector vd).
+for new designs. At most one data write is supported (CPU rd OR vector vd OR scalar sd).
 An explicit empty resources list means acknowledgement only; omitted resources
 means legacy ABI and must not be silently added to existing frozen commands.
 Vector indices consume the selected CPU input without requiring another CPU-read
@@ -1073,6 +1076,76 @@ Rules:
   a missing one fails the rung instead of being skipped."""
 
 
+def dev_test_prompt(
+    isa: dict,
+    *,
+    run_root: str = "",
+    scalar_sources: Iterable[str] = (),
+) -> str:
+    """The dev-test contract for Implement: what you write, what the host owns.
+
+    This replaces the YAML-oracle schema. The model gets a plain C file instead of
+    a structure to satisfy, so its rounds go into observing the design rather
+    than into making an oracle "valid". Everything the verdict depends on (entry
+    point, data, comparison, nonce) stays host-owned.
+    """
+    run_root = str(run_root or "").rstrip("/")
+    root = f"{run_root}/workspace/dev_tests" if run_root else "workspace/dev_tests"
+    sources = [str(item) for item in scalar_sources if str(item).strip()]
+    scalar_block = ""
+    if sources:
+        scalar_block = (
+            "\nThe workload's own pristine scalar sources are on the include path. "
+            "Prefer `#include \"<file>\"` and call that code from "
+            "`cfu_conformance_ref()` instead of transcribing constant tables by "
+            "hand: a hand-copied table is the most error-prone line in a test (an "
+            "MD5 K table copied with 63 of 64 entries failed correct hardware for "
+            "three rounds). If that code allocates, also `#include \"beebsc.c\"` "
+            "and call `init_heap_beebs(heap, sizeof heap)` with a static heap: the "
+            "host does not link the allocator for you. Available:\n"
+            + "\n".join(f"  - {item}" for item in sources[:12]) + "\n"
+        )
+    table = _conformance_command_table(isa)
+    return f"""Dev-test contract (replace the old YAML oracle; there is no schema to satisfy):
+
+Declared commands and the intrinsic each one generates:
+{table}
+
+
+- `add_conformance_test(name)` creates `{root}/<name>.c` from the host template.
+- `edit_conformance_test(name, search, replace)` edits it. Only the region between
+  the MODEL REGION markers may change; the host header, the markers and `main()`
+  are rejected, and a rejected edit restores the previous bytes.
+- `run_conformance(test=name)` compiles and simulates that one test against the
+  current overlay. Budget is limited, so read the failure details before retrying.
+
+You write exactly two functions:
+
+  uint32_t cfu_conformance_dut(void);   /* call the generated cfu_* intrinsics,
+                                           in any order and any number of times */
+  uint32_t cfu_conformance_ref(void);   /* independent scalar C; no cfu_* call */
+
+The host calls both once per case over its own data block (`cfu_conf_data[]`,
+`cfu_conf_len`, `cfu_conf_index` from `cfu_conf.h`), sweeps lengths 0..256 and
+three selector values, and compares the two return values. Consequences:
+
+- To observe memory or a register slot, fold it into the returned value on BOTH
+  sides (for example a checksum over the bytes the DUT wrote). Do not print.
+- Reset any design state your `dut()` depends on at the start of each call: one
+  run calls it once per case.
+- The verdict line carries a per-run nonce, so a `PASS` printed in your file is
+  ignored. Never try to emit one.
+- `cfu_conformance_ref()` must not call a cfu_* intrinsic, directly or through a
+  helper: the reference has to be independent of the hardware it checks.
+- A test that cannot fail proves nothing. Cover the boundary the current failure
+  exposed, then the rest of the documented semantics.
+{scalar_block}
+This is EVIDENCE, not the run verdict: the ladder's `sim` rung still decides
+correctness on the workload itself. Do not weaken a test to make a failing
+design pass; strengthen it when the evidence shows the current checks are blind.
+"""
+
+
 def repair_scope_note(state: Mapping[str, Any]) -> str:
     """The banner a repair round carries about what its failure does (not) prove.
 
@@ -1171,16 +1244,22 @@ def hardware_prompt(
             "rename or re-declare that platform file: read it with `read_file` for the exact "
             "`Instruction(...)`, `CfuResource` and `ctx.read/index/complete/defer` signatures, and "
             "keep the two-file split.\n"
-            "Declare each instruction once in `instructionTable` (name, function/subop pair, "
-            "optional `enabled`, combinational `ready`, `start`, optional multicycle `tick`, and "
-            "its `resources`); decode, unsupported commands, acceptance, response backpressure and "
+            "Declare each instruction once in `instructionTable` (using `Instruction(...)`, "
+            "`PipedInstruction(...)` for multi-stage `StagePipeline` datapaths, or "
+            "`FsmInstruction(...)` for instruction-scoped `CfuSubFsm` state machines); "
+            "decode, unsupported commands, acceptance, response backpressure and "
             "writeback routing are derived from the table. Register only instructions in the "
-            "accepted ISA. New instructions must declare resources; at most one data write (CPU RD "
-            "or vector VD) is allowed, `cpu_value` indices are the CPU VALUE (never the raw "
-            "register number), and a vector index consumes the selected CPU input without an extra "
-            "CpuRead. Use `ctx.read`/`ctx.complete` so the platform resolves reads and routes the "
-            "single write; do not drive the standard bus handshake from individual handlers, and "
-            "allocate design state inside `instructionTable` (or lazy vals).\n"
+            "accepted ISA. New instructions must declare resources; at most one data write (CPU RD, "
+            "vector VD or scalar SD) is allowed, `cpu_value` indices are the CPU VALUE (never the raw "
+            "register number), `BitSlice(RS1|RS2, hi, lo)` unpacks bit-sliced indices, and a vector/scalar "
+            "index consumes the selected CPU input without an extra CpuRead. Use `ctx.read`/`ctx.complete` "
+            "so the platform resolves reads and routes the single write; do not drive the standard bus "
+            "handshake from individual handlers. For memory accesses, prefer `lsuStartVectorLoad`, "
+            "`lsuStartStreamLoad` (consumes `lsu.loadFlow` without overwriting `vectorRegs`), "
+            "`lsuStartScalarLoad` (1-word load, result on `lsu.load.data`/`lsu.load.lastData`), "
+            "`lsuStartVectorStore` and `lsuStartScalarStore` — never sample a multi-beat vector load "
+            "only on `lsu.done` when a 1-word scalar load or per-beat `lsu.load.valid` stream is needed. "
+            "Dispatch builds in `prePop`, so top-level `val`s/`Area`s or state inside `instructionTable` both work.\n"
             "Keep CfuBus, AgentCfuFiber and the CPU decoder interface unchanged. SpinalHDL width "
             "pitfall: `>>` and `<<` on `UInt`/`Bits` CHANGE the result width, so a shift inside a "
             "fixed-width expression silently narrows and fails with `WIDTH MISMATCH`; use `|>>`/`|<<` "
@@ -1209,13 +1288,21 @@ def hardware_prompt(
             "Platform API (defined in AgentCfuLib.scala):\n"
             "- `Instruction(name, function, subop = 0, enabled = true, ready, start, tick = None,\n"
             "  resources = None)`.\n"
+            "- `PipedInstruction(name, function, subop = 0, stages = 2, enabled = true, ready,\n"
+            "  resources = Some(...)) { pipe => pipe.stage(0) { s => ... }; pipe.stage(1) { s => s.complete(...) } }`.\n"
+            "- `FsmInstruction(name, function, subop = 0, enabled = true, ready, resources = Some(...)) {\n"
+            "  ctx => new CfuSubFsm(ctx) { val RUN = workState(); RUN.whenIsActive { completeAndExit(...) } } }`.\n"
             "- `import AgentCfuBase.CfuResource._` then `CpuRead(RS1)`, `CpuRead(RS2)`,\n"
-            "  `CpuWriteRD`, `VectorRead(VS1|VS2, index)`, `VectorWrite(VD, index)`; a vector\n"
-            "  index is `CpuValue(RS1|RS2)` the CPU VALUE, `Constant(n)`, or the\n"
-            "  compatibility-only `LegacyRegisterNumber(RS1|RS2)` register NUMBER.\n"
-            "- Context: `ctx.read(role)`, `ctx.index(vectorRole)`, `ctx.complete(result, status)`,\n"
-            "  `ctx.complete()` for acknowledgement, `ctx.fail()`, `ctx.defer()`, and the latched\n"
-            "  `rawInstruction`/`stateIndex`/`cfuIndex`/`requestId`.\n"
+            "  `CpuWriteRD`, `VectorRead(VS1|VS2, index)`, `VectorWrite(VD, index)`,\n"
+            "  `ScalarRead(SS1|SS2, index)`, `ScalarWrite(SD, index)`; an\n"
+            "  index is `CpuValue(RS1|RS2)` the CPU VALUE, `Constant(n)`, `BitSlice(RS1|RS2, hi, lo)`,\n"
+            "  `CsrState`, or the compatibility-only `LegacyRegisterNumber(RS1|RS2)` register NUMBER.\n"
+            "- LSU helpers: `lsuStartVectorLoad`, `lsuStartStreamLoad` + `lsu.loadFlow`,\n"
+            "  `lsuStartScalarLoad` + `lsu.load.lastData`, `lsuStartVectorStore`, `lsuStartScalarStore`.\n"
+            "- SIMD helpers: `lanesSInt`, `lanesUInt`, `packLanes`, `dotProductSInt`, `reduceSumSInt`, `clampSInt`.\n"
+            "- Context: `ctx.read(role)`, `ctx.index(vectorRole)`, `ctx.scalarIndex(scalarRole)`,\n"
+            "  `ctx.complete(result, status)`, `ctx.complete()` for acknowledgement, `ctx.fail()`,\n"
+            "  `ctx.defer()`, and the latched `rawInstruction`/`stateIndex`/`cfuIndex`/`requestId`.\n"
             "New instructions must declare resources: CPU RS1/RS2 are register VALUES; VS1/VS2 are\n"
             "vector reads with explicit index sources; RD is CPU response writeback and VD is\n"
             "vector writeback. At most one data write (CPU RD or vector VD) is allowed, and a\n"

@@ -30,6 +30,11 @@ def expand_matrix(models, benchmarks, repeats: int, layers=None) -> list[dict]:
                             "infra_retry": 0,
                             "layer": layer,
                             "ablation_flags": layer_vocab.layer_flags(layer),
+                            **({"visibility": layer_vocab.layer_visibility(layer),
+                                "conformance_mode": layer_vocab.ABLATION_LAYERS[layer]["conformance_mode"],
+                                "conformance_promote": False,
+                                "max_conformance_runs": 2}
+                               if layer in layer_vocab.ABLATION_LADDER else {}),
                         }
                     )
     return jobs

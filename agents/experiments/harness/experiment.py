@@ -9,7 +9,33 @@ from agents.experiments.harness import execution, layers, metrics
 
 
 def materialize_experiment(opts) -> dict:
+    is_ladder = any(name in layers.ABLATION_LADDER for name in opts.layers)
+    extra_flags = [arg for arg in getattr(opts, "agent_args", ()) if arg in layers.ABLATION_FLAG_NAMES]
+    definitions = {}
+    for name in opts.layers:
+        entry = layers.ABLATION_LAYERS[name]
+        definitions[name] = {
+            "flags": list(layers.effective_ablation_flags((*layers.layer_flags(name), *extra_flags))),
+            "adds": entry["adds"],
+            "visibility": layers.layer_visibility(name, opts.visibility),
+        }
+        if name in layers.ABLATION_LADDER:
+            definitions[name].update(
+                conformance_mode=entry["conformance_mode"],
+                conformance_promote=False,
+                max_conformance_runs=getattr(opts, "max_conformance_runs", 2),
+            )
+    templates = {
+        name: execution.build_argv(
+            opts.python, opts.conda_env, None, "<config>", "<benchmark>", "<run_name>",
+            opts.max_iters, entry["visibility"], opts.profile_cache,
+            layers.job_run_flags({**entry, "ablation_flags": entry["flags"]}),
+            [arg for arg in getattr(opts, "agent_args", ()) if arg not in layers.ABLATION_FLAG_NAMES],
+        )
+        for name, entry in definitions.items()
+    }
     meta = {
+        "ablation_scheme": layers.ABLATION_SCHEME if is_ladder else "full-flow-v1",
         "exp_id": opts.exp_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "estimand": metrics.ESTIMAND_HELP,
@@ -21,7 +47,7 @@ def materialize_experiment(opts) -> dict:
         "temperature": opts.temperature,
         "conda_env": opts.conda_env,
         "python": opts.python,
-        "visibility": opts.visibility,
+        "visibility": "per-layer" if is_ladder else opts.visibility,
         "profile_cache": opts.profile_cache,
         "jobs": opts.jobs,
         "timeout": opts.timeout,
@@ -34,19 +60,10 @@ def materialize_experiment(opts) -> dict:
             "file": str(opts.sbt_lock_file),
             "timeout": opts.sbt_lock_timeout,
         },
-        "argv_template": execution.build_argv(
-            opts.python, opts.conda_env, None, "<config>", "<benchmark>", "<run_name>",
-            opts.max_iters, opts.visibility, opts.profile_cache,
-            (), list(getattr(opts, "agent_args", ()) or ()),
-        ),
+        "argv_template": templates[opts.layers[0]],
+        "argv_templates_by_layer": templates,
         "agent_args": list(getattr(opts, "agent_args", ()) or ()),
-        "layers": {
-            name: {
-                "flags": list(layers.ABLATION_LAYERS[name]["flags"]),
-                "adds": layers.ABLATION_LAYERS[name]["adds"],
-            }
-            for name in opts.layers
-        },
+        "layers": definitions,
     }
     meta.update(execution.git_info(opts.workdir))
     return meta

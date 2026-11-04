@@ -118,8 +118,12 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
             validation_state,
             rung,
             ok=ok,
-            # The conformance micro-test runs before any software decision is final.
-            default="check_conformance",
+            # The conformance rung is on the happy path only when it is a real
+            # verdict (legacy `gate` mode, or an explicit promotion). In `dev`
+            # mode its absence would otherwise be re-introduced here: this gate's
+            # recorded `next` overrides the router's default.
+            default=("check_conformance" if gates_mod.conformance_gates(state)
+                     else "build_sw"),
             repair_target="implement",
             repair_kind=None if submitted_candidate else "preverify",
             verification_submission=submitted_candidate,

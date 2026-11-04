@@ -58,6 +58,11 @@ Do not infer generated hardware features from `MARCH` alone. `MARCH=..._zicsr_zi
 
 ## Correctness Ladder
 
+0. Instruction-level dev test, when running under the CfuGym agent: create a test with
+   `add_conformance_test`, implement `cfu_conformance_dut()` beside an independent
+   `cfu_conformance_ref()` inside the marked region, and run it with
+   `run_conformance`. The host supplies the entry point and the data sweep, so this
+   is evidence about the instruction only -- not the workload verdict.
 1. Scalar unit test: compare CFU output with a simple C or Scala reference for small inputs.
 2. Software intrinsic test: confirm custom instruction fields match hardware decode comments.
 3. SoC simulation: run the ELF on the generated SoC with the same parameters used at compile time.
@@ -73,6 +78,7 @@ Reusable scripts:
 - `tools/bncfu_e2e_kivi_benchmark.py` and `tools/bncfu_e2e_llama_benchmark.py`: end-to-end benchmark runner patterns.
 
 For quick CFU cost checks, use `references/yosys-cost-flow.md` and `scripts/yosys_cost_report.py` before a slower vendor flow.
+When `--cost-backend vivado` is selected, the cost gate first requires successful Yosys synthesis: agent CFUs are synthesized standalone, while other workloads synthesize the selected CFU top from frozen generated SoC RTL. Whole-SoC Vivado implementation starts only after that precheck passes; `--skip-cost` skips both stages.
 Use RTL emitted by `MiCoSocGen` or a standalone CFU `generateVerilog` object for this cost flow. Do not synthesize `MiCoSocSim.v` or `simWorkspace` simulation RTL for hardware-cost claims.
 
 For BNCFUv2 block-count exploration, prefer:

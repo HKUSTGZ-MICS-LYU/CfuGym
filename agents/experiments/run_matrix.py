@@ -29,23 +29,44 @@ into ``record.json`` + ``runs.csv``; every failure is classified into a
 ``failure_class`` (which rung broke and why) and archived as ``failure.json`` +
 ``failures.csv``.
 
-Ablation layers (``--layers``): the matrix can carry a third dimension besides
-model x benchmark -- a *layered capability ladder* that adds exactly one
-capability per layer, in the order ISA Contract -> Conformance -> LLVM IR
-(``--no-isa-contract`` implies ``--no-conformance``, so conformance cannot
-exist without the contract):
+Ablation layers (``--layers``): scheme ``isa-visibility-devconf-ir-v3`` adds
+ISA Contract -> visibility -> dev conformance -> LLVM IR (L0-L4, no X groups):
 
-    l0-none   --no-isa-contract --no-conformance --no-llvm-ir   (nothing)
-    l1-isa    --no-conformance --no-llvm-ir                     (+ ISA Contract)
-    l2-conf   --no-llvm-ir                                      (+ Conformance)
-    full      (no flags)                                        (+ LLVM IR)
+    layer        ISA    visibility  conformance-mode  LLVM IR
+    l0-none      off    basic       off               off
+    l1-isa       on     basic       off               off
+    l2-vis       on     extended    off               off
+    l3-devconf   on     extended    dev               off
+    l4-ir        on     extended    dev               on
 
-``--layers ladder`` runs all four layers per cell (4x the runs); the default is
-the single un-ablated ``full`` layer, which keeps the canonical run name.  Every
-ablated layer carries its layer token in the run name; every record and
-aggregated table gets a ``layer`` column, and the summary compares the layers
-side by side.  What each run actually ablated is cross-checked against the
-report's ``## Ablation`` section, so silently ignored switches are flagged.
+Layers explicitly set ``--conformance-mode off/dev``, never mixed with
+``--no-conformance``; promotion is disabled. Dev conformance is evidence, not a
+YAML-oracle gate. Harness ``--max-conformance-runs`` defaults to 2, stage-local,
+NOT two conformance calls for a whole run; place it before any bare ``--``.
+The lowest tier ``basic`` means no EXTRA repo/skills/SpinalHDL visibility,
+not zero source access: workload, interfaces and necessary scaffolds remain.
+This cumulative design estimates conditional additions, not independent
+main effects/interactions. IR is static evidence, not measured cycles.
+
+``--layers ladder`` runs five layers per cell: one model x two benchmarks x
+R=3 = 30 planned runs, excluding infrastructure retries. The default ``full``
+remains the separate legacy un-ablated matrix/sweep preset (agent default
+conformance ``dev``, unsuffixed run names), NOT l4-ir or the new final layer.
+Aliases none/l0, isa/l1 and visibility/vis/l2 select L0/L1/L2;
+l3/conf/conformance/devconf -> l3-devconf, l4/ir/llvm-ir -> l4-ir.
+Old l3-ir and l2-conf are archive-only: no new schedules, but old batches
+remain readable via ``--aggregate-only``.
+New layers reject global ``--visibility`` and passthrough ``--no-isa-contract``,
+``--no-llvm-ir``, ``--ir-features``, ``--no-conformance``, ``--conformance-mode``,
+``--conformance-promote`` and ``--max-conformance-runs``. Do not add global
+conformance flags. Use a NEW unique experiment ID: metadata records
+``ablation_scheme='isa-visibility-devconf-ir-v3'`` and layer controls;
+v3 schema cannot resume into or mix with old v2 batches.
+
+Each new layer carries its token in the run name; records and aggregate tables
+retain the layer coordinate, and the summary compares layers side by side.
+Ablation flags are cross-checked against the report's ``## Ablation`` section,
+so silently ignored switches are flagged.
 
 Concurrency / locking: all heavy commands of the agent (SoC generation,
 ``MiCoSocSim`` RTL simulation, ``GenAgentCfu``) are invoked as ``sbt`` and share
@@ -67,13 +88,24 @@ verbatim to agents/run_cfu_agent.py):
         --repeats 5 --max-iters 5 --temperature 0.7 \
         --conda-env mico_env --jobs 2
 
-    # layered ablation (same harness; --layers defaults to the full ladder):
+    # Generic new-ladder command; set variables before use (not executed here).
+    EXP_ID="<new-unique-v3-experiment-id>"
+    MODELS="<config-name[,config-name...]>"
+    BENCHMARKS="<benchmark[,benchmark...]>"
     python3 agents/experiments/run_ablation.py \
-        --exp-id abl-20260212 \
-        --models deepseek-pro,glm-5.2,gpt-5.6-terra \
-        --benchmarks crc32,matmult-int,md5sum \
-        --repeats 3 --max-iters 5 --temperature 0.7 \
-        --conda-env mico_env --jobs 2
+        --exp-id "$EXP_ID" --models "$MODELS" --benchmarks "$BENCHMARKS" \
+        --layers ladder --repeats 3 --max-iters 5 --max-conformance-runs 2 \
+        --temperature 1.0 --jobs 1 --conda-env mico_env \
+        -- --cost-backend vivado
+
+First add ``--dry-run`` BEFORE the bare ``--`` to print/write the plan only:
+no actual LLM calls or toolchain execution (30 runs for one model and two
+benchmarks). The matrix entry is equivalent with explicit ``--layers ladder``.
+Without ``--dry-run`` the command starts autonomous execution. Remove the
+``-- --cost-backend vivado`` tail to use default Yosys, without Vivado resources.
+Summaries report speedup min/max/mean/median over valid successful samples and
+actual Vivado LUT/FF/BRAM/DSP resources. Missing data stays empty; Yosys cells
+are never substituted for Vivado resources.
 """
 
 from __future__ import annotations

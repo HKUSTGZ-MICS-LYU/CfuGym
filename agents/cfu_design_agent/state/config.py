@@ -56,6 +56,15 @@ class RunConfig(TypedDict, total=False):
     # Ablation switches (all default True; the --no-* CLI flags set False).
     llvm_ir: bool
     require_conformance: bool
+    #: How the conformance capability is delivered:
+    #: ``dev`` (agent-authored tests, evidence only), ``gate`` (the legacy
+    #: host-rendered YAML-oracle rung) or ``off`` (ablation).
+    conformance_mode: Literal["dev", "gate", "off"]
+    #: Bounded number of ``run_conformance`` invocations per implementation stage.
+    max_conformance_runs: int
+    #: Promote a passing dev test to the ``hw_conformance`` gate (off by default:
+    #: a dev test is evidence, and the ``sim`` rung owns the verdict).
+    conformance_promote: bool
     isa_contract: bool
     max_iters: int
     max_answer_repairs: int

@@ -39,7 +39,7 @@ _NODE_LAYOUT: tuple[tuple[str, str | None, str | None, tuple[str, ...]], ...] = 
     ("implement", None, "_route_after_implement",
      ("generate_soc", "analyze_workload", "design_contract", "review_and_route")),
     ("generate_soc", None, "_route_after_hw_build",
-     ("check_conformance", "implement", "review_and_route")),
+     ("check_conformance", "build_sw", "implement", "review_and_route")),
     ("check_conformance", None, "_route_after_hw_conformance",
      ("build_sw", "implement", "review_and_route")),
     ("build_sw", None, "_route_after_sw_build",

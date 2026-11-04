@@ -87,15 +87,18 @@ def validate_cfu_resources(resources: Any, datapath: Any = None, prefix: str = "
     """Validate explicit resource declarations; absence is handled by the caller.
 
     cpu_value indices use the entire CPU value (hardware must bounds-check before
-    narrowing). legacy_register_number explicitly retains historical truncation.
+    narrowing). bit_slice extracts a bit range from rs1/rs2; csr_state uses the
+    CSR state_index; legacy_register_number explicitly retains historical truncation.
     """
     if not isinstance(resources, list):
         return [f"{prefix} must be a list"]
     errors: list[str] = []
     roles: set[str] = set()
     writes = 0
-    depth = datapath.get("regDepth") if isinstance(datapath, dict) else None
-    known_depth = isinstance(depth, int) and not isinstance(depth, bool) and depth > 0
+    vec_depth = datapath.get("regDepth") if isinstance(datapath, dict) else None
+    known_vec_depth = isinstance(vec_depth, int) and not isinstance(vec_depth, bool) and vec_depth > 0
+    scalar_depth = datapath.get("scalarRegDepth") if isinstance(datapath, dict) else None
+    known_scalar_depth = isinstance(scalar_depth, int) and not isinstance(scalar_depth, bool) and scalar_depth > 0
     for n, resource in enumerate(resources):
         path = f"{prefix}[{n}]"
         if not isinstance(resource, dict):
@@ -103,15 +106,23 @@ def validate_cfu_resources(resources: Any, datapath: Any = None, prefix: str = "
             continue
         storage, access, role = (resource.get(k) for k in ("storage", "access", "role"))
         expected = {"storage", "access", "role"}
-        if storage == "vector":
+        if storage in ("vector", "scalar"):
             expected.add("index")
         if set(resource) != expected:
             errors.append(f"{path} keys must be exactly {', '.join(sorted(expected))}")
-        if not isinstance(storage, str) or storage not in ("cpu", "vector"):
-            errors.append(f"{path}.storage must be cpu or vector")
+        if not isinstance(storage, str) or storage not in ("cpu", "vector", "scalar"):
+            errors.append(f"{path}.storage must be cpu, vector, or scalar")
         if not isinstance(access, str) or access not in ("read", "write"):
             errors.append(f"{path}.access must be read or write")
-        allowed = ("rs1", "rs2") if storage == "cpu" and access == "read" else ("rd",) if storage == "cpu" and access == "write" else ("vs1", "vs2") if storage == "vector" and access == "read" else ("vd",) if storage == "vector" and access == "write" else ()
+        allowed = (
+            ("rs1", "rs2") if storage == "cpu" and access == "read"
+            else ("rd",) if storage == "cpu" and access == "write"
+            else ("vs1", "vs2") if storage == "vector" and access == "read"
+            else ("vd",) if storage == "vector" and access == "write"
+            else ("ss1", "ss2") if storage == "scalar" and access == "read"
+            else ("sd",) if storage == "scalar" and access == "write"
+            else ()
+        )
         if not isinstance(role, str) or role not in allowed:
             errors.append(f"{path}.role is invalid for storage/access")
         if isinstance(role, str):
@@ -119,29 +130,49 @@ def validate_cfu_resources(resources: Any, datapath: Any = None, prefix: str = "
                 errors.append(f"{path}.role duplicates {role}")
             roles.add(role)
         writes += access == "write"
-        if storage != "vector":
+        if storage not in ("vector", "scalar"):
             continue
         index = resource.get("index")
         if not isinstance(index, dict):
             errors.append(f"{path}.index must be a mapping")
             continue
         source = index.get("source")
-        if not isinstance(source, str) or source not in ("cpu_value", "constant", "legacy_register_number"):
-            errors.append(f"{path}.index.source must be cpu_value, constant, or legacy_register_number")
+        valid_sources = ("cpu_value", "constant", "bit_slice", "csr_state", "legacy_register_number")
+        if not isinstance(source, str) or source not in valid_sources:
+            errors.append(
+                f"{path}.index.source must be cpu_value, constant, bit_slice, csr_state, or legacy_register_number"
+            )
             continue
-        keys = {"source", "value"} if source == "constant" else {"source", "register"}
+        keys = (
+            {"source", "value"} if source == "constant"
+            else {"source"} if source == "csr_state"
+            else {"source", "register", "hi", "lo"} if source == "bit_slice"
+            else {"source", "register"}
+        )
         if set(index) != keys:
             errors.append(f"{path}.index keys must be exactly {', '.join(sorted(keys))}")
         if source == "constant":
             value = index.get("value")
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 errors.append(f"{path}.index.value must be a nonnegative integer")
-            elif known_depth and value >= depth:
-                errors.append(f"{path}.index.value must be less than datapath.regDepth ({depth})")
-        elif not isinstance(index.get("register"), str) or index["register"] not in ("rs1", "rs2"):
-            errors.append(f"{path}.index.register must be rs1 or rs2 (legacy rd is not supported)")
+            elif storage == "vector" and known_vec_depth and value >= vec_depth:
+                errors.append(f"{path}.index.value must be less than datapath.regDepth ({vec_depth})")
+            elif storage == "scalar" and known_scalar_depth and value >= scalar_depth:
+                errors.append(f"{path}.index.value must be less than datapath.scalarRegDepth ({scalar_depth})")
+        elif source == "bit_slice":
+            reg = index.get("register")
+            hi, lo = index.get("hi"), index.get("lo")
+            if not isinstance(reg, str) or reg not in ("rs1", "rs2"):
+                errors.append(f"{path}.index.register must be rs1 or rs2")
+            if (not isinstance(hi, int) or isinstance(hi, bool)
+                    or not isinstance(lo, int) or isinstance(lo, bool)
+                    or lo < 0 or hi < lo or hi >= 32):
+                errors.append(f"{path}.index hi/lo must be integers with 0 <= lo <= hi < 32")
+        elif source != "csr_state":
+            if not isinstance(index.get("register"), str) or index["register"] not in ("rs1", "rs2"):
+                errors.append(f"{path}.index.register must be rs1 or rs2 (legacy rd is not supported)")
     if writes > 1:
-        errors.append(f"{prefix} permits at most one data write (CPU RD or vector VD)")
+        errors.append(f"{prefix} permits at most one data write (CPU RD, vector VD, or scalar SD)")
     return sorted(errors)
 
 
@@ -155,9 +186,13 @@ def _resource_description(resource: dict[str, Any]) -> str:
         origin = f"constant {index['value']}"
     elif index["source"] == "cpu_value":
         origin = f"CPU {index['register'].upper()} value (full-width bounds check)"
+    elif index["source"] == "bit_slice":
+        origin = f"CPU {index['register'].upper()}[{index['hi']}:{index['lo']}] bit-slice (bounds checked)"
+    elif index["source"] == "csr_state":
+        origin = "CSR state_index (bounds checked)"
     else:
         origin = f"legacy instruction {index['register'].upper()} register number (truncated)"
-    return f"{resource['access']} vector {role}, index = {origin}"
+    return f"{resource['access']} {resource['storage']} {role}, index = {origin}"
 
 
 def validate_isa_spec(data: dict[str, Any]) -> list[str]:
@@ -589,7 +624,7 @@ def _resource_intrinsic(command: dict[str, Any], datapath: Any) -> list[str]:
                 cpu_rd = True
         else:
             index = resource["index"]
-            if index["source"] == "cpu_value":
+            if index["source"] in ("cpu_value", "bit_slice"):
                 values.add(index["register"])
             elif index["source"] == "legacy_register_number":
                 physical.add(index["register"])

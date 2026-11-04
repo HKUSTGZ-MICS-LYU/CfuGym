@@ -43,9 +43,12 @@ class MiCoSocParam {
   var AgentCfuVlen = 256
   var AgentCfuBusWidth = 32
   var AgentCfuRegDepth = 2
+  var AgentCfuScalarDepth = 4
   var AgentCfuTilelink = true
   var AgentCfuLoad = true
   var AgentCfuStore = true
+  var AgentCfuAdvancedMem = false
+  var AgentCfuBurstMem = false
   var BitNetCfuV2DotPipeStages = 1
   var BitNetCfuV2QuantPipeStages = 1
   var BitNetCfuV2LoadBufferDepth = 0
@@ -88,9 +91,12 @@ class MiCoSocParam {
     opt[Int]("agent-cfu-vlen") action { (v, c) => AgentCfuVlen = v }
     opt[Int]("agent-cfu-bus-width") action { (v, c) => AgentCfuBusWidth = v }
     opt[Int]("agent-cfu-reg-depth") action { (v, c) => AgentCfuRegDepth = v }
+    opt[Int]("agent-cfu-scalar-depth") action { (v, c) => AgentCfuScalarDepth = v }
     opt[Unit]("agent-cfu-no-tilelink") action { (v, c) => AgentCfuTilelink = false }
     opt[Unit]("agent-cfu-no-load") action { (v, c) => AgentCfuLoad = false }
     opt[Unit]("agent-cfu-no-store") action { (v, c) => AgentCfuStore = false }
+    opt[Unit]("agent-cfu-advanced-mem") action { (v, c) => AgentCfuAdvancedMem = true }
+    opt[Unit]("agent-cfu-burst-mem") action { (v, c) => AgentCfuBurstMem = true }
     opt[Int]("bitnet-cfu-len") action { (v, c) => BitNetCfuLen = v }
     opt[Int]("bitnet-cfu-width") action { (v, c) => BitNetCfuWidth = v }
     opt[Int]("bitnet-cfu-bus-width") action { (v, c) => BitNetCfuBusWidth = v }
@@ -165,7 +171,10 @@ class MiCoSocParam {
         regDepth = AgentCfuRegDepth,
         withTilelink = AgentCfuTilelink,
         withLoad = AgentCfuTilelink && AgentCfuLoad,
-        withStore = AgentCfuTilelink && AgentCfuStore
+        withStore = AgentCfuTilelink && AgentCfuStore,
+        advancedMem = AgentCfuTilelink && AgentCfuAdvancedMem,
+        burstMem = AgentCfuTilelink && AgentCfuBurstMem,
+        scalarRegDepth = AgentCfuScalarDepth
       )
       if(AgentCfuTilelink) {
         vexii.lsuMemDataWidthMin = vexii.lsuMemDataWidthMin max AgentCfuBusWidth

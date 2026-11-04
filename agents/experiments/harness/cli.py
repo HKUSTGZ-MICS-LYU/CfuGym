@@ -85,14 +85,13 @@ def build_parser(
     parser.add_argument("--benchmarks", default=None, help="Comma list of embench-iot benchmark names.")
     parser.add_argument("--repeats", type=int, default=default_repeats, help="Independent repeats per cell (default: 5).")
     parser.add_argument("--layers", default=default_layers,
-                        help="Comma list of ablation layers, or 'ladder' for the full capability "
-                             "ladder (l0-none -> l1-isa -> l2-conf -> full; each layer adds ISA "
-                             "Contract, then Conformance, then LLVM IR). Default: "
-                             f"{default_layers!r} "
-                             + ("(no ablation flags)" if default_layers == "full"
-                                else "(the full capability ladder)")
-                             + ". Aliases: none, isa, conf, llvm-ir.")
+                        help="Comma list, or 'ladder': l0-none -> l1-isa -> l2-vis -> l3-devconf -> l4-ir "
+                             "(ISA Contract -> visibility -> dev conformance -> IR). "
+                             f"Default: {default_layers!r}. 'full' is the separate legacy flow. "
+                             "Aliases: none/l0, isa/l1, vis/l2, devconf/l3, ir/l4.")
     parser.add_argument("--max-iters", type=int, default=5, help="Maximum candidate submissions to verification; K = attempt budget for pass@K (default: 5).")
+    parser.add_argument("--max-conformance-runs", type=int, default=2,
+                        help="New ladder: run_conformance calls per Implement session (default: 2), not a whole-run limit.")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature forced into the experiment configs (default: 0.7).")
     parser.add_argument("--conda-env", default=DEFAULT_CONDA_ENV,
                         help=f"Conda environment every launched command runs in (default: {DEFAULT_CONDA_ENV!r}; empty disables conda).")
@@ -103,7 +102,9 @@ def build_parser(
     parser.add_argument("--jobs", type=int, default=1, help="Concurrent runs (sbt/RTL-sim stay serialized via the lock shim; default: 1).")
     parser.add_argument("--timeout", type=int, default=10800, help="Per-run wall-clock timeout in seconds (default: 3h).")
     parser.add_argument("--seed", type=int, default=20260212, help="Scheduling shuffle seed.")
-    parser.add_argument("--visibility", default="standard", choices=("basic", "standard", "extended"))
+    parser.add_argument("--visibility", default=None, choices=("basic", "standard", "extended"),
+                        help="Legacy full-flow visibility (default: standard). New ladder layers "
+                             "have fixed basic/basic/extended/extended/extended tiers; omit this option.")
     parser.add_argument("--profile-cache", default="on", choices=("on", "off", "refresh"))
     parser.add_argument("--infra-retries", type=int, default=2, help="Harness retries for infrastructure failures only (default: 2).")
     parser.add_argument("--infra-backoff", type=float, default=60.0,
@@ -148,7 +149,7 @@ def validate_agent_args(agent_args: list[str]) -> None:
     """Reject passthrough flags the harness owns (see ``RESERVED_AGENT_FLAGS``)."""
     for arg in agent_args:
         flag = str(arg).split("=", 1)[0]
-        if flag in RESERVED_AGENT_FLAGS:
+        if flag.startswith("--") and any(owned.startswith(flag) for owned in RESERVED_AGENT_FLAGS):
             raise SystemExit(
                 f"{flag} is owned by the harness and cannot be passed after '--': "
                 "use --models/--max-iters/--visibility/--profile-cache for "
@@ -197,46 +198,101 @@ def main(
                 f"no benchmarks resolved from {opts.workdir}; pass --benchmarks explicitly"
             )
     opts.only = _split(opts.only)
-    opts.layers = layers.resolve_layers(opts.layers)
-    if opts.repeats < 1 or opts.max_iters < 1:
-        raise SystemExit("--repeats and --max-iters must be >= 1")
-    if opts.sbt_lock and opts.jobs > 1 and shutil.which("flock") is None:
-        raise SystemExit("flock(1) unavailable: use --no-sbt-lock --jobs 1 or install util-linux")
-
     out_root = Path(opts.out_root) if opts.out_root else opts.workdir / "agents" / "generated" / "experiments"
     if not out_root.is_absolute():
         out_root = opts.workdir / out_root
     exp_dir = out_root / opts.exp_id
     opts.exp_dir_ref = exp_dir
+    prior_experiment = experiment.read_experiment_yaml(exp_dir / "experiment.yaml")
+    # Archive reads must not resolve old layer names through the new vocabulary,
+    # write a shim/config, or overwrite the experiment's historical controls.
+    if opts.aggregate_only:
+        result = reporting.aggregate(exp_dir, prior_experiment, opts.bootstrap)
+        print(f"aggregated: {result['records']} runs, {result['cells']} cells -> {result['summary']}")
+        return 0
+    if opts.collect_only and prior_experiment.get("layers"):
+        opts.layers = list(prior_experiment["layers"])
+        for key in ("models", "benchmarks", "repeats", "max_iters"):
+            if key in prior_experiment:
+                setattr(opts, key, prior_experiment[key])
+        saved_visibility = prior_experiment.get("visibility")
+        if saved_visibility in ("basic", "standard", "extended"):
+            opts.visibility = saved_visibility
+    else:
+        opts.layers = layers.resolve_layers(opts.layers)
+    is_ladder = any(name in layers.ABLATION_LADDER for name in opts.layers)
+    if not opts.collect_only and prior_experiment.get("ablation_scheme") in (layers.ABLATION_SCHEME, layers.V2_ABLATION_SCHEME) and not is_ladder:
+        raise SystemExit("ablation scheme mismatch: legacy full cannot overwrite a new ladder batch; use a new --exp-id")
+    if is_ladder and not opts.collect_only:
+        if "full" in opts.layers:
+            raise SystemExit("legacy full is separate from the new ladder; do not mix it with new layers")
+        if opts.visibility is not None:
+            raise SystemExit("new ablation layers fix --visibility to basic/basic/extended/extended/extended; omit --visibility")
+        dimension_flags = ("--no-isa-contract", "--no-llvm-ir", "--ir-features",
+                           "--no-conformance", "--conformance-mode", "--conformance-promote",
+                           "--max-conformance-runs")
+        conflicts = {
+            flag for flag in (arg.split("=", 1)[0] for arg in agent_args)
+            if flag.startswith("--") and any(owned.startswith(flag) for owned in dimension_flags)
+        }
+        if conflicts:
+            raise SystemExit("agent passthrough changes fixed ablation dimensions: " + ", ".join(sorted(conflicts)))
+        if prior_experiment or (exp_dir / "runs").exists():
+            if prior_experiment.get("ablation_scheme") != layers.ABLATION_SCHEME:
+                raise SystemExit("ablation scheme mismatch with existing experiment; use a new --exp-id (old results remain aggregate-only)")
+            for name in opts.layers:
+                saved = (prior_experiment.get("layers") or {}).get(name, {})
+                current = layers.ABLATION_LAYERS[name]
+                if (tuple(saved.get("flags", ())) != tuple(current["flags"])
+                        or saved.get("visibility") != current.get("visibility", opts.visibility or "standard")
+                        or saved.get("conformance_mode") != current["conformance_mode"]
+                        or saved.get("conformance_promote") is not False
+                        or saved.get("max_conformance_runs") != opts.max_conformance_runs):
+                    raise SystemExit(f"ablation layer settings mismatch for {name}; use a new --exp-id")
+    opts.visibility = opts.visibility or "standard"
+    if opts.repeats < 1 or opts.max_iters < 1:
+        raise SystemExit("--repeats and --max-iters must be >= 1")
+    if is_ladder and not opts.collect_only and opts.max_conformance_runs < 1:
+        raise SystemExit("--max-conformance-runs must be >= 1 for the new ladder")
+    if opts.sbt_lock and opts.jobs > 1 and shutil.which("flock") is None:
+        raise SystemExit("flock(1) unavailable: use --no-sbt-lock --jobs 1 or install util-linux")
     lock_file = Path(opts.sbt_lock_file) if opts.sbt_lock_file else out_root / ".locks" / "sbt.lock"
     if not lock_file.is_absolute():
         lock_file = opts.workdir / lock_file
     opts.sbt_lock_file = lock_file
-
     jobs = scheduling.expand_matrix(opts.models, opts.benchmarks, opts.repeats, opts.layers)
     if not ordered:
         jobs = scheduling.schedule_jobs(jobs, opts.seed)
     for job in jobs:
         job["exp_id"] = opts.exp_id
         job["max_iters"] = opts.max_iters
-        job["ablation_flags"] = layers.effective_ablation_flags(
-            tuple(job.get("ablation_flags") or ()) + tuple(ablation_args)
+        job["ablation_scheme"] = (
+            prior_experiment.get("ablation_scheme") if opts.collect_only
+            else layers.ABLATION_SCHEME if is_ladder else "full-flow-v1"
         )
+        if opts.collect_only and prior_experiment.get("layers"):
+            entry = prior_experiment["layers"].get(job["layer"], {})
+            job["ablation_flags"] = tuple(entry.get("flags", ()))
+            job["visibility"] = entry.get("visibility") or opts.visibility
+            for key in ("conformance_mode", "conformance_promote", "max_conformance_runs"):
+                job.pop(key, None)
+                if key in entry:
+                    job[key] = entry[key]
+        else:
+            job["ablation_flags"] = layers.effective_ablation_flags(
+                tuple(job.get("ablation_flags") or ()) + tuple(ablation_args))
+            job["visibility"] = layers.job_visibility(job, opts.visibility)
+            if job["layer"] in layers.ABLATION_LADDER:
+                job["max_conformance_runs"] = opts.max_conformance_runs
     jobs = scheduling.filter_jobs(jobs, opts.only)
 
     shim_dir = None
     lock_env: dict[str, str] = {}
-    if opts.sbt_lock:
+    if opts.sbt_lock and not opts.collect_only:
         locking.require_flock()
         shim_dir = exp_dir / "bin"
         locking.write_sbt_shim(shim_dir)
         lock_env = locking.sbt_lock_env(opts.sbt_lock_file, opts.sbt_lock_timeout)
-
-    if opts.aggregate_only:
-        meta = experiment.read_experiment_yaml(exp_dir / "experiment.yaml")
-        result = reporting.aggregate(exp_dir, meta, opts.bootstrap)
-        print(f"aggregated: {result['records']} runs, {result['cells']} cells -> {result['summary']}")
-        return 0
 
     if opts.collect_only:
         meta = experiment.read_experiment_yaml(exp_dir / "experiment.yaml")
@@ -269,6 +325,7 @@ def main(
     generated_configs = configs.materialize_configs(opts.exp_id, opts.models, opts.temperature, opts.workdir)
     meta = experiment.materialize_experiment(opts)
     meta["configs"] = generated_configs
+    meta["schedule_jobs"] = [dict(job) for job in jobs]
     meta["schedule"] = [
         naming.job_run_name(j, opts.exp_id, opts.max_iters) for j in jobs
     ]
@@ -280,9 +337,9 @@ def main(
             name = naming.job_run_name(job, opts.exp_id, opts.max_iters)
             argv_list = execution.build_argv(
                 opts.python, opts.conda_env, shim_dir, generated_configs[job["model"]]["config"],
-                job["benchmark"], name, opts.max_iters, opts.visibility,
+                job["benchmark"], name, opts.max_iters, layers.job_visibility(job, opts.visibility),
                 opts.profile_cache,
-                layers.job_layer_flags(job),
+                layers.job_run_flags(job),
                 opts.agent_forward,
             )
             print(f"[dry ] {name}: {shlex.join(argv_list)}")

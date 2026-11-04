@@ -38,6 +38,28 @@ def _token_usage(text: str, patterns) -> dict:
     return usage
 
 
+def parse_conformance(text: str, *, report: bool = False) -> dict:
+    """Read explicit observations only; never infer a mode from today's default."""
+    out: dict = {}
+    prefix = r"^-\s*(?:conformance[_ -])?" if report else r"^\s*conformance[_ -]"
+    for key, name, value in (
+        ("conformance_mode", "mode", r"(off|dev|gate)"),
+        ("conformance_promote", "promote", r"(true|false|True|False)"),
+        ("max_conformance_runs", "max[_ -](?:conformance[_ -])?runs", r"(\d+)"),
+    ):
+        pattern = (r"^\s*max_conformance_runs\s*[:=]\s*" + value if not report and key == "max_conformance_runs"
+                   else prefix + name + r"\s*[:=]\s*`?" + value)
+        match = re.search(pattern, text, re.M)
+        if match:
+            raw = match.group(1)
+            out[key] = (raw.lower() == "true" if key == "conformance_promote"
+                        else int(raw) if key == "max_conformance_runs" else raw)
+    # Existing reports state promotion in the authority line, not a boolean key.
+    if report and out.get("conformance_mode") == "dev" and "authority: EVIDENCE only" in text:
+        out.setdefault("conformance_promote", "promotion enabled:" in text)
+    return out
+
+
 def parse_cli_stdout(text: str) -> dict:
     """Parse the stable machine-readable CLI lines (status=, summary:, ...)."""
     out: dict = {}
@@ -65,6 +87,7 @@ def parse_cli_stdout(text: str) -> dict:
             "top": m.group(1), "cells": int(m.group(2)), "wire_bits": int(m.group(3)),
             "memories": int(m.group(4)), "memory_bits": int(m.group(5)),
         }
+    out.update(parse_conformance(text))
     out.update(_token_usage(text, CLI_TOKEN_PATTERNS))
     return out
 
@@ -130,6 +153,15 @@ def parse_report(text: str, warnings: list[str]) -> dict:
     # crashed/hung process never gets there while report.md already carries the
     # totals.  Same estimand as the CLI block, just another stable surface.
     out["token_usage"] = _token_usage(text, REPORT_TOKEN_PATTERNS)
+    conformance = re.search(r"^## Conformance[^\n]*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    out.update(parse_conformance(conformance.group(1), report=True) if conformance else {})
+    hardware_cost = re.search(r"^## Hardware Cost\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    if hardware_cost:
+        cost_text = hardware_cost.group(1)
+        if "current validated FPGA PPA;" in cost_text:
+            out["ppa_current_valid"] = True
+        elif "historical FPGA evidence;" in cost_text or "current partial/failed FPGA evidence;" in cost_text:
+            out["ppa_current_valid"] = False
     return out
 
 

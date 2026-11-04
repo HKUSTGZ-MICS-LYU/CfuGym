@@ -34,21 +34,40 @@ case class AgentCfuParameter(
     addressWidth: Int = 32,
     withTilelink: Boolean = true,
     withLoad: Boolean = true,
-    withStore: Boolean = true
+    withStore: Boolean = true,
+    advancedMem: Boolean = false,
+    burstMem: Boolean = false,
+    scalarRegDepth: Int = 4
 ) {
+  def this(
+      xlen: Int,
+      vlen: Int,
+      regDepth: Int,
+      addressWidth: Int,
+      withTilelink: Boolean,
+      withLoad: Boolean,
+      withStore: Boolean
+  ) = this(xlen, vlen, regDepth, addressWidth, withTilelink, withLoad, withStore, false, false, 4)
+
   require(xlen > 0 && xlen % 8 == 0 && isPow2(xlen),
     "AgentCfu xlen must be a positive power-of-two, byte-aligned width")
   require(vlen > 0 && vlen % xlen == 0, "AgentCfu vlen must be a positive multiple of xlen")
   require(regDepth > 0 && regDepth <= 32, "AgentCfu regDepth must be in the raw RISC-V register-index range 1..32")
+  require(scalarRegDepth > 0 && scalarRegDepth <= 32,
+    "AgentCfu scalarRegDepth must be in the range 1..32")
   require(addressWidth > 0, "AgentCfu addressWidth must be positive")
   require(withTilelink || (!withLoad && !withStore),
     "AgentCfu load/store require the optional TileLink interface")
+  require(!burstMem || isPow2(vlen / 8),
+    "AgentCfu burstMem requires a power-of-two vector byte count (vlen / 8)")
 
   val beatBytes = xlen / 8
   val vectorBytes = vlen / 8
   val beatCount = vlen / xlen
   val beatIndexWidth = log2Up(beatCount) max 1
   val regIndexWidth = log2Up(regDepth) max 1
+  val scalarIndexWidth = log2Up(scalarRegDepth) max 1
+  val transferBytes = if (burstMem) vectorBytes else beatBytes
   val pendingSize = beatCount max 1
 }
 
@@ -62,38 +81,39 @@ object AgentCfuFunction {
 /**
   * The agent-owned CFU design.
   *
-  * Everything shared lives in [[AgentCfuBase]]; this class only declares which
-  * instructions exist and what each one does. Add or remove one `Instruction` entry
-  * (and its local handler) to grow or shrink the ISA: decode, unsupported commands,
-  * acceptance, response backpressure and writeback routing are all derived from the
-  * table, so no separate supported/decode/FSM branch needs editing.
+  * Everything shared lives in [[AgentCfuBase]]; this class declares the custom
+  * hardware datapath, state/Areas and the instruction table. Add or remove one
+  * `Instruction`, `PipedInstruction` or `FsmInstruction` entry (or call
+  * `register(...)` inside an `Area`) to grow or shrink the ISA: decode,
+  * unsupported commands, acceptance, response backpressure and writeback routing
+  * are all derived from the table.
   *
-  * Operand and writeback resources are explicit `CfuResource` declarations, never
-  * implicit handler behavior:
-  *   CpuRead(RS1)                            - the CPU X[rs1] value, not its number
-  *   CpuRead(RS2) / CpuWriteRD               - the CPU X[rs2] value / CPU rd result
+  * Operand and writeback resources are explicit `CfuResource` declarations:
+  *   CpuRead(RS1) / CpuRead(RS2)             - CPU X[rs1] / X[rs2] value
+  *   CpuWriteRD                              - write result to CPU rd
   *   VectorRead(VS1, CpuValue(RS1))          - CFU V[X[rs1]], vector width
-  *   VectorRead(VS2, Constant(1))            - CFU V[1]
-  *   VectorWrite(VD, CpuValue(RS1))          - write the result to CFU V[X[rs1]]
-  *   LegacyRegisterNumber(RS2)               - instruction[24:20] with legacy
-  *                                             index-width truncation, not X[rs2]
-  * A vector index implicitly consumes the selected CPU input; it needs no separate
-  * CpuRead. `LegacyRegisterNumber` exists only to keep the historical load/store
-  * encodings, so new instructions should use `CpuValue`/`Constant`. At most one
-  * data write (CPU RD or vector VD) is allowed. `resources = None` is the legacy
-  * two-argument interface; `Some(Seq.empty)` acknowledges with no data write.
+  *   VectorRead(VS2, Constant(1))            - CFU V[1], vector width
+  *   VectorWrite(VD, CpuValue(RS1))          - write result to CFU V[X[rs1]]
+  *   ScalarRead(SS1, Constant(0))            - CFU local scalar S[0], xlen width
+  *   ScalarWrite(SD, BitSlice(RS1, 7, 0))    - write result to CFU S[X[rs1][7:0]]
+  *   BitSlice(RS1, hi, lo) / CsrState        - packed bit-slice or CSR state index
+  *   LegacyRegisterNumber(RS2)               - compatibility-only instruction[24:20]
   *
-  * Handlers read through `ctx.read(role)` and finish with `ctx.complete(result)`,
-  * `ctx.complete()` for an acknowledgement, or `ctx.fail()` for an error. Use
-  * `ctx.defer()` plus a `tick` handler for a multicycle operation; the context
-  * captures request inputs, vector sources and the destination index on acceptance,
-  * so a deferred handler never observes a later bus or register-file change. This
-  * class may not use the legacy `ctx.input`/`ctx.reply` for a resource-aware entry.
+  * Execution styles supported by [[AgentCfuBase]]:
+  *   1. `Instruction(...)`       - 1-cycle combinational (`ctx.complete(res)`) or
+  *                                 deferred (`ctx.defer()` + `tick`)
+  *   2. `PipedInstruction(...)`  - multi-stage SpinalHDL `StagePipeline` with
+  *                                 automatic inter-stage registers and backpressure
+  *   3. `FsmInstruction(...)`    - instruction-scoped `StateMachine` (`CfuSubFsm`)
+  *   4. LSU helpers              - `lsuStartVectorLoad`, `lsuStartStreamLoad`,
+  *                                 `lsuStartScalarLoad`, `lsuStartVectorStore`,
+  *                                 `lsuStartScalarStore` + `lsu.loadFlow`
+  *   5. SIMD/Math helpers        - `lanesSInt`, `lanesUInt`, `packLanes`,
+  *                                 `dotProductSInt`, `reduceSumSInt`, `clampSInt`
   *
-  * The table runs while the platform is still being constructed, so use only
-  * this class's constructor parameters (`p`, `cfuParam`), the platform members, and
-  * state allocated inside the table itself. Do not read a `val` declared in the
-  * class body: Scala assigns those after the platform has already called the table.
+  * Dispatch is elaborated in `prePop` after this class's constructor body runs,
+  * so top-level `val`s, `Reg`s, `Mem`s and `new Area` blocks declared in this
+  * class may be freely referenced inside `instructionTable`.
   */
 class AgentCfu(
     cfuParam: CfuBusParameter,
@@ -112,18 +132,14 @@ class AgentCfu(
       ready = () => lsu.cmd.ready,
       resources = Some(Seq(CpuRead(RS1), VectorWrite(VD, LegacyRegisterNumber(RS2)))),
       start = ctx => {
-        lsu.cmd.address := ctx.read(RS1).asUInt.resize(p.addressWidth)
-        loadDestination := ctx.index(VD)
-        lsu.cmd.load := True
+        lsuStartVectorLoad(ctx.read(RS1).asUInt.resize(p.addressWidth), ctx.index(VD))
         fsm.goto(fsm.LOAD)
       }),
     Instruction("store", AgentCfuFunction.store, enabled = p.withTilelink && p.withStore,
       ready = () => lsu.cmd.ready,
       resources = Some(Seq(CpuRead(RS1), VectorRead(VS1, LegacyRegisterNumber(RS2)))),
       start = ctx => {
-        lsu.cmd.address := ctx.read(RS1).asUInt.resize(p.addressWidth)
-        storeSource := ctx.index(VS1)
-        lsu.cmd.store := True
+        lsuStartVectorStore(ctx.read(RS1).asUInt.resize(p.addressWidth), ctx.index(VS1))
         fsm.goto(fsm.STORE)
       })
   )

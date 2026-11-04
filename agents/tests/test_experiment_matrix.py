@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agents.cfu_design_agent.runtime import failures as runtime_failures
 from agents.cfu_design_agent.runtime.artifacts import _safe_run_id
 from agents.experiments import run_ablation, run_matrix as rm, run_sweep
 from agents.experiments.harness import cli as harness_cli
@@ -414,6 +415,120 @@ class InfraTest(unittest.TestCase):
         )["infra"])
 
 
+class EndpointFailureTextTest(unittest.TestCase):
+    RATE_LIMIT = (
+        "Your requests to gpt-6-luna for gpt-6-luna in eastus "
+        "have exceeded token rate limit."
+    )
+    TRANSFER_ERROR = (
+        "Response payload is not completed: <TransferEncodingError: 400, "
+        "message='Not enough data to satisfy transfer length header.'>"
+    )
+
+    @staticmethod
+    def _terminations(message: str) -> list[dict]:
+        # No SDK/client construction: only fake exception types and serialization.
+        api_error = type("APIError", (Exception,), {"__module__": "litellm"})(message)
+        wrapped = RuntimeError("native stage failed: tool-enabled LLM request failed")
+        wrapped.__cause__ = api_error
+        return [runtime_failures.termination(exc) for exc in (api_error, wrapped)]
+
+    def test_direct_and_tool_wrapped_termination_text(self) -> None:
+        for message, expected in (
+            (self.RATE_LIMIT, "infra_rate_limit"),
+            (self.TRANSFER_ERROR, "infra_error"),
+        ):
+            for typed in self._terminations(message):
+                with self.subTest(message=message, exception=typed["exception_type"]):
+                    infra = rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
+                    self.assertTrue(infra["infra"])
+                    self.assertEqual(infra["infra_kind"], expected)
+                    self.assertIn(message, infra["infra_reason"])
+                    for extra in ({}, {"infra": infra}):
+                        failure = rm.classify_failure(_failure_record(
+                            "analysis", {}, termination=typed, **extra))
+                        self.assertEqual(failure["failure_class"], expected)
+                        self.assertIn(message, failure["failure_detail"])
+                        self.assertIsNone(failure["budget_exhausted"])
+
+    def test_direct_and_tool_wrapped_log_text(self) -> None:
+        for message, expected in (
+            (self.RATE_LIMIT, "infra_rate_limit"),
+            (self.TRANSFER_ERROR, "infra_error"),
+        ):
+            for prefix in ("litellm.APIError: ", "api-error: ",
+                           "RuntimeError: native stage failed: tool-enabled LLM request: "):
+                with self.subTest(message=message, prefix=prefix):
+                    infra = rm.detect_infra("status=failed\n", prefix + message, False, 1)
+                    self.assertTrue(infra["infra"])
+                    self.assertEqual(infra["infra_kind"], expected)
+
+    def test_conformance_transport_text(self) -> None:
+        for message, expected in (
+            (self.RATE_LIMIT, "infra_rate_limit"),
+            (self.TRANSFER_ERROR, "infra_error"),
+        ):
+            with self.subTest(message=message):
+                infra = rm.detect_infra("status=failed\n", "", False, 1,
+                                        {"hw_conformance": {"ok": False, "errors": [message]}})
+                self.assertEqual(infra["infra_kind"], expected)
+
+    def test_invalid_prompt_and_local_budget_are_not_rate_limits(self) -> None:
+        for message in ("HTTP Error 400: invalid prompt",
+                        "HTTP Error 400: rate limit parameter is invalid",
+                        "local token budget exceeded", "local token budget exhausted (limit=429)"):
+            with self.subTest(message=message):
+                self.assertFalse(rm.detect_infra("status=failed\n", message, False, 1)["infra"])
+                for typed in self._terminations(message):
+                    infra = rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
+                    self.assertNotEqual(infra["infra_kind"], "infra_rate_limit")
+                    failure = rm.classify_failure(_failure_record("analysis", {}, termination=typed))
+                    self.assertNotEqual(failure["failure_class"], "infra_rate_limit")
+        budget_error = type("ContextBudgetError", (Exception,), {})("local token budget exceeded")
+        typed = runtime_failures.termination(budget_error)
+        self.assertFalse(rm.detect_infra("status=failed\n", "", False, 1, termination=typed)["infra"])
+        self.assertEqual(rm.classify_failure({"status": "failed", "termination": typed})
+                         ["failure_class"], "precondition")
+
+    def test_explicit_rate_limit_signatures(self) -> None:
+        for message in ("RateLimitError: throttled", "exceeded request rate limit",
+                        "rate limit reached", "rate limit exceeded",
+                        "rate_limit_exceeded", "too many requests"):
+            with self.subTest(message=message):
+                self.assertEqual(rm.detect_infra("status=failed\n", message, False, 1)
+                                 ["infra_kind"], "infra_rate_limit")
+                for typed in self._terminations(message):
+                    self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1,
+                                                     termination=typed)["infra_kind"], "infra_rate_limit")
+
+    def test_hard_quota_errors_override_429_and_rate_limit_text(self) -> None:
+        for message in (
+            "HTTP Error 429: insufficient_quota: token rate limit exceeded",
+            "HTTP Error 429: billing_hard_limit_reached: rate_limit_exceeded",
+            "HTTP Error 429: RateLimitError: exceeded your current quota: too many requests",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(rm.detect_infra("status=failed\n", message, False, 1)
+                                 ["infra_kind"], "infra_error")
+                for typed in self._terminations(message):
+                    infra = rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
+                    self.assertEqual(infra["infra_kind"], "infra_error")
+                    self.assertIn(message, infra["infra_reason"])
+                    self.assertEqual(rm.classify_failure(_failure_record(
+                        "analysis", {}, termination=typed))["failure_class"], "infra_error")
+                self.assertEqual(rm.detect_infra(
+                    "status=failed\n", "", False, 1,
+                    {"hw_conformance": {"ok": False, "errors": [message]}},
+                )["infra_kind"], "infra_error")
+
+    def test_cause_exception_type_can_identify_timeout(self) -> None:
+        typed = {"kind": "runtime_exception", "exception_type": "RuntimeError",
+                 "reason": "tool-enabled LLM request failed",
+                 "cause": {"exception_type": "APITimeoutError", "reason": ""}}
+        self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
+                         ["infra_kind"], "infra_timeout")
+
+
 class RateLimitTest(unittest.TestCase):
     def test_upstream_429_is_a_rate_limit_not_a_crash(self) -> None:
         # 30 of the 43 attempts in the 2026-10-04 ablation matrix died on this
@@ -514,6 +629,12 @@ class RateLimitTest(unittest.TestCase):
             self.assertIsNone(rm.archive_stale_run_dir(path), "an empty dir needs no archive")
 
     def test_a_rate_limited_retry_backs_off_longer(self) -> None:
+        self._assert_rate_limited_retry_backs_off("openai.APIError: upstream error: 429")
+
+    def test_a_rate_limited_retry_without_429_backs_off_longer(self) -> None:
+        self._assert_rate_limited_retry_backs_off("litellm.APIError: " + EndpointFailureTextTest.RATE_LIMIT)
+
+    def _assert_rate_limited_retry_backs_off(self, error: str) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
             root = Path(tmp_str)
             opts = argparse.Namespace(
@@ -533,7 +654,7 @@ class RateLimitTest(unittest.TestCase):
             def fake_run_logged(argv, out_path, err_path, cwd, env, timeout):
                 calls.append(out_path.parent.name)
                 _write(out_path, "status=failed\n")
-                _write(err_path, "openai.APIError: upstream error: 429\n")
+                _write(err_path, error + "\n")
                 return {"exit_code": 1, "wall_seconds": 1}
 
             delays = []
@@ -1041,49 +1162,119 @@ class AggregateTest(unittest.TestCase):
 
 
 class AblationLayerTest(unittest.TestCase):
-    """The layered ladder: one added capability per layer, ISA Contract -> Conformance -> LLVM IR."""
+    """Each rung adds ISA, visibility, developer conformance, then LLVM IR."""
+
+    EXPECTED = {
+        "l0-none": (("--no-isa-contract", "--no-conformance", "--no-llvm-ir"), "basic"),
+        "l1-isa": (("--no-conformance", "--no-llvm-ir"), "basic"),
+        "l2-vis": (("--no-conformance", "--no-llvm-ir"), "extended"),
+        "l3-devconf": (("--no-llvm-ir",), "extended"),
+        "l4-ir": ((), "extended"),
+    }
+    MODES = {name: ("dev" if name in ("l3-devconf", "l4-ir") else "off")
+             for name in EXPECTED}
+
+    @staticmethod
+    def assert_run_controls(test, argv, layer, budget=2):
+        flags, visibility = AblationLayerTest.EXPECTED[layer]
+        test.assertEqual(argv[argv.index("--visibility") + 1], visibility)
+        test.assertEqual(tuple(arg for arg in argv if arg in harness_layers.ABLATION_FLAG_NAMES),
+                         tuple(flag for flag in flags if flag != "--no-conformance"))
+        test.assertEqual(argv.count("--conformance-mode"), 1)
+        test.assertEqual(argv[argv.index("--conformance-mode") + 1],
+                         AblationLayerTest.MODES[layer])
+        test.assertEqual(argv.count("--max-conformance-runs"), 1)
+        test.assertEqual(argv[argv.index("--max-conformance-runs") + 1], str(budget))
+        test.assertNotIn("--conformance-promote", argv)
 
     def test_ladder_adds_one_capability_per_layer(self) -> None:
-        self.assertEqual(len(rm.ABLATION_LADDER), 4)
-        disabled = [
-            set(rm.ABLATION_LAYERS[name]["flags"]) for name in rm.ABLATION_LADDER
-        ]
-        # l0 ablates everything; each next layer re-enables exactly one
-        # capability and the last layer is the un-ablated reference flow.
-        self.assertEqual(disabled[0],
-                         {"--no-isa-contract", "--no-conformance", "--no-llvm-ir"})
-        self.assertEqual(disabled[-1], set())
-        for prev, nxt in zip(disabled, disabled[1:]):
-            self.assertEqual(len(prev - nxt), 1, (prev, nxt))
-            self.assertFalse(nxt - prev, (prev, nxt))  # never re-disable anything
-        # The order of re-enabling is ISA Contract, then Conformance, then LLVM IR.
-        reenabled = [next(iter(a - b)) for a, b in zip(disabled, disabled[1:])]
-        self.assertEqual(reenabled, ["--no-isa-contract", "--no-conformance", "--no-llvm-ir"])
-        # --no-isa-contract implies --no-conformance in the CLI: layer 0 spells
-        # both out so the recorded argv is honest about what was removed.
-        self.assertIn("--no-conformance", rm.ABLATION_LAYERS["l0-none"]["flags"])
-        # Every flag is a real agent CLI switch.
-        for name in rm.ABLATION_LADDER:
-            for flag in rm.ABLATION_LAYERS[name]["flags"]:
-                self.assertRegex(flag, r"^--no-(isa-contract|conformance|llvm-ir)$")
-            self.assertTrue(rm.ABLATION_LAYERS[name]["adds"])
+        self.assertEqual(rm.ABLATION_LADDER, tuple(self.EXPECTED))
+        for name, (flags, visibility) in self.EXPECTED.items():
+            with self.subTest(layer=name):
+                self.assertEqual(tuple(rm.ABLATION_LAYERS[name]["flags"]), flags)
+                self.assertEqual(harness_layers.layer_visibility(name), visibility)
+                self.assertTrue(rm.ABLATION_LAYERS[name]["adds"])
+        # L1 -> L2 changes source visibility, not ablation switches.
+        self.assertEqual(rm.layer_flags("l1-isa"), rm.layer_flags("l2-vis"))
+        self.assertEqual(harness_layers.ABLATION_SCHEME, "isa-visibility-devconf-ir-v3")
+        self.assertEqual(["--no-conformance" in rm.layer_flags(name)
+                          for name in rm.ABLATION_LADDER], [True, True, True, False, False])
+        for name, mode in self.MODES.items():
+            self.assertEqual(rm.ABLATION_LAYERS[name]["conformance_mode"], mode)
+            self.assertIs(rm.ABLATION_LAYERS[name]["conformance_promote"], False)
+        self.assertNotIn("full", rm.ABLATION_LADDER)
+        self.assertEqual(harness_layers.DEFAULT_LAYERS, ("full",))
 
     def test_resolve_layers(self) -> None:
-        self.assertEqual(rm.resolve_layers("ladder"), list(rm.ABLATION_LADDER))
-        self.assertEqual(rm.resolve_layers("all"), list(rm.ABLATION_LADDER))
+        self.assertEqual(rm.resolve_layers("ladder"), list(self.EXPECTED))
+        self.assertEqual(rm.resolve_layers("all"), list(self.EXPECTED))
         self.assertEqual(rm.resolve_layers("full"), ["full"])
-        self.assertEqual(rm.resolve_layers("none"), ["l0-none"])
-        self.assertEqual(rm.resolve_layers("conf,isa"), ["l1-isa", "l2-conf"])  # ladder order
-        self.assertEqual(rm.resolve_layers("l3"), ["full"])
-        with self.assertRaises(SystemExit):
-            rm.resolve_layers("nope")
-        with self.assertRaises(SystemExit):
-            rm.resolve_layers("")
+        for alias in ("none", "l0"):
+            self.assertEqual(rm.resolve_layers(alias), ["l0-none"])
+        for alias in ("isa", "l1"):
+            self.assertEqual(rm.resolve_layers(alias), ["l1-isa"])
+        for alias in ("vis", "visibility", "l2"):
+            self.assertEqual(rm.resolve_layers(alias), ["l2-vis"])
+        for alias in ("conf", "conformance", "devconf", "l3"):
+            self.assertEqual(rm.resolve_layers(alias), ["l3-devconf"])
+        for alias in ("llvm-ir", "ir", "l4"):
+            self.assertEqual(rm.resolve_layers(alias), ["l4-ir"])
+        self.assertEqual(rm.resolve_layers("ir,vis,conf,isa,none,vis"), list(self.EXPECTED))
+        for invalid in ("nope", "", "l2-conf", "l3-ir"):
+            with self.subTest(layer=invalid), self.assertRaises(SystemExit):
+                rm.resolve_layers(invalid)
 
     def test_layer_flags(self) -> None:
+        for name, (flags, _) in self.EXPECTED.items():
+            self.assertEqual(rm.layer_flags(name), flags)
+        # Historical collection recognizes archive-only v1/v2 rungs.
         self.assertEqual(rm.layer_flags("l2-conf"), ("--no-llvm-ir",))
+        self.assertEqual(rm.layer_flags("l3-ir"), ("--no-conformance",))
         self.assertEqual(rm.layer_flags("full"), ())
         self.assertEqual(rm.layer_flags(""), ())  # legacy jobs = full flow
+
+    def test_visibility_helpers_keep_legacy_fallback_and_job_override(self) -> None:
+        for layer in ("full", "l2-conf", "", "historical-unknown"):
+            self.assertEqual(harness_layers.layer_visibility(layer), "standard")
+            self.assertEqual(harness_layers.layer_visibility(layer, "extended"), "extended")
+        self.assertEqual(harness_layers.job_visibility({}), "standard")
+        self.assertEqual(harness_layers.job_visibility({"layer": "full"}, "basic"), "basic")
+        self.assertEqual(harness_layers.job_visibility({"layer": "l2-vis"}), "extended")
+        self.assertEqual(harness_layers.job_visibility(
+            {"layer": "l2-vis", "visibility": "basic"}), "basic")
+
+    def test_expansion_freezes_each_new_layers_visibility_and_flags(self) -> None:
+        jobs = rm.expand_matrix(("test-a",), ("crc32",), 1, list(self.EXPECTED))
+        self.assertEqual([job["layer"] for job in jobs], list(self.EXPECTED))
+        for job in rm.schedule_jobs(jobs, seed=7):
+            flags, visibility = self.EXPECTED[job["layer"]]
+            self.assertEqual(tuple(job["ablation_flags"]), flags)
+            self.assertEqual(job["visibility"], visibility)
+            self.assertEqual(job["conformance_mode"], self.MODES[job["layer"]])
+            self.assertIs(job["conformance_promote"], False)
+            self.assertEqual(job["max_conformance_runs"], 2)
+        default_jobs = rm.expand_matrix(("test-a",), ("crc32",), 1)
+        self.assertEqual([job["layer"] for job in default_jobs], ["full"])
+        self.assertEqual(tuple(default_jobs[0]["ablation_flags"]), ())
+        self.assertEqual(harness_layers.job_visibility(default_jobs[0]), "standard")
+        for field in ("conformance_mode", "conformance_promote", "max_conformance_runs"):
+            self.assertNotIn(field, default_jobs[0])
+
+    def test_job_run_flags_translate_new_controls_but_leave_legacy_flags_alone(self) -> None:
+        for layer, (flags, _) in self.EXPECTED.items():
+            with self.subTest(layer=layer):
+                job = rm.expand_matrix(("test-a",), ("crc32",), 1, [layer])[0]
+                expected = tuple(flag for flag in flags if flag != "--no-conformance") + (
+                    "--conformance-mode", self.MODES[layer], "--max-conformance-runs", "2")
+                self.assertEqual(tuple(harness_layers.job_run_flags(job)), expected)
+                job["max_conformance_runs"] = 7
+                self.assertEqual(tuple(harness_layers.job_run_flags(job)), expected[:-1] + ("7",))
+        # A v2 job may reuse a current layer name; absence of saved mode must
+        # not silently opt the archived run into today's v3 controls.
+        for layer in ("full", "l0-none", "l1-isa", "l2-vis", "l3-ir", "l2-conf"):
+            flags = rm.layer_flags(layer)
+            self.assertEqual(tuple(harness_layers.job_run_flags(
+                {"layer": layer, "ablation_flags": flags})), flags)
 
     def test_layer_suffix_naming(self) -> None:
         name = rm.make_run_name("e", "glm-5.2", "crc32", 1, 5, layer="l0-none")
@@ -1104,15 +1295,15 @@ class AblationLayerTest(unittest.TestCase):
             for repeat in (1, 2)
             for layer in rm.ABLATION_LADDER
         }
-        self.assertEqual(len(names), 32)
+        self.assertEqual(len(names), 40)
 
 
 class LayerMatrixTest(unittest.TestCase):
     def test_expand_matrix_with_layers(self) -> None:
         layers = rm.resolve_layers("ladder")
         jobs = rm.expand_matrix(("a",), ("x", "y"), 2, layers)
-        self.assertEqual(len(jobs), 2 * 2 * 4)
-        self.assertEqual([j["layer"] for j in jobs[:4]], list(rm.ABLATION_LADDER))
+        self.assertEqual(len(jobs), 2 * 2 * 5)
+        self.assertEqual([j["layer"] for j in jobs[:5]], list(rm.ABLATION_LADDER))
         for job in jobs:
             self.assertEqual(tuple(job["ablation_flags"]), rm.layer_flags(job["layer"]))
         # Default: a single full-flow layer (the classic pass@k matrix shape).
@@ -1125,9 +1316,9 @@ class LayerMatrixTest(unittest.TestCase):
         for job in jobs:
             job["exp_id"] = "abl"
             job["max_iters"] = 5
-        kept = rm.filter_jobs(jobs, ["l2-conf"])
+        kept = rm.filter_jobs(jobs, ["l2-vis"])
         self.assertEqual(len(kept), 1)
-        self.assertEqual(kept[0]["layer"], "l2-conf")
+        self.assertEqual(kept[0]["layer"], "l2-vis")
 
 
 class AblationParseTest(unittest.TestCase):
@@ -1198,7 +1389,7 @@ class AblationParseTest(unittest.TestCase):
                     run_dir.mkdir(parents=True)
                     (run_dir / "record.json").write_text(json.dumps(record))
             result = rm.aggregate(exp_dir, {"exp_id": "abl-test"}, bootstrap_iters=100)
-            self.assertEqual(result["cells"], 4)  # layers never pool into one cell
+            self.assertEqual(result["cells"], 5)  # layers never pool into one cell
 
             with (exp_dir / "results" / "pass_at_k.csv").open() as handle:
                 rows = list(csv.DictReader(handle))
@@ -1209,7 +1400,7 @@ class AblationParseTest(unittest.TestCase):
             self.assertIn("## Ablation ladder", summary)
             self.assertIn("--no-isa-contract --no-conformance --no-llvm-ir", summary)
             self.assertIn("### Layer comparison (pass@k budget", summary)
-            self.assertIn("| model | benchmark | l0-none | l1-isa | l2-conf | full |", summary)
+            self.assertIn("| model | benchmark | l0-none | l1-isa | l2-vis | l3-devconf | l4-ir |", summary)
 
             with (exp_dir / "results" / "runs.csv").open() as handle:
                 run_rows = list(csv.DictReader(handle))
@@ -1242,18 +1433,449 @@ class AblationDryRunTest(unittest.TestCase):
                 ])
             self.assertEqual(code, 0)
             text = stdout.getvalue()
-            # 1 model x 1 benchmark x 2 repeats x 4 layers = 8 scheduled runs.
-            self.assertEqual(text.count("[dry ]"), 9)  # + the schedule summary line
+            # 1 model x 1 benchmark x 2 repeats x 5 layers = 10 scheduled runs.
+            self.assertEqual(text.count("[dry ]"), 11)  # + the schedule summary line
             for layer in rm.ABLATION_LADDER:
                 token = "" if layer == "full" else f"-{layer}"
                 self.assertIn(f"abl-test-{rm.model_slug('test-a')}-crc32-r01-mi5{token}", text)
-            self.assertIn("--no-isa-contract --no-conformance --no-llvm-ir", text)
-            self.assertIn("--no-conformance --no-llvm-ir", text)
+            self.assertIn("--no-isa-contract --no-llvm-ir", text)
+            self.assertNotIn("--no-conformance", text)
             # The layer metadata is frozen into experiment.yaml.
             import yaml
             meta = yaml.safe_load((out_root / "abl-test" / "experiment.yaml").read_text())
             self.assertEqual(list(meta["layers"]), list(rm.ABLATION_LADDER))
             self.assertEqual(meta["layers"]["l1-isa"]["flags"], ["--no-conformance", "--no-llvm-ir"])
+            self.assertEqual(meta["ablation_scheme"], "isa-visibility-devconf-ir-v3")
+            for layer, (flags, visibility) in AblationLayerTest.EXPECTED.items():
+                self.assertEqual(meta["layers"][layer]["visibility"], visibility)
+                self.assertEqual(meta["layers"][layer]["conformance_mode"], AblationLayerTest.MODES[layer])
+                self.assertIs(meta["layers"][layer]["conformance_promote"], False)
+                self.assertEqual(meta["layers"][layer]["max_conformance_runs"], 2)
+                AblationLayerTest.assert_run_controls(
+                    self, meta["argv_templates_by_layer"][layer], layer)
+                lines = [line for line in text.splitlines()
+                         if line.startswith("[dry ] abl-test-") and f"-{layer}:" in line]
+                self.assertEqual(len(lines), 2)
+                import shlex
+                for line in lines:
+                    argv = shlex.split(line.split(": ", 1)[1])
+                    AblationLayerTest.assert_run_controls(self, argv, layer)
+            self.assertEqual(len(meta["schedule_jobs"]), 10)
+            for job in meta["schedule_jobs"]:
+                flags, visibility = AblationLayerTest.EXPECTED[job["layer"]]
+                self.assertEqual(job["visibility"], visibility)
+                self.assertEqual(tuple(job["ablation_flags"]), flags)
+                self.assertEqual(job["conformance_mode"], AblationLayerTest.MODES[job["layer"]])
+                self.assertIs(job["conformance_promote"], False)
+                self.assertEqual(job["max_conformance_runs"], 2)
+
+
+class AblationOfflineContractTest(unittest.TestCase):
+    """Synthetic artifacts and dry runs only: no API, agent process, or sbt."""
+
+    def _invoke(self, root: Path, *extra: str, preset=run_ablation):
+        import contextlib
+        import io
+        from unittest import mock
+
+        config = root / "agents" / "llm_configs" / "test-a.json"
+        if not config.exists():
+            _write(config, json.dumps({"name": "test-a", "model": "TEST-A"}))
+        stdout = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(mock.patch.object(execution, "git_info", return_value={}))
+            for seam in ("preflight", "execute_one", "run_logged"):
+                stack.enter_context(mock.patch.object(
+                    execution, seam, side_effect=AssertionError(f"unexpected execution: {seam}")))
+            code = preset.main([
+                "--exp-id", "offline-abl", "--models", "test-a", "--benchmarks", "crc32",
+                "--repeats", "1", "--workdir", str(root), "--out-root", str(root / "out"),
+                "--conda-env", "", "--dry-run", "--no-sbt-lock", *extra,
+            ])
+        return code, stdout.getvalue()
+
+    def test_explicit_visibility_is_rejected_for_every_new_rung(self) -> None:
+        for layer in AblationLayerTest.EXPECTED:
+            for visibility in ("basic", "standard", "extended"):
+                # Reject even a matching value: explicit overrides hide the layer contract.
+                for option in (["--visibility", visibility], [f"--visibility={visibility}"]):
+                    with self.subTest(layer=layer, option=option), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        with self.assertRaises(SystemExit):
+                            self._invoke(root, "--layers", layer, *option)
+                        self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
+
+    def test_mixed_legacy_and_new_layers_also_reject_explicit_visibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(SystemExit):
+            self._invoke(Path(tmp), "--layers", "full,l2-vis", "--visibility", "extended")
+
+    def test_new_ladder_rejects_capability_changing_passthrough(self) -> None:
+        for layer in AblationLayerTest.EXPECTED:
+            for tail in (["--no-isa-contract"], ["--no-llvm-ir"],
+                         ["--ir-features", "off"], ["--ir-features=auto"],
+                         ["--no-isa"], ["--no-llvm"], ["--ir-feature=off"],
+                         ["--vis=standard"]):
+                with self.subTest(layer=layer, tail=tail), tempfile.TemporaryDirectory() as tmp:
+                    with self.assertRaises(SystemExit):
+                        self._invoke(Path(tmp), "--layers", layer, "--", *tail)
+
+    def test_legacy_full_cannot_mix_with_new_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(SystemExit):
+            self._invoke(Path(tmp), "--layers", "full,l2-vis")
+
+    def test_same_scheme_can_resume_but_legacy_full_cannot_overwrite_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self._invoke(root)[0], 0)
+            self.assertEqual(self._invoke(root)[0], 0)
+            path = root / "out" / "offline-abl" / "experiment.yaml"
+            original = path.read_bytes()
+            with self.assertRaises(SystemExit):
+                self._invoke(root, preset=rm)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_collect_only_preserves_historical_controls(self) -> None:
+        import yaml
+        from unittest import mock
+        from agents.experiments.harness import collection
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            meta = {"exp_id": "offline-abl", "models": ["test-a"], "benchmarks": ["crc32"],
+                    "repeats": 1, "max_iters": 5, "visibility": "extended", "layers": {
+                        "l2-conf": {"flags": ["--no-llvm-ir"]}, "full": {"flags": []}}}
+            path = _write(root / "out" / "offline-abl" / "experiment.yaml",
+                          yaml.safe_dump(meta, sort_keys=False))
+            original = path.read_bytes()
+            with mock.patch.object(collection, "collect_record", return_value={}) as collect, \
+                    mock.patch.object(collection, "save_record"):
+                self.assertEqual(self._invoke(root, "--collect-only")[0], 0)
+            self.assertEqual(collect.call_count, 2)
+            for call in collect.call_args_list:
+                job = call.args[1]
+                self.assertEqual(job["visibility"], "extended")
+                self.assertEqual(tuple(job["ablation_flags"]), tuple(meta["layers"][job["layer"]]["flags"]))
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_repeated_no_conformance_is_rejected_without_creating_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(SystemExit):
+                self._invoke(root, "--", "--no-conformance", "--no-conformance")
+            self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
+
+    def test_new_ladder_rejects_conformance_control_passthrough_and_abbreviations(self) -> None:
+        tails = (
+            ["--no-conformance"], ["--no-conf"], ["--no-conformance", "--no-conformance"],
+            ["--conformance-mode", "off"], ["--conformance-mode=dev"],
+            ["--conformance-m", "dev"], ["--conformance=off"],
+            ["--conformance-promote"], ["--conformance-pro"],
+            ["--max-conformance-runs", "2"], ["--max-conformance-runs=7"],
+            ["--max-conformance-r", "2"], ["--max-conf=2"],
+        )
+        for layer in AblationLayerTest.EXPECTED:
+            for tail in tails:
+                with self.subTest(layer=layer, tail=tail), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    with self.assertRaises(SystemExit):
+                        self._invoke(root, "--layers", layer, "--", *tail)
+                    self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
+
+    def test_conformance_budget_is_shared_by_all_new_layers_and_templates(self) -> None:
+        import shlex
+        import yaml
+
+        for budget in (1, 7):
+            with self.subTest(budget=budget), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                code, text = self._invoke(root, "--max-conformance-runs", str(budget))
+                self.assertEqual(code, 0)
+                meta = yaml.safe_load((root / "out" / "offline-abl" / "experiment.yaml").read_text())
+                self.assertEqual(len(meta["schedule_jobs"]), 5)
+                for layer, entry in meta["layers"].items():
+                    self.assertEqual(entry["max_conformance_runs"], budget)
+                    self.assertEqual(entry["conformance_mode"], AblationLayerTest.MODES[layer])
+                    self.assertIs(entry["conformance_promote"], False)
+                    AblationLayerTest.assert_run_controls(
+                        self, meta["argv_templates_by_layer"][layer], layer, budget)
+                for job in meta["schedule_jobs"]:
+                    self.assertEqual(job["max_conformance_runs"], budget)
+                    self.assertEqual(job["conformance_mode"], AblationLayerTest.MODES[job["layer"]])
+                    self.assertIs(job["conformance_promote"], False)
+                    line = next(line for line in text.splitlines()
+                                if line.startswith("[dry ] offline-abl-") and f'-{job["layer"]}:' in line)
+                    AblationLayerTest.assert_run_controls(
+                        self, shlex.split(line.split(": ", 1)[1]), job["layer"], budget)
+
+    def test_conformance_budget_must_be_positive_before_writing_metadata(self) -> None:
+        for budget in ("0", "-1", "-20"):
+            with self.subTest(budget=budget), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaises(SystemExit):
+                    self._invoke(root, "--max-conformance-runs", budget)
+                self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
+
+    def test_existing_v3_controls_cannot_be_overwritten_or_inferred_when_missing(self) -> None:
+        import yaml
+
+        for key, changed in (("conformance_mode", "off"), ("conformance_promote", True),
+                             ("max_conformance_runs", 7)):
+            for missing in (False, True):
+                with self.subTest(key=key, missing=missing), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.assertEqual(self._invoke(root)[0], 0)
+                    path = root / "out" / "offline-abl" / "experiment.yaml"
+                    meta = yaml.safe_load(path.read_text())
+                    if missing:
+                        del meta["layers"]["l3-devconf"][key]
+                    else:
+                        meta["layers"]["l3-devconf"][key] = changed
+                    path.write_text(yaml.safe_dump(meta, sort_keys=False))
+                    original = path.read_bytes()
+                    with self.assertRaises(SystemExit):
+                        self._invoke(root)
+                    self.assertEqual(path.read_bytes(), original)
+
+    def test_existing_v3_budget_cannot_be_changed_by_resuming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self._invoke(root, "--max-conformance-runs", "7")[0], 0)
+            self.assertEqual(self._invoke(root, "--max-conformance-runs", "7")[0], 0)
+            path = root / "out" / "offline-abl" / "experiment.yaml"
+            original = path.read_bytes()
+            with self.assertRaises(SystemExit):
+                self._invoke(root)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_legacy_matrix_and_sweep_keep_full_standard_and_allow_visibility(self) -> None:
+        import yaml
+
+        for preset in (rm, run_sweep):
+            for options, visibility in (((), "standard"), (("--visibility", "extended"), "extended")):
+                with self.subTest(preset=preset.__name__, options=options), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    code, text = self._invoke(root, *options, preset=preset)
+                    self.assertEqual(code, 0)
+                    meta = yaml.safe_load((root / "out" / "offline-abl" / "experiment.yaml").read_text())
+                    self.assertEqual(list(meta["layers"]), ["full"])
+                    self.assertEqual(meta["layers"]["full"]["flags"], [])
+                    self.assertEqual(meta["layers"]["full"]["visibility"], visibility)
+                    self.assertIn(f"--visibility {visibility}", text)
+                    for field, flag in (("conformance_mode", "--conformance-mode"),
+                                        ("conformance_promote", "--conformance-promote"),
+                                        ("max_conformance_runs", "--max-conformance-runs")):
+                        self.assertNotIn(field, meta["layers"]["full"])
+                        self.assertNotIn(field, meta["schedule_jobs"][0])
+                        self.assertNotIn(flag, meta["argv_templates_by_layer"]["full"])
+                        self.assertNotIn(flag, text)
+
+    def test_execute_one_uses_job_visibility_mode_and_budget_not_global_fallbacks(self) -> None:
+        import contextlib
+        import io
+        from unittest import mock
+
+        for layer, (flags, visibility) in AblationLayerTest.EXPECTED.items():
+            with self.subTest(layer=layer), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                opts = argparse.Namespace(
+                    exp_id="offline-abl", max_iters=5, workdir=root, python="python3", conda_env="",
+                    visibility="extended" if visibility == "basic" else "basic",
+                    max_conformance_runs=2,
+                    profile_cache="on", timeout=1, force=False, infra_retries=0, agent_forward=[],
+                )
+                job = rm.expand_matrix(("test-a",), ("crc32",), 1, [layer])[0]
+                job["max_conformance_runs"] = 7
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    launch = stack.enter_context(mock.patch.object(
+                        execution, "run_logged", return_value={"exit_code": 0, "wall_seconds": 0}))
+                    collect = stack.enter_context(mock.patch.object(
+                        execution.collection, "collect_record", return_value={"status": "complete"}))
+                    stack.enter_context(mock.patch.object(execution.collection, "save_record"))
+                    records = execution.execute_one(
+                        job, opts, root / "out", {"test-a": {"config": "test-a"}}, None, {})
+                self.assertEqual(len(records), 1)
+                launch.assert_called_once()
+                argv = launch.call_args.args[0]
+                AblationLayerTest.assert_run_controls(self, argv, layer, budget=7)
+                from agents.cfu_design_agent import cli as agent_cli
+                parsed = agent_cli.build_parser().parse_args(argv[2:])
+                self.assertEqual(parsed.conformance_mode, AblationLayerTest.MODES[layer])
+                self.assertFalse(parsed.no_conformance)
+                self.assertFalse(parsed.conformance_promote)
+                self.assertEqual(parsed.max_conformance_runs, 7)
+                collected_job = collect.call_args.args[1]
+                self.assertEqual(collected_job["visibility"], visibility)
+                self.assertEqual(tuple(collected_job["ablation_flags"]), flags)
+                self.assertEqual(collected_job["conformance_mode"], AblationLayerTest.MODES[layer])
+                self.assertIs(collected_job["conformance_promote"], False)
+                self.assertEqual(collected_job["max_conformance_runs"], 7)
+
+    def test_collection_preserves_observed_visibility_and_warns_on_mismatch(self) -> None:
+        for observed in ("basic", "extended"):
+            for run_yaml in (RUN_YAML_PASS.replace("standard", observed),
+                             RUN_YAML_PASS.replace("visibility: {level: standard}\n", "")):
+                with self.subTest(observed=observed, run_yaml=run_yaml), tempfile.TemporaryDirectory() as tmp:
+                    flags = rm.layer_flags("l2-vis")
+                    report = REPORT_PASS.replace("## Gates", "## Ablation\n" + "".join(
+                        f"- `{flag}`: disabled\n" for flag in flags) + "\n## Gates")
+                    run_dir, fw = CollectTest()._fixture(
+                        Path(tmp), STDOUT_PASS.replace("standard", observed), report, run_yaml, EMBENCH_PASS)
+                    job = {"model": "test-a", "benchmark": "crc32", "repeat": 1,
+                           "max_iters": 5, "infra_retry": 0, "layer": "l2-vis",
+                           "visibility": "extended", "ablation_flags": flags}
+                    record = rm.collect_record("offline-abl", job, "run", run_dir, fw, {"exit_code": 0})
+                    self.assertEqual(record["visibility"], observed)
+                    if observed == "extended":
+                        self.assertNotIn("visibility mismatch", record["parse_warnings"])
+                    else:
+                        self.assertIn("visibility mismatch", record["parse_warnings"])
+                        self.assertIn("extended", record["parse_warnings"])
+                        self.assertIn("basic", record["parse_warnings"])
+
+    def test_existing_legacy_scheme_is_rejected_without_overwriting_metadata(self) -> None:
+        import yaml
+
+        for scheme in (None, "isa-conformance-ir-v1", "isa-visibility-ir-v2"):
+            with self.subTest(scheme=scheme), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                meta = {"exp_id": "offline-abl", "layers": {
+                    "l2-conf": {"flags": ["--no-llvm-ir"], "adds": "historical conformance"},
+                    "full": {"flags": [], "adds": "historical LLVM IR"}}}
+                if scheme is not None:
+                    meta["ablation_scheme"] = scheme
+                path = _write(root / "out" / "offline-abl" / "experiment.yaml",
+                              yaml.safe_dump(meta, sort_keys=False))
+                original = path.read_bytes()
+                with self.assertRaises(SystemExit):
+                    self._invoke(root)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertFalse((root / "agents" / "llm_configs" / "offline-abl-test-a.json").exists())
+
+    @staticmethod
+    def _v2_metadata():
+        return {
+            "exp_id": "offline-abl", "ablation_scheme": "isa-visibility-ir-v2",
+            "models": ["test-a"], "benchmarks": ["crc32"], "repeats": 1,
+            "max_iters": 5, "visibility": "per-layer",
+            "layers": {
+                "l0-none": {"flags": ["--no-isa-contract", "--no-conformance", "--no-llvm-ir"],
+                            "visibility": "basic", "adds": "archived v2 baseline"},
+                "l1-isa": {"flags": ["--no-conformance", "--no-llvm-ir"],
+                           "visibility": "basic", "adds": "archived v2 ISA"},
+                "l2-vis": {"flags": ["--no-conformance", "--no-llvm-ir"],
+                           "visibility": "extended", "adds": "archived v2 visibility"},
+                "l3-ir": {"flags": ["--no-conformance"],
+                          "visibility": "extended", "adds": "archived v2 LLVM IR"},
+            },
+        }
+
+    def test_v2_batch_cannot_be_rescheduled_as_v3(self) -> None:
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = _write(root / "out" / "offline-abl" / "experiment.yaml",
+                          yaml.safe_dump(self._v2_metadata(), sort_keys=False))
+            original = path.read_bytes()
+            with self.assertRaises(SystemExit):
+                self._invoke(root)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertFalse((root / "agents" / "llm_configs" / "offline-abl-test-a.json").exists())
+
+    def test_collect_only_v2_does_not_inject_v3_controls_into_reused_layer_names(self) -> None:
+        import yaml
+        from unittest import mock
+        from agents.experiments.harness import collection, reporting
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            meta = self._v2_metadata()
+            path = _write(root / "out" / "offline-abl" / "experiment.yaml",
+                          yaml.safe_dump(meta, sort_keys=False))
+            original = path.read_bytes()
+            with mock.patch.object(collection, "collect_record", return_value={}) as collect, \
+                    mock.patch.object(collection, "save_record"), \
+                    mock.patch.object(reporting, "aggregate", return_value={
+                        "records": 4, "cells": 4, "summary": "synthetic"}) as aggregate:
+                # Even an explicit current CLI budget must not taint archive reads.
+                self.assertEqual(self._invoke(root, "--collect-only", "--max-conformance-runs", "7")[0], 0)
+            self.assertEqual(collect.call_count, 4)
+            self.assertEqual(aggregate.call_args.args[1], meta)
+            self.assertEqual({call.args[1]["layer"] for call in collect.call_args_list}, set(meta["layers"]))
+            for call in collect.call_args_list:
+                job = call.args[1]
+                saved = meta["layers"][job["layer"]]
+                self.assertEqual(tuple(job["ablation_flags"]), tuple(saved["flags"]))
+                self.assertEqual(job["visibility"], saved["visibility"])
+                for field in ("conformance_mode", "conformance_promote", "max_conformance_runs"):
+                    self.assertNotIn(field, job)
+                self.assertEqual(tuple(harness_layers.job_run_flags(job)), tuple(saved["flags"]))
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_aggregate_only_v2_uses_its_own_ladder_without_v3_defaults(self) -> None:
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exp_dir = root / "out" / "offline-abl"
+            meta = self._v2_metadata()
+            path = _write(exp_dir / "experiment.yaml", yaml.safe_dump(meta, sort_keys=False))
+            original = path.read_bytes()
+            originals = {}
+            for layer, entry in meta["layers"].items():
+                record = AggregateTest()._record(run_name=f"v2-{layer}", layer=layer,
+                    ablation_flags=" ".join(entry["flags"]))
+                record_path = _write(exp_dir / "runs" / record["run_name"] / "record.json", json.dumps(record))
+                originals[record_path] = record_path.read_bytes()
+            code, text = self._invoke(root, "--aggregate-only", "--bootstrap", "10")
+            self.assertEqual(code, 0)
+            self.assertIn("4 runs, 4 cells", text)
+            self.assertEqual(path.read_bytes(), original)
+            for record_path, content in originals.items():
+                self.assertEqual(record_path.read_bytes(), content)
+            summary = (exp_dir / "results" / "summary.md").read_text()
+            for entry in meta["layers"].values():
+                self.assertIn(entry["adds"], summary)
+            self.assertNotIn("l3-devconf", summary)
+            self.assertNotIn("l4-ir", summary)
+            with (exp_dir / "results" / "runs.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual({row["layer"] for row in rows}, set(meta["layers"]))
+            for row in rows:
+                for field in ("conformance_mode", "conformance_promote", "max_conformance_runs"):
+                    self.assertFalse(row.get(field))
+
+    def test_aggregate_only_uses_historical_metadata_without_rewriting_it(self) -> None:
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exp_dir = root / "out" / "offline-abl"
+            meta = {"exp_id": "offline-abl", "layers": {
+                "l2-conf": {"flags": ["--no-llvm-ir"], "adds": "archived conformance oracle"},
+                "full": {"flags": [], "adds": "archived full LLVM IR"}}}
+            path = _write(exp_dir / "experiment.yaml", yaml.safe_dump(meta, sort_keys=False))
+            original = path.read_bytes()
+            for layer in meta["layers"]:
+                record = AggregateTest()._record(run_name=f"old-{layer}", layer=layer,
+                    ablation_flags=" ".join(meta["layers"][layer]["flags"]))
+                _write(exp_dir / "runs" / record["run_name"] / "record.json", json.dumps(record))
+            code, text = self._invoke(root, "--aggregate-only", "--bootstrap", "10")
+            self.assertEqual(code, 0)
+            self.assertIn("2 runs, 2 cells", text)
+            self.assertEqual(path.read_bytes(), original)
+            summary = (exp_dir / "results" / "summary.md").read_text()
+            for layer in meta["layers"]:
+                self.assertIn(meta["layers"][layer]["adds"], summary)
+            self.assertNotIn("l2-vis", summary)
+            self.assertNotIn("l3-ir", summary)
+            with (exp_dir / "results" / "runs.csv").open() as handle:
+                self.assertEqual({row["layer"] for row in csv.DictReader(handle)}, {"l2-conf", "full"})
+
+
 @unittest.skipUnless(shutil.which("flock"), "flock(1) required for the sbt lock")
 class DryRunTest(unittest.TestCase):
     def test_dry_run_writes_experiment_and_schedule(self) -> None:

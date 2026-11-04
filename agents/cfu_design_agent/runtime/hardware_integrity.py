@@ -229,7 +229,13 @@ def _payload(expr: str, values: dict[str, list[str]], seen=frozenset()) -> bool:
     visible = _searchable(expr)
     comparison = re.split(r'\s*(?:===|=/=|==|!=)\s*', expr, maxsplit=1)
     if len(comparison) == 2 and all(_constant(x, values) is not _UNKNOWN for x in comparison): return False
-    if re.search(r'\blsu\.load\.data\b|\bvectorRegs\s*\(|\b\w+\.(?:read|input)\s*\(', visible):
+    if re.search(
+        r'\blsu\.load\.(?:data|firstData|lastData)\b|\blsu\.loadFlow\b'
+        r'|\b(?:vectorRegs|scalarRegs)\s*\('
+        r'|\b(?:vectorRead|scalarRead|lanesSInt|lanesUInt|dotProductSInt|dotProductUInt)\s*\('
+        r'|\b\w+\.(?:read|input)\s*\(',
+        visible,
+    ):
         return True
     for name in set(re.findall(r'\b[A-Za-z_]\w*\b', visible)) - seen:
         if any(_payload(rhs, values, seen | {name}) for rhs in values.get(name, [])):
@@ -325,11 +331,13 @@ def validate_sources(sources: dict[str, str], isa_spec: dict | None = None) -> l
             if not (re.search(r'\bcompute\b', function) or (command and isa.command_kind(command) == 'compute')): continue
             # Explicit acknowledgement-only declarations have no computational writeback.
             resources = fields.get('resources')
-            if resources is not None and resources != 'None' and not re.search(r'\b(?:CpuWriteRD|VectorWrite)\b', _searchable(resources)): continue
+            if resources is not None and resources != 'None' and not re.search(r'\b(?:CpuWriteRD|VectorWrite|ScalarWrite)\b', _searchable(resources)): continue
             replies, guards = [], _guard_blocks(body)
-            for reply in re.finditer(r'\b[A-Za-z_]\w*\.(?:complete|reply)\s*\(', _searchable(body)):
+            for reply in re.finditer(r'(?:\b[A-Za-z_]\w*\.(?:complete|reply)|\bcompleteAndExit)\s*\(', _searchable(body)):
                 payload, _ = _balanced(body, body.index('(', reply.start()))
-                expr = _arguments(payload)[0]
+                args = _arguments(payload)
+                if not args or not args[0]: continue
+                expr = args[0]
                 constant = _constant(expr, values)
                 replies.append((reply.start(), expr, constant))
             distinct = {repr(v) for _, expr, v in replies if expr and v is not _UNKNOWN}

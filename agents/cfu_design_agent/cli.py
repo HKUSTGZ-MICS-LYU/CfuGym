@@ -77,19 +77,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-iters",
         type=int,
-        default=2,
+        default=5,
         help="Maximum candidate submissions to the verification ladder, including the first (default: 2).",
     )
     parser.add_argument(
         "--max-preverify-repairs",
         type=int,
-        default=2,
+        default=10,
         help="Separate bound for implementation reroutes before a candidate reaches verification (default: 2).",
     )
     parser.add_argument(
         "--max-answer-repairs",
         type=int,
-        default=2,
+        default=10,
         help="Separate repair budget for malformed analysis/oracle/ISA answers; any candidate rerun still needs a --max-iters slot (default: 2).",
     )
     parser.add_argument("--dry-run", action="store_true",
@@ -135,14 +135,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-conformance",
         action="store_true",
-        help="Ablation: drop the conformance requirement (no oracle delivery; the hw_conformance "
-        "rung is recorded as disabled instead of validated).",
+        help="Ablation: drop the conformance requirement entirely (no oracle and no dev "
+        "tests; the hw_conformance rung is recorded as disabled). Same as "
+        "--conformance-mode off.",
+    )
+    parser.add_argument(
+        "--conformance-mode",
+        choices=("dev", "gate", "off"),
+        default=None,
+        help="How conformance is delivered. `dev` (default): the agent authors free-form "
+        "C tests under workspace/dev_tests and may run them in Implement; the host owns "
+        "the data, entry point and verdict, and the rung is evidence, not a gate. "
+        "`gate`: the legacy host-rendered YAML-oracle rung before the software build. "
+        "`off`: ablation, same as --no-conformance.",
+    )
+    parser.add_argument(
+        "--conformance-promote",
+        action="store_true",
+        help="In `dev` mode, also run passing dev tests as the hw_conformance gate "
+        "(stronger, slower; off by default because `sim` already owns the verdict).",
+    )
+    parser.add_argument(
+        "--max-conformance-runs",
+        type=int,
+        default=2,
+        help="How many times Implement may call run_conformance on a dev test (default: 2).",
     )
     parser.add_argument(
         "--no-isa-contract",
         action="store_true",
         help="Ablation: skip the ISA contract stage; the agent writes cfu_intrinsics.h itself "
-        "from the intrinsic template with free encodings. Implies --no-conformance.",
+        "from the intrinsic template with free encodings. Implies conformance off; "
+        "cannot be combined with an explicit --conformance-mode dev/gate.",
     )
     parser.add_argument("--skip-sim", action="store_true", help="Skip SBT generation/simulation.")
     parser.add_argument("--skip-yosys", action="store_true", help="Skip Yosys cost estimation (Yosys backend only).")
@@ -297,15 +321,33 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.max_output_tokens < 0:
         raise SystemExit("--max-output-tokens must be zero or positive")
+    if args.max_conformance_runs < 0:
+        raise SystemExit("--max-conformance-runs must be zero or positive")
+    if args.conformance_mode and args.no_conformance:
+        raise SystemExit(
+            "--conformance-mode conflicts with --no-conformance; pass only one "
+            "(use --conformance-mode off for the ablation)"
+        )
+    if args.conformance_promote and args.conformance_mode == "gate":
+        raise SystemExit("--conformance-promote applies to --conformance-mode dev only")
+    conformance_mode = args.conformance_mode or (
+        "off" if (args.no_conformance or args.no_isa_contract) else "dev"
+    )
+    if args.no_isa_contract and conformance_mode != "off":
+        # A dev test only needs the generated intrinsics header, which the agent
+        # authors itself without a contract, but the legacy oracle and any
+        # promotion consume ISA facts. Keep the historical implication visible
+        # instead of silently enabling a capability the ablation asked to remove.
+        raise SystemExit(
+            "--no-isa-contract requires --conformance-mode off: the conformance "
+            "oracle/promotion consumes the ISA contract"
+        )
     if args.resume and any((args.task, args.embench, args.project_root, args.kernel_file,
                             args.kernel_function, args.build_cmd, args.run_cmd, args.test_cmd)):
         raise SystemExit("--resume accepts only the prior run id and execution options, not a new workload")
     input_mode = infer_input_mode(args)
     task = args.task or ("" if args.resume else default_task(args))
     dry_run = bool(args.dry_run)
-    if args.no_isa_contract and not args.no_conformance:
-        print("note: --no-isa-contract implies --no-conformance "
-              "(conformance consumes the ISA contract)")
     state: CfuDesignState = {
         "task": task,
         "input_kind": input_mode,
@@ -328,7 +370,10 @@ def main(argv: list[str] | None = None) -> int:
         "profile_cache": args.profile_cache,
         "ir_features": "off" if args.no_llvm_ir else args.ir_features,
         "llvm_ir": not args.no_llvm_ir,
-        "require_conformance": not (args.no_conformance or args.no_isa_contract),
+        "require_conformance": conformance_mode != "off",
+        "conformance_mode": conformance_mode,
+        "conformance_promote": bool(args.conformance_promote),
+        "max_conformance_runs": args.max_conformance_runs,
         "isa_contract": not args.no_isa_contract,
         "loop_optimize": args.loop_optimize,
         "loop_policy": args.loop_policy,
@@ -488,6 +533,11 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
     if measurement:
         print("  embench_measurement:")
         for line in measurement:
+            print(f"    {line.removeprefix('- ')}")
+    conformance = report_mod.conformance_lines(final_state)
+    if conformance:
+        print("  conformance:")
+        for line in conformance:
             print(f"    {line.removeprefix('- ')}")
     if reference and cfu:
         print(f"  cycles_before = {reference}")

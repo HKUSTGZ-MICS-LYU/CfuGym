@@ -299,8 +299,37 @@ def all_failure_feedback(state: CfuDesignState) -> str:
         labeled_feedback(
             "implementation_sw rejection", implementation_feedback(state, "implementation_sw")
         ),
+        dev_test_evidence(state),
     ]
     return "\n\n".join(part for part in parts if part)
+
+
+def dev_test_evidence(state: CfuDesignState) -> str:
+    """The latest agent-authored dev-test results, as repair evidence.
+
+    The rendering lives with the dev-test workspace (``runtime.dev_tests``) so a
+    repair prompt and the report cannot disagree about what a test proved.
+    """
+    from ..runtime import dev_tests
+
+    block = dev_tests.evidence_block(
+        list(state.get("conformance_runs") or []),
+        list(state.get("conformance_tests") or []),
+    )
+    stale = dev_tests.stale_tests_from_state(state)
+    if stale:
+        described = "; ".join(
+            f"{name} (missing {', '.join(missing[:3])}{'...' if len(missing) > 3 else ''})"
+            for name, missing in stale.items()
+        )
+        block = "\n".join(filter(None, [block, (
+            "## Stale dev tests\n"
+            f"- {described}: these tests reference intrinsics the current ISA no longer "
+            "provides, so they cannot compile. Update them to the current commands "
+            "before treating any earlier PASS as evidence, or delete them and write a "
+            "test for the new instructions."
+        )]))
+    return block
 
 
 def implementation_feedback(state: CfuDesignState, rung: str, *, limit: int = 3) -> str:

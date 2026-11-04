@@ -59,6 +59,23 @@ class InstructionEncodingTest(TestCase):
         self.assertEqual(result['problems'], [])
         self.assertEqual(len(result['coverage']), 4)
 
+    def test_piped_fsm_and_lsu_helper_declarations_are_supported(self):
+        commands = [
+            {'name': 'pipe_op', 'function_id': 1, 'subfunction_id': 2, 'kind': 'compute'},
+            {'name': 'fsm_ld', 'function_id': 4, 'subfunction_id': 1, 'kind': 'load'},
+        ]
+        entries = [
+            'PipedInstruction("pipe_op", 1, subop = 2, stages = 2, resources = Some(Seq(CpuRead(RS1), CpuWriteRD))) { pipe => pipe.stage(1) { s => s.complete(s.read(RS1)) } }',
+            'FsmInstruction("fsm_ld", 4, subop = 1, enabled = p.withTilelink && p.withLoad, resources = Some(Seq(CpuRead(RS1), CpuWriteRD))) { ctx => new CfuSubFsm(ctx) { val S = workState(); S.whenIsActive { lsuStartScalarLoad(ctx.read(RS1).asUInt); completeAndExit(lsu.load.lastData) } } }',
+        ]
+        result = self.source(table(*entries), spec(*commands, memory={'load': True, 'burst': True, 'outstanding': True}))
+        self.assertTrue(result['checked'])
+        self.assertEqual(result['problems'], [])
+        self.assertTrue(result['config']['burstMem'])
+        self.assertTrue(result['config']['advancedMem'])
+        disabled = self.source(table(*entries), spec(*commands, memory={'load': False}))
+        self.assertTrue(any('disabled_instruction' in p for p in disabled['problems']))
+
     def test_range_duplicate_and_disabled_checks_include_disabled_entries(self):
         for entries, message in [
             ([instruction(function='8')], 'encoding_range'),

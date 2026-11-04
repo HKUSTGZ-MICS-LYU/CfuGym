@@ -53,4 +53,11 @@ class Ledger(TypedDict, total=False):
     # Rejected conformance-oracle attempts (problems_hash): a rejection that
     # recurs means the repair is oscillating between two validation errors.
     conformance_attempts: Annotated[list[dict], operator.add]
+    # Agent-authored dev tests: one entry per created test and one per run, so the
+    # report can say whether a test ever observed a failure (a test that never
+    # failed is weaker evidence, not an error).
+    #: A snapshot of the dev-test files, not an accumulator: each round reports
+    #: the whole directory, so appending would duplicate every name per round.
+    conformance_tests: list[dict]
+    conformance_runs: Annotated[list[dict], operator.add]
     progress_summary: dict[str, Any]

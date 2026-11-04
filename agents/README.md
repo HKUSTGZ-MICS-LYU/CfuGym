@@ -122,6 +122,17 @@ immutable `versions/` copy, and the tool loop can enumerate them with
 record is written for successes as well as failures, so a repairable regression can
 be compared against the last passing run instead of guessed from a truncated tail.
 
+All agent-issued `sbt` commands (including direct CLI runs, profile, preflight,
+SoC generation, conformance, simulation and cost RTL generation) acquire a shared
+workspace lock at `agents/generated/.sbt.lock` before starting. Contention waits
+are cancellable and bounded by the command's timeout; execution then gets its own
+full timeout. Closing the lock descriptor releases it on success or failure; an
+existing lock file is not itself evidence of a held lock. The Host never deletes
+sbt's boot locks/sockets or kills another invocation to unlock it. sbt runs with
+closed stdin by default and CI/server-autostart/supershell properties suitable for
+noninteractive commands. The optional experiment PATH shim remains compatible;
+manual sbt invocations outside the agent do not acquire the workspace lock.
+
 ### Benchmark verifier visibility
 
 The Embench `verify_benchmark` interface remains visible, but its function body is
@@ -316,6 +327,26 @@ Pure API self-tests outside a graph run have no run ledger. Inspect it locally w
 python -m json.tool --json-lines agents/generated/runs/YOUR_RUN_ID/request_audit.jsonl
 ```
 
+Transient upstream failures retry the **same request on the same endpoint**, at
+most ten times, before surfacing the original error. This includes gateway SSE
+errors without an HTTP status: explicit token/request rate limits and truncated
+upstream payloads. Transport backoff is 5–60 seconds; rate-limit backoff is
+60–300 seconds. `Retry-After` (seconds/HTTP-date) and `retry-after-ms` can increase
+the delay, capped at 300 seconds. Exhausted transient errors never mark Responses
+unsupported or trigger Chat fallback. Permanent quota/billing errors and ordinary
+invalid-input 400s are not transient retries; actual endpoint/stream compatibility
+fallbacks remain available. Partial failed streams are discarded before any tool
+is executed, and streams are closed before retrying. Backoff observes the existing
+cancellation token; cancellation is propagated without endpoint fallback. This is bounded recovery,
+not a guarantee against upstream TPM limits or a cross-process quota scheduler.
+
+Error audit events retain a bounded, credential-redacted message, error kind,
+retryability, available status/provider code and request ID, plus retry delay when
+applicable. They do not copy raw error bodies or headers. Status-less SSE messages
+are not assigned an invented HTTP status. Batch classification recognizes textual
+rate limits, including wrapped causes, and uses its configured rate-limit backoff
+if request-level recovery is exhausted.
+
 No real-provider cache-hit improvement or gateway window discovery is inferred from
 offline tests; those require a separate, explicitly authorized live run.
 
@@ -361,6 +392,10 @@ routed to `implement`. The category table and the 2026-09-29 case study (the
 `--agent-cfu-no-store` platform bug, since fixed in `AgentCfuFiber.getM2sParameters`)
 are in [`docs/cfu_agent_failure_taxonomy.md`](../docs/cfu_agent_failure_taxonomy.md).
 
+**`gate` mode only below this point.** In the default `dev` mode Implement authors
+free-form C dev tests instead (see [Conformance](#conformance-agent-authored-dev-tests)),
+and the YAML-oracle machinery described in this paragraph is not used.
+
 Implement delivers the formal oracle through `write_conformance(oracle)`: the host
 parses/validates the oracle (independent scalar semantics plus the *shape* of the input
 space) and renders fixed C source **and its test data**. The
@@ -375,9 +410,11 @@ afterwards (tool ordering must not cost a round). In the no-tool delivery mode t
 re-authored on every repair round, and a revision the validator rejects keeps the
 approved pair instead of failing the design round. Optional
 `check_conformance_syntax()` invokes only `-fsyntax-only` (no ELF/link/simulation) with `-std=gnu99`, because the framework's own generated `cfu_intrinsics.h` binds operand registers with `register uint32_t r1 asm("a1")` and `-std=c99` rejected the header before the body was ever parsed. The same preflight is **host-owned and automatic**: every accepted `write_conformance` renders the pair and compiles it, and a compiler error (positive return code) rejects the delivery — the previous pair stays on disk and the session stays open so the model can deliver a corrected oracle in the same round. A negative status (policy denial, missing toolchain, timeout) is not a rejection: the model cannot fix that, and the `hw_conformance` rung still owns the verdict.
-Implement exposes no `run_conformance` or `run_simulation` capability. Verify makes
-no model calls and never authors or rewrites oracle/C/header: it checks the approved
-bytes and builds/simulates that delivery. Missing/stale oracle or test compile errors
+Implement exposes no `run_simulation` capability. Its only simulation is
+`run_conformance`, a budgeted check over the agent's own dev tests (above); it
+records evidence and cannot decide the run. Verify makes no model calls and never
+authors or rewrites oracle/C/header: it checks the approved bytes and
+builds/simulates that delivery. Missing/stale oracle or test compile errors
 return to Implement in conformance-only scope using the answer-repair budget;
 healthy HW/SW need no dummy edits. A **completed differential mismatch is
 unattributed**: the test ran to a verdict and disagreed with its own reference, so
@@ -464,7 +501,7 @@ The design is checked by the tool that owns each artifact **immediately after it
 | `isa` | CFU ISA/integration contract lints | `isa` | `design_contract` |
 | `implementation_hw` | writes `workspace/design/AgentCfu*.scala` only | `implementation_hw` | — |
 | `hw_build` | `sbt … MiCoSocGen --mico-agent-cfu` (Scala compile + SpinalHDL elaboration + Verilog) | `hw_build` | `implement` |
-| `hw_conformance` | harness-generated differential micro-test of every declared instruction (`make … cfu_conformance` + `MiCoSocSim --load-elf`); must print `CFU_CONFORMANCE PASS commands=n/n …` | `hw_conformance` | `implement` |
+| `hw_conformance` | **`gate` mode only** (or `dev` mode with `--conformance-promote`): host-rendered differential micro-test of every declared instruction (`make … cfu_conformance` + `MiCoSocSim --load-elf`), or a host re-run of the agent's dev tests; must print the host's verdict line | `hw_conformance` | `implement` |
 | `implementation_sw` | writes the accelerated kernel + `cfu_intrinsics.h`; the CFU build must call a CFU datapath intrinsic (not `cfu_enable()` + scalar). The rung may be **reused** instead of re-run when the kernel already in the workspace still drives this exact ISA contract | `implementation_sw` | — |
 | `sw_build` | `make … compile` | `sw_build` | `implement` |
 | `sim` | `sbt … MiCoSocSim --load-elf …` plus the correctness oracle; an embench CFU build must also show >= 1.05x reference cycles (`MIN_EMBENCH_SPEEDUP_X100` in `flow/gates.py`) | `sim` | `implement` |
@@ -494,7 +531,7 @@ The design is checked by the tool that owns each artifact **immediately after it
 
 - The implementation stage writes both sides before the ladder runs, so `hw_build`, `hw_conformance`, `sw_build`, `sim` and `cost` always validate what the stage actually delivered. Whether the kernel was rewritten is the stage's own decision; the ladder compiles whatever is in the workspace and still enforces the correctness oracle and the speedup floor.
 
-- After Implement delivers hardware, software and the oracle, the `hw_conformance` rung runs the **smallest possible program** that exercises each declared instruction and compares it against an independent scalar reference, so a contract/encoding/writeback mistake is found before a kernel is written on top of it. Ownership is split three ways. The **harness** owns the C test (`conformance.render_conformance`) **and the test data** (`conformance.conformance_data`): the oracle declares only the *shape* of the input space and the generator produces a fixed-seed boundary sweep — `length` gets 0, 1, the half block and the full block, `index` gets 1/half/max, `value` gets 0/1/0x7FFFFFFF/0xFFFFFFFF — followed by deterministic random draws (`data.count`, default 4). No case argument is model-authored, so a run cannot pass on a hand-picked degenerate input set (run `20261005-073745` declared a single zero-length message and never transferred a source byte) and "the expected value is whatever my table says" cannot be arranged by choosing easy inputs. The **model** owns the scalar semantics: `reference` for a command that writes CPU `rd`, or `verify` for a command with no CPU result (a vector write or an acknowledgement) — that is **weaker evidence** (the model attesting its own hardware) and is recorded as such. A command that uses the vector register file must supply `setup`; the harness never guesses how to seed it. A command with CPU-value roles must declare `data.roles` (one descriptor per argument, rs1/rs2 order) and, when a role is an `address`, a `data.buffer`; the harness defines `<NAME>_CONF_DATA_BASE`/`<NAME>_CONF_DATA_BYTES` and owns the `cfu_memory_fence()` that orders the block before the DUT reads it, so `setup`/`reference` read exactly the bytes the DUT read. A missing `reference`/`verify`/`setup`, an unusable `data` block, a legacy `cases`, an unknown command name or a role-count mismatch is a **coverage failure**, and a missing `CFU_CONFORMANCE` line is a failure too: silence is never evidence. Lazy oracles are rejected by the validator: a `reference`/`verify` that is a compile-time constant (no identifier), that calls a `cfu_*` intrinsic (self-reference), that names an undeclared case argument, that compares an operand with itself (`a == a`), that (as `verify`) is built only from the case arguments, or that compares a value the same oracle's `setup`/`helpers` assigned a literal to fails with an actionable message, as does a `helpers` symbol defined by more than one command — **function, file-scope object or macro**, since any repeated name makes the harness-owned C fail to compile (run `20261003-130005`: two entries defined `md5_oracle_mem`). `data.buffer` is capped at 1024 bytes, `data.count` at 16 and each command's generated cases at 2048 transferred bytes (`conformance_data.CASE_BYTE_BUDGET`, kept in priority order: the full-block case first, then the sweep, then the draws), so every case is still a quick functional check; the harness always binds `a`/`b` at case scope, so a stale oracle cannot fail the generated C build. The rung is purely functional — it measures no cycles and asserts no performance; correctness is proved later by the `sim` rung and the workload's own oracle. Because a model-authored reference is unvalidated ground truth, the oracle may instead `#include` the workload's own pristine scalar implementation: `commands.conformance_scalar_sources` puts `workspace/embench_<bench>/reference/{src,support}` (the harness-owned plain copy that `embench.workspace_tampering` guards — never the writable `cfu` copy) on both the syntax preflight's and the build's include path, with the benchmark's own `-D` set, so the expected value can come from code the model did not write. The include is a single translation unit: `-ffunction-sections` + `--gc-sections` drop the benchmark's `benchmark_body`/`workspace` code, so the run's `main` stays the only entry point (verified with a real `make -C sw … compile`). It is offered, not required — a config/reset/acknowledgement command has no workload counterpart and still needs its own independent expression. A **completed differential mismatch** is unattributed evidence: nothing validates the model's scalar reference, so a wrong reference makes correct hardware look broken (run `20261005-073745`: an oracle whose MD5 K table held 63 of 64 entries failed three consecutive rounds, and the last one reported a *correct* DUT). It therefore repairs `implement` in conformance scope with `oracle_unattributed: true` and no forced hardware edit, and an oracle-only delivery is charged to the separate answer-repair budget (see the repair-budget note above); a malformed/unbuildable oracle is an answer failure outright, and a watchdog/hang without a verdict stays design-scope. The generated C, the oracle and the verdict are kept under `09_implementation/conformance/`.
+- **`gate` mode.** After Implement delivers hardware, software and the oracle, the `hw_conformance` rung runs the **smallest possible program** that exercises each declared instruction and compares it against an independent scalar reference, so a contract/encoding/writeback mistake is found before a kernel is written on top of it. Ownership is split three ways. The **harness** owns the C test (`conformance.render_conformance`) **and the test data** (`conformance.conformance_data`): the oracle declares only the *shape* of the input space and the generator produces a fixed-seed boundary sweep — `length` gets 0, 1, the half block and the full block, `index` gets 1/half/max, `value` gets 0/1/0x7FFFFFFF/0xFFFFFFFF — followed by deterministic random draws (`data.count`, default 4). No case argument is model-authored, so a run cannot pass on a hand-picked degenerate input set (run `20261005-073745` declared a single zero-length message and never transferred a source byte) and "the expected value is whatever my table says" cannot be arranged by choosing easy inputs. The **model** owns the scalar semantics: `reference` for a command that writes CPU `rd`, or `verify` for a command with no CPU result (a vector write or an acknowledgement) — that is **weaker evidence** (the model attesting its own hardware) and is recorded as such. A command that uses the vector register file must supply `setup`; the harness never guesses how to seed it. A command with CPU-value roles must declare `data.roles` (one descriptor per argument, rs1/rs2 order) and, when a role is an `address`, a `data.buffer`; the harness defines `<NAME>_CONF_DATA_BASE`/`<NAME>_CONF_DATA_BYTES` and owns the `cfu_memory_fence()` that orders the block before the DUT reads it, so `setup`/`reference` read exactly the bytes the DUT read. A missing `reference`/`verify`/`setup`, an unusable `data` block, a legacy `cases`, an unknown command name or a role-count mismatch is a **coverage failure**, and a missing `CFU_CONFORMANCE` line is a failure too: silence is never evidence. Lazy oracles are rejected by the validator: a `reference`/`verify` that is a compile-time constant (no identifier), that calls a `cfu_*` intrinsic (self-reference), that names an undeclared case argument, that compares an operand with itself (`a == a`), that (as `verify`) is built only from the case arguments, or that compares a value the same oracle's `setup`/`helpers` assigned a literal to fails with an actionable message, as does a `helpers` symbol defined by more than one command — **function, file-scope object or macro**, since any repeated name makes the harness-owned C fail to compile (run `20261003-130005`: two entries defined `md5_oracle_mem`). `data.buffer` is capped at 1024 bytes, `data.count` at 16 and each command's generated cases at 2048 transferred bytes (`conformance_data.CASE_BYTE_BUDGET`, kept in priority order: the full-block case first, then the sweep, then the draws), so every case is still a quick functional check; the harness always binds `a`/`b` at case scope, so a stale oracle cannot fail the generated C build. The rung is purely functional — it measures no cycles and asserts no performance; correctness is proved later by the `sim` rung and the workload's own oracle. Because a model-authored reference is unvalidated ground truth, the oracle may instead `#include` the workload's own pristine scalar implementation: `commands.conformance_scalar_sources` puts `workspace/embench_<bench>/reference/{src,support}` (the harness-owned plain copy that `embench.workspace_tampering` guards — never the writable `cfu` copy) on both the syntax preflight's and the build's include path, with the benchmark's own `-D` set, so the expected value can come from code the model did not write. The include is a single translation unit: `-ffunction-sections` + `--gc-sections` drop the benchmark's `benchmark_body`/`workspace` code, so the run's `main` stays the only entry point (verified with a real `make -C sw … compile`). It is offered, not required — a config/reset/acknowledgement command has no workload counterpart and still needs its own independent expression. A **completed differential mismatch** is unattributed evidence: nothing validates the model's scalar reference, so a wrong reference makes correct hardware look broken (run `20261005-073745`: an oracle whose MD5 K table held 63 of 64 entries failed three consecutive rounds, and the last one reported a *correct* DUT). It therefore repairs `implement` in conformance scope with `oracle_unattributed: true` and no forced hardware edit, and an oracle-only delivery is charged to the separate answer-repair budget (see the repair-budget note above); a malformed/unbuildable oracle is an answer failure outright, and a watchdog/hang without a verdict stays design-scope. The generated C, the oracle and the verdict are kept under `09_implementation/conformance/`.
 - The oracle declares the input space, never the values: `data.buffer` (the harness-owned byte block the DUT reads), `data.count` (random draws on top of the boundary sweep) and `data.roles` (one `kind: address|length|index|value` descriptor per CPU-value argument, rs1/rs2 order, with `max` for `length`/`index`). The validator rejects a legacy `cases` block, a model-supplied `data.seed`, an `address` role without a buffer, a `length` bound larger than the buffer, a buffer that is not a ≤1024-byte multiple of 4, an out-of-range `count`, an unknown kind (listing the vocabulary) and a role-count mismatch, each naming the fix. The oracle's C may call only the **generated intrinsics named in the prompt's command table** (plus `cfu_enable`/`cfu_memory_fence`, and the harness `<NAME>_CONF_DATA_BASE`/`<NAME>_CONF_DATA_BYTES` macros); an invented name such as `cfu_load` is caught by a static lint before the build (`unknown intrinsic cfu_load (did you mean cfu_vector_load_i32?)`) instead of surfacing as a bare linker error. Conformance build/sim failures embed the compiler/linker diagnostics in the repair feedback (previously only the `make` command line reached the model, so it repaired blind), and a **recurring** rejection — validator failure or build failure — is flagged as a `REPEATED ORACLE REJECTION` with the correct shape pinned. `run.yaml` merges artifact refs across writer instances, so every oracle attempt's raw answer stays registered and numbered (`conformance_000/001/...`) instead of being dropped and overwritten.
 - With `--loop` a run does not have to stop when it succeeds (see **Multi-instruction ISA evolution** below for the current exploration and delivery rules). If every gate passes **and** a `--max-iters` verification-submission slot remains, the review node asks the agent (stage `optimize`, plus at most one stop reconsideration) whether another round is worth spending on: `{"continue": true|false, "target": "implement_hw"|"implement_sw"|"extend_isa", "focus": "performance"|"cost", "reason": ...}`. A round re-enters the normal ladder (`implement_hw` → `generate_soc` → software reuse-or-rewrite → `build_sw` → `simulate` → `estimate_cost` → review, or `implement_sw` → `build_sw` → …), so it can never skip verify, the 1.05x speedup floor, or a build rung. Each optimization candidate consumes one verification-submission slot: `--max-iters N` stays the bound on candidates sent through the ladder, and a round with no slot left, an unusable target, or a missing "concrete change" reason stops the loop deterministically; in default explore mode a `continue: false` is reconsidered once before the framework accepts it (no model answer can extend a run). The chosen rung receives an `=== OPTIMIZATION ROUND ===` block (not a `*_REPAIR MODE` block) with the current measured result, the focus, and the rule that the accepted ISA revision is frozen during implementation; only `extend_isa` may append compatible commands before re-entering hardware and software validation. Every round that produced its own measurement is recorded in `12_review/optimization_rounds.yaml` (speedup, reference/CFU cycles, Yosys cells/wires/memories), and `simulate`/`estimate_cost` stamp their gates with the round they ran in, so a round that failed before measuring is listed as `not measured` instead of repeating the previous round's numbers. The report's `## Optimization Rounds` section and the end-of-run CLI `summary:` each print one line per round with the change against the previous measured round — for example `round 1: implement_hw speedup=2.50x cells=1300 (+0.50x, +100 cells) (best)` — so the whole progression of speedup and cost is traceable; the first round is the initial ladder. A round counts as an improvement only when it is Pareto-better than the best round so far (not slower, not larger, better on at least one axis); a final measured round that regresses is reported with an explicit warning in the report and in the CLI summary. `--loop` is off by default (env `CFU_AGENT_LOOP`); without it, review stops as before.
 - The cost rung synthesizes the CFU **in isolation** rather than the whole SoC: `GenAgentCfu` (a tracked, non-agent-editable entry point) elaborates only the overlaid `AgentCfu` class into `11_cost/cfu_rtl/AgentCfu.v`, and Yosys runs `synth -top AgentCfu` on it. Cost numbers therefore track the agent's CFU design instead of the CPU/SoC, and the cost rung needs no CPU build. If the standalone generation produces no RTL, the cost rung fails and repairs `implement_hw`.
@@ -530,13 +567,61 @@ python3 agents/run_cfu_agent.py --task "..." --visibility basic
 `--apply-patch`, `--run-commands` and `--no-dry-run` remain accepted as no-ops so
 older invocations keep working; they no longer change anything.
 
+### Conformance: agent-authored dev tests
+
+`--conformance-mode {dev,gate,off}` (default **`dev`**) selects how conformance is
+delivered. It is a mode, not an ablation: what it changes is who owns the test.
+
+In `dev` mode the agent writes ordinary C under `workspace/dev_tests/` and runs it
+itself inside Implement:
+
+- `add_conformance_test(name)` creates the file from a host template;
+  `edit_conformance_test(name, search, replace)` edits it with exact
+  SEARCH/REPLACE; `run_conformance(test=name)` compiles and simulates it.
+- The **model owns two functions**: `cfu_conformance_dut()` (calls the generated
+  `cfu_*` intrinsics, in any order and any number of times) and
+  `cfu_conformance_ref()` (an independent scalar reference, which must not call a
+  `cfu_*` intrinsic). There is no YAML schema and no per-command input-space
+  description to satisfy.
+- The **host owns everything the verdict depends on**: the file header, the data
+  block (`cfu_conf_data[]`, `cfu_conf_len`, `cfu_conf_index`), `main()`, the
+  length/selector sweep, the comparison, and a per-run nonce in the verdict line.
+  A `PASS` printed by the model is ignored; a `dut()` that returns the
+  reference's own value is rejected as vacuous, as is `main()`, an edit outside
+  the marked region, or a modified header.
+- `run_conformance` is a budgeted `Verification` (`--max-conformance-runs`,
+  default 2), so it records **evidence** and never a Gate. Compilation and
+  simulation run under the `conformance` stage's command allowlist, not
+  Implement's, so introducing dev tests does not widen what Implement may
+  execute.
+- A dev test lives in the run workspace and is rolled back with the rest of the
+  stage transaction, so a rejected attempt cannot leave a test behind.
+
+`dev` mode removes `hw_conformance` from the happy path: the ladder routes
+`generate_soc → build_sw`, and `sim` (the workload's own oracle plus the speedup
+floor) owns correctness. The report's `## Conformance` section lists every test,
+its runs and whether it ever observed a failure — a test that only ever passed is
+weaker evidence, not proof.
+
+`gate` restores the previous behaviour exactly: the agent authors the YAML oracle
+(`write_conformance`), the host renders the C test, and `hw_conformance` is a
+**required** rung before the software build. Use it to reproduce pre-change
+results; the two modes are not comparable as a single sample.
+
+`--conformance-promote` keeps `dev` mode for authoring but also runs the dev
+tests as the `hw_conformance` gate before `build_sw`: the host regenerates the
+runner, uses a fresh nonce, and requires every test to pass. Off by default.
+
+`off` (alias: `--no-conformance`) is the ablation below.
+
 ### Ablation flags
 
-Three `--no-*` switches each remove exactly one capability, for ablation experiments.
-All are **off by default** (the full flow). What a switch disabled is never silently
-absent: it is recorded in `run.yaml`, the report's `## Ablation` section and the CLI
-`summary:` block, and the affected rung gate carries a `disabled` marker instead of a
-verdict. A `disabled` rung is excluded from the completeness requirement, so an
+Two `--no-*` switches each remove exactly one capability, for ablation
+experiments; `--conformance-mode off` removes the third. All are **off by
+default** (the full flow). What a switch disabled is never silently absent: it is
+recorded in `run.yaml`, the report's `## Ablation` section and the CLI
+`summary:` block, and the affected rung gate carries a `disabled` marker instead of
+a verdict. A `disabled` rung is excluded from the completeness requirement, so an
 otherwise passing run still reaches `complete`; a **real** skip (`--dry-run`,
 `--skip-sim`, execution disabled) keeps the honesty rule above and stays `planned`.
 
@@ -547,11 +632,12 @@ otherwise passing run still reaches `complete`; a **real** skip (`--dry-run`,
 # Conflicts with --ir-features require|approx (explicit IR evidence is refused).
 python3 agents/run_cfu_agent.py --task "..." --no-llvm-ir
 
-# Drop the conformance requirement: Implement no longer authors/delivers the
-# oracle (write_conformance/check_conformance_syntax disappear from its tools and
-# its gate), and the hw_conformance rung is recorded as disabled. The sim rung
-# still enforces the workload's own correctness oracle and the speedup floor.
+# Drop the conformance requirement entirely: no dev tests and no YAML oracle.
+# The hw_conformance rung is recorded as disabled. The sim rung still enforces
+# the workload's own correctness oracle and the speedup floor.
 python3 agents/run_cfu_agent.py --task "..." --no-conformance
+# equivalent:
+python3 agents/run_cfu_agent.py --task "..." --conformance-mode off
 
 # Skip the ISA contract stage entirely: no contract LLM step and no isa_spec.
 # The agent designs the instructions itself and writes cfu_intrinsics.h from the
@@ -560,14 +646,86 @@ python3 agents/run_cfu_agent.py --task "..." --no-conformance
 # (custom0 opcode 0x0B; funct3/funct7 its choice), keeping the RTL consistent.
 # The header is an ordinary editable software target: seeded once from the
 # template and never overwritten by the harness afterwards. Implies
-# --no-conformance (the conformance oracle consumes the contract), and --loop
-# loses the extend_isa target (only implementation rounds remain).
+# --conformance-mode off (the conformance oracle consumes the contract), and
+# --loop loses the extend_isa target (only implementation rounds remain).
 python3 agents/run_cfu_agent.py --task "..." --no-isa-contract
 ```
 
-State fields `llvm_ir`, `require_conformance` and `isa_contract` (all default
-`True`) carry the switches; every read defaults to enabled, so states built without
-them keep the full flow.
+State fields `llvm_ir`, `isa_contract` (default `True`), `conformance_mode`
+(default `dev`) and the derived `require_conformance` carry the switches; every
+read defaults to the full flow, so states built without them keep working
+(an old state with `require_conformance` but no mode is read as `gate`).
+
+### Experiment capability ladder: ISA Contract → visibility → dev conformance → IR
+
+The presets share scheme `isa-visibility-devconf-ir-v3`: a cumulative **L0–L4
+ladder, without X cross groups**. `run_ablation.py` defaults to `--layers ladder`;
+`run_matrix.py` and `run_sweep.py` retain the separate legacy `--layers full` default.
+
+| Layer | ISA Contract | Fixed visibility | Explicit conformance mode | LLVM IR | Addition |
+| --- | --- | --- | --- | --- | --- |
+| `l0-none` | off (`--no-isa-contract`) | `basic` | `--conformance-mode off` | off (`--no-llvm-ir`) | Agent authors instructions and intrinsic header |
+| `l1-isa` | on | `basic` | `--conformance-mode off` | off (`--no-llvm-ir`) | ISA Contract |
+| `l2-vis` | on | `extended` | `--conformance-mode off` | off (`--no-llvm-ir`) | Extra repo/skills/SpinalHDL visibility |
+| `l3-devconf` | on | `extended` | `--conformance-mode dev` | off (`--no-llvm-ir`) | Agent-authored dev conformance evidence |
+| `l4-ir` | on | `extended` | `--conformance-mode dev` | on | LLVM IR evidence |
+
+The harness explicitly sets `--conformance-mode` and **never mixes it with
+`--no-conformance`**. Promotion is disabled (`conformance_promote=False`). Dev
+conformance is agent-authored C-test evidence, not the legacy YAML-oracle gate;
+workload correctness, speedup and cost gates still own completion.
+Harness `--max-conformance-runs` defaults to **2, stage-local**, not two calls
+for the entire run. Supply it before any bare `--`, never as agent passthrough.
+
+`basic` means **visibility-none = no extra repo/skills/SpinalHDL visibility**, not
+zero source access: workload, interfaces and scaffolds remain readable.
+`extended` permits policy-allowed on-demand reads, not automatic source loading.
+Aliases: `none/l0→l0-none`, `isa/l1→l1-isa`, `visibility/vis/l2→l2-vis`,
+`l3/conf/conformance/devconf→l3-devconf`, `l4/ir/llvm-ir→l4-ir`.
+Old `l3-ir` and `l2-conf` are **archive-only**, not accepted for new schedules;
+old batches remain readable with `--aggregate-only`.
+
+Legacy `full` remains an independent un-ablated matrix/sweep flow using the
+agent's default `dev` mode, **not** the new final layer or an alias for `l4-ir`.
+Historical `full` with the YAML-oracle gate needs explicit `--conformance-mode gate`
+for reproduction; do not pool gate and dev samples. Do not mix `full` with the ladder.
+New layers reject global `--visibility` overrides, even matching values, and reject
+passthrough `--no-isa-contract`, `--no-llvm-ir`, `--ir-features`, `--no-conformance`,
+`--conformance-mode`, `--conformance-promote` and `--max-conformance-runs`.
+No global conformance or visibility flag is needed for the ladder command below.
+
+Use a **new unique `--exp-id`**: metadata records
+`ablation_scheme='isa-visibility-devconf-ir-v3'` and layer controls. The v3 schema
+must not resume into or mix with old v2 batches; archives retain their original scheme.
+
+```bash
+# Replace placeholders: models are comma-separated config names, benchmarks a comma list.
+EXP_ID="<new-unique-v3-experiment-id>"
+MODELS="<config-name[,config-name...]>"
+BENCHMARKS="<benchmark[,benchmark...]>"
+python3 agents/experiments/run_ablation.py \
+  --exp-id "$EXP_ID" --models "$MODELS" --benchmarks "$BENCHMARKS" \
+  --layers ladder --repeats 3 --max-iters 5 --max-conformance-runs 2 \
+  --temperature 1.0 --jobs 1 --conda-env mico_env \
+  -- --cost-backend vivado
+```
+
+**First add `--dry-run` before the bare `--`** to print commands/write planning
+artifacts only, with **no actual LLM calls or toolchain execution**. With one model
+and two benchmarks, five layers × 1 × 2 × R=3 = **30 planned runs**, excluding infra
+retries. Omitting `--dry-run` starts autonomous execution; these examples are not run.
+Remove the `-- --cost-backend vivado` tail to use default Yosys; that does not
+produce Vivado resource data.
+
+Summaries report **speedup min/max/mean/median over valid successful samples**
+and capture **actual Vivado LUT/FF/BRAM/DSP** resources. Missing data stays empty,
+not zero; Yosys cells are never substituted for Vivado resources.
+
+This is **cumulative, not full-factorial**: adjacent differences are conditional
+on prior capabilities, not independent effects or interactions. R=3–5 has wide
+uncertainty. IR `auto` may produce labelled approximate IR: static evidence is not
+exact-target instructions, measured cycles or a speedup guarantee. See the
+[detailed experiment design](../docs/agent_pass_at_k_experiment_matrix.md#12-分层消融实验isa-contract--visibility--dev-conformance--llvm-ir).
 
 ### Visibility levels
 
@@ -630,14 +788,16 @@ Consequences:
   workspace that still inlines a top-level `CfuResource` keeps compiling against the
   current repository platform.
 
-The dispatcher is built during the platform constructor. It has to be: the CfuLsu
-state machine consumes its registered `whenIsActive` tasks exactly once, at prePop
-time, and `fsm.goto` is only legal while that build runs. Scala assigns
-primary-constructor parameter fields before the superclass body executes, so
-`AgentCfu.instructionTable` may read its own constructor parameters (`p`,
-`cfuParam`) and the platform members. It must not read a `val` declared in the
-subclass body, which is assigned only after the platform has called the table;
-allocate design state inside the table body instead.
+The dispatcher is built at the start of `Component.prePop()`, after the
+`AgentCfu` subclass constructor finishes and before any `StateMachine` or
+`StagePipeline` runs its `prePop` build task. `AgentCfu` may therefore declare
+top-level `val`s, `Reg`s, `Mem`s and `new Area` blocks in the class body, or
+allocate state inside `instructionTable`, and may use `Instruction`,
+`PipedInstruction` (SpinalHDL `StagePipeline`), `FsmInstruction` (`CfuSubFsm`),
+decoupled LSU helpers (`lsuStartVectorLoad`, `lsuStartStreamLoad`,
+`lsuStartScalarLoad`, `lsuStartVectorStore`, `lsuStartScalarStore`, `lsu.loadFlow`),
+local scalar RF resources (`ScalarRead`/`ScalarWrite`), packed `BitSlice`/`CsrState`
+indices, and SIMD helpers (`lanesSInt`, `dotProductSInt`, `reduceSumSInt`, `clampSInt`).
 
 ### Declarative CFU instruction table
 
@@ -894,6 +1054,8 @@ Every run gets a unique directory `agents/generated/runs/<run_id>/` and writes:
 07_analysis/analysis_tool_calls.yaml       # analysis-rung read/search/inspect_observation transcript
 08_isa/isa_tool_calls.yaml                 # ISA-contract read/search transcript
 09_implementation/conformance_tool_calls.yaml  # conformance-oracle read/search transcript
+workspace/dev_tests/<name>.c              # agent-authored dev tests (model region only)
+workspace/dev_tests/_host/                # host runner, cfu_conf.h, per-test MAIN stub (read-only)
 12_review/optimize_tool_calls.yaml         # optimization-planner read/search transcript
 09_implementation/sw_plan.md, sw_patch.diff, sw_changed_files.yaml
 09_implementation/software_decision.yaml   # required/reused (software_change) + its evidence

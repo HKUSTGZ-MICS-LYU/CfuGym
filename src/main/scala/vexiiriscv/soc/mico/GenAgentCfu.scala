@@ -24,10 +24,13 @@ case class GenAgentCfuConfig(
     vlen: Int = 256,
     busWidth: Int = 32,
     regDepth: Int = 2,
+    scalarDepth: Int = 4,
     addressWidth: Int = 32,
     tilelink: Boolean = true,
     load: Boolean = true,
-    store: Boolean = true
+    store: Boolean = true,
+    advancedMem: Boolean = false,
+    burstMem: Boolean = false
 )
 
 object GenAgentCfu extends App {
@@ -38,10 +41,13 @@ object GenAgentCfu extends App {
     opt[Int]("agent-cfu-vlen").action((v, c) => c.copy(vlen = v)).text("CFU vector register width in bits")
     opt[Int]("agent-cfu-bus-width").action((v, c) => c.copy(busWidth = v)).text("CFU data width in bits")
     opt[Int]("agent-cfu-reg-depth").action((v, c) => c.copy(regDepth = v)).text("CFU vector register count")
+    opt[Int]("agent-cfu-scalar-depth").action((v, c) => c.copy(scalarDepth = v)).text("CFU local scalar register count")
     opt[Int]("agent-cfu-address-width").action((v, c) => c.copy(addressWidth = v))
     opt[Unit]("agent-cfu-no-tilelink").action((_, c) => c.copy(tilelink = false)).text("Generate the direct (no TileLink) CFU")
     opt[Unit]("agent-cfu-no-load").action((_, c) => c.copy(load = false))
     opt[Unit]("agent-cfu-no-store").action((_, c) => c.copy(store = false))
+    opt[Unit]("agent-cfu-advanced-mem").action((_, c) => c.copy(advancedMem = true))
+    opt[Unit]("agent-cfu-burst-mem").action((_, c) => c.copy(burstMem = true))
   }
 
   val config = parser.parse(args, GenAgentCfuConfig()).getOrElse(sys.exit(1))
@@ -53,7 +59,10 @@ object GenAgentCfu extends App {
     addressWidth = config.addressWidth,
     withTilelink = config.tilelink,
     withLoad = config.tilelink && config.load,
-    withStore = config.tilelink && config.store
+    withStore = config.tilelink && config.store,
+    advancedMem = config.tilelink && config.advancedMem,
+    burstMem = config.tilelink && config.burstMem,
+    scalarRegDepth = config.scalarDepth
   )
 
   // Same bus construction the SoC uses: the CPU-facing CfuBus width comes from

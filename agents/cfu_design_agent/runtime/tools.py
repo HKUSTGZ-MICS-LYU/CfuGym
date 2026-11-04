@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from . import processes, source_visibility
+from . import processes, sbt_guard, source_visibility
 
 # Keep the longstanding tools.subprocess.run mock seam local to this module;
 # never replace the standard library's process runner for unrelated callers.
@@ -351,16 +351,18 @@ class RepoToolbox:
         execution_args = [arg for arg in args if arg != "--unsafe-paths"] if selected in {
             "git_apply", "git_apply_check"
         } else args
-        with _tool_operation(self, "command", " ".join(execution_args)):
+        with _tool_operation(self, "command", " ".join(execution_args)), \
+                sbt_guard.command_guard(execution_args, self.workdir, timeout) as sbt_env:
             result = subprocess.run(
                 execution_args,
                 cwd=run_cwd,
-                input=input_text,
+                input="" if sbt_env is not None and input_text is None else input_text,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=timeout,
                 check=False,
+                **({"env": sbt_env} if sbt_env is not None else {}),
             )
         stdout = filter_output(result.stdout)
         stderr = filter_output(result.stderr)

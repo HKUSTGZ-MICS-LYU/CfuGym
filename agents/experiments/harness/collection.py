@@ -140,6 +140,84 @@ def framework_artifacts_are_stale(framework_run_dir: Path, started_at: str) -> b
     return written < started
 
 
+def collect_resources(cost: dict, gates: dict, report: dict, warnings: list[str], *, stale: bool = False) -> dict:
+    """Read the real Vivado PPA surface used by runtime.ppa, never Yosys cells.
+
+    The cost gate is the committed candidate verdict. Its input fingerprint and
+    evaluation ID must agree with PPA evidence; an unbound summary.json (or an
+    old command's result) cannot certify the current candidate.
+    """
+    gate = gates.get("cost") or {}
+    commands = [cmd for cmd in cost.get("commands") or [] if isinstance(cmd, dict)]
+    ppa_commands = [cmd for cmd in commands if isinstance((cmd.get("parsed") or {}).get("ppa"), dict)
+                    and (cmd.get("parsed") or {}).get("ppa")]
+    data = gate.get("ppa") or ((ppa_commands[-1].get("parsed") or {}).get("ppa") if ppa_commands else {})
+    backend = str(gate.get("backend") or data.get("backend") or cost.get("backend") or "")
+    if not backend:
+        if any("vivado_ppa_report.py" in str(cmd.get("command") or "") for cmd in commands):
+            backend = "vivado"
+        elif any((cmd.get("parsed") or {}).get("cost") or
+                 "yosys_cost_report.py" in str(cmd.get("command") or "") for cmd in commands):
+            backend = "yosys"
+    result = {"cost_backend": backend or "unknown", "resource_valid": False,
+              "resource_status": "unsupported", "resource_warning": "", "resource_provenance": {},
+              "resource_part": None, "resource_phase": None,
+              **{field: None for field in metrics.RESOURCE_FIELDS}}
+
+    def unavailable(reason: str, status: str = "unavailable") -> dict:
+        result.update(resource_status=status, resource_warning=reason)
+        warnings.append(reason)
+        return result
+
+    if backend != "vivado":
+        # A supported non-Vivado backend is not an artifact parse error.
+        # Retain its notice only in the dedicated resource column.
+        result["resource_warning"] = (
+            f"Vivado resources unsupported: cost backend {backend or 'unknown'}; "
+            "Yosys generic cells are not FPGA LUT/FF/BRAM/DSP counts"
+        )
+        return result
+    evidence = data.get("evidence") or {}
+    result.update(resource_provenance=dict(evidence), resource_part=data.get("part"),
+                  resource_phase=data.get("phase"))
+    if not data:
+        return unavailable("Vivado resources unavailable: no structured PPA evidence")
+    if data.get("backend") != "vivado" or data.get("phase") != "post_route":
+        return unavailable("Vivado resources unavailable: unsupported backend/phase")
+    if (stale or report.get("ppa_current_valid") is False or gate.get("ok") is not True
+            or any(gate.get(key) for key in ("stale", "skipped", "cancelled"))
+            or data.get("status") != "passed" or (cost and cost.get("status") != "passed")):
+        return unavailable("Vivado resources unavailable: cost is failed, stale, skipped, cancelled or historical")
+    current = report.get("current_performance") or {}
+    if current.get("candidate_provenance") is not None and current.get("candidate_matches") is not True:
+        return unavailable("Vivado resources unavailable: final candidate provenance does not match")
+    digest, evaluation = gate.get("input_sha256"), gate.get("evaluation_id")
+    if (not digest or not evaluation or evidence.get("input_sha256") != digest
+            or evidence.get("evaluation_id") != evaluation):
+        return unavailable("Vivado resources unavailable: candidate input/evaluation provenance missing or mismatched")
+    for cmd in ppa_commands:
+        command_ppa = (cmd.get("parsed") or {})["ppa"]
+        if (cmd.get("returncode") != 0 or cmd.get("skipped") or cmd.get("cancelled")
+                or cmd.get("evaluation_id") != evaluation or command_ppa.get("evidence") != evidence
+                or command_ppa != data):
+            return unavailable("Vivado resources unavailable: cost artifact and committed candidate gate disagree")
+    for scope in ("soc", "cfu"):
+        area = (data.get(scope) or {}).get("area") or {}
+        for name in ("lut", "ff", "bram_36k", "dsp"):
+            value = area.get(name)
+            if metrics._number(value):
+                result[f"vivado_{scope}_{name}"] = value
+    missing = [field for field in metrics.RESOURCE_FIELDS if result[field] is None]
+    if len(missing) == len(metrics.RESOURCE_FIELDS):
+        return unavailable("Vivado resources unavailable: no finite nonnegative area counts")
+    result.update(resource_valid=True, resource_status="partial" if missing else "valid")
+    if missing:
+        reason = "Vivado resources partial: missing " + ", ".join(missing)
+        result["resource_warning"] = reason
+        warnings.append(reason)
+    return result
+
+
 def collect_record(
     exp_id: str,
     job: dict,
@@ -266,7 +344,20 @@ def collect_record(
 
     llm_request = run_yaml.get("llm_request") or {}
     visibility = (run_yaml.get("visibility") or {}).get("level") or cli.get("visibility") or ""
+    expected_visibility = str(job.get("visibility") or "")
+    if expected_visibility and visibility != expected_visibility:
+        warnings.append(f"visibility mismatch: scheduled {expected_visibility} but artifacts recorded {visibility or 'missing'}")
     profile_cache = (run_yaml.get("profile_cache") or {}).get("status") or ""
+    conformance_metadata = {}
+    conformance = run_yaml.get("conformance") or {}
+    for key, nested in (("conformance_mode", "mode"), ("conformance_promote", "promote"),
+                        ("max_conformance_runs", "max_runs")):
+        scheduled = job.get(key, "unknown")
+        observed = run_yaml.get(key, conformance.get(nested, cli.get(key, report.get(key, "unknown"))))
+        conformance_metadata[key] = scheduled
+        conformance_metadata[f"{key}_observed"] = observed
+        if scheduled != "unknown" and observed != scheduled:
+            warnings.append(f"{key} mismatch: scheduled {scheduled} but artifacts recorded {observed}")
 
     record: dict = {
         "exp_id": exp_id,
@@ -277,6 +368,8 @@ def collect_record(
         "benchmark": job.get("benchmark", ""),
         "suite": SUITE,
         "layer": layer,
+        "ablation_scheme": job.get("ablation_scheme", "unknown"),
+        **conformance_metadata,
         "ablation_flags": " ".join(expected_flags),
         "ablation_observed": " ".join(observed_flags),
         "repeat": job.get("repeat"),
@@ -456,6 +549,10 @@ def collect_record(
     record["infra"] = meta.get("infra") or classification.detect_infra(
         stdout, stderr, bool(meta.get("timed_out")), meta.get("exit_code"), record["gates"], termination, record["stopped_at"]
     )
+    record["speedup_ratio_x"] = metrics.speedup_ratio(record)
+    record.update(collect_resources(cost_yaml, record["gates"], report, warnings,
+                                    stale=record["stale_evidence_ignored"]))
+    record["evidence"]["cost"] = str(framework_run_dir / "11_cost/result.yaml") if cost_yaml else ""
     record["failure"] = classification.classify_failure(record)
     if record["failure"]:
         for field in ("failure_class", "failure_rung", "failure_detail"):

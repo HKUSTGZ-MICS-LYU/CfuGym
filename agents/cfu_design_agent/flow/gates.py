@@ -65,6 +65,31 @@ def disabled_gate(gate: Any) -> bool:
     return isinstance(gate, dict) and bool(gate.get("disabled"))
 
 
+def conformance_mode(state: CfuDesignState) -> str:
+    """How this run delivers conformance: ``dev``, ``gate`` or ``off``.
+
+    Older states (and checkpoints) carry only ``require_conformance``; they keep
+    the historical meaning, where enabled meant the gate.
+    """
+    mode = str(state.get("conformance_mode") or "").strip()
+    if mode in ("dev", "gate", "off"):
+        return mode
+    return "gate" if state.get("require_conformance", True) else "off"
+
+
+def conformance_gates(state: CfuDesignState) -> bool:
+    """True when ``hw_conformance`` is a required verdict for this run.
+
+    A dev test is evidence: the rung is not required unless the run explicitly
+    promotes tests to a gate (``--conformance-promote``). The ``sim`` rung always
+    owns correctness for the workload.
+    """
+    mode = conformance_mode(state)
+    if mode == "gate":
+        return True
+    return mode == "dev" and bool(state.get("conformance_promote", False))
+
+
 def required_gates(state: CfuDesignState) -> tuple[str, ...]:
     """REQUIRED_GATES minus the rungs an ablation switch disabled."""
     gates = state.get("gates", {}) or {}
@@ -79,7 +104,7 @@ def required_gates(state: CfuDesignState) -> tuple[str, ...]:
             continue
         if rung == "isa" and not state.get("isa_contract", True):
             continue
-        if rung == "hw_conformance" and not state.get("require_conformance", True):
+        if rung == "hw_conformance" and not conformance_gates(state):
             continue
         required.append(rung)
     return tuple(required)

@@ -81,8 +81,25 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
     if "target_frequency_mhz" in state:
         hw_input = _hash({"hardware": hw_input, "frequency_mhz": state["target_frequency_mhz"]})
     built = _hash({"hardware": hw_input})
-    conformance_inputs = {name: _source_hash(root, f"{run_root}/09_implementation/conformance/{name}")
-                          for name in ("oracle.yaml", "cfu_conformance.c")} if run_root else {}
+    # The hw_conformance gate's inputs depend on how conformance was delivered.
+    # ``gate`` mode consumes the approved YAML oracle pair; ``dev`` mode consumes
+    # the agent's own test sources, because those bytes are what a promotion
+    # actually ran. Keeping both out of the hash would let a resume accept a
+    # verdict for a test that has since changed.
+    conformance_inputs: dict[str, str] = {}
+    if run_root:
+        if state.get("conformance_mode") == "gate" or (
+                "conformance_mode" not in state and state.get("require_conformance", True)):
+            conformance_inputs = {
+                name: _source_hash(root, f"{run_root}/09_implementation/conformance/{name}")
+                for name in ("oracle.yaml", "cfu_conformance.c")
+            }
+        else:
+            tests_dir = f"{run_root}/workspace/dev_tests"
+            conformance_inputs = {
+                path.relative_to(root).as_posix(): _source_hash(root, path.relative_to(root).as_posix())
+                for path in sorted((root / tests_dir).glob("*.c"))
+            } if (root / tests_dir).is_dir() else {}
     checked = _hash({"hardware": built, "software": sw_input, "conformance": conformance_inputs,
                      "delivery": state.get("conformance_delivery")})
     sw_built = _hash({"sw": sw_input, "hardware": built})

@@ -16,9 +16,28 @@ def cpu(role, access="read"):
     return {"storage": "cpu", "access": access, "role": role}
 
 
-def vector(role="vs1", source="cpu_value", register="rs1", value=0):
+def vector(role="vs1", source="cpu_value", register="rs1", value=0, hi=7, lo=0):
+    index = {"source": source}
+    if source == "constant":
+        index["value"] = value
+    elif source == "bit_slice":
+        index.update(register=register, hi=hi, lo=lo)
+    elif source != "csr_state":
+        index["register"] = register
     return {"storage": "vector", "access": "write" if role == "vd" else "read", "role": role,
-            "index": {"source": source, **({"value": value} if source == "constant" else {"register": register})}}
+            "index": index}
+
+
+def scalar(role="ss1", source="constant", register="rs1", value=0, hi=7, lo=0):
+    index = {"source": source}
+    if source == "constant":
+        index["value"] = value
+    elif source == "bit_slice":
+        index.update(register=register, hi=hi, lo=lo)
+    elif source != "csr_state":
+        index["register"] = register
+    return {"storage": "scalar", "access": "write" if role == "sd" else "read", "role": role,
+            "index": index}
 
 
 def spec(resources=None, explicit=True):
@@ -35,8 +54,27 @@ class CfuResourcesTest(unittest.TestCase):
         for resources in ([], [cpu("rs1"), cpu("rs2"), cpu("rd", "write")],
                           [vector(), vector("vs2", register="rs2"), cpu("rd", "write")],
                           [vector(), vector("vd", source="constant", value=1)],
-                          [vector(source="legacy_register_number", register="rs2")]):
+                          [vector(source="legacy_register_number", register="rs2")],
+                          [vector("vs1", source="bit_slice", register="rs1", hi=3, lo=0),
+                           vector("vs2", source="bit_slice", register="rs1", hi=7, lo=4),
+                           scalar("sd", source="constant", value=0)],
+                          [scalar("ss1", source="csr_state"), cpu("rd", "write")]):
             self.assertEqual(validate_isa_spec(spec(resources)), [])
+
+    def test_scalar_and_packed_slice_validation_and_intrinsics(self):
+        self.assertTrue(validate_cfu_resources([scalar(source="constant", value=4)], {"scalarRegDepth": 4}))
+        self.assertEqual(validate_cfu_resources([scalar(source="constant", value=3)], {"scalarRegDepth": 4}), [])
+        self.assertTrue(validate_cfu_resources([vector(source="bit_slice", register="rs1", hi=3, lo=5)]))
+        self.assertTrue(validate_cfu_resources([vector(source="bit_slice", register="rs1", hi=32, lo=0)]))
+        self.assertTrue(validate_cfu_resources([scalar("sd"), cpu("rd", "write")]))
+        header = render_cfu_intrinsics(spec([
+            vector("vs1", source="bit_slice", register="rs1", hi=3, lo=0),
+            scalar("ss1", source="csr_state"),
+            scalar("sd", source="constant", value=0),
+        ]))
+        self.assertIn("void cfu_op(uint32_t rs1)", header)
+        self.assertIn("bit-slice", header)
+        self.assertIn("CSR state_index", header)
 
     def test_malformed_shapes_and_enums_never_throw(self):
         for resources in (None, {}, 1, True, "cpu", [None], [[]], [True]):
