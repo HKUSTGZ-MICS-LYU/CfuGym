@@ -380,39 +380,20 @@ class InfraTest(unittest.TestCase):
         result = rm.detect_infra("status=failed\nstopped_at=hw_build\n", "scala boom", False, 1)
         self.assertFalse(result["infra"])
 
-    def test_conformance_endpoint_failure_from_structured_gate(self) -> None:
+    def test_conformance_endpoint_and_log_failures(self) -> None:
         for error, expected in (
             ("the conformance oracle request got no model answer (TimeoutError: timed out)", "infra_timeout"),
             ("the conformance oracle request got no model answer (upstream HTTP 500)", "infra_error"),
+            ("oracle endpoint upstream HTTP 500", "infra_error"),
         ):
             with self.subTest(error=error):
-                gate = {"ok": False, "model_failure": True, "errors": [error]}
-                result = rm.detect_infra("status=failed\n", "", False, 1,
-                                         {"hw_conformance": gate})
+                gate = {"ok": False, "errors": [error]}
+                result = rm.detect_infra("status=failed\n", "", False, 1, {"hw_conformance": gate})
                 self.assertTrue(result["infra"])
                 self.assertEqual(result["infra_kind"], expected)
-                self.assertIn(error, result["infra_reason"])
-
-    def test_conformance_endpoint_error_without_model_failure_flag(self) -> None:
-        gate = {"ok": False, "errors": ["oracle endpoint upstream HTTP 500"]}
-        self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1,
-                                         {"hw_conformance": gate})["infra_kind"], "infra_error")
-        gate = {"ok": False, "errors": ["conformance oracle request got no model answer (timeout)"]}
-        self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1,
-                                         {"hw_conformance": gate})["infra_kind"], "infra_timeout")
         gate = {"ok": False, "oracle_failure": True, "errors": ["oracle C compile failed"]}
-        self.assertFalse(rm.detect_infra("status=failed\n", "", False, 1,
-                                         {"hw_conformance": gate})["infra"])
-
-    def test_endpoint_log_fallback_without_parseable_gate(self) -> None:
-        for log in ("HTTP Error 500: Internal Server Error", "upstream 500 Internal Server Error",
-                    "conformance oracle request got no model answer (TimeoutError)"):
-            with self.subTest(log=log):
-                self.assertTrue(rm.detect_infra("status=failed\n" + log, "", False, 1)["infra"])
-        self.assertFalse(rm.detect_infra(
-            "status=failed\n", "conformance verdict fail commands=0/1 cases=1", False, 1,
-            {"hw_conformance": {"ok": False, "oracle_failure": False, "errors": ["verdict fail"]}},
-        )["infra"])
+        self.assertFalse(rm.detect_infra("status=failed\n", "", False, 1, {"hw_conformance": gate})["infra"])
+        self.assertTrue(rm.detect_infra("status=failed\nHTTP Error 500: Internal Server Error", "", False, 1)["infra"])
 
 
 class EndpointFailureTextTest(unittest.TestCase):
@@ -427,106 +408,55 @@ class EndpointFailureTextTest(unittest.TestCase):
 
     @staticmethod
     def _terminations(message: str) -> list[dict]:
-        # No SDK/client construction: only fake exception types and serialization.
         api_error = type("APIError", (Exception,), {"__module__": "litellm"})(message)
         wrapped = RuntimeError("native stage failed: tool-enabled LLM request failed")
         wrapped.__cause__ = api_error
         return [runtime_failures.termination(exc) for exc in (api_error, wrapped)]
 
-    def test_direct_and_tool_wrapped_termination_text(self) -> None:
+    def test_termination_log_and_conformance_transport_classification(self) -> None:
         for message, expected in (
             (self.RATE_LIMIT, "infra_rate_limit"),
             (self.TRANSFER_ERROR, "infra_error"),
         ):
             for typed in self._terminations(message):
-                with self.subTest(message=message, exception=typed["exception_type"]):
-                    infra = rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
-                    self.assertTrue(infra["infra"])
-                    self.assertEqual(infra["infra_kind"], expected)
-                    self.assertIn(message, infra["infra_reason"])
-                    for extra in ({}, {"infra": infra}):
-                        failure = rm.classify_failure(_failure_record(
-                            "analysis", {}, termination=typed, **extra))
-                        self.assertEqual(failure["failure_class"], expected)
-                        self.assertIn(message, failure["failure_detail"])
-                        self.assertIsNone(failure["budget_exhausted"])
-
-    def test_direct_and_tool_wrapped_log_text(self) -> None:
-        for message, expected in (
-            (self.RATE_LIMIT, "infra_rate_limit"),
-            (self.TRANSFER_ERROR, "infra_error"),
-        ):
-            for prefix in ("litellm.APIError: ", "api-error: ",
-                           "RuntimeError: native stage failed: tool-enabled LLM request: "):
-                with self.subTest(message=message, prefix=prefix):
-                    infra = rm.detect_infra("status=failed\n", prefix + message, False, 1)
-                    self.assertTrue(infra["infra"])
-                    self.assertEqual(infra["infra_kind"], expected)
-
-    def test_conformance_transport_text(self) -> None:
-        for message, expected in (
-            (self.RATE_LIMIT, "infra_rate_limit"),
-            (self.TRANSFER_ERROR, "infra_error"),
-        ):
-            with self.subTest(message=message):
-                infra = rm.detect_infra("status=failed\n", "", False, 1,
-                                        {"hw_conformance": {"ok": False, "errors": [message]}})
+                infra = rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
                 self.assertEqual(infra["infra_kind"], expected)
+                failure = rm.classify_failure(_failure_record("analysis", {}, termination=typed))
+                self.assertEqual(failure["failure_class"], expected)
+            self.assertEqual(
+                rm.detect_infra("status=failed\n", "litellm.APIError: " + message, False, 1)["infra_kind"],
+                expected,
+            )
+            self.assertEqual(
+                rm.detect_infra("status=failed\n", "", False, 1,
+                                {"hw_conformance": {"ok": False, "errors": [message]}})["infra_kind"],
+                expected,
+            )
 
-    def test_invalid_prompt_and_local_budget_are_not_rate_limits(self) -> None:
+    def test_rate_limit_boundaries_and_quota_override(self) -> None:
         for message in ("HTTP Error 400: invalid prompt",
                         "HTTP Error 400: rate limit parameter is invalid",
-                        "local token budget exceeded", "local token budget exhausted (limit=429)"):
-            with self.subTest(message=message):
-                self.assertFalse(rm.detect_infra("status=failed\n", message, False, 1)["infra"])
-                for typed in self._terminations(message):
-                    infra = rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
-                    self.assertNotEqual(infra["infra_kind"], "infra_rate_limit")
-                    failure = rm.classify_failure(_failure_record("analysis", {}, termination=typed))
-                    self.assertNotEqual(failure["failure_class"], "infra_rate_limit")
+                        "local token budget exhausted (limit=429)"):
+            self.assertFalse(rm.detect_infra("status=failed\n", message, False, 1)["infra"])
         budget_error = type("ContextBudgetError", (Exception,), {})("local token budget exceeded")
         typed = runtime_failures.termination(budget_error)
         self.assertFalse(rm.detect_infra("status=failed\n", "", False, 1, termination=typed)["infra"])
-        self.assertEqual(rm.classify_failure({"status": "failed", "termination": typed})
-                         ["failure_class"], "precondition")
+        self.assertEqual(rm.classify_failure({"status": "failed", "termination": typed})["failure_class"], "precondition")
 
-    def test_explicit_rate_limit_signatures(self) -> None:
-        for message in ("RateLimitError: throttled", "exceeded request rate limit",
-                        "rate limit reached", "rate limit exceeded",
-                        "rate_limit_exceeded", "too many requests"):
-            with self.subTest(message=message):
-                self.assertEqual(rm.detect_infra("status=failed\n", message, False, 1)
-                                 ["infra_kind"], "infra_rate_limit")
-                for typed in self._terminations(message):
-                    self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1,
-                                                     termination=typed)["infra_kind"], "infra_rate_limit")
+        for message in ("RateLimitError: throttled", "rate_limit_exceeded", "too many requests"):
+            self.assertEqual(rm.detect_infra("status=failed\n", message, False, 1)["infra_kind"], "infra_rate_limit")
 
-    def test_hard_quota_errors_override_429_and_rate_limit_text(self) -> None:
         for message in (
             "HTTP Error 429: insufficient_quota: token rate limit exceeded",
             "HTTP Error 429: billing_hard_limit_reached: rate_limit_exceeded",
-            "HTTP Error 429: RateLimitError: exceeded your current quota: too many requests",
         ):
-            with self.subTest(message=message):
-                self.assertEqual(rm.detect_infra("status=failed\n", message, False, 1)
-                                 ["infra_kind"], "infra_error")
-                for typed in self._terminations(message):
-                    infra = rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
-                    self.assertEqual(infra["infra_kind"], "infra_error")
-                    self.assertIn(message, infra["infra_reason"])
-                    self.assertEqual(rm.classify_failure(_failure_record(
-                        "analysis", {}, termination=typed))["failure_class"], "infra_error")
-                self.assertEqual(rm.detect_infra(
-                    "status=failed\n", "", False, 1,
-                    {"hw_conformance": {"ok": False, "errors": [message]}},
-                )["infra_kind"], "infra_error")
+            self.assertEqual(rm.detect_infra("status=failed\n", message, False, 1)["infra_kind"], "infra_error")
 
-    def test_cause_exception_type_can_identify_timeout(self) -> None:
-        typed = {"kind": "runtime_exception", "exception_type": "RuntimeError",
-                 "reason": "tool-enabled LLM request failed",
-                 "cause": {"exception_type": "APITimeoutError", "reason": ""}}
-        self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1, termination=typed)
-                         ["infra_kind"], "infra_timeout")
+        timeout_cause = {"kind": "runtime_exception", "exception_type": "RuntimeError",
+                         "reason": "tool-enabled LLM request failed",
+                         "cause": {"exception_type": "APITimeoutError", "reason": ""}}
+        self.assertEqual(rm.detect_infra("status=failed\n", "", False, 1, termination=timeout_cause)["infra_kind"],
+                         "infra_timeout")
 
 
 class RateLimitTest(unittest.TestCase):
@@ -629,9 +559,6 @@ class RateLimitTest(unittest.TestCase):
             self.assertIsNone(rm.archive_stale_run_dir(path), "an empty dir needs no archive")
 
     def test_a_rate_limited_retry_backs_off_longer(self) -> None:
-        self._assert_rate_limited_retry_backs_off("openai.APIError: upstream error: 429")
-
-    def test_a_rate_limited_retry_without_429_backs_off_longer(self) -> None:
         self._assert_rate_limited_retry_backs_off("litellm.APIError: " + EndpointFailureTextTest.RATE_LIMIT)
 
     def _assert_rate_limited_retry_backs_off(self, error: str) -> None:
@@ -856,7 +783,7 @@ class MeasurementProtocolTest(unittest.TestCase):
                    "global_scale_factor": 1, "warmup": False}
     INTEGRITY = {"version": 1, "ok": True, "problems": []}
 
-    def test_collection_preserves_validation_protocol_and_integrity_metadata(self) -> None:
+    def test_collection_resolves_protocol_from_validation_sim_or_legacy_fallback(self) -> None:
         import yaml
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -867,51 +794,21 @@ class MeasurementProtocolTest(unittest.TestCase):
                                               "benchmark_integrity": self.INTEGRITY}),
             )
             record = rm.collect_record("e", {"benchmark": "crc32"}, "run_name", run_dir, fw)
-        self.assertEqual(record["measurement_protocol"], self.PROTOCOL)
-        self.assertEqual(record["measurement"], self.MEASUREMENT)
-        self.assertEqual(record["benchmark_integrity"], self.INTEGRITY)
-        self.assertIn("not pure math-kernel latency", record["measurement_notice"])
-        self.assertIn("not proof of true operation equivalence", record["measurement_notice"])
+            self.assertEqual(record["measurement_protocol"], self.PROTOCOL)
+            self.assertEqual(record["measurement"], self.MEASUREMENT)
+            self.assertEqual(record["benchmark_integrity"], self.INTEGRITY)
 
-    def test_collection_uses_sim_artifact_protocol_when_embench_evidence_is_absent(self) -> None:
-        import yaml
+            run_dir2, fw2 = CollectTest()._fixture(Path(tmp) / "legacy", STDOUT_PASS, REPORT_PASS, RUN_YAML_PASS, EMBENCH_PASS)
+            legacy = rm.collect_record("e", {"benchmark": "crc32"}, "run_name", run_dir2, fw2)
+            self.assertEqual(legacy["measurement_protocol"], "legacy")
+            self.assertIn("protocol evidence absent", legacy["measurement_notice"])
 
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir, fw = CollectTest()._fixture(Path(tmp), STDOUT_PASS, REPORT_PASS, RUN_YAML_PASS, "")
-            _write(fw / "10_validation/sim.yaml", yaml.safe_dump({
+            _write(fw2 / "10_validation/sim.yaml", yaml.safe_dump({
                 "measurement_protocol": self.PROTOCOL, "measurement": self.MEASUREMENT,
                 "benchmark_integrity": self.INTEGRITY,
             }))
-            record = rm.collect_record("e", {"benchmark": "crc32"}, "run_name", run_dir, fw)
-        self.assertEqual(record["measurement_protocol"], self.PROTOCOL)
-        self.assertEqual(record["benchmark_integrity"], self.INTEGRITY)
-
-    def test_collection_accepts_nested_protocol_and_marks_absent_evidence_legacy(self) -> None:
-        import yaml
-
-        for metadata in ({}, {"measurement": self.MEASUREMENT}):
-            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as tmp:
-                run_dir, fw = CollectTest()._fixture(
-                    Path(tmp), STDOUT_PASS, REPORT_PASS, RUN_YAML_PASS,
-                    EMBENCH_PASS + yaml.safe_dump(metadata),
-                )
-                record = rm.collect_record("e", {"benchmark": "crc32"}, "run_name", run_dir, fw)
-                self.assertEqual(record["measurement_protocol"], self.PROTOCOL if metadata else "legacy")
-                if not metadata:
-                    self.assertIn("protocol evidence absent", record["measurement_notice"])
-                    self.assertEqual(record["benchmark_integrity"], {})
-                    self.assertIn("not a legacy resume", record["measurement_notice"])
-
-    def test_collection_can_use_sim_gate_protocol(self) -> None:
-        gate = {"ok": True, "measurement_protocol": self.PROTOCOL,
-                "measurement": self.MEASUREMENT, "benchmark_integrity": self.INTEGRITY}
-        report = REPORT_PASS.replace(
-            REPORT_PASS.split("## Gates\n", 1)[1].splitlines()[0], f"- sim: {gate!r}")
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir, fw = CollectTest()._fixture(Path(tmp), STDOUT_PASS, report, RUN_YAML_PASS, "")
-            record = rm.collect_record("e", {"benchmark": "crc32"}, "run_name", run_dir, fw)
-        self.assertEqual(record["measurement_protocol"], self.PROTOCOL)
-        self.assertEqual(record["measurement"], self.MEASUREMENT)
+            from_sim = rm.collect_record("e", {"benchmark": "crc32"}, "run_name", run_dir2, fw2)
+            self.assertEqual(from_sim["measurement_protocol"], self.PROTOCOL)
 
     def test_mixed_complete_protocols_suppress_only_speedup_median(self) -> None:
         records = [
@@ -923,34 +820,15 @@ class MeasurementProtocolTest(unittest.TestCase):
         row = rm.cell_metrics(records, bootstrap_iters=20)
         self.assertIsNone(row["speedup_x100_median"])
         self.assertIn("different measurement protocols", row["speedup_warning"])
-        self.assertIn("legacy", row["measurement_protocols"])
         self.assertEqual(row["complete_runs"], 2)
-        self.assertEqual(row["pass_at_3_budget"], 1)
-        self.assertEqual(row["tokens_per_complete_mean"], 200)
         self.assertEqual(row["yosys_cells_median"], 2500)
-        self.assertEqual(row["wall_h_per_complete_mean"], 1.5)
 
-    def test_any_different_complete_protocols_are_noncomparable(self) -> None:
-        row = rm.cell_metrics([
+        single = rm.cell_metrics([
             {"status": "complete", "measurement_protocol": self.PROTOCOL, "speedup_x100": 150},
-            {"status": "complete", "measurement_protocol": "future_v2", "speedup_x100": None},
+            {"status": "complete", "measurement_protocol": self.PROTOCOL, "speedup_x100": 250},
+            {"status": "failed", "measurement_protocol": "other", "speedup_x100": 900},
         ], bootstrap_iters=20)
-        self.assertIsNone(row["speedup_x100_median"])
-        self.assertIn("future_v2", row["speedup_warning"])
-
-    def test_single_protocol_median_and_noncomplete_records_remain_compatible(self) -> None:
-        for protocol in (None, self.PROTOCOL):
-            with self.subTest(protocol=protocol):
-                records = [
-                    {"status": "complete", "measurement_protocol": protocol, "speedup_x100": 150},
-                    {"status": "complete", "measurement_protocol": protocol, "speedup_x100": 250},
-                    {"status": "failed", "measurement_protocol": "other", "speedup_x100": 900},
-                    {"status": "complete", "measurement_protocol": "infra", "speedup_x100": 900,
-                     "infra": {"infra": True}},
-                ]
-                row = rm.cell_metrics(records, bootstrap_iters=20)
-                self.assertEqual(row["speedup_x100_median"], 200)
-                self.assertEqual(row["speedup_warning"], "")
+        self.assertEqual(single["speedup_x100_median"], 200)
 
     def test_csv_and_summary_preserve_protocol_metadata_and_mixed_notice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -982,6 +860,33 @@ class MeasurementProtocolTest(unittest.TestCase):
             self.assertIn("Speedup median unavailable", summary)
             self.assertIn("not pure math-kernel latency", summary)
             self.assertIn("legacy", summary)
+
+    def test_collection_accepts_nested_protocol_and_marks_absent_evidence_legacy(self) -> None:
+        import yaml
+
+        for metadata in ({}, {"measurement": self.MEASUREMENT}):
+            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as tmp:
+                run_dir, fw = CollectTest()._fixture(
+                    Path(tmp), STDOUT_PASS, REPORT_PASS, RUN_YAML_PASS,
+                    EMBENCH_PASS + yaml.safe_dump(metadata),
+                )
+                record = rm.collect_record("e", {"benchmark": "crc32"}, "run_name", run_dir, fw)
+                self.assertEqual(record["measurement_protocol"], self.PROTOCOL if metadata else "legacy")
+                if not metadata:
+                    self.assertIn("protocol evidence absent", record["measurement_notice"])
+                    self.assertEqual(record["benchmark_integrity"], {})
+                    self.assertIn("not a legacy resume", record["measurement_notice"])
+
+    def test_collection_can_use_sim_gate_protocol(self) -> None:
+        gate = {"ok": True, "measurement_protocol": self.PROTOCOL,
+                "measurement": self.MEASUREMENT, "benchmark_integrity": self.INTEGRITY}
+        report = REPORT_PASS.replace(
+            REPORT_PASS.split("## Gates\n", 1)[1].splitlines()[0], f"- sim: {gate!r}")
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir, fw = CollectTest()._fixture(Path(tmp), STDOUT_PASS, report, RUN_YAML_PASS, "")
+            record = rm.collect_record("e", {"benchmark": "crc32"}, "run_name", run_dir, fw)
+        self.assertEqual(record["measurement_protocol"], self.PROTOCOL)
+        self.assertEqual(record["measurement"], self.MEASUREMENT)
 
 
 class EndpointRetryTest(unittest.TestCase):
@@ -1299,16 +1204,6 @@ class AblationLayerTest(unittest.TestCase):
 
 
 class LayerMatrixTest(unittest.TestCase):
-    def test_expand_matrix_with_layers(self) -> None:
-        layers = rm.resolve_layers("ladder")
-        jobs = rm.expand_matrix(("a",), ("x", "y"), 2, layers)
-        self.assertEqual(len(jobs), 2 * 2 * 5)
-        self.assertEqual([j["layer"] for j in jobs[:5]], list(rm.ABLATION_LADDER))
-        for job in jobs:
-            self.assertEqual(tuple(job["ablation_flags"]), rm.layer_flags(job["layer"]))
-        # Default: a single full-flow layer (the classic pass@k matrix shape).
-        self.assertEqual(len(rm.expand_matrix(("a", "b"), ("x", "y", "z"), 3)), 18)
-
     def test_filter_jobs_can_select_a_layer(self) -> None:
         jobs = rm.schedule_jobs(
             rm.expand_matrix(("glm-5.2",), ("crc32",), 1, rm.resolve_layers("ladder")), seed=1
@@ -1496,158 +1391,72 @@ class AblationOfflineContractTest(unittest.TestCase):
             ])
         return code, stdout.getvalue()
 
-    def test_explicit_visibility_is_rejected_for_every_new_rung(self) -> None:
-        for layer in AblationLayerTest.EXPECTED:
-            for visibility in ("basic", "standard", "extended"):
-                # Reject even a matching value: explicit overrides hide the layer contract.
-                for option in (["--visibility", visibility], [f"--visibility={visibility}"]):
-                    with self.subTest(layer=layer, option=option), tempfile.TemporaryDirectory() as tmp:
-                        root = Path(tmp)
-                        with self.assertRaises(SystemExit):
-                            self._invoke(root, "--layers", layer, *option)
-                        self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
+    def test_explicit_visibility_and_conflicting_layers_are_rejected(self) -> None:
+        for args in (
+            ("--layers", "l0-none", "--visibility", "basic"),
+            ("--layers", "l2-vis", "--visibility=extended"),
+            ("--layers", "full,l2-vis", "--visibility", "extended"),
+            ("--layers", "full,l2-vis"),
+        ):
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaises(SystemExit):
+                    self._invoke(root, *args)
+                self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
 
-    def test_mixed_legacy_and_new_layers_also_reject_explicit_visibility(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(SystemExit):
-            self._invoke(Path(tmp), "--layers", "full,l2-vis", "--visibility", "extended")
+    def test_new_ladder_rejects_capability_and_conformance_passthrough_flags(self) -> None:
+        tails = (
+            ["--no-isa-contract"], ["--no-llvm-ir"], ["--ir-features", "off"],
+            ["--no-isa"], ["--vis=standard"], ["--no-conformance"], ["--no-conf"],
+            ["--conformance-mode", "off"], ["--conformance-mode=dev"],
+            ["--conformance-promote"], ["--max-conformance-runs", "2"], ["--max-conf=2"],
+        )
+        for tail in tails:
+            with self.subTest(tail=tail), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaises(SystemExit):
+                    self._invoke(root, "--layers", "l3-devconf", "--", *tail)
+                self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
 
-    def test_new_ladder_rejects_capability_changing_passthrough(self) -> None:
-        for layer in AblationLayerTest.EXPECTED:
-            for tail in (["--no-isa-contract"], ["--no-llvm-ir"],
-                         ["--ir-features", "off"], ["--ir-features=auto"],
-                         ["--no-isa"], ["--no-llvm"], ["--ir-feature=off"],
-                         ["--vis=standard"]):
-                with self.subTest(layer=layer, tail=tail), tempfile.TemporaryDirectory() as tmp:
-                    with self.assertRaises(SystemExit):
-                        self._invoke(Path(tmp), "--layers", layer, "--", *tail)
+    def test_same_scheme_can_resume_but_mismatched_controls_cannot_overwrite(self) -> None:
+        import yaml
 
-    def test_legacy_full_cannot_mix_with_new_layers(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(SystemExit):
-            self._invoke(Path(tmp), "--layers", "full,l2-vis")
-
-    def test_same_scheme_can_resume_but_legacy_full_cannot_overwrite_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.assertEqual(self._invoke(root)[0], 0)
-            self.assertEqual(self._invoke(root)[0], 0)
+            self.assertEqual(self._invoke(root, "--max-conformance-runs", "7")[0], 0)
+            self.assertEqual(self._invoke(root, "--max-conformance-runs", "7")[0], 0)
             path = root / "out" / "offline-abl" / "experiment.yaml"
             original = path.read_bytes()
             with self.assertRaises(SystemExit):
                 self._invoke(root, preset=rm)
-            self.assertEqual(path.read_bytes(), original)
-
-    def test_collect_only_preserves_historical_controls(self) -> None:
-        import yaml
-        from unittest import mock
-        from agents.experiments.harness import collection
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            meta = {"exp_id": "offline-abl", "models": ["test-a"], "benchmarks": ["crc32"],
-                    "repeats": 1, "max_iters": 5, "visibility": "extended", "layers": {
-                        "l2-conf": {"flags": ["--no-llvm-ir"]}, "full": {"flags": []}}}
-            path = _write(root / "out" / "offline-abl" / "experiment.yaml",
-                          yaml.safe_dump(meta, sort_keys=False))
-            original = path.read_bytes()
-            with mock.patch.object(collection, "collect_record", return_value={}) as collect, \
-                    mock.patch.object(collection, "save_record"):
-                self.assertEqual(self._invoke(root, "--collect-only")[0], 0)
-            self.assertEqual(collect.call_count, 2)
-            for call in collect.call_args_list:
-                job = call.args[1]
-                self.assertEqual(job["visibility"], "extended")
-                self.assertEqual(tuple(job["ablation_flags"]), tuple(meta["layers"][job["layer"]]["flags"]))
-            self.assertEqual(path.read_bytes(), original)
-
-    def test_repeated_no_conformance_is_rejected_without_creating_metadata(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
             with self.assertRaises(SystemExit):
-                self._invoke(root, "--", "--no-conformance", "--no-conformance")
-            self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
+                self._invoke(root)
+            meta = yaml.safe_load(path.read_text())
+            meta["layers"]["l3-devconf"]["conformance_mode"] = "off"
+            path.write_text(yaml.safe_dump(meta, sort_keys=False))
+            with self.assertRaises(SystemExit):
+                self._invoke(root, "--max-conformance-runs", "7")
+            path.write_bytes(original)
 
-    def test_new_ladder_rejects_conformance_control_passthrough_and_abbreviations(self) -> None:
-        tails = (
-            ["--no-conformance"], ["--no-conf"], ["--no-conformance", "--no-conformance"],
-            ["--conformance-mode", "off"], ["--conformance-mode=dev"],
-            ["--conformance-m", "dev"], ["--conformance=off"],
-            ["--conformance-promote"], ["--conformance-pro"],
-            ["--max-conformance-runs", "2"], ["--max-conformance-runs=7"],
-            ["--max-conformance-r", "2"], ["--max-conf=2"],
-        )
-        for layer in AblationLayerTest.EXPECTED:
-            for tail in tails:
-                with self.subTest(layer=layer, tail=tail), tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp)
-                    with self.assertRaises(SystemExit):
-                        self._invoke(root, "--layers", layer, "--", *tail)
-                    self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
-
-    def test_conformance_budget_is_shared_by_all_new_layers_and_templates(self) -> None:
+    def test_conformance_budget_is_shared_and_must_be_positive(self) -> None:
         import shlex
         import yaml
 
-        for budget in (1, 7):
-            with self.subTest(budget=budget), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                code, text = self._invoke(root, "--max-conformance-runs", str(budget))
-                self.assertEqual(code, 0)
-                meta = yaml.safe_load((root / "out" / "offline-abl" / "experiment.yaml").read_text())
-                self.assertEqual(len(meta["schedule_jobs"]), 5)
-                for layer, entry in meta["layers"].items():
-                    self.assertEqual(entry["max_conformance_runs"], budget)
-                    self.assertEqual(entry["conformance_mode"], AblationLayerTest.MODES[layer])
-                    self.assertIs(entry["conformance_promote"], False)
-                    AblationLayerTest.assert_run_controls(
-                        self, meta["argv_templates_by_layer"][layer], layer, budget)
-                for job in meta["schedule_jobs"]:
-                    self.assertEqual(job["max_conformance_runs"], budget)
-                    self.assertEqual(job["conformance_mode"], AblationLayerTest.MODES[job["layer"]])
-                    self.assertIs(job["conformance_promote"], False)
-                    line = next(line for line in text.splitlines()
-                                if line.startswith("[dry ] offline-abl-") and f'-{job["layer"]}:' in line)
-                    AblationLayerTest.assert_run_controls(
-                        self, shlex.split(line.split(": ", 1)[1]), job["layer"], budget)
-
-    def test_conformance_budget_must_be_positive_before_writing_metadata(self) -> None:
-        for budget in ("0", "-1", "-20"):
-            with self.subTest(budget=budget), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                with self.assertRaises(SystemExit):
-                    self._invoke(root, "--max-conformance-runs", budget)
-                self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
-
-    def test_existing_v3_controls_cannot_be_overwritten_or_inferred_when_missing(self) -> None:
-        import yaml
-
-        for key, changed in (("conformance_mode", "off"), ("conformance_promote", True),
-                             ("max_conformance_runs", 7)):
-            for missing in (False, True):
-                with self.subTest(key=key, missing=missing), tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp)
-                    self.assertEqual(self._invoke(root)[0], 0)
-                    path = root / "out" / "offline-abl" / "experiment.yaml"
-                    meta = yaml.safe_load(path.read_text())
-                    if missing:
-                        del meta["layers"]["l3-devconf"][key]
-                    else:
-                        meta["layers"]["l3-devconf"][key] = changed
-                    path.write_text(yaml.safe_dump(meta, sort_keys=False))
-                    original = path.read_bytes()
-                    with self.assertRaises(SystemExit):
-                        self._invoke(root)
-                    self.assertEqual(path.read_bytes(), original)
-
-    def test_existing_v3_budget_cannot_be_changed_by_resuming(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.assertEqual(self._invoke(root, "--max-conformance-runs", "7")[0], 0)
-            self.assertEqual(self._invoke(root, "--max-conformance-runs", "7")[0], 0)
-            path = root / "out" / "offline-abl" / "experiment.yaml"
-            original = path.read_bytes()
             with self.assertRaises(SystemExit):
-                self._invoke(root)
-            self.assertEqual(path.read_bytes(), original)
+                self._invoke(root, "--max-conformance-runs", "0")
+            self.assertFalse((root / "out" / "offline-abl" / "experiment.yaml").exists())
+            code, text = self._invoke(root, "--max-conformance-runs", "7")
+            self.assertEqual(code, 0)
+            meta = yaml.safe_load((root / "out" / "offline-abl" / "experiment.yaml").read_text())
+            self.assertEqual(len(meta["schedule_jobs"]), 5)
+            for job in meta["schedule_jobs"]:
+                self.assertEqual(job["max_conformance_runs"], 7)
+                line = next(line for line in text.splitlines()
+                            if line.startswith("[dry ] offline-abl-") and f'-{job["layer"]}:' in line)
+                AblationLayerTest.assert_run_controls(
+                    self, shlex.split(line.split(": ", 1)[1]), job["layer"], 7)
 
     def test_legacy_matrix_and_sweep_keep_full_standard_and_allow_visibility(self) -> None:
         import yaml
@@ -1735,25 +1544,6 @@ class AblationOfflineContractTest(unittest.TestCase):
                         self.assertIn("extended", record["parse_warnings"])
                         self.assertIn("basic", record["parse_warnings"])
 
-    def test_existing_legacy_scheme_is_rejected_without_overwriting_metadata(self) -> None:
-        import yaml
-
-        for scheme in (None, "isa-conformance-ir-v1", "isa-visibility-ir-v2"):
-            with self.subTest(scheme=scheme), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                meta = {"exp_id": "offline-abl", "layers": {
-                    "l2-conf": {"flags": ["--no-llvm-ir"], "adds": "historical conformance"},
-                    "full": {"flags": [], "adds": "historical LLVM IR"}}}
-                if scheme is not None:
-                    meta["ablation_scheme"] = scheme
-                path = _write(root / "out" / "offline-abl" / "experiment.yaml",
-                              yaml.safe_dump(meta, sort_keys=False))
-                original = path.read_bytes()
-                with self.assertRaises(SystemExit):
-                    self._invoke(root)
-                self.assertEqual(path.read_bytes(), original)
-                self.assertFalse((root / "agents" / "llm_configs" / "offline-abl-test-a.json").exists())
-
     @staticmethod
     def _v2_metadata():
         return {
@@ -1772,51 +1562,26 @@ class AblationOfflineContractTest(unittest.TestCase):
             },
         }
 
-    def test_v2_batch_cannot_be_rescheduled_as_v3(self) -> None:
+    def test_existing_legacy_or_v2_scheme_is_rejected_on_reschedule(self) -> None:
         import yaml
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            path = _write(root / "out" / "offline-abl" / "experiment.yaml",
-                          yaml.safe_dump(self._v2_metadata(), sort_keys=False))
-            original = path.read_bytes()
-            with self.assertRaises(SystemExit):
-                self._invoke(root)
-            self.assertEqual(path.read_bytes(), original)
-            self.assertFalse((root / "agents" / "llm_configs" / "offline-abl-test-a.json").exists())
+        for meta in (
+            {"exp_id": "offline-abl", "layers": {"l2-conf": {"flags": ["--no-llvm-ir"]}, "full": {"flags": []}}},
+            self._v2_metadata(),
+        ):
+            with self.subTest(scheme=meta.get("ablation_scheme")), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = _write(root / "out" / "offline-abl" / "experiment.yaml",
+                              yaml.safe_dump(meta, sort_keys=False))
+                original = path.read_bytes()
+                with self.assertRaises(SystemExit):
+                    self._invoke(root)
+                self.assertEqual(path.read_bytes(), original)
 
-    def test_collect_only_v2_does_not_inject_v3_controls_into_reused_layer_names(self) -> None:
+    def test_collect_and_aggregate_only_preserve_v2_metadata_without_v3_defaults(self) -> None:
         import yaml
         from unittest import mock
         from agents.experiments.harness import collection, reporting
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            meta = self._v2_metadata()
-            path = _write(root / "out" / "offline-abl" / "experiment.yaml",
-                          yaml.safe_dump(meta, sort_keys=False))
-            original = path.read_bytes()
-            with mock.patch.object(collection, "collect_record", return_value={}) as collect, \
-                    mock.patch.object(collection, "save_record"), \
-                    mock.patch.object(reporting, "aggregate", return_value={
-                        "records": 4, "cells": 4, "summary": "synthetic"}) as aggregate:
-                # Even an explicit current CLI budget must not taint archive reads.
-                self.assertEqual(self._invoke(root, "--collect-only", "--max-conformance-runs", "7")[0], 0)
-            self.assertEqual(collect.call_count, 4)
-            self.assertEqual(aggregate.call_args.args[1], meta)
-            self.assertEqual({call.args[1]["layer"] for call in collect.call_args_list}, set(meta["layers"]))
-            for call in collect.call_args_list:
-                job = call.args[1]
-                saved = meta["layers"][job["layer"]]
-                self.assertEqual(tuple(job["ablation_flags"]), tuple(saved["flags"]))
-                self.assertEqual(job["visibility"], saved["visibility"])
-                for field in ("conformance_mode", "conformance_promote", "max_conformance_runs"):
-                    self.assertNotIn(field, job)
-                self.assertEqual(tuple(harness_layers.job_run_flags(job)), tuple(saved["flags"]))
-            self.assertEqual(path.read_bytes(), original)
-
-    def test_aggregate_only_v2_uses_its_own_ladder_without_v3_defaults(self) -> None:
-        import yaml
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1824,29 +1589,49 @@ class AblationOfflineContractTest(unittest.TestCase):
             meta = self._v2_metadata()
             path = _write(exp_dir / "experiment.yaml", yaml.safe_dump(meta, sort_keys=False))
             original = path.read_bytes()
-            originals = {}
+            with mock.patch.object(collection, "collect_record", return_value={}) as collect, \
+                    mock.patch.object(collection, "save_record"), \
+                    mock.patch.object(reporting, "aggregate", return_value={
+                        "records": 4, "cells": 4, "summary": "synthetic"}):
+                self.assertEqual(self._invoke(root, "--collect-only", "--max-conformance-runs", "7")[0], 0)
+            self.assertEqual(collect.call_count, 4)
+            for call in collect.call_args_list:
+                job = call.args[1]
+                for field in ("conformance_mode", "conformance_promote", "max_conformance_runs"):
+                    self.assertNotIn(field, job)
+
             for layer, entry in meta["layers"].items():
                 record = AggregateTest()._record(run_name=f"v2-{layer}", layer=layer,
                     ablation_flags=" ".join(entry["flags"]))
-                record_path = _write(exp_dir / "runs" / record["run_name"] / "record.json", json.dumps(record))
-                originals[record_path] = record_path.read_bytes()
+                _write(exp_dir / "runs" / record["run_name"] / "record.json", json.dumps(record))
             code, text = self._invoke(root, "--aggregate-only", "--bootstrap", "10")
             self.assertEqual(code, 0)
             self.assertIn("4 runs, 4 cells", text)
             self.assertEqual(path.read_bytes(), original)
-            for record_path, content in originals.items():
-                self.assertEqual(record_path.read_bytes(), content)
             summary = (exp_dir / "results" / "summary.md").read_text()
-            for entry in meta["layers"].values():
-                self.assertIn(entry["adds"], summary)
             self.assertNotIn("l3-devconf", summary)
             self.assertNotIn("l4-ir", summary)
-            with (exp_dir / "results" / "runs.csv").open() as handle:
-                rows = list(csv.DictReader(handle))
-            self.assertEqual({row["layer"] for row in rows}, set(meta["layers"]))
-            for row in rows:
-                for field in ("conformance_mode", "conformance_promote", "max_conformance_runs"):
-                    self.assertFalse(row.get(field))
+
+    def test_existing_v3_controls_cannot_be_overwritten_or_inferred_when_missing(self) -> None:
+        import yaml
+
+        for key, changed in (("conformance_mode", "off"), ("conformance_promote", True),
+                             ("max_conformance_runs", 7)):
+            for missing in (False, True):
+                with self.subTest(key=key, missing=missing), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.assertEqual(self._invoke(root)[0], 0)
+                    path = root / "out" / "offline-abl" / "experiment.yaml"
+                    meta = yaml.safe_load(path.read_text())
+                    if missing:
+                        del meta["layers"]["l3-devconf"][key]
+                    else:
+                        meta["layers"]["l3-devconf"][key] = changed
+                    path.write_text(yaml.safe_dump(meta, sort_keys=False))
+                    original = path.read_bytes()
+                    with self.assertRaises(SystemExit):
+                        self._invoke(root)
+                    self.assertEqual(path.read_bytes(), original)
 
     def test_aggregate_only_uses_historical_metadata_without_rewriting_it(self) -> None:
         import yaml

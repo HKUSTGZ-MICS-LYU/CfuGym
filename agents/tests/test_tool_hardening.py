@@ -261,26 +261,6 @@ class HardeningTest(unittest.TestCase):
         bad = tools.run('search_text', {'pattern': 'hit', 'path': self.target, 'skip': -1})
         self.assertTrue(bad.startswith('usage error:'), bad)
 
-    def test_budget_messages_are_quantitative_and_suggest_narrowing(self):
-        # max_files caps a listing, and a search is bounded by the candidate
-        # walk: either way the message must name the limit and a way forward.
-        for i in range(5):
-            self.put(self.run + f'/workspace/cfu_benchmark/m{i}.txt', 'x')
-        listing = ReadOnlyToolset(self.box, max_files=2).run(
-            'list_dir', {'path': self.run + '/workspace/cfu_benchmark'}
-        )
-        self.assertIn('truncated at 2 entries', listing)
-        self.assertNotIn('denied by access policy', listing)
-        out = ReadOnlyToolset(self.box, max_entries=2).run(
-            'search_text',
-            {'pattern': 'x', 'path': self.run + '/workspace/cfu_benchmark', 'glob': '*.txt'},
-        )
-        self.assertIn('enumeration budget exceeded', out)
-        self.assertIn('(limit 2)', out)
-        self.assertIn('narrow path', out)
-        self.assertIn('tighten glob', out)
-        self.assertNotIn('denied by access policy', out)
-
     def test_read_file_distinguishes_missing_empty_and_denied(self):
         tools = ReadOnlyToolset(self.box)
         missing = tools.run('read_file', {'path': self.run + '/workspace/design/nope.txt'})

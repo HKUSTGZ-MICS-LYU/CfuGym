@@ -32,6 +32,7 @@ class RunConfig(TypedDict, total=False):
     agent_tools: bool
     max_tool_rounds: int
     max_tool_calls: int
+    max_tool_retries: int
     profile_cache: str
     ir_features: str
     stream_llm: bool

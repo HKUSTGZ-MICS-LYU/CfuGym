@@ -63,10 +63,14 @@ class V2OptionsTest(unittest.TestCase):
         self.assertEqual((DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
                           DEFAULT_MAX_TOOL_CALLS), (20, 4, 96))
         self.assertEqual((args.max_tool_rounds, args.max_tool_calls), (20, 96))
+        self.assertEqual(args.max_tool_retries, 10)
         explicit = cli.build_parser().parse_args([
-            "--max-tool-rounds", "3", "--max-tool-calls", "7",
+            "--max-tool-rounds", "3", "--max-tool-calls", "7", "--max-tool-retries", "2",
         ])
         self.assertEqual((explicit.max_tool_rounds, explicit.max_tool_calls), (3, 7))
+        self.assertEqual(explicit.max_tool_retries, 2)
+        with self.assertRaisesRegex(SystemExit, "--max-tool-retries must be zero or positive"):
+            cli.main(["--task", "offline test", "--max-tool-retries", "-1"])
 
     def test_resume_and_eval_budget_options(self) -> None:
         args = cli.build_parser().parse_args(["--resume", "abc", "--max-evals", "2"])
@@ -94,29 +98,16 @@ class V2OptionsTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "not a new workload"):
             cli.main(["--resume", "old-run", "--task", "new task"])
 
-    def test_success_branch(self) -> None:
-        original = cli.OpenAiTextClient
-        cli.OpenAiTextClient = _FakeClient
-        try:
-            self.assertEqual(cli.run_api_test(REPO_ROOT, _args()), 0)
-        finally:
-            cli.OpenAiTextClient = original
-
-    def test_missing_key_branch(self) -> None:
-        original = cli.OpenAiTextClient
-        cli.OpenAiTextClient = _UnavailableClient
-        try:
-            self.assertEqual(cli.run_api_test(REPO_ROOT, _args()), 1)
-        finally:
-            cli.OpenAiTextClient = original
-
-    def test_raising_client_branch(self) -> None:
-        original = cli.OpenAiTextClient
-        cli.OpenAiTextClient = _RaisingClient
-        try:
-            self.assertEqual(cli.run_api_test(REPO_ROOT, _args()), 1)
-        finally:
-            cli.OpenAiTextClient = original
+    def test_run_api_test_branches(self) -> None:
+        for client_cls, expected in (
+            (_FakeClient, 0),
+            (_UnavailableClient, 1),
+            (_RaisingClient, 1),
+        ):
+            with self.subTest(client=client_cls.__name__), \
+                    mock.patch.object(cli, "OpenAiTextClient", client_cls), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.run_api_test(REPO_ROOT, _args()), expected)
 
 
 class RunSummaryTest(unittest.TestCase):
@@ -321,12 +312,10 @@ class StreamFlagTest(unittest.TestCase):
             self.assertIs(cli.build_parser().parse_args(["--task", "x"]).stream_llm, True)
 
 
-class EffectFlagTest(unittest.TestCase):
-    """Patch application and command execution are the default; --dry-run opts out."""
+class CliStateThreadingTest(unittest.TestCase):
+    """CLI flags for effects, ablation, IR evidence, and loop optimization."""
 
     def _run(self, *argv: str) -> dict:
-        from unittest import mock
-
         captured: dict = {}
 
         def _fake_run(state, **kwargs):
@@ -335,135 +324,60 @@ class EffectFlagTest(unittest.TestCase):
 
         with mock.patch.object(cli, "run_agent", _fake_run), \
                 mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
-                mock.patch.object(cli, "enable_progress", lambda: None):
+                mock.patch.object(cli, "enable_progress", lambda: None), \
+                contextlib.redirect_stdout(io.StringIO()):
             cli.main(["--task", "x", *argv])
         return captured
 
-    def test_effects_are_enabled_by_default(self) -> None:
-        captured = self._run()
-        self.assertFalse(captured["dry_run"])
-        self.assertTrue(captured["apply_patch"])
-        self.assertTrue(captured["run_commands"])
-        self.assertEqual(captured["mode"], "autonomous")
+    def test_effect_flags_and_dry_run_modes(self) -> None:
+        default = self._run()
+        self.assertEqual((default["dry_run"], default["apply_patch"], default["run_commands"], default["mode"]),
+                         (False, True, True, "autonomous"))
 
-    def test_dry_run_forces_read_only(self) -> None:
-        captured = self._run("--dry-run")
-        self.assertTrue(captured["dry_run"])
-        self.assertFalse(captured["apply_patch"])
-        self.assertFalse(captured["run_commands"])
-        self.assertEqual(captured["mode"], "dry-run")
+        dry = self._run("--dry-run")
+        self.assertEqual((dry["dry_run"], dry["apply_patch"], dry["run_commands"], dry["mode"]),
+                         (True, False, False, "dry-run"))
 
-    def test_effects_can_be_disabled_individually(self) -> None:
-        captured = self._run("--no-apply-patch")
-        self.assertFalse(captured["apply_patch"])
-        self.assertTrue(captured["run_commands"])
-        captured = self._run("--no-run-commands")
-        self.assertTrue(captured["apply_patch"])
-        self.assertFalse(captured["run_commands"])
+        no_patch = self._run("--no-apply-patch")
+        self.assertEqual((no_patch["apply_patch"], no_patch["run_commands"]), (False, True))
 
-    def test_legacy_effect_flags_and_no_dry_run_are_accepted_no_ops(self) -> None:
-        captured = self._run("--apply-patch", "--run-commands", "--no-dry-run")
-        self.assertFalse(captured["dry_run"])
-        self.assertTrue(captured["apply_patch"])
-        self.assertTrue(captured["run_commands"])
+        no_cmd = self._run("--no-run-commands")
+        self.assertEqual((no_cmd["apply_patch"], no_cmd["run_commands"]), (True, False))
 
+        legacy = self._run("--apply-patch", "--run-commands", "--no-dry-run")
+        self.assertEqual((legacy["dry_run"], legacy["apply_patch"], legacy["run_commands"]),
+                         (False, True, True))
 
-class AblationFlagTest(unittest.TestCase):
-    """--no-llvm-ir / --no-conformance / --no-isa-contract threading and conflicts."""
+    def test_ablation_and_ir_switches(self) -> None:
+        default = self._run()
+        self.assertEqual((default["llvm_ir"], default["require_conformance"],
+                          default["isa_contract"], default["ir_features"]),
+                         (True, True, True, "auto"))
 
-    def _run(self, *argv: str) -> dict:
-        from unittest import mock
+        no_ir = self._run("--no-llvm-ir")
+        self.assertEqual((no_ir["llvm_ir"], no_ir["ir_features"]), (False, "off"))
 
-        captured: dict = {}
+        for mode in ("require", "approx"):
+            with self.assertRaisesRegex(SystemExit, "--no-llvm-ir conflicts"):
+                cli.main(["--task", "x", "--no-llvm-ir", "--ir-features", mode])
 
-        def _fake_run(state, **kwargs):
-            captured.update(state)
-            return {"status": "planned"}
+        no_conf = self._run("--no-conformance")
+        self.assertEqual((no_conf["require_conformance"], no_conf["isa_contract"]), (False, True))
 
-        with mock.patch.object(cli, "run_agent", _fake_run), \
-                mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
-                mock.patch.object(cli, "enable_progress", lambda: None):
-            cli.main(["--task", "x", *argv])
-        return captured
+        no_isa = self._run("--no-isa-contract")
+        self.assertEqual((no_isa["isa_contract"], no_isa["require_conformance"]), (False, False))
 
-    def test_ablation_switches_default_off(self) -> None:
-        captured = self._run()
-        self.assertTrue(captured["llvm_ir"])
-        self.assertTrue(captured["require_conformance"])
-        self.assertTrue(captured["isa_contract"])
-        self.assertEqual(captured["ir_features"], "auto")
-
-    def test_no_llvm_ir_forces_ir_features_off(self) -> None:
-        captured = self._run("--no-llvm-ir")
-        self.assertFalse(captured["llvm_ir"])
-        self.assertEqual(captured["ir_features"], "off")
-
-    def test_no_llvm_ir_conflicts_with_explicit_ir_evidence(self) -> None:
-        with self.assertRaisesRegex(SystemExit, "--no-llvm-ir conflicts"):
-            cli.main(["--task", "x", "--no-llvm-ir", "--ir-features", "require"])
-        with self.assertRaisesRegex(SystemExit, "--no-llvm-ir conflicts"):
-            cli.main(["--task", "x", "--no-llvm-ir", "--ir-features", "approx"])
-
-    def test_no_conformance_is_independent(self) -> None:
-        captured = self._run("--no-conformance")
-        self.assertFalse(captured["require_conformance"])
-        self.assertTrue(captured["isa_contract"])
-
-    def test_no_isa_contract_implies_no_conformance(self) -> None:
-        captured = self._run("--no-isa-contract")
-        self.assertFalse(captured["isa_contract"])
-        self.assertFalse(captured["require_conformance"])
-
-
-class IrFeaturesFlagTest(unittest.TestCase):
-    def test_ir_evidence_is_opt_in_and_passed_to_state(self) -> None:
-        from unittest import mock
-
-        parser = cli.build_parser()
-        self.assertEqual(parser.parse_args(["--task", "x"]).ir_features, "auto")
-        self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "auto"]).ir_features, "auto")
-        self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "require"]).ir_features, "require")
-        self.assertEqual(parser.parse_args(["--task", "x", "--ir-features", "approx"]).ir_features, "approx")
-        captured: dict = {}
-
-        def _fake_run(state, **kwargs):
-            captured.update(state)
-            return {"status": "planned"}
-
-        with mock.patch.object(cli, "run_agent", _fake_run), \
-                mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
-                mock.patch.object(cli, "enable_progress", lambda: None):
-            cli.main(["--task", "x", "--ir-features", "auto"])
-        self.assertEqual(captured.get("ir_features"), "auto")
-
-
-class LoopFlagTest(unittest.TestCase):
-    def test_loop_is_off_by_default_and_can_be_enabled(self) -> None:
+    def test_loop_and_budget_flags(self) -> None:
         import os
-        from unittest import mock
 
         parser = cli.build_parser()
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CFU_AGENT_LOOP", None)
             self.assertFalse(parser.parse_args(["--task", "x"]).loop_optimize)
-        self.assertTrue(parser.parse_args(["--task", "x", "--loop"]).loop_optimize)
         with mock.patch.dict(os.environ, {"CFU_AGENT_LOOP": "on"}):
             self.assertTrue(cli.build_parser().parse_args(["--task", "x"]).loop_optimize)
 
-    def test_main_passes_the_flag_into_the_state(self) -> None:
-        from unittest import mock
-
-        captured: dict = {}
-
-        def _fake_run(state, **kwargs):
-            captured.update(state)
-            return {"status": "planned"}
-
-        with mock.patch.object(cli, "run_agent", _fake_run), \
-                mock.patch.object(cli, "export_graph_visualization", lambda path: {}), \
-                mock.patch.object(cli, "enable_progress", lambda: None):
-            cli.main(["--task", "x", "--loop", "--max-iters", "3",
-                      "--max-preverify-repairs", "4"])
+        captured = self._run("--loop", "--max-iters", "3", "--max-preverify-repairs", "4")
         self.assertTrue(captured.get("loop_optimize"))
         self.assertEqual(captured.get("max_iters"), 3)
         self.assertEqual(captured.get("max_preverify_repairs"), 4)

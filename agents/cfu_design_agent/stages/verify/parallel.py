@@ -15,6 +15,9 @@ _WORKER_CHANNELS = frozenset({'validation_results', 'cost_results', 'errors', 'i
 
 
 def _evaluate(state: CfuDesignState, evaluation_id: str) -> dict:
+    if ('implementation_design_type' in state and
+            state['implementation_design_type'] not in ('draft', 'complete')):
+        raise ValueError('invalid implementation_design_type in validation state')
     mode = state.get('validation_mode', 'serial')
     if mode not in ('parallel', 'serial'):
         raise ValueError(f'unknown validation_mode: {mode!r}')
@@ -33,14 +36,15 @@ def _evaluate(state: CfuDesignState, evaluation_id: str) -> dict:
                                  'input_sha256': input_fingerprints.get(rung, '')}}
         return clean
 
-    pair = validation_parallel.run_pair({
-        'sim': lambda: worker('sim', software.simulate),
-        'cost': lambda: worker('cost', cost.estimate_cost),
-    }, parallel=mode == 'parallel')
+    draft = candidate.get('implementation_design_type') == 'draft'
+    workers = {'sim': lambda: worker('sim', software.simulate)}
+    if not draft:
+        workers['cost'] = lambda: worker('cost', cost.estimate_cost)
+    pair = validation_parallel.run_pair(workers, parallel=mode == 'parallel')
     if dependencies.input_fingerprints(candidate) != input_fingerprints:
         raise RuntimeError('candidate inputs changed during validation; refusing stale evidence')
     update: dict = {}
-    for rung in ('sim', 'cost'):
+    for rung in workers:
         if rung in pair.updates:
             update = outcome.merge_updates(update, pair.updates[rung])
         else:
@@ -65,6 +69,9 @@ def _evaluate(state: CfuDesignState, evaluation_id: str) -> dict:
                          'passed' if gate.get('ok') else 'failed')
                   for rung, gate in gate_map.items()},
     }
+    if draft:
+        evaluation['lanes']['cost'] = 'not_run_draft'
+        evaluation['diagnostic_only'] = True
     update.update(evaluation_id=evaluation_id, evaluation=evaluation)
     # Write inside the group task: a replay restores evidence without rerunning
     # workers. A standalone helper remains usable with minimal mocked state.
@@ -106,10 +113,17 @@ def validate_candidate(state: CfuDesignState) -> CfuDesignState:
         {**state, 'gates': {**(state.get('gates') or {}), **update['gates']}},
         failed_rung or 'validation_pair', ok=pair_ok,
         default='review_and_route', repair_target='implement', skipped=skipped)
+    if pair_ok and state.get('implementation_design_type') == 'draft':
+        extra, next_node = ladder.draft_sim_transition(state)
     update['gates'] = outcome.gates(state, {
         **update['gates'],
+        **({'cost': {'ok': False, 'skipped': True, 'reason': 'not_run_draft',
+                     'evaluation_id': update['evaluation_id']}}
+           if state.get('implementation_design_type') == 'draft' else {}),
         'validation_pair': {
-            'ok': pair_ok, 'skipped': skipped, 'next': next_node,
+            'ok': pair_ok and state.get('implementation_design_type') != 'draft',
+            'skipped': skipped, 'next': next_node,
+            'diagnostic_only': state.get('implementation_design_type') == 'draft',
             'evaluation_id': update['evaluation_id'],
             'failed_rung': failed_rung, 'cancelled': evaluation['cancelled'],
             'round': evaluation['round'],

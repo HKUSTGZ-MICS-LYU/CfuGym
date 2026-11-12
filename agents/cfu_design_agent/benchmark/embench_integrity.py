@@ -413,7 +413,7 @@ def validate_candidate(workdir: Path, run_root: str, name: str,
             raise ValueError("pending host integrity metadata modification")
         workspace_prefix = f"{root.as_posix()}/workspace/embench_"
         pending = {key: value for key, value in all_pending.items() if key.startswith(workspace_prefix)}
-        if any(key.startswith(embench.EMBENCH_ROOT + "/") for key in all_pending):
+        if any(key.startswith(tuple(root + "/" for root in embench.SUITE_NAMES)) for key in all_pending):
             raise ValueError("pending read-only Embench source modification")
         allowed = set(refs) | set(harness) | {
             f"{cfgs['cfu']}/src/{Path(rel).name}" for rel in refs

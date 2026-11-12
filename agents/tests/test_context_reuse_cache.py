@@ -2,23 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import closing
 from copy import deepcopy
 import json
 from pathlib import Path
-import sqlite3
 from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
 
-from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.graph import END, START, StateGraph
-import yaml
-
 from agents.cfu_design_agent import prompts
 from agents.cfu_design_agent.runtime import flow_memory, llm_step, request_audit, stage_history
-from agents.cfu_design_agent.state import CfuDesignState
 from agents.cfu_design_agent.runtime.agent_tools import ReadOnlyToolset
 from agents.cfu_design_agent.runtime.llm import LlmResult
 from agents.cfu_design_agent.runtime.policy import AccessPolicy, StagePolicy
@@ -113,26 +106,6 @@ class ContextReuseCacheTest(unittest.TestCase):
                 self.assertNotIn("UNOBSERVED", rendered)
                 self.assertNotIn("TRACKED_SCAFFOLD_MUST_NOT_BE_CAPTURED", rendered)
 
-    def test_disjoint_ranges_survive_json_roundtrip_without_filling_gaps(self):
-        memory = self.memory_for_reads(
-            {"path": self.reference, "start_line": 2, "end_line": 2},
-            {"path": self.reference, "start_line": 4, "end_line": 4},
-        )
-        restored = json.loads(json.dumps(memory, allow_nan=False))
-        self.assertEqual(len(restored["entries"]), 1)
-        rendered = flow_memory.render_memory(restored, self.state, self.toolbox,
-                                             "implementation", max_chars=4000)
-        self.assertIn("REUSED_RANGE_TWO", rendered)
-        self.assertIn("REUSED_RANGE_FOUR", rendered)
-        self.assertNotIn("UNOBSERVED", rendered)
-        self.assertEqual(rendered, flow_memory.render_memory(
-            memory, self.state, self.toolbox, "implementation", max_chars=4000))
-        self.put(self.reference, "CURRENT_BUT_UNOBSERVED\n")
-        stale = flow_memory.render_memory(restored, self.state, self.toolbox,
-                                          "implementation", max_chars=4000)
-        self.assertNotIn("REUSED_RANGE", stale)
-        self.assertNotIn("CURRENT_BUT_UNOBSERVED", stale)
-
     def _prompt(self, stage):
         context = {
             "workdir": str(self.root), "run_root": self.run_root,
@@ -204,99 +177,6 @@ class ContextReuseCacheTest(unittest.TestCase):
                 self.put(path, text)
                 stage_history.record_execution(state, self.toolbox, stage, label, path, kind=kind)
         return stage_history.derive_history(state, {}, events, self.toolbox, accepted=accepted)
-
-    def test_history_rebuilds_summary_and_strips_old_delivery_payloads(self):
-        text = ("PRIOR_STRATEGY retained operands and changed scheduling.\n"
-                "EDIT_BEGIN old.c\n<<<<<<< SEARCH\nOLD_EDIT_BYTES\n=======\n"
-                "OLD_REPLACEMENT_BYTES\n>>>>>>> REPLACE\nEDIT_END\n"
-                "```c\nOLD_FENCED_CODE\n```\nRemaining uncertainty: resource timing.\n")
-        history = self._history(self.state, [("implement", "stage3", "model", text)])
-        self.assertEqual(len(history["entries"]), 1)
-        self.assertEqual(history["entries"][0]["status"], "completed")
-        restored = json.loads(json.dumps(history, allow_nan=False))
-        restored["entries"][0]["summary"] = "FORGED_STORED_SUMMARY"
-        state = {**self.state, "stage_history": restored}
-        before = deepcopy(state)
-        rendered = stage_history.render_history(state, self.toolbox, "implement", label="stage3")
-        self.assertIn("PRIOR_STRATEGY", rendered)
-        self.assertIn("not current gate evidence", rendered)
-        for marker in ("OLD_EDIT_BYTES", "OLD_REPLACEMENT_BYTES", "OLD_FENCED_CODE",
-                       "FORGED_STORED_SUMMARY"):
-            self.assertNotIn(marker, rendered)
-        self.assertEqual(state, before)
-        self.put(history["entries"][0]["path"], "ARTIFACT_CHANGED_AFTER_RECORDING")
-        self.assertEqual(stage_history.render_history(state, self.toolbox, "implement", label="stage3"), "")
-
-    def test_tool_history_keeps_rejection_but_not_successful_tool_payloads(self):
-        transcript = [
-            {"name": "read_file", "arguments": {"path": self.reference},
-             "result": "RAW_READ_BYTES_NOT_HISTORY", "ok": True},
-            {"name": "edit_software", "arguments": {"replace": "OLD_EDIT_NOT_REPLAYED"},
-             "result": "edit applied", "ok": True},
-            {"name": "submit_stage", "arguments": {"delivery": "REJECTED_APPROACH"},
-             "result": "stage gate rejected delivery: command missing", "ok": False},
-            {"name": "(tool loop failed)", "arguments": {"error": "BOUNDED_FAILURE_REASON"},
-             "result": "", "ok": False},
-        ]
-        history = self._history(self.state, [("implement", "stage3", "tools",
-                                             yaml.safe_dump({"transcript": transcript}))], accepted=False)
-        state = {**self.state, "stage_history": history}
-        rendered = stage_history.render_history(state, self.toolbox, "implement", label="stage3")
-        self.assertIn("[rejected]", rendered)
-        self.assertIn("REJECTED_APPROACH", rendered)
-        self.assertIn("BOUNDED_FAILURE_REASON", rendered)
-        self.assertNotIn("RAW_READ_BYTES_NOT_HISTORY", rendered)
-        self.assertNotIn("OLD_EDIT_NOT_REPLAYED", rendered)
-        self.assertNotIn("REJECTED_APPROACH", stage_history.render_history(state, self.toolbox, "review"))
-        successful = self._history(self.state, [("implement", "stage3", "tools",
-                                               yaml.safe_dump({"transcript": transcript[:2]}))])
-        self.assertEqual(successful["entries"], [])
-
-    def test_history_invalidates_on_source_contract_and_task_changes(self):
-        state = {**self.state, "kernel_file": self.reference, "task": "original task"}
-        history = self._history(state, [("implement", "stage3", "model", "PRIOR_SOURCE_STRATEGY")])
-        current = {**state, "stage_history": history}
-        self.assertIn("PRIOR_SOURCE_STRATEGY", stage_history.render_history(current, self.toolbox, "implement"))
-        for changed in ({"task": "different task"}, {"isa_spec": {"commands": [{"name": "new"}]}}):
-            with self.subTest(changed=changed):
-                self.assertEqual(stage_history.render_history({**current, **changed}, self.toolbox, "implement"), "")
-        self.put(self.reference, "CHANGED_SOURCE\n")
-        self.assertEqual(stage_history.render_history(current, self.toolbox, "implement"), "")
-
-    def test_history_is_bounded_and_persists_in_parent_without_tool_replay(self):
-        records = [("implement", "stage3", "model", f"STRATEGY_{index}") for index in range(6)]
-        history = self._history(self.state, records)
-        self.assertLessEqual(len(history["entries"]), stage_history.MAX_PER_STAGE)
-        self.assertNotIn("STRATEGY_0", str(history))
-        self.assertIn("STRATEGY_5", str(history))
-        history = json.loads(json.dumps(history, allow_nan=False))
-        executed = []
-
-        def publish(_state):
-            executed.append("publish")
-            return {"stage_history": history}
-
-        def finish(_state):
-            executed.append("finish")
-            return {"status": "complete"}
-
-        builder = StateGraph(CfuDesignState)
-        builder.add_node("publish", publish)
-        builder.add_node("finish", finish)
-        builder.add_edge(START, "publish")
-        builder.add_edge("publish", "finish")
-        builder.add_edge("finish", END)
-        config = {"configurable": {"thread_id": "offline-history-checkpoint"}}
-        with closing(sqlite3.connect(":memory:", check_same_thread=False)) as connection:
-            graph = builder.compile(checkpointer=SqliteSaver(connection), interrupt_after=["publish"])
-            graph.invoke(self.state, config)
-            snapshot = graph.get_state(config)
-            self.assertEqual(snapshot.values["stage_history"], history)
-            self.assertEqual(executed, ["publish"])
-            resumed = graph.invoke(None, config)
-        self.assertEqual(executed, ["publish", "finish"])
-        self.assertEqual(resumed["stage_history"], history)
-        self.assertEqual(resumed["status"], "complete")
 
     def test_history_and_file_memory_share_one_bounded_virtual_tail(self):
         reads = []

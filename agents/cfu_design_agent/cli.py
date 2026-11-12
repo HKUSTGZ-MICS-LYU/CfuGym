@@ -10,7 +10,7 @@ import traceback
 
 from .graph import enable_progress, export_graph_visualization, run_agent
 from .runtime.llm import (
-    DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS, OpenAiTextClient,
+    DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_MAX_TOOL_RETRIES, OpenAiTextClient,
 )
 from .runtime.llm_config import LlmConfigError, effective_config, list_configs
 from .flow import optimize as flow_optimize
@@ -71,7 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--embench",
         default="",
-        help="Run an embench-iot benchmark as the workload, e.g. --embench crc32.",
+        help=(
+            "Run an embench-iot benchmark as the workload, e.g. --embench crc32. Custom "
+            "workloads with the same interface under benchmarks/custom/src (gf-erasure, "
+            "median3x3, varint-delta) are accepted too."
+        ),
     )
     parser.add_argument("--run-id", default="", help="Explicit run id; defaults to a timestamped unique id.")
     parser.add_argument(
@@ -158,7 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-conformance-runs",
         type=int,
-        default=2,
+        default=5,
         help="How many times Implement may call run_conformance on a dev test (default: 2).",
     )
     parser.add_argument(
@@ -208,6 +212,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_TOOL_CALLS,
         help=(f"Maximum tool calls per agent step, across all rounds "
               f"(default: {DEFAULT_MAX_TOOL_CALLS}; 0 disables the cap)."),
+    )
+    parser.add_argument(
+        "--max-tool-retries",
+        type=int,
+        default=DEFAULT_MAX_TOOL_RETRIES,
+        help=(f"Total corrective retries shared by failed tool calls and submissions "
+              f"per agent step (default: {DEFAULT_MAX_TOOL_RETRIES}; 0 disables retries)."),
     )
     parser.add_argument(
         "--profile-cache",
@@ -312,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--max-evals must be zero or positive")
     if args.max_iters < 1:
         raise SystemExit("--max-iters must be at least 1")
+    if args.max_tool_retries < 0:
+        raise SystemExit("--max-tool-retries must be zero or positive")
     if args.max_preverify_repairs < 0:
         raise SystemExit("--max-preverify-repairs must be zero or positive")
     if args.no_llvm_ir and args.ir_features in ("require", "approx"):
@@ -367,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         "agent_tools": args.agent_tools,
         "max_tool_rounds": args.max_tool_rounds,
         "max_tool_calls": args.max_tool_calls,
+        "max_tool_retries": args.max_tool_retries,
         "profile_cache": args.profile_cache,
         "ir_features": "off" if args.no_llvm_ir else args.ir_features,
         "llvm_ir": not args.no_llvm_ir,
@@ -685,7 +699,9 @@ def infer_input_mode(args: argparse.Namespace) -> str:
 
 def default_task(args: argparse.Namespace) -> str:
     if getattr(args, "embench", ""):
-        return f"Accelerate the embench-iot benchmark {args.embench} with a CFU."
+        from .benchmark import embench as embench_suite
+        suite = embench_suite.benchmark_suite(args.embench, Path(getattr(args, "workdir", ".") or "."))
+        return f"Accelerate the {suite} benchmark {args.embench} with a CFU."
     if args.kernel_file:
         function = f" function {args.kernel_function}" if args.kernel_function else ""
         return f"Design a CFU for C workload {args.kernel_file}{function}"

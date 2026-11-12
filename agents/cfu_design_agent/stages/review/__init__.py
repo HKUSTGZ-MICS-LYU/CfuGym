@@ -23,11 +23,13 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
     the optimization ledger so a regression is visible.
     """
     decision, status = gates._review_decision(state)
+    if state.get("implementation_design_type") == "draft" and status == "complete":
+        decision, status = "final_report", "blocked"
     rounds = [dict(item) for item in (state.get("optimization_rounds") or [])]
     plan = state.get("optimization_plan") or {}
     if not isinstance(plan, dict):
         plan = {}
-    if plan or not rounds:
+    if (plan or not rounds) and state.get("implementation_design_type") != "draft":
         # Record the round that just finished; with no plan yet this is the
         # baseline produced by the initial ladder.
         entry = flow_optimize._score_snapshot(
@@ -168,6 +170,7 @@ def final_report(state: CfuDesignState) -> CfuDesignState:
     if status == "complete" and not gates._is_complete(state):
         # Never claim completion without every required gate passing.
         status = "blocked"
+        state["status"] = status
         state["termination_reason"] = "UNRECOVERABLE_FAILURE"
         report = review_report.render_report(state)
     artifacts.write_text("review", "report.md", report, kind="markdown", status=status)

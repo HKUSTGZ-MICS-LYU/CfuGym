@@ -16,7 +16,7 @@ def batch(ident, content="read output"):
 
 class ContextBudgetTest(unittest.TestCase):
     def test_unknown_and_model_metadata_override(self):
-        self.assertEqual(budget.resolve_window(), budget.WindowSpec(32768, 4096, "unknown-soft", False))
+        self.assertEqual(budget.resolve_window(), budget.WindowSpec(32768, 8192, "unknown-soft", False))
         self.assertEqual(budget.resolve_window(metadata={"model": {"context_length": 64000}}).window_tokens, 64000)
         self.assertEqual(budget.resolve_window({"context_window": 8000, "output_reserve_tokens": 2000},
                                                {"context_length": 64000}).source, "config")
@@ -26,8 +26,12 @@ class ContextBudgetTest(unittest.TestCase):
         with self.assertRaisesRegex(budget.ContextBudgetError, "conflicting"):
             budget.resolve_window(metadata={"context_length": 20000, "context_window": 30000})
         self.assertEqual(budget.resolve_window({"context_window": 20000}, {"context_length": 0}).source, "config")
+        self.assertEqual(budget.resolve_window({"context_window": 4000}).output_reserve_tokens, 1000)
+        self.assertEqual(budget.resolve_window({"context_window": 1048576}).output_reserve_tokens, 16384)
+        self.assertEqual(budget.resolve_window(metadata={"context_window": 64000}).output_reserve_tokens, 16000)
+        self.assertEqual(budget.resolve_window({"context_window": 8000, "output_reserve_tokens": 7000}).output_reserve_tokens, 7000)
         with self.assertRaisesRegex(budget.ContextBudgetError, "smaller"):
-            budget.resolve_window({"context_window": 4000})
+            budget.resolve_window({"output_reserve_tokens": 4000}, {"context_window": 4000})
         with self.assertRaisesRegex(budget.ContextBudgetError, "conflicting"):
             budget.resolve_window(metadata={"context_window": 20000,
                                             "model": {"context_length": 30000}})
@@ -56,7 +60,7 @@ class ContextBudgetTest(unittest.TestCase):
             size = percent
             while True:
                 messages[0]["content"] = "a" * size
-                used = budget.evaluate_budget(messages).total_tokens
+                used = budget.evaluate_budget(messages, window=budget.WindowSpec(32768, 4096, "test", True)).total_tokens
                 if used * 100 % percent == 0:
                     break
                 size += 1
@@ -72,8 +76,9 @@ class ContextBudgetTest(unittest.TestCase):
                     + batch("edit", "patch applied: " + "e" * 350)
                     + [{"role": "user", "content": "current failure and latest edits must stay"}])
         saved = copy.deepcopy(messages)
-        before = budget.evaluate_budget(messages)
-        after_old_removed = budget.evaluate_budget(messages[:2] + messages[4:])
+        fixed = budget.WindowSpec(32768, 4096, "test", True)
+        before = budget.evaluate_budget(messages, window=fixed)
+        after_old_removed = budget.evaluate_budget(messages[:2] + messages[4:], window=fixed)
         self.assertGreater(before.total_tokens, after_old_removed.total_tokens)
         # Select a window so original >=90%, but removing the old batch <90%.
         window_tokens = max(before.total_tokens, (after_old_removed.total_tokens * 100 // 89) + 1)

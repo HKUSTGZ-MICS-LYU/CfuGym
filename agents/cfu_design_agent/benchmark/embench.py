@@ -1,6 +1,8 @@
 """Embench-iot workload support: discovery, workspace preparation, and commands.
 
-Embench lives in a read-only submodule (benchmarks/embench-iot). Every run copies
+Embench lives in a read-only submodule (benchmarks/embench-iot); custom
+workloads with the same benchmark interface live in benchmarks/custom/src and
+are prepared identically. Every run copies
 the selected benchmark, Embench's support code and the VexiiRiscv board
 (sw/embench) into its own workspace, then builds three configurations:
 
@@ -28,6 +30,14 @@ from ..runtime.tools import RepoToolbox, embench_cfu_rel
 
 
 EMBENCH_ROOT = "benchmarks/embench-iot"
+# Custom workloads follow the Embench benchmark interface (support.h,
+# initialise_benchmark/warm_caches/benchmark/verify_benchmark, one
+# LOCAL_SCALE_FACTOR) and reuse Embench's support code and the board, so the
+# whole adapter (configs, integrity, profiling, verify line) applies unchanged.
+CUSTOM_ROOT = "benchmarks/custom"
+SUITE_NAMES = {EMBENCH_ROOT: "embench-iot", CUSTOM_ROOT: "custom"}
+SOURCE_ROOTS = tuple(f"{root}/src" for root in SUITE_NAMES)
+REPO_ROOT = Path(__file__).resolve().parents[3]
 BOARD_ROOT = "sw/embench"
 SUPPORT_FILES = ("main.c", "beebsc.c", "beebsc.h", "support.h")
 BOARD_FILES = ("boardsupport.c", "boardsupport.h", "embench_obs.h")
@@ -110,19 +120,55 @@ def parse_verify_result(text: str) -> dict | None:
 
 
 
-def benchmark_dir(name: str) -> str:
-    return f"{EMBENCH_ROOT}/src/{name}"
+def _suite_root(name: str, workdir: Path | None) -> str:
+    """Suite root holding benchmark ``name``; Embench wins a name clash.
+
+    A custom benchmark is only resolved when its directory exists under the
+    given workdir (the repository root when omitted), so every existing
+    Embench name and fixture workdir keeps resolving to Embench.
+    """
+    base = Path(workdir) if workdir is not None else REPO_ROOT
+    if not (base / EMBENCH_ROOT / "src" / name).is_dir() and name and (
+        base / CUSTOM_ROOT / "src" / name
+    ).is_dir():
+        return CUSTOM_ROOT
+    return EMBENCH_ROOT
 
 
-def list_benchmarks(workdir: Path) -> list[str]:
-    root = workdir / EMBENCH_ROOT / "src"
+def benchmark_suite(name: str, workdir: Path | None = None) -> str:
+    """Suite label of ``name``: ``embench-iot`` or ``custom``."""
+    return SUITE_NAMES[_suite_root(name, workdir)]
+
+
+def benchmark_dir(name: str, workdir: Path | None = None) -> str:
+    return f"{_suite_root(name, workdir)}/src/{name}"
+
+
+def _list_suite(workdir: Path, suite_root: str) -> list[str]:
+    root = workdir / suite_root / "src"
     if not root.is_dir():
         return []
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
 
+def list_benchmarks(workdir: Path) -> list[str]:
+    """The Embench-iot suite only (sweeps and experiment presets rely on it)."""
+    return _list_suite(workdir, EMBENCH_ROOT)
+
+
+def list_custom_benchmarks(workdir: Path) -> list[str]:
+    """Custom workloads under benchmarks/custom/src (same interface as Embench)."""
+    embench_names = set(_list_suite(workdir, EMBENCH_ROOT))
+    return [name for name in _list_suite(workdir, CUSTOM_ROOT) if name not in embench_names]
+
+
+def list_all_benchmarks(workdir: Path) -> list[str]:
+    """Every workload the embench adapter can prepare (Embench + custom)."""
+    return sorted({*list_benchmarks(workdir), *list_custom_benchmarks(workdir)})
+
+
 def benchmark_source_files(workdir: Path, name: str) -> list[str]:
-    root = workdir / benchmark_dir(name)
+    root = workdir / benchmark_dir(name, workdir)
     if not root.is_dir():
         return []
     return sorted(str(p.relative_to(workdir)) for p in root.glob("*.c"))
@@ -270,7 +316,7 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
     patched = embench_patchers.apply_benchmark_patches(name, source_texts)
     source_texts = patched.sources
     notes.extend(patched.notes)
-    source_root = toolbox.workdir / benchmark_dir(name)
+    source_root = toolbox.workdir / benchmark_dir(name, toolbox.workdir)
     header_texts = {
         path.name: toolbox.read_text(str(path.relative_to(toolbox.workdir)), limit=2_000_000)
         for path in sorted(source_root.glob("*.h"))
@@ -327,7 +373,7 @@ def prepare_embench_benchmark(toolbox: RepoToolbox, spec: dict) -> dict:
 
     return {
         "kind": "embench_benchmark",
-        "suite": "embench-iot",
+        "suite": benchmark_suite(name, toolbox.workdir),
         "benchmark": name,
         "workspace": ws,
         "source_path": source_files[0] if source_files else "",

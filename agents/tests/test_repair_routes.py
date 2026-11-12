@@ -281,7 +281,8 @@ class RepairRouteTest(unittest.TestCase):
             self.assertIn("accepted", tool.run("submit_repair_diagnosis", diagnosis()))
             self.assertIn("rolled back", self.request(tool, "analysis"))
             self.assertEqual(kwargs["submit_stage"]("revisit analysis"), (True, ""))
-            return LlmResult("revisit analysis", used_llm=True), "raw fixture", []
+            return LlmResult("revisit analysis", used_llm=True, accepted_submit={
+                "delivery": "revisit analysis", "design_type": "draft", "unimplemented": ["revisit design"]}), "raw fixture", []
         state = {**self.state, "agent_tools": True}
         with mock.patch.object(intrinsics, "intrinsics_header_path", return_value=self.header), \
                 mock.patch.object(intrinsics, "_write_intrinsics_header", side_effect=write_header), \
@@ -291,6 +292,8 @@ class RepairRouteTest(unittest.TestCase):
         self.assertEqual((self.root / self.header).read_text(), "old header\n")
         self.assertEqual(ladder._route_after_implement(update), "analyze_workload")
         self.assertNotIn("implementation_hw", update["gates"])
+        self.assertNotIn("implementation_design_type", update)
+        self.assertNotIn("implementation_unimplemented", update)
 
     def test_plain_integrity_rejection_restores_whole_round(self):
         def hardware(_state):

@@ -154,7 +154,7 @@ def resolve_config(name: str, data: dict[str, Any]) -> dict[str, Any]:
             raise LlmConfigError(f"{field} must be a positive integer")
         context_options[field] = value
     if (context_options.get("context_window_tokens") is not None
-            and context_options.get("output_reserve_tokens", 4096) >= context_options["context_window_tokens"]):
+            and context_options.get("output_reserve_tokens", 0) >= context_options["context_window_tokens"]):
         raise LlmConfigError("output_reserve_tokens must be smaller than context_window_tokens")
 
     # Token streaming: config may opt out; unset keeps the client default (on).

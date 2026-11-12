@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agents.experiments.harness import classification, layers, metrics, parsing
+from agents.experiments.harness import classification, history, layers, metrics, parsing
 from agents.cfu_design_agent.runtime import provenance, request_usage
 
 SUITE = "embench-iot"
@@ -296,6 +296,26 @@ def collect_record(
     # Only measured validation evidence identifies the protocol of these cycles;
     # never infer it from the current default or a newly prepared project.
     sim_yaml = parsing.load_yaml(framework_run_dir / "10_validation/sim.yaml", warnings, "sim.yaml")
+    # A present field (even an invalid one) must not fall through to a more
+    # permissive source. Gate/sim evidence binds the measured candidate first;
+    # run.yaml is only the fallback for runs that never reached simulation.
+    type_source, design_type = next(
+        ((name, source["implementation_design_type"]) for name, source in
+         (("sim_gate", sim_gate), ("sim.yaml", sim_yaml), ("embench.yaml", embench), ("run.yaml", run_yaml))
+         if isinstance(source, dict) and "implementation_design_type" in source), ("", None))
+    upstream_stop = status in {"failed", "blocked", "needs_iteration"} and stopped_at not in {"", "sim", "cost", "review", "final_report"}
+    if upstream_stop:
+        # An older sim describes a different candidate when this attempt failed
+        # before sim. Only an accepted final implementation gate (or run state)
+        # may describe the terminal implementation.
+        type_source, design_type = next(
+            ((name, source["design_type"]) for name, source in
+             (("implementation_sw", gates.get("implementation_sw") or {}),
+              ("implementation_hw", gates.get("implementation_hw") or {}))
+             if isinstance(source, dict) and source.get("ok") is True and "design_type" in source),
+            ("run.yaml", run_yaml["implementation_design_type"]) if "implementation_design_type" in run_yaml else ("", None))
+    if stale:
+        type_source, design_type = "", None
     measurement = embench.get("measurement") or sim_gate.get("measurement") or sim_yaml.get("measurement") or {}
     if not isinstance(measurement, dict):
         measurement = {}
@@ -441,6 +461,15 @@ def collect_record(
         },
     }
 
+    if type_source:
+        record["implementation_design_type"] = design_type
+        record["implementation_design_type_source"] = type_source
+        if design_type not in ("draft", "complete", "legacy"):
+            warnings.append(f"invalid implementation_design_type in {type_source}: {design_type!r}")
+        if status == "complete" and design_type not in ("complete", "legacy"):
+            record["framework_status"] = status
+            record["status"] = "draft" if design_type == "draft" else "invalid_implementation_design_type"
+
     if record["stage_gate_rejected"]:
         rejection_lines = re.findall(r"native stage failed:[^\n]*gate rejected[^\n]*",
                                      f"{stdout}\n{stderr}", re.I)
@@ -545,6 +574,11 @@ def collect_record(
     else:
         current_view = {"performance_valid": False, "candidate_matches": False,
                         "reason": "legacy candidate provenance unavailable", "scope": "current_candidate"}
+    if type_source and design_type not in ("complete", "legacy"):
+        current_view = {**current_view, "performance_valid": False,
+                        "reason": "draft or invalid implementation design type"}
+        record["performance_valid"] = False
+        record["speedup_x100"] = None
     record["current_performance"] = current_view
     record["infra"] = meta.get("infra") or classification.detect_infra(
         stdout, stderr, bool(meta.get("timed_out")), meta.get("exit_code"), record["gates"], termination, record["stopped_at"]
@@ -557,6 +591,7 @@ def collect_record(
     if record["failure"]:
         for field in ("failure_class", "failure_rung", "failure_detail"):
             record[field] = record["failure"][field]
+    record["historical_best_performance"] = history.best_speedup(record, framework_run_dir)
     record["episodes"] = classification.reconstruct_episodes(record, framework_run_dir)
     record["parse_warnings"] = "; ".join(warnings)
     record["pass_at_1"] = metrics._pass_flag(record, 1)
@@ -601,6 +636,7 @@ def write_failure_json(record: dict, run_dir: Path) -> Path | None:
             "termination": record.get("termination"),
             "current_performance": record.get("current_performance"),
             "last_observed_valid_performance": record.get("last_observed_valid_performance"),
+            "historical_best_performance": record.get("historical_best_performance"),
             "gate": (record.get("gates") or {}).get(failure.get("failure_rung", ""), {}),
         },
         "episodes": record.get("episodes") or [],

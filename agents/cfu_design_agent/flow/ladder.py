@@ -332,6 +332,26 @@ def _route_after_validation(state: CfuDesignState) -> str:
     return gates._rung_next(state, "validation_pair", "review_and_route")
 
 
+def draft_sim_transition(state: CfuDesignState) -> tuple[dict, str]:
+    """A passing draft is feedback, not an accepted candidate."""
+    if gates._verify_submissions_left(state):
+        iteration = int(state.get("iteration", 0) or 0) + 1
+        target = "implement"
+        extra = {"repairs_used": int(state.get("repairs_used", 0) or 0) + 1,
+                 "iteration": iteration, "last_repair_target": target, "stage_jobs": target,
+                 "repair_entry": {"kind": "design", "target": target,
+                                  "iteration": iteration, "route_used": False}}
+    else:
+        target = "review_and_route"
+        extra = {"stopped_at": "draft_completion", "stage_jobs": "review"}
+    note = ("Draft simulation passed; implementation remains incomplete. "
+            + ("Continue implementation." if target == "implement" else
+               "Verification-submission budget exhausted."))
+    extra["errors"] = [note]
+    extra["iteration_history"] = state_mod.append_history(state, note)
+    return extra, target
+
+
 def _route_after_sim(state: CfuDesignState) -> str:
     return gates._rung_next(state, "sim", "estimate_cost")
 

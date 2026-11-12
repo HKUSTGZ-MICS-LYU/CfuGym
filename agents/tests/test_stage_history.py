@@ -201,11 +201,10 @@ class StageHistoryTest(unittest.TestCase):
 
     def test_bounded_idempotent_json_serializable_history(self):
         state = self.state
-        for number in range(20):
+        for number in range(stage_history.MAX_PER_STAGE + 2):
             events, _ = self.capture(f"Historical decision {number}: " + "bounded " * 200, number=number, state=state)
             state = self.publish(events, state=state)
-            again = self.publish(events, state=state)
-            self.assertEqual(state["stage_history"], again["stage_history"])
+        self.assertEqual(state["stage_history"], self.publish(events, state=state)["stage_history"])
         entries = state["stage_history"]["entries"]
         self.assertEqual(len(entries), stage_history.MAX_PER_STAGE)
         self.assertTrue(all(len(entry["summary"]) <= stage_history.MAX_SUMMARY_CHARS for entry in entries))
@@ -213,17 +212,17 @@ class StageHistoryTest(unittest.TestCase):
         for limit in (0, 80, 300, 900, 2000):
             rendered = stage_history.render_history(restored, self.toolbox, "implement", max_chars=limit)
             self.assertLessEqual(len(rendered), limit)
-        self.assertIn("19:", stage_history.render_history(restored, self.toolbox, "implement"))
+        self.assertIn(f"{stage_history.MAX_PER_STAGE + 1}:", stage_history.render_history(restored, self.toolbox, "implement"))
         self.assertNotIn("stage_history", append_keys())
 
     def test_pending_collector_is_bounded_and_duplicate_captures_are_idempotent(self):
         with flow_memory.collect_tool_transcripts(self.state), stage_history.collect_executions() as events:
-            for number in range(20):
+            for number in range(stage_history.MAX_PER_STAGE + 2):
                 path = self.put(f"{self.run_root}/09_implementation/llm_raw/stage3_{number:03}.txt", f"Decision {number}")
                 stage_history.record_execution(self.state, self.toolbox, "implement", "stage3", path)
                 stage_history.record_execution(self.state, self.toolbox, "implement", "stage3", path)
             self.assertEqual(len(events), stage_history.MAX_PER_STAGE)
-            for number in range(20):
+            for number in range(stage_history.MAX_ENTRIES + 2):
                 path = self.put(f"{self.run_root}/09_implementation/llm_raw/label_{number:03}.txt", f"Other decision {number}")
                 stage_history.record_execution(self.state, self.toolbox, "implement", f"label_{number}", path)
             self.assertEqual(len(events), stage_history.MAX_ENTRIES)

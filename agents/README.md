@@ -106,10 +106,25 @@ An agent may write **only** those two files for hardware; the access policy reje
 to `src/main/scala/**`. A patch that names the tracked scaffold path is redirected into the run
 workspace automatically, so the repository tree is never modified by a design run.
 
+After SoC generation, the Host freezes the RTL and ROM initialization files into
+this run's content-addressed `10_validation/rtl_snapshots/` fileset. Only this
+Host copy may bypass the generic `**/*.bin` deny for ROM images; other deny rules,
+stage write permissions and write roots still apply. Model tools remain unable
+to read or write `.bin` files, including the frozen copies.
+
 Hardware and software implementation use the shared stage executor for bounded,
 policy-checked repository discovery before producing a final delivery. By default,
 each agent step allows 20 tool rounds, 4 calls per model round, and 96 calls total;
 `--max-tool-rounds` and `--max-tool-calls` can lower or raise the per-step limits.
+Failed tool calls and rejected or malformed `submit_stage` calls share a separate
+**per-step cumulative** `--max-tool-retries` budget (default **10**, `0` disables
+correction retries). Each failure reports its cause and remaining retries, so the
+model can correct arguments/code and call again; success does not reset the pool.
+Corrective turns remain available after the normal exploration budget is spent.
+Malformed calls are audited but excluded from API tool-call history; all valid
+companion results are retained. Successful edits/checks are never blindly replayed.
+Cancellation and transport failures are not tool-correction retries; exhausted
+correction budgets fail the stage and roll back its pending implementation edits.
 A stage can
 inspect a typed failure summary and a bounded excerpt of its run-scoped complete
 command log by failure ID; complete logs are never injected wholesale into prompts.
@@ -224,6 +239,19 @@ commit watchdog stalls and HDL protocol assertions remain separate observations.
 Current performance requires matching candidate/ISA, source/configuration fingerprint,
 repair evidence epoch and known ELF/ASM/RTL product hashes. Historical valid measurements
 retain their snapshot/version/hash separately and never certify the final candidate.
+For terminal `speedup_floor` failures, experiment reports additionally display the
+highest eligible historical simulation as a **historical candidate** value, separate
+from final-candidate fields and successful-run statistics. Collection and aggregate-only
+reporting read content-addressed `10_validation/versions/sim.yaml.<sha256>` snapshots:
+the filename hash must match, the file timestamp must be within the recorded attempt
+start/end window, and explicit matching non-legacy protocol and reference cycles,
+a successful executed simulation command, passing correctness/timing, integrity and
+design-change evidence, consistent cycles/speedup, and complete input,
+HW/SW/ISA and ELF/RTL/ASM hashes with an evidence epoch are required. Missing or
+unprovable evidence yields a blank, never a guessed final value. Snapshot timestamps
+and recorded hashes are provenance evidence, not cryptographic proof against tampering;
+the verifier and integrity gate do not prove correctness on all possible inputs.
+Reused artifacts predating the attempt and old records lacking these fields are excluded.
 Experiment collection reconstructs request usage by request ID; failed requests without
 usage remain unknown, with known-token lower bounds and independent warnings. Historical
 artifacts are not rewritten. No new multi-case semantic adapter is implemented here.
@@ -296,6 +324,18 @@ schemas and reserved output. Named LLM JSON configurations may set:
 {"context_window_tokens": 131072, "output_reserve_tokens": 8192}
 ```
 
+Absent an explicit output reservation, the default is one quarter of the effective
+window, capped at 16384 tokens (8192 for the unknown soft window). The
+`CFU_AGENT_OUTPUT_RESERVE` environment variable overrides the JSON reservation;
+explicit values must be positive and smaller than the effective window. The local
+DeepSeek V4.1 Flash base configuration may use a larger explicit reservation; newly
+materialized experiment configs copy it, while existing configs and running clients
+are unchanged. Output includes provider-counted reasoning as well as answer tokens;
+these bounds cannot guarantee a complete response or endpoint compatibility.
+A Responses `incomplete` result fails the request without executing its partial
+function calls, retrying it, or falling back to Chat. Its provider reason and any
+reported usage are recorded in the request audit; missing usage stays unknown.
+
 An explicit capacity wins; otherwise a bounded `/models/{model}` lookup uses a
 reported context field when present. Standard OpenAI model metadata does not
 promise that field. Unknown capacity uses a **32768-token soft budget**, not a
@@ -361,8 +401,8 @@ implementation stages gain narrow transactional coding capabilities:
 
 The model cannot choose argv, cwd, main class, output directory, simulation, or
 Yosys. A repair begins read-only and must submit a structured diagnosis citing
-current failure IDs before mutation unlocks. Provider/tool errors or rejected
-implementation output roll all model tool edits back to the stage-entry snapshot;
+current failure IDs before mutation unlocks. Terminal provider/tool errors or
+implementation delivery failures roll all model tool edits back to the stage-entry snapshot;
 a semantically accepted implementation commits them. Internal checks are evidence
 only and bind to the current candidate bytes. The ordinary `hw_build` and
 `sw_build` nodes independently rerun the canonical graph-owned commands and remain
@@ -1091,7 +1131,7 @@ The macro stages in `docs/agent_v2_plan.md` specify deliverables and gates, **no
 Two contracts are easy to get wrong and expensive when they are, so both are stated explicitly and checked by the framework:
 
 - **The analysis answer is raw YAML.** `workload_prompt` says the reply is one YAML mapping and nothing else, because the next node parses it directly: a prose preamble or a ` ```yaml ` fence invalidates it. `parsing.parse_yaml_mapping` still tolerates a fence and a preamble for compatibility (the same candidate list the ISA contract accepts), but a genuinely malformed mapping is never guessed at. A failed analysis is an **answer** error: it is repaired from the answer-repair pool (`--max-answer-repairs`) with the parser's complaint and the reply's own opening lines quoted back, and when that budget is spent the run stops as `blocked` instead of handing `{}` to the ISA and implementation stages.
-- **The implementation deliverable is an applied edit, not a patch.** `edit_hardware`/`edit_software` write the workspace files; `submit_stage(delivery)` summarizes what changed. The gate rejects a submission that reports no applied change to a hardware and a software target, returns that specific reason, and grants one corrective retry before the stage fails — so "here is the full file" cannot end a run. The prompt names the editing tools, and no tool-loop stage carries the legacy `FILE_BEGIN`/`PATCH_BEGIN` protocol, which only applies when the tool loop is disabled.
+- **The implementation deliverable is an applied edit, not a patch.** `edit_hardware`/`edit_software` write the workspace files; the Implement stage's `submit_stage` summarizes what changed and declares `design_type` as `complete` or `draft`. A draft must list its unimplemented contract semantics; a complete claim does not itself prove correctness. Prefer completing the contract before submitting: each candidate entering verification, including a draft, spends one `--max-iters` submission. A draft may build and simulate for diagnostic feedback, but it never runs Yosys/Vivado or becomes a successful candidate, even if the simulation passes. If a submission slot remains it returns to Implement; otherwise the run stops incomplete. An untested but actually complete implementation is `complete`, not automatically a draft. Missing or invalid type in a new tool-loop implementation submission is rejected; historical records without a type remain legacy evidence, not a new complete declaration. The legacy non-tool implementation path (including `--no-agent-tools` and dry runs) does not use `submit_stage` and therefore does not support draft declarations; it retains its existing behavior. The gate still rejects a submission that reports no applied change to a hardware and a software target, returns that specific reason, and grants one corrective retry before the stage fails — so "here is the full file" cannot end a run. The prompt names the editing tools, and no tool-loop stage carries the legacy `FILE_BEGIN`/`PATCH_BEGIN` protocol, which only applies when the tool loop is disabled.
 
 The per-stage **evidence index** (`## Key paths`) is filtered to artifacts that already exist, so it never points at a file the stage is about to write or at a name that only exists for another project kind (for example `04_benchmark/manifest.yaml` versus `04_benchmark/embench.yaml`).
 
@@ -1429,6 +1469,24 @@ default: first command/semantic failure cancels the sibling process tree and
 spends at most one repair slot. `--validation-mode serial` is available for
 troubleshooting. Only bounded termination cleanup is awaited, not normal sibling
 completion. `--skip-cost` skips either backend; `--skip-yosys` remains Yosys-only.
+
+Vivado uses a private Linux child-subreaper supervisor that promptly reaps adopted
+helper zombies without taking the main process's exit status or unrelated agent
+children. It inherits the existing command process group. Simulation commands and
+experiment timeouts use bounded TERM/KILL cleanup and track visible descendants
+across sessions with pidfds; the TERM grace is 5.5 seconds to let the Vivado
+supervisor finish its own cleanup. Cancellation and timeout cleanup for a command
+are serialized. While the experiment job pool is running, SIGINT and SIGTERM
+cancel queued jobs and request cleanup of registered agent trees before the pool
+is joined; retries waiting on backoff are interruptible. The Vivado supervisor
+requires working Linux pidfds and `/proc`; it fails before launching Vivado when
+safe pidfd signalling is unavailable. Cross-session tracking is best effort, not
+a cgroup containment boundary: a child
+already reparented before the scan, hidden from `/proc`, or created during a
+race can escape, and SIGKILL of the coordinator cannot run cooperative cleanup.
+A cleanup that cannot be confirmed is reported as an infrastructure error rather
+than a successful cancellation. Do not treat process-group termination as proof
+that every detached or orphaned descendant was reaped.
 
 The reports distinguish whole-SoC and CFU hierarchical area/timing/dynamic power,
 vectorless estimates from board measurement, and current from historical PPA.

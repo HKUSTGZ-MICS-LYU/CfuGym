@@ -51,6 +51,8 @@ read:
   - "sw/**"
   - "benchmarks/embench-iot/src/**"
   - "benchmarks/embench-iot/support/**"
+  # Custom workloads with the Embench benchmark interface (read-only sources).
+  - "benchmarks/custom/src/**"
   # Agent inputs: the policy and ISA spec, worked examples, methodology.
   - "agents/specs/**"
   - "agents/examples/**"

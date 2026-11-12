@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from agents.cfu_design_agent.runtime import processes
 from agents.cfu_design_agent.runtime.implementation_tools import ImplementationToolset, Verification
 from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.cfu_design_agent.runtime.policy import load_policy
@@ -67,6 +68,22 @@ class ImplementationToolsTest(unittest.TestCase):
             {"path": self.hw, "search": "class AgentCfu {}", "replace": "class Accel {}"}]}))
         self.assertNotEqual(old_hash, tool.hardware_session.candidate_hash())
         self.assertIsNone(tool.hardware_session.current_check())
+
+    def test_check_callbacks_never_swallow_cancellation_or_cleanup_failure(self):
+        for error_type in (processes.ValidationCancelled, processes.ProcessTerminationError):
+            for name, attribute in (('check_hardware_elaboration', 'check_elaboration'),
+                                    ('check_software_compile', 'check_compile')):
+                with self.subTest(error=error_type.__name__, tool=name):
+                    tool = self.make_tool()
+                    callback = mock.Mock(side_effect=error_type('stop'))
+                    setattr(tool, attribute, callback)
+                    with self.assertRaises(error_type):
+                        tool.run(name, {})
+                    callback.assert_called_once()
+            tool = self.make_tool()
+            tool.check_conformance_syntax = mock.Mock(side_effect=error_type('stop'))
+            with self.assertRaises(error_type):
+                tool._conformance_syntax_problems()
 
     def test_lightweight_checks_are_unlimited_by_default(self):
         tool = self.make_tool()

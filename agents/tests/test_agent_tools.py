@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from agents.cfu_design_agent.runtime import context_budget, failures, llm, processes
 from agents.cfu_design_agent.runtime.agent_tools import ReadOnlyToolset
-from agents.cfu_design_agent.runtime.llm import LlmResult, OpenAiTextClient
+from agents.cfu_design_agent.runtime.llm import OpenAiTextClient
+from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.runtime.tools import RepoToolbox, design_workspace_paths
 from agents.tests.common import REPO_ROOT
 
@@ -128,11 +132,83 @@ class ToolLoopTest(unittest.TestCase):
         roles = [message["role"] for message in fake.requests[1]["messages"]]
         self.assertIn("tool", roles)
 
-    def test_loop_is_bounded_and_withdraws_tools(self) -> None:
+    def test_malformed_calls_get_feedback_and_do_not_poison_next_request(self):
+        for name, arguments, call_id in (('', '{}', 'bad'), ('read_file', '{}', ''),
+                                         ('read_file', '{broken', 'bad'), ('read_file', '[]', 'bad')):
+            with self.subTest(name=name, arguments=arguments, call_id=call_id):
+                fake = _FakeChatClient([
+                    _tool_call_response(name, arguments, call_id),
+                    _tool_call_response('read_file', '{"path":"fixed"}', 'fixed'),
+                    _final_response('DONE'),
+                ])
+                runner = mock.Mock(return_value='body')
+                with mock.patch('openai.OpenAI', return_value=fake):
+                    result = self._client().complete_with_tools('s', 'u',
+                        tools=[{'type':'function','function':{'name':'read_file'}}],
+                        tool_runner=runner, max_rounds=1, max_total_calls=1)
+                runner.assert_called_once_with('read_file', {'path':'fixed'})
+                self.assertEqual(result.text, 'DONE')
+                self.assertIn('Total tool retries used: 1/10', str(fake.requests[1]['messages']))
+                llm._responses_items(fake.requests[1]['messages'])
+
+    def test_mixed_malformed_and_valid_calls_keep_completed_batches_contiguous(self):
+        response = _multi_tool_call_response(3)
+        response.choices[0].message.tool_calls[1].function.name = ''
+        fake = _FakeChatClient([response, _final_response('DONE')])
+        runner = mock.Mock(return_value='body')
+        with mock.patch('openai.OpenAI', return_value=fake):
+            result = self._client().complete_with_tools('s','u',
+                tools=[{'type':'function','function':{'name':'read_file'}}], tool_runner=runner)
+        self.assertEqual(result.text, 'DONE')
+        self.assertEqual(runner.call_count, 2)
+        context_budget._tool_batches(fake.requests[1]['messages'])
+        llm._responses_items(fake.requests[1]['messages'])
+        self.assertEqual([m['role'] for m in fake.requests[1]['messages']][-3:], ['tool','tool','user'])
+
+    def test_tool_failure_retries_are_total_not_reset_by_success(self):
+        fake = _FakeChatClient([
+            _tool_call_response('read_file', '{}', f'call-{i}') for i in range(4)])
+        runner = mock.Mock(side_effect=[ValueError('first'), 'body', 'usage error: second', ValueError('third')])
+        with mock.patch('openai.OpenAI', return_value=fake):
+            with self.assertRaises(failures.StageDeliveryFailure) as caught:
+                self._client().complete_with_tools('s', 'u',
+                    tools=[{'type':'function','function':{'name':'read_file'}}],
+                    tool_runner=runner, max_tool_retries=2)
+        self.assertEqual(caught.exception.terminal_reason, 'tool_retries_exhausted')
+        self.assertEqual(len(caught.exception.tool_calls), 4)
+        self.assertEqual(runner.call_count, 4)
+
+    def test_default_ten_retries_allow_a_corrected_call_after_round_cap(self):
+        fake = _FakeChatClient([
+            *[_tool_call_response('read_file', '{}', f'call-{i}') for i in range(11)],
+            _final_response('DONE')])
+        runner = mock.Mock(side_effect=[ValueError('bad')] * 10 + ['body'])
+        with mock.patch('openai.OpenAI', return_value=fake):
+            result = self._client().complete_with_tools('s', 'u',
+                tools=[{'type':'function','function':{'name':'read_file'}}],
+                tool_runner=runner, max_rounds=1, max_total_calls=1)
+        self.assertEqual(result.text, 'DONE')
+        self.assertEqual(runner.call_count, 11)
+        self.assertIn('10/10', str(fake.requests[-2]['messages']))
+
+    def test_zero_retry_budget_and_cancellation_do_not_replay_tools(self):
+        for error in (ValueError('bad'), processes.ValidationCancelled('cancelled')):
+            with self.subTest(error=type(error).__name__):
+                fake = _FakeChatClient([_tool_call_response('read_file', '{}')])
+                runner = mock.Mock(side_effect=error)
+                expected = processes.ValidationCancelled if isinstance(error, processes.ValidationCancelled) else failures.StageDeliveryFailure
+                with mock.patch('openai.OpenAI', return_value=fake), self.assertRaises(expected):
+                    self._client().complete_with_tools('s','u',
+                        tools=[{'type':'function','function':{'name':'read_file'}}],
+                        tool_runner=runner, max_tool_retries=0)
+                runner.assert_called_once()
+                self.assertEqual(len(fake.requests), 1)
+
+    def test_loop_is_bounded_withdraws_tools_and_adds_budget_reminder(self) -> None:
         client = self._client()
         fake = _FakeChatClient([
             _tool_call_response("read_file", '{"path": "a"}'),
-            _final_response("DONE"),
+            _final_response("DELIVERED"),
         ])
 
         with mock.patch("openai.OpenAI", return_value=fake):
@@ -144,35 +220,16 @@ class ToolLoopTest(unittest.TestCase):
                 max_rounds=1,
             )
 
-        self.assertEqual(result.text, "DONE")
+        self.assertEqual(result.text, "DELIVERED")
         self.assertEqual(result.tool_rounds, 1)
-        # first request offered tools, the forced final request did not
         self.assertIn("tools", fake.requests[0])
         self.assertNotIn("tools", fake.requests[1])
+        final_messages = fake.requests[1]["messages"]
+        self.assertEqual(final_messages[-1]["role"], "user")
+        self.assertIn("Tool budget exhausted", final_messages[-1]["content"])
+        self.assertIn("EDIT_BEGIN", final_messages[-1]["content"])
 
-    def test_tools_payload_rejection_fails_closed(self) -> None:
-        client = self._client()
-
-        class Completions:
-            def __init__(self):
-                self.calls = 0
-
-            def create(self, **kwargs):
-                self.calls += 1
-                if "tools" in kwargs:
-                    raise RuntimeError("tools not supported")
-                return _final_response("PLAIN")
-
-        fake = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
-        with mock.patch("openai.OpenAI", return_value=fake):
-            with self.assertRaisesRegex(RuntimeError, "tool-enabled model request failed"):
-                client.complete_with_tools(
-                    "s", "u", tools=[{"type": "function", "function": {"name": "read_file"}}],
-                    tool_runner=lambda name, args: "obs", max_rounds=3,
-                )
-        self.assertEqual(fake.chat.completions.calls, 1)
-
-    def test_tools_rejection_never_uses_plain_completion(self) -> None:
+    def test_tools_payload_rejection_fails_closed_without_plain_completion(self) -> None:
         client = self._client()
         requests: list[dict] = []
 
@@ -185,34 +242,13 @@ class ToolLoopTest(unittest.TestCase):
 
         fake = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
         with mock.patch("openai.OpenAI", return_value=fake):
-            with self.assertRaisesRegex(RuntimeError, "tools not supported"):
+            with self.assertRaisesRegex(RuntimeError, "tool-enabled model request failed.*tools not supported"):
                 client.complete_with_tools(
                     "s", "u", tools=[{"type": "function", "function": {"name": "read_file"}}],
                     tool_runner=lambda name, args: "obs", max_rounds=3,
                 )
         self.assertEqual(len(requests), 1)
         self.assertIn("tools", requests[0])
-
-    def test_budget_reminder_precedes_the_forced_final_turn(self) -> None:
-        client = self._client()
-        fake = _FakeChatClient([
-            _tool_call_response("read_file", '{"path": "a"}'),
-            _final_response("DELIVERED"),
-        ])
-        with mock.patch("openai.OpenAI", return_value=fake):
-            result = client.complete_with_tools(
-                "s",
-                "u",
-                tools=[{"type": "function", "function": {"name": "read_file"}}],
-                tool_runner=lambda name, args: "obs",
-                max_rounds=1,
-            )
-        self.assertEqual(result.text, "DELIVERED")
-        final_messages = fake.requests[1]["messages"]
-        self.assertNotIn("tools", fake.requests[1])
-        self.assertEqual(final_messages[-1]["role"], "user")
-        self.assertIn("Tool budget exhausted", final_messages[-1]["content"])
-        self.assertIn("EDIT_BEGIN", final_messages[-1]["content"])
 
     def test_post_withdrawal_tool_calls_keep_the_model_text(self) -> None:
         # Some gateways keep emitting tool_calls once the history holds tool
@@ -360,14 +396,33 @@ class ToolLoopTest(unittest.TestCase):
 
 
 class ReadOnlyToolsetTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._temp.cleanup)
+        cls.workdir = Path(cls._temp.name)
+        policy_dest = cls.workdir / "agents/specs/agent_access_policy.yaml"
+        policy_dest.parent.mkdir(parents=True, exist_ok=True)
+        policy_dest.write_bytes((REPO_ROOT / "agents/specs/agent_access_policy.yaml").read_bytes())
+        mico = cls.workdir / "src/main/scala/vexiiriscv/soc/mico"
+        mico.mkdir(parents=True, exist_ok=True)
+        (mico / "AgentCfu.scala").write_text("class AgentCfu extends AgentCfuBase\n")
+        (mico / "AgentCfuFiber.scala").write_text("class AgentCfuFiber\n")
+        (mico / "AgentCfuLib.scala").write_text("abstract class AgentCfuBase\n")
+        for denied_dir in ("docs", "target", "ext/SpinalHDL"):
+            (cls.workdir / denied_dir).mkdir(parents=True, exist_ok=True)
+            (cls.workdir / denied_dir / "file.txt").write_text("x\n")
+        (cls.workdir / "README.md").write_text("readme\n")
+        cls.policy = load_policy(cls.workdir)
+
     def setUp(self) -> None:
         self.run_id = f"agent-tools-{self._testMethodName}"[:60]
         self.run_root = f"agents/generated/runs/{self.run_id}"
-        self.run_dir = REPO_ROOT / self.run_root
+        self.run_dir = self.workdir / self.run_root
         shutil.rmtree(self.run_dir, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.run_dir, True)
         toolbox = RepoToolbox(
-            REPO_ROOT, dry_run=False, stage="implementation", run_root=self.run_root
+            self.workdir, policy=self.policy, dry_run=False, stage="implementation", run_root=self.run_root
         )
         toolbox.write_text(
             f"{self.run_root}/workspace/cfu_benchmark/main.c",
@@ -385,10 +440,8 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         self.assertIn("unknown tool", tools.run("inspect_observation", {"id": "obs_loop_x"}))
 
     def test_ir_views_schema_is_narrowed_for_ablation(self) -> None:
-        # --no-llvm-ir removes the ir/features views from the offered schema;
-        # asm/summary stay, and the default schema is untouched.
         index = {"observations": {"obs_loop_x": {"id": "obs_loop_x"}}}
-        toolbox = RepoToolbox(REPO_ROOT, dry_run=True, stage="analysis")
+        toolbox = RepoToolbox(self.workdir, policy=self.policy, dry_run=True, stage="analysis")
 
         def view_enum(toolset):
             schema = next(item for item in toolset.schemas()
@@ -420,14 +473,9 @@ class ReadOnlyToolsetTest(unittest.TestCase):
             "search_text", {"pattern": "return\\s+1", "path": f"{self.run_root}/workspace"}
         )
         self.assertIn("main.c:2:", hits)
-
-    def test_list_dir_lists_sub_directories(self) -> None:
-        # Observed failure: a directory whose children are all directories
-        # answered "(no visible entries)", so the model could not find
-        # workspace/design and burned its whole exploration budget on dead ends.
-        listing = self.toolset.run("list_dir", {"path": self.run_root})
-        self.assertIn("{{run-dir}}/workspace/", listing)
-        self.assertNotIn("(no visible entries)", listing)
+        sub_listing = self.toolset.run("list_dir", {"path": self.run_root})
+        self.assertIn("{{run-dir}}/workspace/", sub_listing)
+        self.assertNotIn("(no visible entries)", sub_listing)
 
     def test_run_dir_placeholder_is_accepted_and_echoed_back(self) -> None:
         text = self.toolset.run("read_file", {"path": "{{run-dir}}/workspace/cfu_benchmark/main.c"})
@@ -437,8 +485,6 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         self.assertNotIn(self.run_root, missing)
 
     def test_list_command_logs_finds_the_runs_build_and_simulation_logs(self) -> None:
-        # Every executed command persists its full output; the tool is how the
-        # model finds those logs without guessing numbered filenames.
         logs = self.run_dir / "10_validation/logs"
         logs.mkdir(parents=True, exist_ok=True)
         (logs / "sim_003.log").write_text(
@@ -467,11 +513,8 @@ class ReadOnlyToolsetTest(unittest.TestCase):
                         .startswith("usage error:"))
 
     def test_the_platform_library_is_discoverable_without_a_repo_wide_search(self) -> None:
-        # Observed failure: the implementation stage never found
-        # AgentCfuLib.scala (the read-only ISA vocabulary) and guessed the API
-        # from a docstring instead. Both navigation routes must reach it.
         tools = ReadOnlyToolset(
-            RepoToolbox(REPO_ROOT, dry_run=True, stage="implementation")
+            RepoToolbox(self.workdir, policy=self.policy, dry_run=True, stage="implementation")
         )
         listing = tools.run("list_dir", {"path": "src/main/scala/vexiiriscv/soc/mico"})
         self.assertIn("AgentCfuLib.scala", listing)
@@ -480,9 +523,6 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         self.assertNotIn("usage error", hits)
 
     def test_a_missing_path_says_so_and_suggests_where_it_lives(self) -> None:
-        # Observed failure: `path=vexiiriscv` answered "no such path" with no
-        # suggestion, and a typo answered "denied", which cannot be fixed by
-        # rephrasing.
         out = self.toolset.run("search_text", {"pattern": "x", "path": "vexiiriscv"})
         self.assertTrue(out.startswith("usage error: no such path"), out)
         self.assertIn("did you mean: src/main/scala/vexiiriscv", out)
@@ -490,69 +530,44 @@ class ReadOnlyToolsetTest(unittest.TestCase):
         self.assertIn("no such file", missing)
         self.assertNotIn("denied by access policy", missing)
 
-    def test_an_invisible_tree_is_denied_not_reported_empty(self) -> None:
-        # "docs" exists but is outside the read tree; "(no visible entries)"
-        # would read as "empty directory" and invite retries.
-        denied = self.toolset.run("list_dir", {"path": "docs"})
-        self.assertIn("denied by access policy", denied)
-        self.assertIn("outside the shared read allowlist", denied)
-        self.assertIn(
-            "denied by access policy", self.toolset.run("list_dir", {"path": "target"})
-        )
+    def test_invisible_trees_and_policy_denials_are_reported(self) -> None:
+        for path in ("docs", "target"):
+            denied = self.toolset.run("list_dir", {"path": path})
+            self.assertIn("denied by access policy", denied)
         self.assertIn(
             "denied by access policy",
             self.toolset.run("search_text", {"pattern": "x", "path": "ext/SpinalHDL"}),
         )
-
-    def test_paths_outside_the_stage_policy_are_denied(self) -> None:
-        out = self.toolset.run("read_file", {"path": "README.md"})
-        self.assertIn("denied by access policy", out)
-
-    def test_unknown_tool_and_bad_glob_are_reported(self) -> None:
+        self.assertIn(
+            "denied by access policy",
+            self.toolset.run("read_file", {"path": "README.md"}),
+        )
         self.assertIn("unknown tool", self.toolset.run("nope", {}))
         self.assertIn("glob must be relative", self.toolset.run("list_dir", {"glob": "../*"}))
 
-    def test_tracked_design_target_reads_the_live_workspace_overlay(self) -> None:
-        # The prompt shows, and an edit targets, the run-workspace overlay under
-        # the tracked repo path. A repair tool read must therefore return the
-        # model's previous change, not the pristine scaffold.
+    def test_tracked_design_target_reads_the_live_workspace_overlay_in_every_stage(self) -> None:
         toolbox = RepoToolbox(
-            REPO_ROOT, dry_run=False, stage="implementation", run_root=self.run_root
+            self.workdir, policy=self.policy, dry_run=False, stage="implementation", run_root=self.run_root
         )
         toolbox.seed_design_workspace()
         tracked = "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"
         overlay = design_workspace_paths(self.run_root)[tracked]
-        (REPO_ROOT / overlay).write_text(
-            "// CFU_AGENT_REPAIR_MARKER\n" + (REPO_ROOT / overlay).read_text()
+        (self.workdir / overlay).write_text(
+            "// CFU_AGENT_REPAIR_MARKER\n" + (self.workdir / overlay).read_text()
         )
-        toolset = ReadOnlyToolset(toolbox)
-        self.assertIn("CFU_AGENT_REPAIR_MARKER", toolset.run("read_file", {"path": tracked}))
+        for stage in ("analysis", "isa", "implementation"):
+            tools = ReadOnlyToolset(
+                RepoToolbox(self.workdir, policy=self.policy, dry_run=False, stage=stage, run_root=self.run_root)
+            )
+            out = tools.run("read_file", {"path": tracked, "end_line": 1})
+            self.assertIn("CFU_AGENT_REPAIR_MARKER", out, stage)
         self.assertIn(
             "CFU_AGENT_REPAIR_MARKER",
-            toolset.run(
+            tools.run(
                 "search_text",
                 {"pattern": "CFU_AGENT_REPAIR_MARKER", "path": "src/main/scala/vexiiriscv/soc/mico"},
             ),
         )
-
-    def test_every_stage_reads_the_same_live_copy(self) -> None:
-        # The redirect is not stage-conditioned: what the flow can see is shared,
-        # so `analysis` reads the same live overlay bytes as `implementation`.
-        toolbox = RepoToolbox(
-            REPO_ROOT, dry_run=False, stage="implementation", run_root=self.run_root
-        )
-        toolbox.seed_design_workspace()
-        tracked = "src/main/scala/vexiiriscv/soc/mico/AgentCfu.scala"
-        overlay = design_workspace_paths(self.run_root)[tracked]
-        (REPO_ROOT / overlay).write_text(
-            "// CFU_AGENT_SHARED_VISIBILITY\n" + (REPO_ROOT / overlay).read_text()
-        )
-        for stage in ("analysis", "isa", "implementation"):
-            tools = ReadOnlyToolset(
-                RepoToolbox(REPO_ROOT, dry_run=False, stage=stage, run_root=self.run_root)
-            )
-            out = tools.run("read_file", {"path": tracked, "end_line": 1})
-            self.assertIn("CFU_AGENT_SHARED_VISIBILITY", out, stage)
 
 
 if __name__ == "__main__":

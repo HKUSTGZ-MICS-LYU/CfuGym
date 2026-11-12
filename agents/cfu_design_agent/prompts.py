@@ -569,6 +569,9 @@ def embench_instructions(spec: WorkloadSpec) -> str:
     if spec.get("source_kind") != "embench":
         return ""
     name = spec.get("benchmark_name", "")
+    # Custom workloads share the Embench interface but live in their own tree.
+    source_root = ("benchmarks/custom/src" if spec.get("benchmark_suite") == "custom"
+                   else "benchmarks/embench-iot/src")
     return (
         f"Embench workload: {name}\n\n"
         "The measured profile includes whole-benchmark, function and (when available)\n"
@@ -579,7 +582,7 @@ def embench_instructions(spec: WorkloadSpec) -> str:
         "CFU intrinsics, keeping the scalar path for the reference build:\n\n"
         "- Guard every CFU use with #ifdef USE_AGENT_CFU / #else / #endif so the\n"
         "  reference configuration still compiles and still passes Embench verify.\n"
-        f"- Patch target: benchmarks/embench-iot/src/{name}/<file>.c (the harness\n"
+        f"- Patch target: {source_root}/{name}/<file>.c (the harness\n"
         "  redirects it into this run cfu workspace copy; do not invent other paths).\n"
         "- Include cfu_intrinsics.h (generated from your ISA spec) and call\n"
         "  cfu_enable() once before the first CFU instruction.\n"

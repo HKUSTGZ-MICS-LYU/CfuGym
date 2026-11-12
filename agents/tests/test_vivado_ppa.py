@@ -382,7 +382,21 @@ class VivadoInputTest(unittest.TestCase):
             vivado.load_summary(REPO, self.out)
 
 
-@unittest.skipUnless(sys.platform == 'linux', 'Linux process-tree contract')
+def _pidfd_supported():
+    if sys.platform != 'linux':
+        return False
+    try:
+        fd = DRIVER._open_pidfd(os.getpid())
+        try:
+            DRIVER._send_pidfd(fd, 0)
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+@unittest.skipUnless(_pidfd_supported(), 'Linux pidfd process-tree contract unavailable')
 class VivadoCancellationTest(unittest.TestCase):
     def _cancel(self, group: bool):
         with tempfile.TemporaryDirectory(prefix='vivado-cancel-') as temp:
@@ -447,6 +461,118 @@ Path({str(result_path)!r}).write_text(json.dumps(result))
             for pid in json.loads(pidfile.read_text()):
                 info = DRIVER._process_info(pid)
                 self.assertTrue(info is None or info[2] == 'Z')
+
+    def test_pidfd_is_available_and_does_not_signal_reused_identity(self):
+        fd = DRIVER._open_pidfd(os.getpid())
+        try:
+            DRIVER._send_pidfd(fd, 0)
+        finally:
+            os.close(fd)
+        with mock.patch.object(DRIVER, '_open_pidfd', return_value=123), \
+             mock.patch.object(DRIVER, '_process_info', return_value=(1, 'new-start', 'S')), \
+             mock.patch.object(DRIVER, '_send_pidfd') as send, \
+             mock.patch.object(DRIVER.os, 'close') as close:
+            DRIVER._signal_tracked({9876: 'old-start'}, signal.SIGTERM)
+        send.assert_not_called()
+        close.assert_called_once_with(123)
+
+    def test_cancel_arriving_with_successful_supervisor_response_is_not_lost(self):
+        worker = mock.Mock(returncode=0)
+        worker.poll.return_value = 0
+        def deliver(**kwargs):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return json.dumps({'result': {'returncode': 0, 'execution_issue': None,
+                                           'cancel_signal': None, 'elapsed_seconds': .1}}), ''
+        worker.communicate.side_effect = deliver
+        old_handler = signal.getsignal(signal.SIGTERM)
+        with mock.patch.object(DRIVER.subprocess, 'Popen', return_value=worker):
+            result = DRIVER.run_process(['fake'], Path('/tmp'), Path('/tmp/unused'), timeout=1)
+        self.assertEqual(result['cancel_signal'], signal.SIGTERM)
+        self.assertIn('cancelled', result['execution_issue'])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), old_handler)
+
+    def test_signal_error_does_not_skip_other_owned_processes(self):
+        with mock.patch.object(DRIVER, '_open_pidfd', side_effect=[PermissionError('denied'), 123]) as opened, \
+             mock.patch.object(DRIVER, '_process_info', return_value=(1, 'start', 'S')), \
+             mock.patch.object(DRIVER, '_send_pidfd') as send, \
+             mock.patch.object(DRIVER.os, 'close'):
+            with self.assertRaisesRegex(OSError, 'could not signal'):
+                DRIVER._signal_tracked({10: 'start', 11: 'start'}, signal.SIGTERM)
+        self.assertEqual(opened.call_count, 2)
+        send.assert_called_once_with(123, signal.SIGTERM)
+
+    def test_timeout_reaps_descendant_that_created_a_new_session(self):
+        with tempfile.TemporaryDirectory(prefix='vivado-setsid-') as temp:
+            root = Path(temp)
+            pidfile = root / 'child.pid'
+            child = ('import os,signal,time; os.setsid(); '
+                     'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                     f'open({str(pidfile)!r},"w").write(str(os.getpid())); time.sleep(30)')
+            launcher = f'import subprocess,sys,time; subprocess.Popen([sys.executable,"-c",{child!r}]); time.sleep(30)'
+            result = DRIVER.run_process([sys.executable, '-c', launcher], root, root / 'log',
+                                        timeout=.6, grace_seconds=.1)
+            self.assertIn('timeout', result['execution_issue'])
+            self.assertTrue(pidfile.is_file(), 'detached child did not start')
+            self.assertIsNone(DRIVER._process_info(int(pidfile.read_text())))
+
+    def test_timeout_does_not_kill_or_reap_unrelated_child(self):
+        with tempfile.TemporaryDirectory(prefix='vivado-unrelated-') as temp:
+            root = Path(temp)
+            unrelated = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+            try:
+                result = DRIVER.run_process([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                            root, root / 'log', timeout=.2, grace_seconds=.1)
+                self.assertIn('timeout', result['execution_issue'])
+                self.assertIsNone(unrelated.poll())
+            finally:
+                if unrelated.poll() is None:
+                    unrelated.terminate()
+                unrelated.wait(timeout=3)
+
+    def test_adopted_zombie_is_reaped_before_launcher_exits(self):
+        with tempfile.TemporaryDirectory(prefix='vivado-orphan-') as temp:
+            root = Path(temp)
+            pidfile = root / 'orphan.pid'
+            # The launcher waits for its short-lived orphan to disappear from
+            # /proc, as vendor tools can. A zombie held until supervisor exit
+            # would deadlock this launcher.
+            intermediate = (
+                "import os,time; pid=os.fork(); "
+                f"open({str(pidfile)!r},'w').write(str(pid)) if pid else None; "
+                "time.sleep(.1) if pid == 0 else None; os._exit(0)"
+            )
+            launcher = f'''
+import os, subprocess, sys, time
+from pathlib import Path
+p = subprocess.Popen([sys.executable, '-c', {intermediate!r}])
+p.wait()
+f = Path({str(pidfile)!r})
+deadline = time.monotonic() + 5
+while not f.exists() and time.monotonic() < deadline: time.sleep(.01)
+if not f.exists(): sys.exit(41)
+pid = int(f.read_text())
+while Path('/proc', str(pid)).exists() and time.monotonic() < deadline: time.sleep(.01)
+sys.exit(42 if Path('/proc', str(pid)).exists() else 37)
+'''
+            unrelated = subprocess.Popen([sys.executable, '-c', 'import sys; sys.exit(29)'])
+            try:
+                result = DRIVER.run_process([sys.executable, '-c', launcher], root, root / 'log',
+                                            timeout=6, grace_seconds=.2)
+                self.assertEqual(result['returncode'], 37)
+                self.assertIsNone(result['execution_issue'])
+                self.assertEqual(unrelated.wait(timeout=3), 29)
+                self.assertFalse(Path('/proc', pidfile.read_text()).exists())
+            finally:
+                if unrelated.poll() is None:
+                    unrelated.kill()
+                    unrelated.wait(timeout=3)
+
+
+class VivadoPidfdCapabilityTest(unittest.TestCase):
+    def test_unknown_architecture_fails_closed_without_python_pidfd(self):
+        with mock.patch.object(DRIVER.platform, 'machine', return_value='unsupported-cpu'):
+            with self.assertRaisesRegex(OSError, 'pidfd is unavailable'):
+                DRIVER._pidfd_call(434, 1, 0)
 
 
 class VivadoFixedTclTest(unittest.TestCase):

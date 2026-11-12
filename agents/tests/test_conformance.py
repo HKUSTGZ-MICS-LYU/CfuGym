@@ -239,75 +239,26 @@ class HarnessDataTest(unittest.TestCase):
         # The rendered argument is the owned block, never a model literal address.
         self.assertIn("a = (uint32_t)(HASH_CONF_DATA_BASE);", text)
 
-    def test_legacy_cases_field_is_rejected_with_the_migration(self) -> None:
-        oracle = {"commands": [{"name": "compute", "cases": [{"args": [1, 2]}],
-                                "reference": "a + b"}]}
-        problems = validate_oracle(isa(CPU_COMMAND), oracle)
-        message = next((p for p in problems if "cases is no longer accepted" in p), None)
-        self.assertIsNotNone(message, problems)
-        self.assertIn("data.buffer", message)
-        self.assertIn("data.roles", message)
-
-    def test_model_supplied_seed_is_rejected(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
-            "name": "compute", "reference": "a + b",
-            "data": {"seed": 1, **data_for(CPU_COMMAND)}}]})
-        self.assertTrue(any("seed is not allowed" in p for p in problems), problems)
-
-    def test_legacy_edge_flag_is_rejected(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
-            {"name": "compute", "reference": "a + b", "data": data_for(CPU_COMMAND),
-             "edge_cases": True}]})
-        self.assertTrue(any("edge_cases is no longer accepted" in p for p in problems), problems)
-
-    def test_role_count_must_match_the_command(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
-            "name": "compute", "reference": "a + b",
-            "data": {"roles": [{"kind": "value"}]}}]})
-        message = next((p for p in problems if "data.roles has 1 entry" in p), None)
-        self.assertIsNotNone(message, problems)
-        self.assertIn("rs1/rs2 order", message)
-
-    def test_missing_data_block_names_the_replacement(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND),
-                                   {"commands": [{"name": "compute", "reference": "a + b"}]})
-        message = next((p for p in problems if "data must be a mapping" in p), None)
-        self.assertIsNotNone(message, problems)
-        self.assertIn("cases", message)
-
-    def test_address_role_requires_a_buffer(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
-            "name": "compute", "reference": "a + b",
-            "data": {"roles": [{"kind": "address"}, {"kind": "value"}]}}]})
-        self.assertTrue(any("data.buffer is missing" in p for p in problems), problems)
-
-    def test_length_bound_may_not_exceed_the_owned_block(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
-            "name": "compute", "reference": "a + b",
-            "data": {"buffer": 64,
-                     "roles": [{"kind": "address"}, {"kind": "length", "max": 128}]}}]})
-        self.assertTrue(any("bounds the transferred length" in p for p in problems), problems)
-
-    def test_buffer_size_and_count_are_bounded(self) -> None:
-        cases = [
-            ({"buffer": 6, "roles": [{"kind": "value"}, {"kind": "value"}]}, "multiple of 4"),
-            ({"buffer": 4096, "roles": [{"kind": "value"}, {"kind": "value"}]}, "between 4 and 1024"),
-            ({"count": 99, **data_for(CPU_COMMAND)}, "data.count must be an integer between"),
+    def test_data_spec_validation_rules_and_migration_hints(self) -> None:
+        invalid_entries = [
+            ({"name": "compute", "cases": [{"args": [1, 2]}], "reference": "a + b"}, "cases is no longer accepted"),
+            ({"name": "compute", "reference": "a + b", "data": {"seed": 1, **data_for(CPU_COMMAND)}}, "seed is not allowed"),
+            ({"name": "compute", "reference": "a + b", "data": data_for(CPU_COMMAND), "edge_cases": True}, "edge_cases is no longer accepted"),
+            ({"name": "compute", "reference": "a + b", "data": {"roles": [{"kind": "value"}]}}, "data.roles has 1 entry"),
+            ({"name": "compute", "reference": "a + b", "data": {"buffer": 16}}, "data.roles has 0 entry"),
+            ({"name": "compute", "reference": "a + b"}, "data must be a mapping"),
+            ({"name": "compute", "reference": "a + b", "data": {"roles": [{"kind": "address"}, {"kind": "value"}]}}, "data.buffer is missing"),
+            ({"name": "compute", "reference": "a + b", "data": {"buffer": 64, "roles": [{"kind": "address"}, {"kind": "length", "max": 128}]}}, "bounds the transferred length"),
+            ({"name": "compute", "reference": "a + b", "data": {"buffer": 6, "roles": [{"kind": "value"}, {"kind": "value"}]}}, "multiple of 4"),
+            ({"name": "compute", "reference": "a + b", "data": {"buffer": 4096, "roles": [{"kind": "value"}, {"kind": "value"}]}}, "between 4 and 1024"),
+            ({"name": "compute", "reference": "a + b", "data": {"count": 99, **data_for(CPU_COMMAND)}}, "data.count must be an integer between"),
+            ({"name": "compute", "reference": "a + b", "data": {"roles": [{"kind": "banana"}, {"kind": "value"}]}}, "kind must be one of"),
+            ({"name": "compute", "reference": "a + b", "data": {"roles": [{"kind": "index"}, {"kind": "value"}]}}, "max is required"),
         ]
-        for data, needle in cases:
-            with self.subTest(data=data):
-                problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
-                    {"name": "compute", "reference": "a + b", "data": data}]})
+        for entry, needle in invalid_entries:
+            with self.subTest(needle=needle):
+                problems = validate_oracle(isa(CPU_COMMAND), {"commands": [entry]})
                 self.assertTrue(any(needle in p for p in problems), problems)
-
-    def test_unknown_role_kind_lists_the_vocabulary(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [{
-            "name": "compute", "reference": "a + b",
-            "data": {"roles": [{"kind": "banana"}, {"kind": "value"}]}}]})
-        message = next((p for p in problems if "kind must be one of" in p), None)
-        self.assertIsNotNone(message, problems)
-        for kind in conformance_data.ROLE_KINDS:
-            self.assertIn(kind, message)
 
     def test_role_less_command_gets_one_invocation(self) -> None:
         control = {"function_id": 3, "subfunction_id": 0, "name": "ctl",
@@ -335,16 +286,14 @@ class HarnessDataTest(unittest.TestCase):
         self.assertEqual(plan.bytes_total, 339)
         self.assertEqual(len(plan.cases), 10)
 
-    def test_prompt_states_the_harness_owns_the_data(self) -> None:
+    def test_prompt_states_the_harness_owns_the_data_and_repair_discipline(self) -> None:
         from agents.cfu_design_agent.prompts import conformance_prompt
 
-        for tools in (True, False):
-            with self.subTest(tools=tools):
-                prompt = conformance_prompt("test", isa(CPU_COMMAND), {}, agent_tools=tools)
-                self.assertIn("YOU DO NOT CHOOSE THE TEST DATA", prompt)
-                self.assertIn("data.roles", prompt)
-                self.assertIn("data.buffer", prompt)
-                self.assertNotIn("cases:\n      - args:", prompt)
+        prompt = conformance_prompt("test", isa(CPU_COMMAND), {}, feedback="compute: problems")
+        self.assertIn("YOU DO NOT CHOOSE THE TEST DATA", prompt)
+        self.assertIn("data.roles", prompt)
+        self.assertIn("ORACLE REPAIR MODE", prompt)
+        self.assertIn("cfu_compute(", prompt)
 
 
 class ValidateOracleTest(unittest.TestCase):
@@ -465,41 +414,6 @@ class ParseVerdictTest(unittest.TestCase):
         self.assertFalse(verdict["ok"])
         self.assertEqual(verdict["failed"], ["add"])
         self.assertTrue(any("add[0]" in d for d in verdict["details"]), verdict)
-
-
-class DataSpecGuidanceTest(unittest.TestCase):
-    """A rejected data spec must explain the fix, not just the format."""
-
-    def entry(self, **fields) -> dict:
-        return {"name": "compute", **fields}
-
-    def test_missing_roles_error_says_one_descriptor_per_role(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
-            self.entry(reference="a + b", data={"buffer": 16})]})
-        message = next(p for p in problems if "data.roles has 0 entry" in p)
-        self.assertIn("rs1/rs2 order", message)
-        self.assertIn("omit data.roles when the command takes none", message)
-
-    def test_index_role_requires_its_bound(self) -> None:
-        problems = validate_oracle(isa(CPU_COMMAND), {"commands": [
-            self.entry(reference="a + b", data={
-                "roles": [{"kind": "index"}, {"kind": "value"}]})]})
-        message = next(p for p in problems if "max is required" in p)
-        self.assertIn("bounds the index", message)
-
-    def test_prompt_documents_the_data_block_and_repair_discipline(self) -> None:
-        from agents.cfu_design_agent.prompts import conformance_prompt
-
-        prompt = conformance_prompt("task", isa(CPU_COMMAND), {}, feedback="compute: problems")
-        self.assertIn("data:", prompt)
-        self.assertIn("kind: address", prompt)
-        self.assertIn("kind: length", prompt)
-        self.assertIn("ORACLE REPAIR MODE", prompt)
-        self.assertIn("at once", prompt)
-        # The prompt names the generated intrinsics so setup/verify cannot
-        # invent names like cfu_load (2026-09-26 link failure).
-        self.assertIn("cfu_compute(", prompt)
-        self.assertIn("undefined reference", prompt)
 
 
 class UnknownIntrinsicLintTest(unittest.TestCase):

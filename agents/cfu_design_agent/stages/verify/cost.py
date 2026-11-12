@@ -34,6 +34,14 @@ def _cost_wall_failure(state: CfuDesignState, wall: dict, errors: list[str]) -> 
 
 
 def estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesignState:
+    if ("implementation_design_type" in state and
+            state["implementation_design_type"] not in ("draft", "complete")):
+        raise ValueError("invalid implementation_design_type in cost state")
+    if state.get("implementation_design_type") == "draft":
+        return {"cost_results": [], "stage_jobs": "review",
+                **outcome.stage_result(state, rung="cost", ok=False, skipped=True,
+                                       reason="draft", next="review_and_route",
+                                       history="Draft cost estimation not executed.")}
     if state.get("cost_backend", "yosys") == "vivado":
         return _estimate_vivado(state, transition=transition)
     if state.get("skip_yosys", False) or state.get("skip_cost", False):

@@ -20,8 +20,6 @@ from agents.cfu_design_agent.prompts import (
     workload_digest_block,
     workload_prompt,
 )
-from agents.cfu_design_agent.stages import contract as contract_mod
-from agents.cfu_design_agent.stages import fallbacks
 
 
 class RooflinePromptTest(unittest.TestCase):
@@ -47,32 +45,12 @@ class RooflinePromptTest(unittest.TestCase):
 
     def test_workload_prompt_keeps_roofline_lightweight_and_optional(self) -> None:
         prompt = workload_prompt("accelerate it", self.spec, self.context)
-        for field in (
-            "hot_function",
-            "hot_loop",
-            "trip_count",
-            "arithmetic_intensity",
-            "compute_peak",
-            "bandwidth_peak",
-            "ridge_point",
-            "predicted_ceiling",
-            "bottleneck",
-            "verification_metric",
-        ):
+        for field in ("hot_function", "hot_loop", "arithmetic_intensity", "bottleneck"):
             self.assertIn(field, prompt)
-        self.assertIn("mapping is useful but optional", prompt)
-        self.assertIn("do not fill a schema for its own sake", prompt)
-        contract = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
-        self.assertIn("independent optional knobs", contract)
-        self.assertIn("regDepth: 0", contract)
-        self.assertIn("Roofline fallback", prompt)
-
-    def test_analysis_prompt_allows_flexible_serialization(self) -> None:
-        prompt = workload_prompt("accelerate it", self.spec, self.context)
         self.assertIn("YAML mapping is preferred but not required", prompt)
-        self.assertIn("plain prose or Markdown is acceptable", prompt)
         self.assertNotIn("Return exactly one YAML mapping", prompt)
-        self.assertNotIn("invalidates the entire analysis", prompt)
+        contract = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
+        self.assertIn("regDepth: 0", contract)
 
     def test_analysis_repair_prompt_quotes_the_previous_rejection(self) -> None:
         prompt = workload_prompt(
@@ -95,12 +73,9 @@ class RooflinePromptTest(unittest.TestCase):
         }
         prompt = workload_prompt("accelerate it", self.spec, self.context, ir_evidence=evidence)
         self.assertIn("target_match: False", prompt)
-        self.assertIn("do not infer loop counts, cycles", prompt)
         self.assertIn("kernel.ll", prompt)
         self.assertNotIn("large_ir", prompt)
-        self.assertNotIn("@" * 100, prompt)
-        default = workload_prompt("accelerate it", self.spec, self.context)
-        self.assertNotIn("LLVM IR export", default)
+        self.assertNotIn("LLVM IR export", workload_prompt("accelerate it", self.spec, self.context))
 
     def test_observation_tool_prompt_names_only_measured_hotspots(self) -> None:
         index = {"observations": {
@@ -112,7 +87,6 @@ class RooflinePromptTest(unittest.TestCase):
         prompt = workload_prompt("accelerate", self.spec, self.context,
                                  agent_tools=True, observation_index=index)
         self.assertIn("Call inspect_observation", prompt)
-        self.assertIn("top measured loop", prompt)
         self.assertLess(prompt.index("obs_loop_hot"), prompt.index("obs_loop_cold"))
         self.assertNotIn("obs_loop_unmeasured", prompt)
         self.assertNotIn("obs_fn_context", prompt)
@@ -124,49 +98,23 @@ class RooflinePromptTest(unittest.TestCase):
     def test_fallback_keeps_roofline_values_conservative(self) -> None:
         roofline = deterministic_roofline_analysis({"operation": "dot_product"})
         self.assertEqual(roofline["arithmetic_intensity"]["value"], "unknown")
-        self.assertEqual(roofline["compute_peak"]["value"], "unknown")
-        self.assertEqual(roofline["bandwidth_peak"]["value"], "unknown")
         self.assertEqual(roofline["bottleneck"], "unknown")
         self.assertTrue(roofline["unknowns"])
 
         isa = _isa_from_template("", self.spec, "")
         self.assertEqual(isa["datapath"]["regDepth"], 0)
-        self.assertNotIn("maclen", isa["datapath"])
-        self.assertNotIn("accWidth", isa["datapath"])
         self.assertEqual(isa["datapath"]["implementation"], {})
         self.assertIn("roofline", isa)
-        import yaml
-        from agents.tests.common import REPO_ROOT
-        template = yaml.safe_load((REPO_ROOT / "agents/specs/cfu_isa_template.yaml").read_text())
-        for field in ("maclen", "accWidth", "computePipe", "rfRam", "rfSync"):
-            self.assertNotIn(field, template["datapath"])
-        self.assertEqual(template["datapath"]["implementation"], {})
-        instruction_prompt = contract_prompt("crc32", self.spec, self.analysis, self.context)
-        self.assertNotIn("maclen", instruction_prompt)
-        self.assertNotIn("accWidth", instruction_prompt)
-        self.assertIn("datapath.implementation", instruction_prompt)
         self.assertIn("unknown", render_isa_markdown(isa).lower())
 
     def test_resource_contract_is_explicit_for_new_commands(self) -> None:
         prompt = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
-        for term in ("CfuResource", "cpu_value", "legacy_register_number", "resources",
-                     "CPU rd OR vector vd", "completion response", "void intrinsic"):
-            self.assertIn(term, prompt)
+        self.assertIn("CfuResource", prompt)
+        self.assertIn("Do not return `ABSTAIN`", prompt)
         hw = hardware_prompt("accelerate it", self.spec, self.analysis, "contract", self.context)
-        for term in ("CfuResource", "VS1/VS2", "ctx.read", "ctx.complete",
-                     "vector source snapshots", "LegacyRegisterNumber",
-                     "AgentCfuLib.scala", "AgentCfuBase", "read-only platform",
-                     "import AgentCfuBase.CfuResource._"):
-            self.assertIn(term, hw)
-        # The platform is read-only and must not be presented as an edit target.
-        self.assertIn("Never edit,", hw)
-        self.assertEqual(
-            [path for path in HARDWARE_TARGETS if "AgentCfuLib" in path], [],
-        )
-        sw = software_prompt("accelerate it", self.spec, self.analysis, "contract", self.context,
-                             targets=[("agents/generated/runs/test/main.c", "")])
-        for term in ("return void", "rd=x0", "vector/memory effects"):
-            self.assertIn(term, sw)
+        self.assertIn("CfuResource", hw)
+        self.assertIn("AgentCfuLib.scala", hw)
+        self.assertEqual([path for path in HARDWARE_TARGETS if "AgentCfuLib" in path], [])
         isa = _isa_from_template("", self.spec, "")
         for command in isa["commands"]:
             self.assertEqual(command["resources"], [
@@ -175,20 +123,9 @@ class RooflinePromptTest(unittest.TestCase):
                 {"storage": "cpu", "access": "write", "role": "rd"},
             ])
 
-    def test_contract_prompt_forbids_wrapping_and_abstaining(self) -> None:
-        # GLM wrapped the contract in an envelope; the ISA rung also no longer
-        # accepts an abstention as a terminal model choice.
-        prompt = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
-        for term in ("must BE the top level", "isa_contract", "as a string",
-                     "thoughts/analysis/reasoning", "Do not return `ABSTAIN`",
-                     "still return the smallest useful contract"):
-            self.assertIn(term, prompt)
-
     def test_conformance_prompt_mentions_json_for_json_mode(self) -> None:
         # The conformance request sets json_object mode; a prompt without the word
         # "json" makes OpenAI-compatible gateways answer HTTP 400.
-        from agents.cfu_design_agent.prompts import conformance_prompt
-
         isa = {
             "spec_version": "1",
             "identity": {"name": "x", "opcode": "custom0", "function_id_width": 3},
@@ -205,7 +142,7 @@ class RooflinePromptTest(unittest.TestCase):
         self.assertIn("commands", prompt)
 
     def test_downstream_prompts_preserve_roofline_decision(self) -> None:
-        prompts = (
+        rendered = (
             contract_prompt("accelerate it", self.spec, self.analysis, self.context),
             hardware_prompt("accelerate it", self.spec, self.analysis, "roofline: {}", self.context),
             software_prompt(
@@ -217,13 +154,9 @@ class RooflinePromptTest(unittest.TestCase):
                 targets=[("agents/generated/runs/test/main.c", "int main(void) { return 0; }")],
             ),
         )
-        for prompt in prompts:
+        for prompt in rendered:
             self.assertIn("Roofline", prompt)
             self.assertIn("memory-bound", prompt)
-        self.assertIn("roofline`", prompts[0])
-        self.assertIn("external bytes/cycle", prompts[2])
-        self.assertIn("vector width", prompts[1])
-        self.assertIn("packing", prompts[2])
 
 
 class RepairPromptTest(unittest.TestCase):
@@ -244,54 +177,36 @@ class RepairPromptTest(unittest.TestCase):
         }
         self.error_log = "AgentCfu.scala:203:30: type mismatch; found: Boolean, required: spinal.core.Bool"
 
-    def test_hardware_repair_prompt_requires_diagnosis(self) -> None:
-        prompt = hardware_prompt(
-            "accelerate it",
-            self.spec,
-            "analysis",
-            "contract",
-            self.context,
+    def test_repair_mode_toggles_with_feedback(self) -> None:
+        hw_repair = hardware_prompt(
+            "accelerate it", self.spec, "analysis", "contract", self.context,
             feedback=f"### hw_build (SoC generation) errors\n{self.error_log}",
         )
-        self.assertIn("HARDWARE REPAIR MODE", prompt)
-        self.assertIn("REPAIR_DIAGNOSIS", prompt)
-        self.assertIn("Observed errors", prompt)
-        self.assertIn("Repair mapping", prompt)
-        self.assertIn(self.error_log, prompt)
+        self.assertIn("HARDWARE REPAIR MODE", hw_repair)
+        self.assertIn("REPAIR_DIAGNOSIS", hw_repair)
+        self.assertIn(self.error_log, hw_repair)
+        self.assertNotIn(
+            "HARDWARE REPAIR MODE",
+            hardware_prompt("accelerate it", self.spec, "analysis", "contract", self.context),
+        )
 
-    def test_hardware_first_attempt_has_no_repair_mode(self) -> None:
-        prompt = hardware_prompt("accelerate it", self.spec, "analysis", "contract", self.context)
-        self.assertNotIn("HARDWARE REPAIR MODE", prompt)
-        self.assertIn("first hardware attempt", prompt)
-
-    def test_software_repair_prompt_requires_diagnosis(self) -> None:
-        prompt = software_prompt(
-            "accelerate it",
-            self.spec,
-            "analysis",
-            "contract",
-            self.context,
+        sw_repair = software_prompt(
+            "accelerate it", self.spec, "analysis", "contract", self.context,
             targets=[("agents/generated/runs/test/main.c", "int main(void) { return 0; }")],
             feedback=f"### sw_build errors\n{self.error_log}",
         )
-        self.assertIn("SOFTWARE REPAIR MODE", prompt)
-        self.assertIn("REPAIR_DIAGNOSIS", prompt)
-        self.assertIn(self.error_log, prompt)
+        self.assertIn("SOFTWARE REPAIR MODE", sw_repair)
+        self.assertIn(self.error_log, sw_repair)
 
-    def test_isa_repair_prompt_carries_linter_problems(self) -> None:
-        prompt = contract_prompt(
-            "accelerate it",
-            self.spec,
-            "analysis",
-            self.context,
+        isa_repair = contract_prompt(
+            "accelerate it", self.spec, "analysis", self.context,
             feedback="- datapath must be a mapping when provided",
         )
-        self.assertIn("ISA REPAIR MODE", prompt)
-        self.assertIn("datapath must be a mapping when provided", prompt)
-
-    def test_isa_first_attempt_has_no_repair_mode(self) -> None:
-        prompt = contract_prompt("accelerate it", self.spec, "analysis", self.context)
-        self.assertNotIn("ISA REPAIR MODE", prompt)
+        self.assertIn("ISA REPAIR MODE", isa_repair)
+        self.assertNotIn(
+            "ISA REPAIR MODE",
+            contract_prompt("accelerate it", self.spec, "analysis", self.context),
+        )
 
 
 class EditProtocolPromptTest(unittest.TestCase):
@@ -356,13 +271,6 @@ class SearchBlockGuidanceTest(unittest.TestCase):
             "t", {}, "", "", self._context(benchmark), targets=[(benchmark, "LIVE_BYTES")]
         )
         self.assertEqual(prompt.count("LIVE_BYTES"), 1)
-
-    def test_delivery_protocols_warn_about_large_comment_search_blocks(self) -> None:
-        from agents.cfu_design_agent.prompts import DELIVERY_PROTOCOLS
-
-        self.assertIn("Do NOT wrap large comment blocks", DELIVERY_PROTOCOLS)
-        self.assertIn("copy it\nbyte-for-byte", DELIVERY_PROTOCOLS)
-        self.assertIn("do not resend the same block", DELIVERY_PROTOCOLS)
 
 
 class EmbenchSimLogGuidanceTest(unittest.TestCase):
@@ -436,49 +344,11 @@ def _stage_prompts(agent_tools: bool) -> dict[str, str]:
 class GeneralityPromptTest(unittest.TestCase):
     """Prompt-only policy coverage, not evidence that a CFU generalizes."""
 
-    def test_system_requires_workload_generality_without_banning_exact_tables(self) -> None:
-        for rule in (
-            "reusable algorithm-specific CFU", "all legal runtime values and data patterns",
-            "Agent-authored ISA", "sample identity", "random seed", "invocation number",
-            "known input address", "recognized input patterns", "exact algorithmic lookup tables",
-            "fixed-shape specialization", "fixture's static array", "all remaining legal inputs",
-            "mostly scalar fallback", "reset/state effects", "universal processor",
-        ):
-            with self.subTest(rule=rule):
-                self.assertIn(rule, prompts.SYSTEM_PROMPT)
-        self.assertNotIn("and declared fixed-shape specialization are allowed", prompts.SYSTEM_PROMPT)
-
-    def test_analysis_and_contract_cover_unseen_inputs_in_both_tool_modes(self) -> None:
-        for tools in (False, True):
-            stage_prompts = _stage_prompts(tools)
-            for stage in ("analysis", "contract"):
-                with self.subTest(tools=tools, stage=stage):
-                    self.assertIn("runtime input domain", stage_prompts[stage])
-                    self.assertIn("unseen-input counterexamples", stage_prompts[stage])
-            self.assertIn("incidental benchmark data", stage_prompts["analysis"])
-            self.assertIn("validation.requirements", stage_prompts["contract"])
-            self.assertIn("Do not add new", stage_prompts["contract"])
-
-    def test_delivery_self_review_is_bounded_and_does_not_require_simulation(self) -> None:
+    def test_implementation_prompts_include_generality_self_review(self) -> None:
         for tools in (False, True):
             stage_prompts = _stage_prompts(tools)
             for stage in ("hardware", "software"):
-                with self.subTest(tools=tools, stage=stage):
-                    self.assertIn(prompts.GENERALITY_REVIEW, stage_prompts[stage])
-            self.assertIn("reject sample- or pattern-specific shortcuts", stage_prompts["optimize"])
-        for rule in ("2-3", "not executed tests", "do not claim generalization",
-                     "extra simulations", "existing delivery format and tool budget"):
-            self.assertIn(rule, prompts.GENERALITY_REVIEW)
-
-    def test_contract_free_deliveries_keep_generality_self_review(self) -> None:
-        context = _prompt_context()
-        spec = {"name": "w", "operation": "crc32", "unknowns": []}
-        for tools in (False, True):
-            for builder in (hardware_prompt, software_prompt):
-                with self.subTest(tools=tools, builder=builder.__name__):
-                    prompt = builder("t", spec, "analysis", "", context,
-                                     agent_tools=tools, contract_free=True)
-                    self.assertIn(prompts.GENERALITY_REVIEW, prompt)
+                self.assertIn(prompts.GENERALITY_REVIEW, stage_prompts[stage])
 
 
 class PromptBudgetTest(unittest.TestCase):

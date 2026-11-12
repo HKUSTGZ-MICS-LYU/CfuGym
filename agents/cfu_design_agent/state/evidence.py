@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 from .schemas import BenchmarkProject, ProfileResult, RepoContext, WorkloadSpec
 
 
@@ -40,6 +40,8 @@ class Evidence(TypedDict, total=False):
     software_plan: str
     hardware_patch: str
     software_patch: str
+    implementation_design_type: Literal["draft", "complete"]
+    implementation_unimplemented: list[str]
     implementation_hw_summary: str
     implementation_sw_summary: str
     changed_sw_files: list[str]

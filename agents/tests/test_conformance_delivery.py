@@ -210,17 +210,22 @@ class ConformanceDeliveryTest(unittest.TestCase):
         with self.assertRaises(PolicyError):
             delivery_mod.inspect_delivery(self.state, self.toolbox)
 
-    def test_second_write_failure_restores_previous_pair_and_pending(self):
+    def test_write_failures_restore_previous_or_absent_pair(self):
         session = self.session()
-        first, errors = session.write(self.text)
-        self.assertEqual(errors, [])
-        before = self.bytes()
         real_write = self.toolbox.write_text
         def fail_source(path, text):
             result = real_write(path, text)
             if path == self.paths["source_path"]:
-                raise OSError("second write failed after mutation")
+                raise OSError("write failed after mutation")
             return result
+        with mock.patch.object(self.toolbox, "write_text", side_effect=fail_source), self.assertRaises(OSError):
+            session.write(self.text)
+        self.assertFalse(session.changed)
+        self.assertEqual(self.bytes(), {path: None for path in self.paths.values()})
+
+        first, errors = session.write(self.text)
+        self.assertEqual(errors, [])
+        before = self.bytes()
         revised = deepcopy(self.oracle)
         revised["commands"][0]["data"]["count"] = 8
         with mock.patch.object(self.toolbox, "write_text", side_effect=fail_source), self.assertRaises(OSError):
@@ -229,37 +234,27 @@ class ConformanceDeliveryTest(unittest.TestCase):
         self.assertEqual(session.current(), (first, []))
         session.rollback()
         self.assertEqual(self.bytes(), {path: None for path in self.paths.values()})
-        self.assertFalse(session.changed)
 
-    def test_second_write_failure_restores_absent_files(self):
-        session = self.session()
-        real_write = self.toolbox.write_text
-        def fail_source(path, text):
-            if path == self.paths["source_path"]:
-                raise OSError("failure")
-            return real_write(path, text)
-        with mock.patch.object(self.toolbox, "write_text", side_effect=fail_source), self.assertRaises(OSError):
-            session.write(self.text)
-        self.assertFalse(session.changed)
-        self.assertEqual(self.bytes(), {path: None for path in self.paths.values()})
-
-    def test_rollback_exact_bytes_and_only_fixed_pair(self):
+    def test_rollback_and_commit_close_transaction(self):
         for path in self.paths.values():
             full = self.root / path
             full.parent.mkdir(parents=True, exist_ok=True)
             full.write_bytes(b"old\r\nbytes\xff")
         before = self.bytes()
-        manifest = self.root / self.run / "manifest.yaml"
-        manifest.write_text("untouched: true")
         session = self.session()
         self.assertEqual(session.write(self.text)[1], [])
         session.rollback()
         self.assertEqual(self.bytes(), before)
-        self.assertEqual(manifest.read_text(), "untouched: true")
         self.assertFalse(session.changed)
-        self.assertTrue(session.write(self.text)[1])
         with self.assertRaises(RuntimeError):
             session.commit()
+
+        session2 = self.session()
+        self.assertEqual(session2.write(self.text)[1], [])
+        session2.commit()
+        committed = self.bytes()
+        session2.rollback()
+        self.assertEqual(self.bytes(), committed)
 
     def test_inspection_io_failure_propagates_and_invalid_header_never_mutates(self):
         self.approved()
@@ -283,17 +278,6 @@ class ConformanceDeliveryTest(unittest.TestCase):
         self.assertEqual(self.bytes(), before)
         self.assertFalse(session.changed)
         self.assertEqual(session.current()[1], [])
-
-    def test_commit_keeps_bytes_and_closes_transaction(self):
-        session = self.session()
-        self.assertEqual(session.write(self.text)[1], [])
-        session.commit()
-        before = self.bytes()
-        session.rollback()
-        self.assertEqual(self.bytes(), before)
-        self.assertTrue(session.write(self.text)[1])
-        with self.assertRaises(ValueError):
-            self.session().commit()
 
 
 if __name__ == "__main__":

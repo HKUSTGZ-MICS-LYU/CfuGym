@@ -127,6 +127,55 @@ def _update_ok(update: Any, name: str) -> bool:
     return _node_ok(update, name) and added <= 0
 
 
+def _delivery_guard(state: dict, name: str) -> bool:
+    from ..runtime import stage_services
+
+    if name not in {"generate_soc", "build_sw"} or stage_services._profile_reason(state):
+        return False
+    gates = state.get("gates") or {}
+    if name == "generate_soc":
+        impl = gates.get("implementation_hw") or {}
+        return bool(impl) and not impl.get("ok", False)
+    return not (gates.get("implementation_sw") or {}).get("ok", False)
+
+
+def _verification_display_status(state: dict, update: Any, name: str) -> str | None:
+    """Explain a build guard without calling an unexecuted verification a failure.
+
+    This is presentation only: gate verdicts, routing, and summary counts retain
+    their existing meaning. Only the two build nodes expose enough evidence here
+    to distinguish their pre-command guards from executed checks.
+    """
+    effective = _node_update(update)
+    if not isinstance(effective, dict):
+        return None
+    if state.get("implementation_design_type") == "draft" and name in {"simulate", "validate_candidate"}:
+        sim = (effective.get("gates") or {}).get("sim") or {}
+        if sim.get("ok") and not sim.get("skipped"):
+            return "DRAFT SIM PASS (no synthesis; implementation incomplete)"
+    rung = {"generate_soc": "hw_build", "build_sw": "sw_build"}.get(name)
+    if not rung or _update_ok(update, name):
+        return None
+    gate = (effective.get("gates") or {}).get(rung) or {}
+    if gate.get("skipped") or "validation_results" not in effective:
+        return None
+    results = effective.get("validation_results") or []
+    if any(item.get("kind") != "host_gate_check" for item in results):
+        return None
+    impl = (state.get("gates") or {}).get(
+        "implementation_hw" if name == "generate_soc" else "implementation_sw"
+    ) or {}
+    if (name == "generate_soc" and impl and not impl.get("ok", False)) or (
+        name == "build_sw" and not impl.get("ok", False)
+    ):
+        detail = "NOT RUN (implementation delivery not applied)"
+        if (name == "generate_soc" and "verify_submissions" in effective
+                and effective["verify_submissions"] == (state.get("verify_submissions", 0) or 0)):
+            detail += "; no verification submission consumed"
+        return detail
+    return "REJECTED (before verification command)"
+
+
 def _audit_context(state):
     """Run-scoped request audit for every model call inside this node.
 
@@ -243,7 +292,8 @@ def _wrap_node(fn):
             return invoke()
         prior_total = _PROGRESS._running_total()
         start = time.monotonic()
-        _PROGRESS.begin(name)
+        delivery_guard = _delivery_guard(state, name)
+        _PROGRESS.begin(name, delivery_guard=delivery_guard)
         try:
             update = invoke()
         except Exception:
@@ -253,6 +303,7 @@ def _wrap_node(fn):
                 ok=False,
                 elapsed=time.monotonic() - start,
                 tokens=_PROGRESS._running_total() - prior_total,
+                delivery_guard=delivery_guard,
             )
             raise
         _LIVE_LINE.clear()
@@ -261,6 +312,8 @@ def _wrap_node(fn):
             ok=_update_ok(update, name),
             elapsed=time.monotonic() - start,
             tokens=_PROGRESS._running_total() - prior_total,
+            display_status=_verification_display_status(state, update, name),
+            delivery_guard=delivery_guard,
         )
         return update
 

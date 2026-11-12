@@ -239,6 +239,105 @@ class StageProgressTest(unittest.TestCase):
         self.assertIn("check conformance", STAGE_LABELS.values())
 
 
+class VerificationDisplayTest(unittest.TestCase):
+    def test_build_guard_display_and_summary(self) -> None:
+        cases = [
+            ("generate_soc", {"implementation_hw": {"ok": False}}, [],
+             "NOT RUN (implementation delivery not applied)"),
+            ("build_sw", {"implementation_sw": {"ok": False}}, [],
+             "NOT RUN (implementation delivery not applied)"),
+            ("generate_soc", {"implementation_hw": {"ok": True}},
+             [{"kind": "host_gate_check"}], "REJECTED (before verification command)"),
+            ("generate_soc", {"implementation_hw": {"ok": True}},
+             [{"returncode": 1}], None),
+        ]
+        for name, gates, results, expected in cases:
+            with self.subTest(name=name, expected=expected):
+                rung = "hw_build" if name == "generate_soc" else "sw_build"
+                state = {"gates": gates, "verify_submissions": 3}
+                update = {"gates": {rung: {"ok": False, "skipped": False}},
+                          "validation_results": results, "errors": ["failed"]}
+                status = instrument._verification_display_status(state, update, name)
+                self.assertEqual(status, expected)
+                progress = StageProgress(StageProgressTest.ORDER)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    progress.end(name, ok=False, elapsed=0, tokens=0, display_status=status)
+                self.assertIn(expected or "FAIL", out.getvalue())
+                self.assertEqual(progress.summary()["stages_failed"], 1)
+                self.assertEqual(state["verify_submissions"], 3)
+
+    def test_wrapped_build_prints_guard_without_changing_update(self) -> None:
+        state = {"gates": {"implementation_hw": {"ok": False}}, "verify_submissions": 2,
+                 "run_commands": True}
+        update = {"gates": {"hw_build": {"ok": False, "skipped": False, "next": "implement"}},
+                  "validation_results": [], "errors": ["no delivery"], "verify_submissions": 2}
+
+        def generate_soc(_state):
+            return update
+
+        reporter = StageProgress(StageProgressTest.ORDER)
+        out = io.StringIO()
+        with (mock.patch.object(instrument, "_PROGRESS", reporter),
+              mock.patch.object(instrument.dependencies, "input_fingerprints", return_value={}),
+              mock.patch.object(instrument, "_with_flow_memory", side_effect=lambda state, update, *a, **kw: update),
+              contextlib.redirect_stdout(out)):
+            result = instrument._wrap_node(generate_soc)(state)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(line.startswith("[DELIVERY]") for line in lines))
+        self.assertIn("verification not started", lines[0])
+        self.assertIn("NOT RUN (implementation delivery not applied)", lines[1])
+        self.assertIn("no verification submission consumed", lines[1])
+        self.assertNotIn("[VERIFY", out.getvalue())
+        self.assertFalse(result["gates"]["hw_build"]["ok"])
+        self.assertEqual(result["gates"]["hw_build"]["next"], "implement")
+        self.assertEqual(result["verify_submissions"], 2)
+        self.assertEqual(reporter.summary()["stages_failed"], 1)
+
+    def test_wrapped_software_guard_never_claims_unspent_submission(self) -> None:
+        state = {"gates": {"implementation_sw": {"ok": False}},
+                 "verify_submissions": 2, "run_commands": True}
+        update = {"gates": {"sw_build": {"ok": False, "skipped": False}},
+                  "validation_results": [], "errors": ["no delivery"]}
+
+        def build_sw(_state):
+            return update
+
+        out = io.StringIO()
+        with (mock.patch.object(instrument, "_PROGRESS", StageProgress(StageProgressTest.ORDER)),
+              mock.patch.object(instrument.dependencies, "input_fingerprints", return_value={}),
+              mock.patch.object(instrument, "_with_flow_memory", side_effect=lambda state, update, *a, **kw: update),
+              contextlib.redirect_stdout(out)):
+            instrument._wrap_node(build_sw)(state)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(line.startswith("[DELIVERY]") for line in lines))
+        self.assertIn("NOT RUN", lines[1])
+        self.assertNotIn("submission consumed", out.getvalue())
+        self.assertNotIn("[VERIFY", out.getvalue())
+
+    def test_draft_simulation_display_preserves_actual_verdict(self) -> None:
+        state = {"implementation_design_type": "draft"}
+        for name in ("simulate", "validate_candidate"):
+            passed = {"gates": {"sim": {"ok": True, "skipped": False}},
+                      "errors": ["draft implementation incomplete"]}
+            self.assertEqual(instrument._verification_display_status(state, passed, name),
+                             "DRAFT SIM PASS (no synthesis; implementation incomplete)")
+            for sim in ({"ok": False}, {"ok": False, "skipped": True}):
+                self.assertIsNone(instrument._verification_display_status(
+                    state, {"gates": {"sim": sim}}, name))
+        self.assertIsNone(instrument._verification_display_status(
+            {"implementation_design_type": "complete"}, passed, "validate_candidate"))
+
+    def test_skip_and_non_build_failures_are_not_reclassified(self) -> None:
+        update = {"gates": {"hw_build": {"ok": False, "skipped": True}},
+                  "validation_results": []}
+        self.assertIsNone(instrument._verification_display_status({}, update, "generate_soc"))
+        self.assertIsNone(instrument._verification_display_status({}, update, "simulate"))
+        self.assertIsNone(instrument._verification_display_status({}, {"errors": ["x"]}, "generate_soc"))
+
+
 class UpdateOkTest(unittest.TestCase):
     def test_conformance_failure_is_fail_even_with_prior_errors(self) -> None:
         # Regression: added_errors subtracted the state's prior error total, so

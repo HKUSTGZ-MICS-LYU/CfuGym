@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import io
+from dataclasses import replace
 from contextlib import redirect_stdout
 from agents.cfu_design_agent import cli
 from pathlib import Path
@@ -11,21 +12,11 @@ import unittest
 from unittest import mock
 
 from agents.cfu_design_agent.runtime import commands, dependencies, effects, ppa, processes, rtl_snapshot, stage_services, validation_parallel, vivado
+from agents.cfu_design_agent.runtime.policy import PolicyError, load_policy
 from agents.cfu_design_agent.stages.verify import cost
 from agents.cfu_design_agent.flow import ladder
 from contextlib import ExitStack
 from agents.cfu_design_agent.flow import optimize
-
-
-class _Artifacts:
-    def __init__(self, root, run):
-        self.root, self.run = root, run
-
-    def write_text(self, stage, relative, text, **kwargs):
-        path = self.root / self.run / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
-        return {"path": str(path)}
 
 
 class FpgaInputsTest(unittest.TestCase):
@@ -53,26 +44,75 @@ class FpgaInputsTest(unittest.TestCase):
             for key in ("hw_build", "sim", "cost"):
                 self.assertNotEqual(before[key], after[key])
 
+    def _snapshot_state(self, root):
+        run = "agents/generated/runs/fpga-input-test"
+        source = root / run / "workspace/soc"
+        source.mkdir(parents=True)
+        (source / "MiCoSoc.v").write_text('module MiCoSoc; initial $readmemb("ram.bin", mem); endmodule')
+        (source / "ram.bin").write_bytes(b"01\n10\n")
+        policy_path = root / "agents/specs/agent_access_policy.yaml"
+        policy_path.parent.mkdir(parents=True)
+        policy_path.write_bytes((Path(__file__).resolve().parents[2] /
+                                 "agents/specs/agent_access_policy.yaml").read_bytes())
+        return {"workdir": str(root), "run_id": "fpga-input-test", "run_root": run,
+                "target_frequency_mhz": 100.0}
+
     def test_snapshot_freezes_complete_fileset_and_detects_tampering(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            run = "agents/generated/runs/fpga-input-test"
-            source = root / run / "workspace/soc"
-            source.mkdir(parents=True)
-            (source / "MiCoSoc.v").write_text('module MiCoSoc; initial $readmemb("ram.bin", mem); endmodule')
-            (source / "ram.bin").write_text("01\n10\n")
-            state = {"workdir": directory, "run_root": run, "target_frequency_mhz": 100.0}
-            with mock.patch.object(stage_services, "_policy", return_value=mock.Mock()), mock.patch.object(
-                stage_services, "_artifacts_for_stage", return_value=_Artifacts(root, run)):
-                snapshot = rtl_snapshot.freeze(state)
+            state = self._snapshot_state(root)
+            source = root / state["run_root"] / "workspace/soc"
+            policy = load_policy(root)
+            snapshot = rtl_snapshot.freeze(state)
             state["rtl_snapshot"] = snapshot
             self.assertEqual(len(snapshot["files"]), 2)
+            self.assertEqual((root / snapshot["root"] / "ram.bin").read_bytes(), b"01\n10\n")
+            self.assertEqual(rtl_snapshot.freeze(state), snapshot)
             rtl_snapshot.validate(state)
+            # Only the Host's freezer may copy the ROM; model-facing policy stays intact.
+            for path in (f'{state["run_root"]}/workspace/soc/ram.bin',
+                         f'{snapshot["root"]}/ram.bin'):
+                with self.subTest(path=path):
+                    self.assertFalse(policy.can_read(path))
+                    for stage in ("implementation", "validation", "cost"):
+                        with self.assertRaises(PolicyError):
+                            policy.check_write(stage, path)
             (source / "MiCoSoc.v").write_text("later candidate")
             self.assertIn("module MiCoSoc", (root / snapshot["root"] / "MiCoSoc.v").read_text())
             (root / snapshot["root"] / "ram.bin").write_text("tampered")
             with self.assertRaisesRegex(ValueError, "hash mismatch"):
                 rtl_snapshot.validate(state)
+
+    def test_rom_copy_still_enforces_other_denies_and_write_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = self._snapshot_state(root)
+            policy = load_policy(root)
+            for restricted in (
+                replace(policy, deny=(*policy.deny, "**/ram.bin")),
+                replace(policy, stages={**policy.stages, "validation":
+                                        replace(policy.stages["validation"], write=())}),
+                replace(policy, write_roots=("sw/tests",)),
+            ):
+                with self.subTest(policy=restricted), \
+                        mock.patch.object(stage_services, "_policy", return_value=restricted), \
+                        self.assertRaises(PolicyError):
+                    rtl_snapshot.freeze(state)
+
+    def test_snapshot_destination_cannot_escape_through_a_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = self._snapshot_state(root)
+            digest = "a" * 64
+            snapshot_root = root / state["run_root"] / "10_validation/rtl_snapshots" / digest
+            snapshot_root.mkdir(parents=True)
+            outside = root / "outside-snapshot"
+            outside.mkdir()
+            (snapshot_root / "rtl").symlink_to(outside, target_is_directory=True)
+            with mock.patch.object(rtl_snapshot, "_digest", return_value=digest), \
+                    self.assertRaisesRegex(ValueError, "escapes snapshot root"):
+                rtl_snapshot.freeze(state)
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_missing_memory_reference_refuses_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

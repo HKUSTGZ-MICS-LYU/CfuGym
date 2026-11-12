@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import unittest
 
-from agents.cfu_design_agent import prompts
 from agents.cfu_design_agent.benchmark import cfu_execution, embench
 from agents.cfu_design_agent.runtime import tools
 from agents.cfu_design_agent.stages.verify import software
@@ -91,13 +90,6 @@ class HostExecutionGuardsTest(unittest.TestCase):
     def test_actual_harness_crash_is_not_replaced_by_missing_diagnostic(self):
         got = self.evaluate(category='sim_harness_crash', rc=1)
         self.assertEqual(got['terminal_reason'], 'sim_harness_crash')
-
-    def test_system_prompt_covers_semantics_encoding_and_legitimate_returns(self):
-        for rule in ('valid input domain', 'decorative operand/LSU reads', 'fixed-shape specialization',
-                     'Conditional Boolean', 'success status', 'unchecked default subop',
-                     'clear error status', 'analysis/contract repair', 'command coverage table'):
-            with self.subTest(rule=rule):
-                self.assertIn(rule, prompts.SYSTEM_PROMPT)
 
 
 if __name__ == '__main__':

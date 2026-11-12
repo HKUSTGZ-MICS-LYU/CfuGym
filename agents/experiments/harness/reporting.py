@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agents.experiments.harness import layers, metrics
+from agents.experiments.harness import history, layers, metrics, parsing
 from agents.cfu_design_agent.runtime import provenance
 
 RUNS_COLUMNS = [
@@ -17,18 +17,18 @@ RUNS_COLUMNS = [
     "conformance_mode_observed", "conformance_promote_observed", "max_conformance_runs_observed",
     "repeat", "max_iters", "verify_submissions", "max_verify_submissions",
     "answer_repairs_used", "max_answer_repairs", "preverify_repairs_used", "max_preverify_repairs",
-    "status", "exit_code", "stopped_at",
+    "status", "framework_status", "implementation_design_type", "implementation_design_type_source", "exit_code", "stopped_at",
     "failure_class", "failure_rung", "failure_detail",
     "repairs_used", "attempt_index", "pass_at_1", "pass_at_3", "pass_at_5",
     "sim_ok", "sim_attempts", "verify_failures", "reference_cycles", "cfu_cycles", "speedup_x100",
     "sim_terminal_reason", "correctness_ok", "timing_ok", "performance_valid", "observed_speedup_x100",
     "measurement_protocol", "measurement", "benchmark_integrity", "measurement_notice",
-    "speedup_ratio_x", "cost_backend", "cost_status", "resource_valid", "resource_status",
+    "speedup_ratio_x", "display_speedup_x100", "display_speedup_source", "cost_backend", "cost_status", "resource_valid", "resource_status",
     "resource_part", "resource_phase", "resource_provenance", "resource_warning",
     *metrics.RESOURCE_FIELDS,
     "yosys_cells", "yosys_wire_bits",
     "token_calls", "token_in", "token_out", "token_total", "token_cached_in",
-    "token_usage_source", "token_usage_complete", "token_usage_warnings", "current_performance", "last_observed_valid_performance",
+    "token_usage_source", "token_usage_complete", "token_usage_warnings", "current_performance", "last_observed_valid_performance", "historical_best_performance",
     "wall_seconds", "profile_cache_status", "visibility", "infra_retries",
     "parse_warnings", "run_dir", "framework_run_dir", "report_path",
     "started_at", "finished_at",
@@ -38,6 +38,7 @@ FAILURES_COLUMNS = [
     "exp_id", "run_name", "model", "benchmark", "layer", "repeat", "kind", "attempt",
     "failure_class", "failure_rung", "trigger_rung", "repair_target",
     "decision_source", "budget_exhausted", "detail", "evidence",
+    "historical_best_speedup_x100", "historical_best_protocol", "historical_best_evidence",
 ]
 
 PASS_AT_K_COLUMNS = [
@@ -71,6 +72,41 @@ def load_records(exp_dir: Path) -> list[dict]:
             continue
         if isinstance(data, dict) and data.get("terminal"):
             data.setdefault("layer", "full")
+            # Re-aggregating an older archive must not resurrect a draft as a
+            # success. Prefer its archived sim gate; disk evidence is used only
+            # when the framework artifacts were not already marked stale.
+            if "implementation_design_type" not in data:
+                gates = data.get("gates") or {}
+                upstream = data.get("status") in {"failed", "blocked", "needs_iteration"} and data.get("stopped_at") not in {"", None, "sim", "cost", "review", "final_report"}
+                sources = []
+                if upstream:
+                    for name in ("implementation_sw", "implementation_hw"):
+                        gate = gates.get(name) or {}
+                        if isinstance(gate, dict) and gate.get("ok") is True and "design_type" in gate:
+                            sources.append((name, {"implementation_design_type": gate["design_type"]}))
+                else:
+                    sources.append(("sim_gate", gates.get("sim") or {}))
+                fw = data.get("framework_run_dir")
+                if fw and not data.get("stale_framework_artifacts"):
+                    root = Path(fw)
+                    for name in (("run.yaml",) if upstream else ("10_validation/sim.yaml", "10_validation/embench.yaml", "run.yaml")):
+                        path = root / name
+                        try:
+                            start = datetime.fromisoformat(str(data.get("started_at") or "").replace("Z", "+00:00"))
+                            finish = datetime.fromisoformat(str(data.get("finished_at") or "").replace("Z", "+00:00"))
+                            if start.tzinfo is None or finish.tzinfo is None or not start.timestamp() <= path.stat().st_mtime <= finish.timestamp():
+                                continue
+                        except (ValueError, OverflowError, OSError):
+                            continue
+                        sources.append((name, parsing.load_yaml(path, [], name)))
+                for source_name, source in sources:
+                    if isinstance(source, dict) and "implementation_design_type" in source:
+                        data["implementation_design_type"] = source["implementation_design_type"]
+                        data["implementation_design_type_source"] = source_name
+                        break
+            if data.get("status") == "complete" and not metrics.successful(data):
+                data["framework_status"] = "complete"
+                data["status"] = "draft" if data.get("implementation_design_type") == "draft" else "invalid_implementation_design_type"
             data["measurement_protocol"] = str(data.get("measurement_protocol") or "legacy")
             # Old archive C/T/P=true describes an observed simulation, not a
             # final candidate that later failed its implementation/build rung.
@@ -86,6 +122,9 @@ def load_records(exp_dir: Path) -> list[dict]:
                 data["performance_valid"] = False
                 for field in ("speedup_x100", "reference_cycles", "cfu_cycles", "correctness_ok", "timing_ok"):
                     data[field] = None
+            # Re-evaluate old archives from their immutable evidence, read-only.
+            fw = data.get("framework_run_dir")
+            data["historical_best_performance"] = history.best_speedup(data, Path(fw)) if fw else {}
             records.append(data)
     records.sort(key=lambda r: (str(r.get("model_config")), str(r.get("benchmark")),
                                 layers._layer_order(r.get("layer")), int(r.get("repeat") or 0)))
@@ -99,8 +138,29 @@ def write_runs_csv(records: list[dict], path: Path) -> None:
         for record in records:
             row = {key: metrics._fmt(record.get(key)) for key in RUNS_COLUMNS}
             row["measurement_protocol"] = str(record.get("measurement_protocol") or "legacy")
+            if record.get("status") == "complete" and not metrics.successful(record):
+                row["framework_status"] = "complete"
+                row["status"] = "draft" if record.get("implementation_design_type") == "draft" else "invalid_implementation_design_type"
+            for k in metrics.PASS_AT_K:
+                row[f"pass_at_{k}"] = metrics._fmt(metrics._pass_flag(record, k))
             row["speedup_ratio_x"] = metrics._fmt(metrics.speedup_ratio(record))
-            for key in ("measurement", "benchmark_integrity", "current_performance", "last_observed_valid_performance", "resource_provenance"):
+            best = record.get("historical_best_performance") or {} if history.is_floor_failure(record) else {}
+            current = record.get("current_performance") or {}
+            valid = (("implementation_design_type" not in record or record["implementation_design_type"] in ("complete", "legacy"))
+                     and record.get("performance_valid") is True and current.get("performance_valid") is True
+                     and current.get("candidate_matches") is True
+                     and current.get("speedup_x100") == record.get("speedup_x100")
+                     and record.get("speedup_x100") is not None)
+            row["display_speedup_x100"] = metrics._fmt(best["speedup_x100"] if best else record.get("speedup_x100") if valid else None)
+            row["display_speedup_source"] = "historical_best_candidate" if best else "current_candidate" if valid else "unavailable"
+            if "implementation_design_type" in record and record["implementation_design_type"] not in ("complete", "legacy"):
+                row["observed_speedup_x100"] = metrics._fmt(record.get("observed_speedup_x100", record.get("speedup_x100")))
+                row["speedup_x100"] = ""
+                row["performance_valid"] = "False"
+                if not best and row["observed_speedup_x100"]:
+                    row["display_speedup_x100"] = row["observed_speedup_x100"]
+                    row["display_speedup_source"] = "draft_diagnostic" if record["implementation_design_type"] == "draft" else "invalid_type_diagnostic"
+            for key in ("measurement", "benchmark_integrity", "current_performance", "last_observed_valid_performance", "historical_best_performance", "resource_provenance"):
                 if isinstance(record.get(key), dict):
                     row[key] = json.dumps(record[key], sort_keys=True)
             writer.writerow(row)
@@ -123,6 +183,9 @@ def write_failures_csv(records: list[dict], path: Path) -> None:
                 "budget_exhausted": failure.get("budget_exhausted"),
                 "detail": failure.get("failure_detail"),
                 "evidence": (record.get("evidence") or {}).get("report", ""),
+                "historical_best_speedup_x100": (record.get("historical_best_performance") or {}).get("speedup_x100"),
+                "historical_best_protocol": (record.get("historical_best_performance") or {}).get("measurement_protocol"),
+                "historical_best_evidence": json.dumps((record.get("historical_best_performance") or {}).get("evidence") or {}, sort_keys=True),
             })
         for episode in record.get("episodes") or []:
             rows.append({
@@ -279,6 +342,24 @@ def write_summary_md(exp_dir: Path, meta: dict, records: list[dict], cells: list
     for layer, model, benchmark, m in cells:
         lines.append(f"| {model} | {benchmark} | {layer} | "
                      f"{m.get('measurement_protocols') or '—'} | {m.get('speedup_warning') or '—'} |")
+    lines.append("")
+
+    lines.extend(["## Speedup-floor failures: historical best", "",
+                  "Historical candidate measurements only, not final-candidate measurements or successful runs. "
+                  "Blank means no provably eligible history; see runs.csv for candidate provenance and snapshot hash.",
+                  "", "| run | model | benchmark | final candidate (ratio×) | historical best (ratio×) | protocol | evidence snapshot |",
+                  "| --- | --- | --- | --- | --- | --- | --- |"])
+    for record in records:
+        if not history.is_floor_failure(record):
+            continue
+        best = record.get("historical_best_performance") or {}
+        value = best.get("speedup_x100")
+        snapshot = (best.get("evidence") or {}).get("snapshot", "")
+        final = record.get("speedup_x100")
+        lines.append(f"| {record.get('run_name', '')} | {record.get('model_config', '')} | "
+                     f"{record.get('benchmark', '')} | {metrics._fmt(final / 100) if isinstance(final, (int, float)) else '—'} | "
+                     f"{metrics._fmt(value / 100) if value is not None else '—'} | "
+                     f"{best.get('measurement_protocol', '')} | {snapshot} |")
     lines.append("")
 
     lines.append("## Cost of successful runs")

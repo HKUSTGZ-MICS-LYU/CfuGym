@@ -71,8 +71,9 @@ class LlmConfigTest(unittest.TestCase):
         for invalid in (True, "64000", 0, -1):
             with self.subTest(invalid=invalid), self.assertRaises(LlmConfigError):
                 resolve_config("bad", {"context_window_tokens": invalid})
+        self.assertNotIn("output_reserve_tokens", resolve_config("small", {"context_window_tokens": 4096}))
         with self.assertRaises(LlmConfigError):
-            resolve_config("bad", {"context_window_tokens": 4096})
+            resolve_config("bad", {"context_window_tokens": 4096, "output_reserve_tokens": 4096})
 
     def test_output_reserve_env_overrides_the_config_file(self) -> None:
         """A reasoning model's completion budget is configurable without editing JSON.

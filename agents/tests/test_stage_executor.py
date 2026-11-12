@@ -10,7 +10,7 @@ from unittest import mock
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agents.cfu_design_agent import graph
-from agents.cfu_design_agent.runtime import llm_step
+from agents.cfu_design_agent.runtime import context_budget, failures, llm, llm_step, processes
 from agents.cfu_design_agent.runtime.llm import (
     DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     DEFAULT_MAX_TOOL_ROUNDS, LlmResult,
@@ -207,6 +207,7 @@ class StageExecutorTest(unittest.TestCase):
         executor.execute({}, object(), self._request(tools_enabled=True), client=client)
         self.assertEqual(client.kwargs["max_rounds"], DEFAULT_MAX_TOOL_ROUNDS)
         self.assertEqual(client.kwargs["max_total_calls"], DEFAULT_MAX_TOOL_CALLS)
+        self.assertEqual(client.kwargs["max_tool_retries"], 10)
 
     def test_tool_exception_audits_failure_and_returns_empty_transcript(self) -> None:
         client = _ToolClient(error=RuntimeError("unsupported"))
@@ -241,6 +242,53 @@ class StageExecutorTest(unittest.TestCase):
                 client=_ToolClient(LlmResult("done", used_llm=True)),
             )
         self.assertTrue(_Toolset.latest.session.rolled_back)
+
+    def test_implement_structured_submit_retries_before_companion_effects(self) -> None:
+        class SchemaClient(_RoundClient):
+            def _chat_round(self, sdk, messages, *, allow_tools, tools, response_format):
+                self.schemas = tools
+                return super()._chat_round(sdk, messages, allow_tools=allow_tools,
+                                           tools=tools, response_format=response_format)
+
+        client = SchemaClient([
+            ("", [("submit_stage", {"delivery": "done", "design_type": "draft", "unimplemented": []}),
+                  ("read_file", {"path": "must-not-run"})]),
+            ("", [("submit_stage", {"delivery": "done", "design_type": "complete", "unimplemented": ["unfinished"]}),
+                  ("read_file", {"path": "must-not-run"})]),
+            ("", [("submit_stage", {"delivery": "done", "design_type": "complete", "unknown": True}),
+                  ("read_file", {"path": "must-not-run"})]),
+            ("", [("submit_stage", {"delivery": "done", "design_type": "draft", "unimplemented": ["finish ALU"]})]),
+        ])
+        executor, calls = self._executor()
+        gate = mock.Mock(return_value=True)
+        output = executor.execute({}, object(), self._request(stage="implement", tools_enabled=True,
+                                  native_tool_loop=True, submit_stage=gate), client=client)
+        self.assertEqual(output.result.accepted_submit,
+                         {"delivery": "done", "design_type": "draft", "unimplemented": ["finish ALU"]})
+        self.assertEqual(gate.call_count, 1)
+        self.assertEqual(len([e for e in calls["live"] if e["name"] == "read_file"
+                              and e["result"].startswith("skipped:")]), 3)
+        params = client.schemas[-1]["function"]["parameters"]
+        self.assertIn("design_type", params["required"])
+        self.assertNotIn("unimplemented", params["required"])
+        converted = llm._responses_tools(client.schemas)
+        submit_schema = next(tool for tool in converted if tool["name"] == "submit_stage")
+        self.assertEqual(submit_schema["parameters"], params)
+
+    def test_implement_submit_parameter_validation(self) -> None:
+        from agents.cfu_design_agent.runtime.stage_executor import implementation_submit_error
+        for args in ({}, {"design_type": "bogus"}, {"design_type": "draft"},
+                     {"design_type": "draft", "unimplemented": [""]},
+                     {"design_type": "complete", "unimplemented": "none"},
+                     {"design_type": "complete", "unimplemented": ["unfinished"]},
+                     {"design_type": "complete", "unimplemented": [1]},
+                     {"design_type": "complete", "extra": True},
+                     {"design_type": ["complete"]}):
+            with self.subTest(args=args):
+                self.assertTrue(implementation_submit_error(args))
+        for args in ({"design_type": "complete"}, {"design_type": "complete", "unimplemented": []},
+                     {"design_type": "draft", "unimplemented": ["unfinished"]}):
+            self.assertEqual(implementation_submit_error(args), "")
 
     def test_native_graph_interleaves_tools_and_gates_explicit_submission(self) -> None:
         client = _RoundClient([
@@ -331,7 +379,7 @@ class StageExecutorTest(unittest.TestCase):
         self.assertIn("denied by access policy", output.tool_calls[0]["result"])
         self.assertIn("budget", output.tool_calls[2]["result"])
         self.assertEqual(len(calls["artifacts"]), 1)
-        self.assertEqual(client.seen[-1][1], ["submit_stage"])
+        self.assertIn("read_file", client.seen[-1][1])
 
     def test_native_graph_records_a_tool_usage_error_as_failed(self) -> None:
         # Observed 2026-09-29: every "usage error:" was journaled as ok=True, so
@@ -414,18 +462,107 @@ class StageExecutorTest(unittest.TestCase):
         follow_up = " ".join(str(item.get("content", "")) for item in client.seen[1][0])
         self.assertIn("no hardware target was edited", follow_up)
 
-    def test_two_submissions_in_one_batch_are_refused(self) -> None:
-        client = _RoundClient([
-            ("", [("submit_stage", {"delivery": "one"}),
-                  ("submit_stage", {"delivery": "two"})]),
-        ])
+    def test_malformed_submissions_get_feedback_before_a_corrected_submit(self):
+        for calls in ([('submit_stage', {'delivery': 'one'}), ('submit_stage', {'delivery': 'two'})],
+                      [('submit_stage', {})]):
+            with self.subTest(calls=calls):
+                executor, _ = self._executor()
+                gate = mock.Mock(return_value=True)
+                client = _RoundClient([('', calls), ('', [('submit_stage', {'delivery': 'done'})])])
+                output = executor.execute({}, object(), self._request(tools_enabled=True,
+                    native_tool_loop=True, submit_stage=gate), client=client)
+                self.assertEqual(output.result.text, 'done')
+                gate.assert_called_once_with('done')
+                self.assertIn('Total tool retries used: 1/10', str(client.seen[1][0]))
+                context_budget._tool_batches(client.seen[1][0])
+                llm._responses_items(client.seen[1][0])
+
+    def test_malformed_calls_never_pollute_wire_history_or_execute(self):
+        for name, arguments in (('', {}), ('read_file', [])):
+            with self.subTest(name=name, arguments=arguments):
+                executor, _ = self._executor()
+                client = _RoundClient([
+                    ('', [(name, arguments), ('read_file', {'path': 'valid'})]),
+                    ('', [('submit_stage', {'delivery': 'done'})]),
+                ])
+                with mock.patch.object(_Toolset, 'run', return_value='body') as run:
+                    output = executor.execute({}, object(), self._request(tools_enabled=True,
+                        native_tool_loop=True, submit_stage=lambda _: True), client=client)
+                run.assert_called_once_with('read_file', {'path': 'valid'})
+                self.assertFalse(output.tool_calls[0]['ok'])
+                context_budget._tool_batches(client.seen[1][0])
+                items = llm._responses_items(client.seen[1][0])
+                wire_calls = [item for item in items if item.get('type') == 'function_call']
+                self.assertEqual(len(wire_calls), 1)
+                self.assertIn('malformed tool call', str(client.seen[1][0]))
+
+    def test_rejected_edits_and_diagnoses_reopen_last_round_for_correction(self):
+        for error in ('edit rejected: SEARCH did not match', 'diagnosis rejected: wrong failure id',
+                      'repair route rejected: unsupported route'):
+            with self.subTest(error=error):
+                executor, _ = self._executor()
+                client = _RoundClient([
+                    ('', [('read_file', {})]), ('', [('read_file', {})]),
+                    ('', [('submit_stage', {'delivery': 'done'})]),
+                ])
+                with mock.patch.object(_Toolset, 'run', side_effect=[error, 'body']):
+                    output = executor.execute({'max_tool_rounds': 1}, object(),
+                        self._request(tools_enabled=True, native_tool_loop=True,
+                                      submit_stage=lambda _: True), client=client)
+                self.assertFalse(output.tool_calls[0]['ok'])
+                self.assertIn('Total tool retries used: 1/10', str(client.seen[1][0]))
+                self.assertIn('read_file', client.seen[1][1])
+
+    def test_default_ten_retries_can_recover_even_after_exploration_budget(self):
         executor, _ = self._executor()
-        with self.assertRaisesRegex(RuntimeError, "exactly one submit_stage"):
-            executor.execute(
-                {}, object(),
+        turns = [('', [('read_file', {'path': 'x'})])] * 11
+        client = _RoundClient(turns + [('', [('submit_stage', {'delivery': 'done'})])])
+        with mock.patch.object(_Toolset, 'run', side_effect=[ValueError('bad path')] * 10 + ['body']):
+            output = executor.execute({'max_tool_rounds': 1, 'max_tool_calls': 1}, object(),
                 self._request(tools_enabled=True, native_tool_loop=True,
-                              submit_stage=lambda _delivery: True), client=client,
-            )
+                              submit_stage=lambda _: True), client=client)
+        self.assertEqual(output.result.text, 'done')
+        self.assertEqual(sum(not c['ok'] for c in output.tool_calls), 10)
+        self.assertIn('10/10', str(client.seen[-2][0]))
+        self.assertFalse(_Toolset.latest.session.rolled_back)
+
+    def test_retries_are_shared_and_success_does_not_reset_them(self):
+        executor, calls = self._executor()
+        client = _RoundClient([
+            ('', [('read_file', {})]), ('', [('read_file', {})]),
+            ('', [('submit_stage', {'delivery': 'bad'})]), ('', [('read_file', {})]),
+        ])
+        with mock.patch.object(_Toolset, 'run', side_effect=['usage error: bad', 'body', ValueError('bad')]):
+            with self.assertRaises(failures.StageDeliveryFailure) as caught:
+                executor.execute({'max_tool_retries': 2}, object(),
+                    self._request(tools_enabled=True, native_tool_loop=True,
+                                  submit_stage=lambda _: False), client=client)
+        self.assertEqual(caught.exception.terminal_reason, 'tool_retries_exhausted')
+        self.assertEqual(len(caught.exception.tool_calls), 4)
+        self.assertEqual(len(calls['live']), 4)
+        self.assertTrue(_Toolset.latest.session.rolled_back)
+
+    def test_default_retry_exhaustion_audits_the_eleventh_failure(self):
+        executor, calls = self._executor()
+        client = _RoundClient([('', [('submit_stage', {'delivery': 'bad'})])] * 11)
+        with self.assertRaises(failures.StageDeliveryFailure) as caught:
+            executor.execute({}, object(), self._request(tools_enabled=True,
+                native_tool_loop=True, submit_stage=lambda _: False), client=client)
+        self.assertEqual(caught.exception.terminal_reason, 'tool_retries_exhausted')
+        self.assertEqual(len(calls['live']), 11)
+        self.assertEqual(len(caught.exception.tool_calls), 11)
+        self.assertIn('10/10', calls['live'][-1]['result'])
+        self.assertTrue(_Toolset.latest.session.rolled_back)
+
+    def test_cancelled_tool_is_not_retried(self):
+        executor, _ = self._executor()
+        client = _RoundClient([('', [('read_file', {})])])
+        with mock.patch.object(_Toolset, 'run', side_effect=processes.ValidationCancelled('cancelled')):
+            with self.assertRaises(processes.ValidationCancelled):
+                executor.execute({}, object(), self._request(tools_enabled=True,
+                    native_tool_loop=True, submit_stage=lambda _: True), client=client)
+        self.assertEqual(len(client.seen), 1)
+        self.assertTrue(_Toolset.latest.session.rolled_back)
 
     def test_the_last_tool_round_is_announced_while_tools_remain(self) -> None:
         # Observed 2026-09-30: the only budget message told the model to "submit
@@ -530,7 +667,7 @@ class StageExecutorTest(unittest.TestCase):
         executor, _ = self._executor()
         with self.assertRaisesRegex(RuntimeError, "gate rejected"):
             executor.execute(
-                {}, object(), self._request(tools_enabled=True, native_tool_loop=True,
+                {"max_tool_retries": 1}, object(), self._request(tools_enabled=True, native_tool_loop=True,
                                              submit_stage=lambda _delivery: False), client=client,
             )
         self.assertTrue(_Toolset.latest.session.rolled_back)

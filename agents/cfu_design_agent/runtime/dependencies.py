@@ -114,6 +114,10 @@ def input_fingerprints(state: dict[str, Any]) -> dict[str, str]:
                                                     "benchmark_patches": project.get("patches")}
                                                   if project.get("kind") == "embench_benchmark" else {}),
                                               "flags": state.get("soc_flags")}})
+    # Preserve historical fingerprints when the field did not exist.
+    if "implementation_design_type" in state:
+        measured = _hash({"measurement": measured,
+                          "implementation_design_type": state["implementation_design_type"]})
     cost_input = measured
     if state.get("cost_backend") == "vivado":
         cost_input = _hash({"measurement": measured, "backend": "vivado",

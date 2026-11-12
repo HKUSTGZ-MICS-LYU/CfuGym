@@ -168,13 +168,12 @@ class FlowMemoryRangeTests(unittest.TestCase):
 
     def test_storage_and_active_collector_obey_all_budgets(self):
         with flow_memory.collect_tool_transcripts(self.state) as calls:
-            for index in range(28):
+            for index in range(flow_memory.MAX_ENTRIES + 2):
                 path = f"src/source_{index}.c"
                 self.put(path, "\n".join(f"row_{line} " + "x" * 1700 for line in range(6)))
                 for line in range(1, 7):
                     self.read(line, line, path)
-                entries = [call["entry"] for call in calls]
-                self.assert_bounded(entries)
+            self.assert_bounded([call["entry"] for call in calls])
             memory = self.derive(calls)
         self.assert_bounded(memory["entries"])
         self.assertLessEqual(len(self.render(memory)), 4000)

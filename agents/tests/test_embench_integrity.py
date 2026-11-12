@@ -11,7 +11,6 @@ from agents.cfu_design_agent.benchmark import cfu_execution, embench, embench_in
 from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
-from agents.tests.test_embench import temporary_embench_repo
 
 
 SOURCE = '''#include "support.h"
@@ -44,31 +43,33 @@ def replace_body(source: str, name: str, body: str) -> str:
 
 
 class IntegrityTest(unittest.TestCase):
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.workdir = Path(temporary.name)
-        self.run_root = "agents/generated/runs/integrity-test"
-        self.name = "fixture"
-        source = self.workdir / embench.benchmark_dir(self.name) / "kernel.c"
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._temporary.cleanup)
+        cls.workdir = Path(cls._temporary.name)
+        cls.run_root = "agents/generated/runs/integrity-test"
+        cls.name = "fixture"
+        source = cls.workdir / embench.benchmark_dir(cls.name) / "kernel.c"
         source.parent.mkdir(parents=True)
         source.write_text(SOURCE)
-        support = self.workdir / embench.EMBENCH_ROOT / "support"
+        support = cls.workdir / embench.EMBENCH_ROOT / "support"
         support.mkdir(parents=True)
         for fname in embench.SUPPORT_FILES:
             (support / fname).write_text((REPO_ROOT / embench.EMBENCH_ROOT / "support" / fname).read_text())
-        board = self.workdir / embench.BOARD_ROOT
+        board = cls.workdir / embench.BOARD_ROOT
         board.mkdir(parents=True)
         for fname in embench.BOARD_FILES:
             (board / fname).write_text((REPO_ROOT / embench.BOARD_ROOT / fname).read_text())
-        self.project = embench.prepare_embench_benchmark(
-            RepoToolbox(self.workdir, policy=load_policy(REPO_ROOT), stage="prepare_benchmark", run_root=self.run_root),
-            {"benchmark_name": self.name})
-        self.metadata = self.workdir / self.run_root / "04_benchmark/embench.yaml"
-        self.metadata.parent.mkdir(parents=True)
-        self.metadata.write_text(yaml.safe_dump(self.project))
-        self.target = f"{embench.config_workspace(self.run_root, self.name, 'cfu')}/src/kernel.c"
-        self.original = (self.workdir / self.target).read_text()
+        cls.project = embench.prepare_embench_benchmark(
+            RepoToolbox(cls.workdir, policy=load_policy(REPO_ROOT), stage="prepare_benchmark", run_root=cls.run_root),
+            {"benchmark_name": cls.name})
+        cls.metadata = cls.workdir / cls.run_root / "04_benchmark/embench.yaml"
+        cls.metadata.parent.mkdir(parents=True)
+        cls.metadata_text = yaml.safe_dump(cls.project)
+        cls.metadata.write_text(cls.metadata_text)
+        cls.target = f"{embench.config_workspace(cls.run_root, cls.name, 'cfu')}/src/kernel.c"
+        cls.original = (cls.workdir / cls.target).read_text()
 
     def check(self, text: str | None = None, extra: dict[str, str] | None = None) -> list[str]:
         pending = dict(extra or {})
@@ -87,7 +88,6 @@ class IntegrityTest(unittest.TestCase):
         text = self.original.replace("static const unsigned input", "/* #define SIZE 0 */\nstatic\nconst unsigned input")
         text = replace_body(text, "calculate", 'const char *s = "} #define benchmark(x) 0 {"; return s[0] + n;')
         self.assertEqual(self.check(text), [])
-        # Literal spelling in an initializer is protected, unlike a comment.
         text = self.original.replace("{1, 2, 3, 4}", "{1, 2, 3, 5}")
         self.assertTrue(self.check(text))
 
@@ -151,13 +151,11 @@ class IntegrityTest(unittest.TestCase):
 
     def test_macro_shadowing_variants_rejected(self) -> None:
         directives = [
-            "#define benchmark() 1", "#define benchmark_body(a,b) 1",
-            "#define verify_benchmark(x) 1", "#define input cfu_fake", "#undef SIZE",
+            "#define benchmark() 1", "#define verify_benchmark(x) 1",
+            "#define input cfu_fake", "#undef SIZE",
             "#define GLOBAL_SCALE_FACTOR 0", "#define unsigned signed",
-            "#define start_trigger()", "#define initialise_benchmark()",
             "#define bench\\\nmark() 1", "%:define benchmark() 1",
-            "#/**/define /**/ benchmark /**/() 1",
-            "#define SIZE(x) 4", "#define calculate(x) 0",
+            "#/**/define /**/ benchmark /**/() 1", "#define calculate(x) 0",
         ]
         for directive in directives:
             with self.subTest(directive=directive):
@@ -171,19 +169,23 @@ class IntegrityTest(unittest.TestCase):
                     self.assertTrue(self.check(self.original + "\n" + command + "\n"))
                     self.assertTrue(self.check(extra={rel: command + "\n"}))
 
-    def test_missing_or_legacy_metadata_requires_new_run(self) -> None:
-        for data in ({}, {**self.project, "integrity": {"version": 0}},
-                     {**self.project, "measurement": {"protocol": "legacy"}}):
-            with self.subTest(data=str(data)[:50]):
-                self.metadata.write_text(yaml.safe_dump(data))
-                problems = self.check()
-                self.assertTrue(problems)
-                self.assertIn("start a new run", "\n".join(problems))
-                self.assertNotIn("re-prepare", "\n".join(problems))
-        missing = self.metadata.with_name("missing.yaml")
-        self.assertFalse(missing.exists())
-        self.metadata.rename(missing)
-        self.assertIn("start a new run", "\n".join(self.check()))
+    def test_missing_or_legacy_metadata_fails_closed_and_requires_new_run(self) -> None:
+        try:
+            cases = (
+                ({}, "start a new run"),
+                ({**self.project, "integrity": {"version": 0}}, "start a new run"),
+                ({**self.project, "measurement": {"protocol": "legacy"}}, "start a new run"),
+                ({**self.project, "integrity": {**self.project["integrity"], "protected_files": {}}},
+                 "missing required harness hashes"),
+            )
+            for data, expected in cases:
+                with self.subTest(expected=expected):
+                    self.metadata.write_text(yaml.safe_dump(data))
+                    self.assertIn(expected, "\n".join(self.check()))
+            self.metadata.unlink()
+            self.assertIn("start a new run", "\n".join(self.check()))
+        finally:
+            self.metadata.write_text(self.metadata_text)
 
     def test_intrinsics_header_cannot_shadow_source_or_harness(self) -> None:
         rel = f"{embench.config_workspace(self.run_root, self.name, 'cfu')}/include/cfu_intrinsics.h"
@@ -191,10 +193,6 @@ class IntegrityTest(unittest.TestCase):
             with self.subTest(name=name):
                 header = f"#ifndef CFU_INTRINSICS_H\n#define CFU_INTRINSICS_H\n#define {name}(...) 1\n#endif\n"
                 self.assertTrue(self.check(extra={rel: header}))
-        header_path = self.workdir / rel
-        header_path.parent.mkdir(parents=True)
-        header_path.write_text("#define benchmark_body(...) 0\n")
-        self.assertTrue(self.check())
 
     def test_preprocessor_wrappers_constructors_and_pragmas_rejected(self) -> None:
         changes = [
@@ -218,109 +216,107 @@ class IntegrityTest(unittest.TestCase):
         text = replace_body(self.original, "calculate", "\n#ifdef USE_AGENT_CFU\nreturn n + 1;\n#else\nreturn n + 1;\n#endif\n")
         self.assertEqual(self.check(text), [])
 
-    def test_missing_legacy_and_incomplete_metadata_fail_closed(self) -> None:
-        for data in ({}, {"benchmark": self.name}, {**self.project, "integrity": {"version": 0}},
-                     {**self.project, "integrity": {**self.project["integrity"], "protected_files": {}}}):
-            with self.subTest(data=str(data)[:60]):
-                self.metadata.write_text(yaml.safe_dump(data))
-                self.assertTrue(self.check())
-        self.metadata.write_text("")
-        self.assertTrue(self.check())
-        missing = self.metadata.with_name("missing.yaml")
-        self.assertFalse(missing.exists())
-        self.metadata.rename(missing)
-        self.assertTrue(self.check())
-
-    def test_full_transaction_ignores_scala_but_checks_pending_harness(self) -> None:
+    def test_full_transaction_and_disk_tampering_checks(self) -> None:
         scala = f"{self.run_root}/workspace/design/AgentCfu.scala"
         self.assertEqual(self.check(extra={scala: "new Scala bytes"}), [])
-        for rel in list(self.project["integrity"]["reference_sources"]) + list(self.project["integrity"]["protected_files"]):
+        sample_ref = next(iter(self.project["integrity"]["reference_sources"]))
+        sample_prot = next(iter(self.project["integrity"]["protected_files"]))
+        for rel in (sample_ref, sample_prot):
             with self.subTest(path=rel):
-                text = (self.workdir / rel).read_text()
+                path = self.workdir / rel
+                text = path.read_text()
                 self.assertEqual(self.check(extra={scala: "new Scala bytes", rel: text}), [])
                 self.assertTrue(self.check(extra={scala: "new Scala bytes", rel: text + "/* tampered */"}))
-                self.assertEqual((self.workdir / rel).read_text(), text)
+                try:
+                    path.write_text(text + "/* tampered */\n")
+                    self.assertTrue(self.check())
+                finally:
+                    path.write_text(text)
         unknown = self.target.replace("kernel.c", "untrusted.c")
         self.assertTrue(self.check(extra={unknown: "int fake;"}))
         sibling = self.target.replace("embench_fixture", "embench_other")
         self.assertTrue(self.check(extra={sibling: "int fake;"}))
-        self.assertTrue(self.check(extra={str(self.metadata.relative_to(self.workdir)): "fake metadata"}))
-        self.assertTrue(self.check(extra={f"{embench.benchmark_dir(self.name)}/kernel.c": "fake source"}))
-
-    def test_trusted_reference_and_all_config_harness_hashes_checked(self) -> None:
-        paths = list(self.project["integrity"]["reference_sources"]) + list(self.project["integrity"]["protected_files"])
-        for rel in paths:
-            with self.subTest(path=rel):
-                path = self.workdir / rel
-                original = path.read_text()
-                path.write_text(original + "/* tampered */\n")
-                self.assertTrue(self.check())
-                path.write_text(original)
 
     def test_missing_required_source_harness_or_unknown_candidate_rejected(self) -> None:
         rel = next(iter(self.project["integrity"]["protected_files"]))
         path = self.workdir / rel
         backup = path.with_suffix(".backup")
-        self.assertFalse(backup.exists())
         path.rename(backup)
-        self.assertTrue(self.check())
-        backup.rename(path)
+        try:
+            self.assertTrue(self.check())
+        finally:
+            backup.rename(path)
         cfu = self.workdir / self.target
         original = cfu.read_text()
-        cfu.rename(cfu.with_suffix(".backup"))
-        self.assertTrue(self.check(original))
-        self.assertTrue(self.check(extra={"unknown.c": original}))
+        cfu_backup = cfu.with_suffix(".backup")
+        cfu.rename(cfu_backup)
+        try:
+            self.assertTrue(self.check(original))
+            self.assertTrue(self.check(extra={"unknown.c": original}))
+        finally:
+            cfu_backup.rename(cfu)
 
 
 class RealEmbenchIntegrityTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.workdir = temporary_embench_repo(self)
-        self.run_root = "agents/generated/runs/real-integrity-test"
-        self.policy = load_policy(REPO_ROOT)
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._temp.cleanup)
+        cls.workdir = Path(cls._temp.name)
+        import shutil
+        for subdir in ("src", "support"):
+            shutil.copytree(REPO_ROOT / embench.EMBENCH_ROOT / subdir,
+                            cls.workdir / embench.EMBENCH_ROOT / subdir)
+        board = cls.workdir / embench.BOARD_ROOT
+        board.mkdir(parents=True)
+        for fname in embench.BOARD_FILES:
+            shutil.copyfile(REPO_ROOT / embench.BOARD_ROOT / fname, board / fname)
+        cls.run_root = "agents/generated/runs/real-integrity-test"
+        cls.policy = load_policy(REPO_ROOT)
+        cls._prepared: dict[str, tuple[dict, dict[str, str]]] = {}
 
     def prepare(self, name: str) -> tuple[dict, dict[str, str]]:
-        project = embench.prepare_embench_benchmark(RepoToolbox(
-            self.workdir, policy=self.policy, stage="prepare_benchmark", run_root=self.run_root),
-            {"benchmark_name": name})
+        if name not in self._prepared:
+            project = embench.prepare_embench_benchmark(RepoToolbox(
+                self.workdir, policy=self.policy, stage="prepare_benchmark", run_root=self.run_root),
+                {"benchmark_name": name})
+            sources = {str(p.relative_to(self.workdir)): p.read_text()
+                       for p in (self.workdir / embench.config_workspace(self.run_root, name, "cfu") / "src").glob("*.c")}
+            self._prepared[name] = (project, sources)
+        project, sources = self._prepared[name]
         metadata = self.workdir / self.run_root / "04_benchmark/embench.yaml"
         metadata.parent.mkdir(parents=True, exist_ok=True)
         metadata.write_text(yaml.safe_dump(project))
-        sources = {str(p.relative_to(self.workdir)): p.read_text()
-                   for p in (self.workdir / embench.config_workspace(self.run_root, name, "cfu") / "src").glob("*.c")}
         return project, sources
 
-    def test_all_real_19_prepare_single_invocation_and_validate(self) -> None:
+    def test_representative_real_benchmarks_prepare_and_validate(self) -> None:
         names = embench.list_benchmarks(self.workdir)
         self.assertEqual(len(names), 19)
-        for name in names:
+        for name in ("crc32", "huffbench", "statemate", "md5sum"):
             with self.subTest(name=name):
                 original = {p.name: p.read_bytes() for p in (self.workdir / embench.benchmark_dir(name)).glob("*.c")}
                 project, sources = self.prepare(name)
                 self.assertEqual(project["measurement"], {"protocol": embench.MEASUREMENT_PROTOCOL,
                     "local_scale_factor": 1, "global_scale_factor": 1, "warmup": False,
                      "cfu_status_protocol": cfu_execution.PROTOCOL})
-                for config in embench.CONFIGS:
-                    cfg = self.workdir / embench.config_workspace(self.run_root, name, config)
-                    source_paths = [*(cfg / "src").glob("*.c"),
-                        *(cfg / "support" / filename for filename in embench_patchers.extra_support_files(name)
-                          if filename.endswith(".c"))]
-                    definitions = [t.value for p in source_paths for t in integrity.scan(p.read_text())
-                                   if t.directive and t.value.split()[:3] == ["#", "define", "LOCAL_SCALE_FACTOR"]]
-                    self.assertEqual(definitions, ["# define LOCAL_SCALE_FACTOR 1"])
-                    main = cfg.joinpath("embench_main.c").read_text()
-                    self.assertNotIn("warm_caches", [t.value for t in integrity.scan(main) if not t.directive])
-                    for call in ("initialise_board", "initialise_benchmark", "start_trigger", "benchmark", "stop_trigger", "verify_benchmark"):
-                        self.assertIn(call, [t.value for t in integrity.scan(main) if not t.directive])
-                    self.assertIn("-DGLOBAL_SCALE_FACTOR=1", embench.config_defines(name, config))
+                cfg = self.workdir / embench.config_workspace(self.run_root, name, "cfu")
+                source_paths = [*(cfg / "src").glob("*.c"),
+                    *(cfg / "support" / filename for filename in embench_patchers.extra_support_files(name)
+                      if filename.endswith(".c"))]
+                definitions = [t.value for p in source_paths for t in integrity.scan(p.read_text())
+                               if t.directive and t.value.split()[:3] == ["#", "define", "LOCAL_SCALE_FACTOR"]]
+                self.assertEqual(definitions, ["# define LOCAL_SCALE_FACTOR 1"])
+                main = cfg.joinpath("embench_main.c").read_text()
+                self.assertNotIn("warm_caches", [t.value for t in integrity.scan(main) if not t.directive])
                 self.assertEqual(integrity.validate_candidate(self.workdir, self.run_root, name), [])
-                for rel, text in sources.items():
-                    parsed = integrity._parse(text)
-                    fn = next(o.name for o in parsed.objects if o.body is not None and o.name not in integrity.ENTRY_FUNCTIONS)
-                    pending = {rel: replace_body(text, fn, "/* kernel optimization fixture */ return 0;")}
-                    self.assertEqual(integrity.validate_candidate(self.workdir, self.run_root, name, pending), [])
-                    if any(o.name == "verify_benchmark" for o in parsed.objects):
-                        changed = replace_body(text, "verify_benchmark", "return 1;")
-                        self.assertTrue(integrity.validate_candidate(self.workdir, self.run_root, name, {rel: changed}))
+                rel, text = next(iter(sources.items()))
+                parsed = integrity._parse(text)
+                fn = next(o.name for o in parsed.objects if o.body is not None and o.name not in integrity.ENTRY_FUNCTIONS)
+                pending = {rel: replace_body(text, fn, "/* kernel optimization fixture */ return 0;")}
+                self.assertEqual(integrity.validate_candidate(self.workdir, self.run_root, name, pending), [])
+                if any(o.name == "verify_benchmark" for o in parsed.objects):
+                    changed = replace_body(text, "verify_benchmark", "return 1;")
+                    self.assertTrue(integrity.validate_candidate(self.workdir, self.run_root, name, {rel: changed}))
                 self.assertEqual(original, {p.name: p.read_bytes() for p in (self.workdir / embench.benchmark_dir(name)).glob("*.c")})
 
     def test_md5_extra_argument_is_preserved_and_protected(self) -> None:

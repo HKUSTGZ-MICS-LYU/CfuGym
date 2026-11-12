@@ -10,11 +10,24 @@ from ... import prompts
 from ...flow import gates, ladder, outcome
 from ...prompts import SYSTEM_PROMPT
 from ...runtime.llm import DEFAULT_MAX_TOOL_ROUNDS
-from ...runtime import coding_tools, conformance_delivery, dev_tests, effects, failures, commands as commands_mod, llm_step, observations, stage_services, tools as tools_mod
+from ...runtime import coding_tools, conformance_delivery, dev_tests, effects, failures, commands as commands_mod, llm_step, observations, stage_executor, stage_services, tools as tools_mod
 from ...runtime.implementation_tools import ImplementationToolset, Verification
 from ...stages import feedback as feedback_mod
 from ...stages.implement import header_transaction, intrinsics, repair_scope, submission
 from ...state import CfuDesignState
+
+def _prior_draft_block(state: CfuDesignState) -> str:
+    """Carry the model's prior declaration forward, not as independent evidence."""
+    if state.get("implementation_design_type") != "draft":
+        return ""
+    items = state.get("implementation_unimplemented")
+    items = items if isinstance(items, list) else []
+    summary = state.get("hardware_plan") or state.get("software_plan") or "(unavailable)"
+    return ("\n\nPrevious draft declaration (model-provided, unverified; not independent "
+            "proof of implementation or verification):\n"
+            + "Unimplemented: " + repr(items) + "\n"
+            + "Previous delivery summary: " + str(summary))
+
 
 @coding_tools.delivery_failure_gate
 @header_transaction.atomic_header
@@ -219,8 +232,18 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
             "content or a patch is not applied "
             "anywhere and will be rejected.\n"
             + conformance_step
-            + f"{submit_number}. `submit_stage(delivery)`: `delivery` is a summary of what you changed, "
+            + f"{submit_number}. `submit_stage(delivery, design_type, unimplemented)`: `delivery` is a summary of what you changed, "
             "which evidence you ran, and what remains unknown — not the change itself. "
+            "Explicitly choose design_type `complete` or `draft`; for draft provide a nonempty "
+            "list of specific unfinished work in `unimplemented`. For complete it may be omitted or empty. "
+            "When routing back to analysis or contract without a completed implementation, "
+            "submit a draft and name the unfinished work. "
+            "Untested does not mean unimplemented: report missing test evidence separately in delivery. "
+            "Both draft and complete consume one `--max-iters` iteration each time they enter verification. "
+            "A draft returns to implementation after simulation without synthesis; exhaustion of the "
+            "iteration budget terminates the run. Aim to submit a genuinely complete implementation "
+            "directly when possible, but never falsely claim completeness to save budget. "
+            "A declaration is not verification evidence and does not relax any safety gate. "
             "The gate rejects a submission that reports no applied change to a hardware "
             "and a software target on first delivery; repairs require applied changes "
             "to each failing domain and validated reuse of an unchanged healthy side."
@@ -284,6 +307,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         + schedule_line
         + "\n\n" + prompts.GENERALITY_REVIEW
         + "\nCurrent failure evidence:\n" + feedback
+        + _prior_draft_block(state)
         + scope_line
         + (feedback_mod.repair_route_guidance(tool_mode=True) if feedback else "")
         + conformance_block
@@ -343,6 +367,19 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                             "diagnosis_required": bool(feedback)},
         )
         tools = toolsets[-1]
+        declaration = getattr(result, "accepted_submit", None)
+        if not isinstance(declaration, dict):
+            raise failures.StageDeliveryFailure("accepted Stage 3 submission has no structured declaration",
+                                                stage="implement", tool_calls=calls)
+        if declaration.get("delivery") != result.text:
+            raise failures.StageDeliveryFailure("accepted Stage 3 delivery does not match final audit text",
+                                                stage="implement", tool_calls=calls)
+        declaration_error = stage_executor.implementation_submit_error(declaration)
+        if declaration_error:
+            raise failures.StageDeliveryFailure("invalid accepted Stage 3 declaration: " + declaration_error,
+                                                stage="implement", tool_calls=calls)
+        design_type = declaration["design_type"]
+        unimplemented = list(declaration.get("unimplemented", []))
         accepted, reason = audit(result.text)
         if not accepted:
             raise failures.StageDeliveryFailure("accepted Stage 3 submission failed final audit: " + reason,
@@ -379,6 +416,8 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
             "conformance_runs": list(dev_workspace.runs)}
            if dev_workspace is not None else {}),
         "hardware_plan": result.text, "software_plan": result.text,
+        "implementation_design_type": design_type,
+        "implementation_unimplemented": unimplemented,
         "implementation_hw_summary": "Unified Stage 3 submission; formal gates pending",
         "implementation_sw_summary": "Unified Stage 3 submission; formal gates pending",
         "changed_design_files": hardware_changed, "changed_sw_files": software_changed,
@@ -387,8 +426,10 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         "gates": outcome.gates(state, {
             "implementation_route": {"ok": True, "next": "generate_soc"},
             "implementation_hw": {"ok": True, "applied": True, "files": hardware_changed,
+                                  "design_type": design_type, "unimplemented": list(unimplemented),
                                   "candidate_hash": hw_hash, "reused": not bool(hardware_changed)},
             "implementation_sw": {"ok": True, "applied": True, "files": software_changed,
+                                  "design_type": design_type, "unimplemented": list(unimplemented),
                                   "candidate_hash": sw_hash, "isa_hash": intrinsics._isa_digest(state),
                                   "intrinsics_header": header_path, "reused": not bool(software_changed)},
         }),

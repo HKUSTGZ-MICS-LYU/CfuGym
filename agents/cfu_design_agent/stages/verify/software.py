@@ -133,7 +133,7 @@ def _cycle_count(value) -> int | None:
 def _simulation_outcome(*, results: list[dict], name: str, reference: dict,
                         profile: dict, verification: str, changed: bool,
                         integrity_errors: list[str], changed_domains: dict[str, bool] | None = None,
-                        cfu_status_expected: bool = False) -> dict:
+                        cfu_status_expected: bool = False, draft: bool = False) -> dict:
     """Assess this execution; ``changed`` compares final sources to the run baseline.
 
     Old verify-only benchmarks are supported when *both* observable values are
@@ -169,7 +169,7 @@ def _simulation_outcome(*, results: list[dict], name: str, reference: dict,
                       and verify_passed and not verify_failed and not mismatch
                       and not missing_result and reference.get("verify", 1) == 1)
     timing_ok = ref_cycles is not None and cfu_cycles is not None
-    performance_valid = bool(correctness_ok and timing_ok and changed and not integrity_errors)
+    performance_valid = bool(not draft and correctness_ok and timing_ok and changed and not integrity_errors)
     speedup = ref_cycles * 100 // cfu_cycles if performance_valid else None
     issues = []
     if integrity_errors:
@@ -182,7 +182,7 @@ def _simulation_outcome(*, results: list[dict], name: str, reference: dict,
     if mismatch:
         issues.append(("result_mismatch", f"the CFU build computed result={cfu_result} but the reference run computed "
                        f"result={ref_result}: the accelerated kernel changes the benchmark's observable result"))
-    if not timing_ok:
+    if not timing_ok and not draft:
         issues.append(("no_timing", "no valid reference/CFU cycle count is available; acceleration cannot be verified"))
     if missing_result:
         issues.append(("result_missing", "reference/CFU observable result is missing on one side; correctness cannot be claimed"))
@@ -221,14 +221,17 @@ def simulate(state: CfuDesignState, *, transition: bool = True) -> CfuDesignStat
     """Rung 5: run the ELF on the generated SoC and check the result."""
     rung = "sim"
     reason = stage_services._profile_reason(state)
+    design_evidence = {"implementation_design_type": state.get("implementation_design_type") or "legacy",
+                       "implementation_unimplemented": list(state.get("implementation_unimplemented") or [])}
     if reason:
         result = stage_services._skipped_result("sbt MiCoSocSim", state, reason)
         result["rung"] = rung
-        stage_services._write_ladder_artifact(state, rung, [result], "planned", reason)
+        stage_services._write_ladder_artifact(state, rung, [result], "planned", reason, evidence=design_evidence)
         return {
             "validation_results": [result],
             "stage_jobs": "cost",
             **outcome.stage_result(state, rung=rung, ok=False, skipped=True, reason=reason,
+                                   **design_evidence,
                                    history=f"Skipped simulation ({reason})."),
         }
 
@@ -279,6 +282,7 @@ def simulate(state: CfuDesignState, *, transition: bool = True) -> CfuDesignStat
             changed=design_changed, integrity_errors=integrity_errors,
             changed_domains=changed_domains,
             cfu_status_expected=measurement.get("cfu_status_protocol") == cfu_execution.PROTOCOL,
+            draft=state.get("implementation_design_type") == "draft",
         )
         errors.extend(sim_evidence["errors"])
     elif not design_changed:
@@ -328,21 +332,36 @@ def simulate(state: CfuDesignState, *, transition: bool = True) -> CfuDesignStat
                 "verification": verification,
                 **measurement_evidence,
                 **sim_evidence,
+                **design_evidence,
                 "status": "passed" if ok else "failed",
             },
         )
 
+    if state.get("implementation_design_type") == "draft":
+        missing = state.get("implementation_unimplemented") or []
+        diagnostic = stage_services.gate_failure_result(
+            state, "draft_completion", "draft_incomplete",
+            ["Draft implementation is incomplete: " + "; ".join(map(str, missing))])
+        diagnostic["log_path"] = f"{state.get('run_root', '')}/10_validation/sim.yaml"
+        diagnostic["failure_observation"]["log_path"] = diagnostic["log_path"]
+        results.append(diagnostic)
+    elif ok and state.get("implementation_design_type") == "complete":
+        results.append({"rung": "draft_completion", "kind": "host_gate_check", "returncode": 0,
+                        "command": "implementation complete declaration"})
     stage_services._write_ladder_artifact(state, rung, results, "passed" if ok else "failed", "",
-        evidence={**measurement_evidence, **sim_evidence})
+        evidence={**measurement_evidence, **sim_evidence, **design_evidence})
 
     # One implementation stage owns both sides, so a failed simulation has a
     # single repair target: the agent decides inside the stage what to change.
     repair_target = "implement" if not ok else "estimate_cost"
     extra, next_node = ({}, None)
     if transition:
-        extra, next_node = ladder._ladder_transition(
-            state, rung, ok=ok, default="estimate_cost", repair_target=repair_target
-        )
+        if ok and state.get("implementation_design_type") == "draft":
+            extra, next_node = ladder.draft_sim_transition(state)
+        else:
+            extra, next_node = ladder._ladder_transition(
+                state, rung, ok=ok, default="estimate_cost", repair_target=repair_target
+            )
     update = {
         "validation_results": results,
         "stage_jobs": "cost",
@@ -352,6 +371,7 @@ def simulate(state: CfuDesignState, *, transition: bool = True) -> CfuDesignStat
         **outcome.stage_result(
             state, rung=rung, ok=ok, skipped=False, next=next_node,
             round=int(state.get("optimization_round", 0) or 0),
+            **design_evidence,
             **({**sim_evidence, **measurement_evidence} if is_embench else {
                 **sim_evidence,
                 "reference_cycles": None, "cfu_cycles": None, "speedup_x100": None,

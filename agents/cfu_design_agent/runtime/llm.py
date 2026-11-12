@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, is_dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from . import context_budget, processes, request_audit, source_visibility, tools as tools_mod
+from . import context_budget, failures, processes, request_audit, source_visibility, tools as tools_mod
 
 DEFAULT_MODEL = "gpt-5"
 # Reasoning/thinking is OFF unless a config opts in. ``reasoning_effort`` values
@@ -33,6 +33,21 @@ DEFAULT_THINKING_BODY: dict[str, Any] = {"thinking": {"type": "enabled"}}
 DEFAULT_MAX_TOOL_ROUNDS = 20
 DEFAULT_MAX_TOOL_CALLS_PER_ROUND = 4
 DEFAULT_MAX_TOOL_CALLS = 96
+DEFAULT_MAX_TOOL_RETRIES = 10
+
+
+def tool_failure_feedback(reason: str, used: int, limit: int) -> tuple[str, int, bool]:
+    """Grant a corrective model turn, never blindly replay a side-effecting tool."""
+    if used >= limit:
+        return f"{reason}\nTool retry budget exhausted ({used}/{limit}).", used, True
+    used += 1
+    return (
+        f"{reason}\nTool call failed. Correct the call or the underlying work, then retry "
+        f"using the authorized tools; do not assume any failed action succeeded. "
+        f"Total tool retries used: {used}/{limit}; {limit - used} remaining.",
+        used, False,
+    )
+
 # Transport retries are bounded here rather than at the graph-node level, so a
 # transient provider outage never re-runs stage side effects or spends a new turn.
 LLM_REQUEST_MAX_RETRIES = 10
@@ -109,6 +124,8 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 
 def _is_retryable_request_error(exc: Exception) -> bool:
     """Retry transient transport/throughput failures, never arbitrary input 400s."""
+    if isinstance(exc, ResponseTerminalError):
+        return False
     text = _request_error_text(exc)
     if re.search(r"insufficient_quota|billing_hard_limit_reached|"
                  r"exceeded your current quota", text, re.IGNORECASE):
@@ -195,6 +212,8 @@ def _request_error_details(exc: Exception, api_key: str | None = None) -> dict[s
     status = _request_status_code(exc)
     if status is not None:
         error["status_code"] = status
+    if isinstance(exc, IncompleteResponseError):
+        error.update(response_status=exc.status, incomplete_reason=exc.reason, usage=exc.usage)
     for key, value in _provider_error_fields(exc).items():
         error[f"provider_{key}"] = _safe_error_text(value, api_key)
     request_id = getattr(exc, "request_id", None)
@@ -440,6 +459,8 @@ class LlmResult:
     # call was sent. Reported so the stage line can show that the transcript the
     # model saw is shorter than the run's history (and why).
     context_compaction: dict[str, Any] = field(default_factory=dict)
+    # Structured declaration from an accepted native implementation submit only.
+    accepted_submit: dict[str, Any] | None = None
 
 
 # --- Reasoning / thinking handling -----------------------------------------
@@ -788,32 +809,47 @@ def _assistant_text_message(message: Any, content: str) -> dict[str, Any]:
     return result
 
 
-def _assistant_tool_message(message: Any) -> dict[str, Any]:
-    """Convert an SDK assistant message with tool_calls back into request form."""
+def _normalized_tool_calls(message: Any) -> list[dict[str, str]]:
+    """Validate model calls before execution or insertion into wire history.
+
+    Malformed calls remain in the audit, but must never create incomplete
+    function_call/output pairs that make the next request fail preflight.
+    """
     calls = []
-    for call in getattr(message, "tool_calls", None) or []:
-        function = getattr(call, "function", None)
-        calls.append(
-            {
-                "id": str(getattr(call, "id", "") or ""),
-                "type": "function",
-                "function": {
-                    "name": str(getattr(function, "name", "") or ""),
-                    "arguments": str(getattr(function, "arguments", "") or "{}"),
-                },
-            }
-        )
-    result = {
-        "role": "assistant",
-        "content": getattr(message, "content", None),
-        "tool_calls": calls,
-    }
-    # DeepSeek requires the exact reasoning_content from each previous turn to
-    # be echoed when tools are enabled. Other gateways that don't return it see
-    # no change to the assistant transcript.
-    reasoning_content = _object_value(message, "reasoning_content")
-    if reasoning_content is not None:
-        result["reasoning_content"] = reasoning_content
+    seen = set()
+    for call in _object_value(message, "tool_calls") or []:
+        function = _object_value(call, "function")
+        call_id = str(_object_value(call, "id") or "").strip()
+        name = str(_object_value(function, "name") or "").strip()
+        raw = _object_value(function, "arguments")
+        arguments = json.dumps(raw) if isinstance(raw, dict) else str(raw or "{}")
+        errors = []
+        if not call_id or not name:
+            errors.append("id and name are required")
+        if call_id in seen:
+            errors.append("duplicate tool call id")
+        seen.add(call_id)
+        try:
+            if not isinstance(json.loads(arguments), dict):
+                errors.append("arguments must be a JSON object")
+        except (TypeError, ValueError):
+            errors.append("arguments must be valid JSON")
+        item = {"id": call_id, "name": name, "arguments": arguments}
+        if errors:
+            item["error"] = "usage error: malformed tool call: " + "; ".join(errors)
+        calls.append(item)
+    return calls
+
+
+def _assistant_tool_message(message: Any, calls=None) -> dict[str, Any]:
+    """Keep only valid call/result pairs; malformed calls get user feedback."""
+    calls = _normalized_tool_calls(message) if calls is None else calls
+    result = _assistant_text_message(message, _object_value(message, "content"))
+    valid = [{"id": call["id"], "type": "function", "function": {
+        "name": call["name"], "arguments": call["arguments"]}}
+        for call in calls if not call.get("error")]
+    if valid:
+        result["tool_calls"] = valid
     return result
 
 @dataclass
@@ -1103,8 +1139,51 @@ def _responses_text(output_items: Any) -> str:
     return "".join(parts)
 
 
+class ResponseTerminalError(RuntimeError):
+    """A response cannot safely be treated as a completed model turn."""
+
+
+class ResponseStreamEOFError(ResponseTerminalError):
+    """A nonempty Responses stream ended without a terminal event."""
+
+
+class IncompleteResponseError(ResponseTerminalError):
+    """Provider declared a response incomplete; never execute its partial output."""
+
+    def __init__(self, reason: str = "unknown", usage: dict | None = None):
+        self.status = "incomplete"
+        self.reason = reason
+        self.usage = usage
+        super().__init__(f"Responses status=incomplete reason={reason}")
+
+
+def _reject_incomplete(response: Any, *, event_incomplete: bool = False) -> None:
+    if event_incomplete or str(getattr(response, "status", "") or "") == "incomplete":
+        details = getattr(response, "incomplete_details", None)
+        reason = (details.get("reason") if isinstance(details, dict)
+                  else getattr(details, "reason", None))
+        # Provider reason is diagnostic only; do not put arbitrary response text in errors.
+        reason = str(reason or "unknown")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", reason):
+            reason = "unknown"
+        raw_usage = getattr(response, "usage", None)
+        usage = None
+        if raw_usage is not None:
+            usage = {}
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                value = raw_usage.get(key) if isinstance(raw_usage, dict) else getattr(raw_usage, key, None)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    usage[key] = value
+            if not usage:
+                usage = None
+            elif len(usage) == 3:
+                record_usage(current_stage(), usage["input_tokens"], usage["output_tokens"], usage["total_tokens"])
+        raise IncompleteResponseError(reason, usage)
+
+
 def _responses_round_from_response(response: Any) -> "_ChatRound":
     """Shape a non-streamed Responses result like a chat round."""
+    _reject_incomplete(response)
     output_items = getattr(response, "output", None) or []
     text = _responses_text(output_items) or str(getattr(response, "output_text", "") or "")
     calls = _responses_function_calls(output_items)
@@ -1199,6 +1278,7 @@ def _responses_round_from_stream(stream: Any) -> "_ChatRound":
         elif etype in ("response.completed", "response.done", "response.incomplete"):
             completed = True
             response = getattr(event, "response", None)
+            _reject_incomplete(response, event_incomplete=etype == "response.incomplete")
             if response is not None:
                 usage = getattr(response, "usage", None) or usage
             else:
@@ -1215,10 +1295,12 @@ def _responses_round_from_stream(stream: Any) -> "_ChatRound":
 
     if stream_error:
         raise RuntimeError(f"responses stream error: {stream_error}")
-    if not completed and not text_parts and not reason_parts and not call_order:
-        # Mirror the plain-text Responses path: an empty/error SSE stream lets
-        # api_mode=auto fall back to chat instead of returning a blank round.
-        raise RuntimeError("responses stream produced no content")
+    if not completed:
+        if not any(kind.startswith(("response.output_", "response.function_call_", "response.reasoning_"))
+                   for kind in observed):
+            # Preserve the empty-stream compatibility probe.
+            raise RuntimeError("responses stream produced no content")
+        raise ResponseStreamEOFError("responses stream ended without a terminal event")
 
     for call_id in call_order:
         current = calls[call_id]
@@ -1354,7 +1436,10 @@ class OpenAiTextClient:
                         "max_context_tokens", "max_context_length", "max_model_len",
                         "max_position_embeddings") if name in raw}
                     try:
-                        context_budget.resolve_window(self.window_config, metadata)
+                        # Validate discovery independently of explicit reservation:
+                        # an override larger than a valid reported window must fail
+                        # closed, not make us discard that window as malformed.
+                        context_budget.resolve_window({}, metadata)
                     except context_budget.ContextBudgetError:
                         metadata = {}  # malformed discovery is unknown, not authoritative
                     request_audit.record_result(request_id, result={"model_metadata": metadata})
@@ -1474,7 +1559,7 @@ class OpenAiTextClient:
         try:
             return self._responses(client, system, user, response_format=response_format)
         except (context_budget.ContextBudgetError, request_audit.RequestAuditError,
-                processes.ValidationCancelled):
+                processes.ValidationCancelled, ResponseTerminalError):
             raise
         except Exception as responses_error:
             if _is_retryable_request_error(responses_error):
@@ -1506,6 +1591,7 @@ class OpenAiTextClient:
         max_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         max_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
         max_total_calls: int = DEFAULT_MAX_TOOL_CALLS,
+        max_tool_retries: int = DEFAULT_MAX_TOOL_RETRIES,
         fallback: str = "",
         response_format: dict[str, Any] | None = None,
         deliverable_hint: str = "",
@@ -1546,6 +1632,9 @@ class OpenAiTextClient:
         cached_reported = False
         tool_rounds = 0
         total_calls = 0
+        retries = 0
+        retry_limit = max(0, int(max_tool_retries))
+        corrective_turn = False
         nudges = 0
         max_nudges = 1 if nudge_on_tool_intent else 0
         empty_retries = 0
@@ -1554,9 +1643,11 @@ class OpenAiTextClient:
         total_cap = max(0, int(max_total_calls))
         mode = "chat+tools" if max_tool_rounds > 0 else "chat"
 
-        for iteration in range(max_tool_rounds + 1):
+        for iteration in range(max_tool_rounds + retry_limit + 3):
             budget_exhausted = bool(total_cap) and total_calls >= total_cap
-            allow_tools = iteration < max_tool_rounds and not budget_exhausted
+            correction = corrective_turn
+            corrective_turn = False
+            allow_tools = correction or (tool_rounds < max_tool_rounds and not budget_exhausted)
             if not allow_tools and tool_rounds:
                 # One explicit nudge before the forced final answer.
                 messages.append({"role": "user", "content": tool_budget_reminder(deliverable_hint)})
@@ -1568,7 +1659,7 @@ class OpenAiTextClient:
                     tools=tools,
                     response_format=response_format if not allow_tools else None,
                 )
-            except processes.ValidationCancelled:
+            except (processes.ValidationCancelled, processes.ProcessTerminationError, ResponseTerminalError):
                 raise
             except Exception as exc:
                 if not allow_tools:
@@ -1589,7 +1680,7 @@ class OpenAiTextClient:
             record_usage(current_stage(), inp, out, total, round_.cached_input_tokens)
 
             message = round_.message
-            tool_calls = list(getattr(message, "tool_calls", None) or [])
+            tool_calls = _normalized_tool_calls(message)
             text = round_.text
             if not allow_tools or not tool_calls:
                 intent_only = bool(allow_tools and looks_like_tool_intent(text))
@@ -1650,14 +1741,21 @@ class OpenAiTextClient:
                 )
 
             tool_rounds += 1
-            messages.append(_assistant_tool_message(message))
+            assistant = _assistant_tool_message(message, tool_calls)
+            if assistant.get("tool_calls") or assistant.get("content"):
+                messages.append(assistant)
+            retry_exhausted = False
+            tool_messages = []
             for index, call in enumerate(tool_calls):
-                function = getattr(call, "function", None)
-                name = str(getattr(function, "name", "") or "")
-                arguments = _parse_tool_arguments(getattr(function, "arguments", ""))
+                name = call["name"]
+                arguments = _parse_tool_arguments(call["arguments"])
                 over_round = index >= round_cap
-                over_total = bool(total_cap) and total_calls >= total_cap
-                if over_round or over_total:
+                over_total = not correction and bool(total_cap) and total_calls >= total_cap
+                if retry_exhausted:
+                    observation, ok = "skipped: tool retry budget exhausted", False
+                elif call.get("error"):
+                    observation, ok = call["error"], False
+                elif over_round or over_total:
                     observation = (
                         "skipped: tool-call budget reached; produce the final "
                         "deliverable instead of reading more"
@@ -1669,10 +1767,15 @@ class OpenAiTextClient:
                         # Keep the string runner API, but do not count error text
                         # or a rendered "check failed" as a successful observation.
                         ok = tools_mod.tool_result_ok(observation)
-                    except Exception as exc:  # pragma: no cover - tools report their own errors
+                    except (processes.ValidationCancelled, processes.ProcessTerminationError):
+                        raise
+                    except Exception as exc:
                         observation = f"tool error: {type(exc).__name__}: {exc}"
                         ok = False
                     total_calls += 1
+                if not ok and not observation.startswith("skipped:"):
+                    observation, retries, retry_exhausted = tool_failure_feedback(observation, retries, retry_limit)
+                    corrective_turn = not retry_exhausted
                 entry = {
                     "round": tool_rounds,
                     "name": name,
@@ -1683,13 +1786,13 @@ class OpenAiTextClient:
                 transcript.append(entry)
                 if on_tool_call is not None:
                     on_tool_call(entry)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": str(getattr(call, "id", "") or ""),
-                        "content": observation,
-                    }
-                )
+                tool_messages.append({"role": "user", "content": observation} if call.get("error") else
+                                     {"role": "tool", "tool_call_id": call["id"], "content": observation})
+            messages.extend(sorted(tool_messages, key=lambda message: message["role"] != "tool"))
+            if retry_exhausted:
+                raise failures.StageDeliveryFailure(
+                    "tool retry budget exhausted", tool_calls=tuple(transcript),
+                    terminal_reason="tool_retries_exhausted")
 
         raise RuntimeError("tool-enabled model exhausted its rounds without a stage answer")
 
@@ -1708,8 +1811,10 @@ class OpenAiTextClient:
         last_emit = started
         stream_error = ""
         completed = False
+        output_observed = False
         for event in stream:
             etype = str(getattr(event, "type", "") or "")
+            output_observed |= etype.startswith(("response.output_", "response.function_call_", "response.reasoning_"))
             if etype in ("error", "response.failed"):
                 stream_error = _responses_stream_error(event)
             if etype == "response.output_text.delta":
@@ -1726,6 +1831,7 @@ class OpenAiTextClient:
             elif etype in ("response.completed", "response.done", "response.incomplete"):
                 completed = True
                 response = getattr(event, "response", None)
+                _reject_incomplete(response, event_incomplete=etype == "response.incomplete")
                 usage = getattr(response, "usage", None) if response is not None else None
             now = time.monotonic()
             if now - last_emit >= _STREAM_EMIT_INTERVAL:
@@ -1738,10 +1844,11 @@ class OpenAiTextClient:
                 )
         if stream_error:
             raise RuntimeError(f"responses stream error: {stream_error}")
-        if not text_parts and not reason_parts and not completed:
-            # Some gateways answer a streaming request with an empty/error SSE
-            # stream; raising lets api_mode=auto fall back to chat.
-            raise RuntimeError("responses stream produced no content")
+        if not completed:
+            if not output_observed:
+                # Preserve the empty-stream compatibility fallback.
+                raise RuntimeError("responses stream produced no content")
+            raise ResponseStreamEOFError("responses stream ended without a terminal event")
         text, inline = split_reasoning("".join(text_parts))
         # Streamed deltas are fragments of one string: concatenate, do not join.
         summary = "".join(reason_parts).strip()
@@ -1803,7 +1910,7 @@ class OpenAiTextClient:
                         {"model": self.model, "input": inputs, "stream": True, **kwargs},
                         budget=budget, max_retries=0)
                 except (context_budget.ContextBudgetError, request_audit.RequestAuditError,
-                processes.ValidationCancelled):
+                        processes.ValidationCancelled, ResponseTerminalError):
                     raise
                 except Exception as exc:
                     if _is_retryable_request_error(exc):
@@ -1885,6 +1992,7 @@ class OpenAiTextClient:
         raise AssertionError("unreachable: bounded Responses request retries exhausted")
 
     def _responses_result(self, response, fallback_reason: str = "") -> LlmResult:
+        _reject_incomplete(response)
         inp, out, total = _extract_usage(response, "responses")
         cached = _cached_usage(getattr(response, "usage", None), "responses")
         record_usage(current_stage(), inp, out, total, cached)
@@ -1962,6 +2070,8 @@ class OpenAiTextClient:
                 # initiating request immediately; record completion after consumption.
                 if body.get("stream") and not hasattr(response, "choices") and not hasattr(response, "output"):
                     return response, request_id
+                if endpoint == "responses":
+                    _reject_incomplete(response)
                 usage = self._audit_usage(response, endpoint)
                 request_audit.record_result(request_id, result={"status": "received",
                     "response_id": str(getattr(response, "id", "") or ""),
@@ -2129,7 +2239,7 @@ class OpenAiTextClient:
                 stream, request_id = self._sdk_request(
                     client, "responses", stream_body, budget=budget, max_retries=0)
             except (context_budget.ContextBudgetError, request_audit.RequestAuditError,
-                processes.ValidationCancelled):
+                    processes.ValidationCancelled, ResponseTerminalError):
                 raise
             except Exception as exc:
                 if _is_retryable_request_error(exc):
@@ -2231,7 +2341,7 @@ class OpenAiTextClient:
             self._last_round_mode = "responses"
             return round_
         except (context_budget.ContextBudgetError, request_audit.RequestAuditError,
-                processes.ValidationCancelled):
+                processes.ValidationCancelled, ResponseTerminalError):
             raise
         except Exception as exc:
             if self.api_mode != "auto" or _is_retryable_request_error(exc):

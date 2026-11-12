@@ -8,7 +8,7 @@ from .. import spec as spec_mod, state as state_mod
 from ..benchmark import embench, generic
 from ..flow import gates, ladder, outcome
 from ..runtime import llm_step, stage_services
-from ..runtime.llm import DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND, DEFAULT_MAX_TOOL_ROUNDS, LlmResult
+from ..runtime.llm import DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS_PER_ROUND, DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_MAX_TOOL_RETRIES, LlmResult
 from ..runtime.policy import PolicyError
 from ..runtime.tools import DEFAULT_CONTEXT_FILES, DESIGN_SOURCE_FILES, DESIGN_WORKSPACE_SUBDIR, RepoToolbox
 from ..state import CfuDesignState
@@ -101,6 +101,7 @@ def load_context(state: CfuDesignState) -> CfuDesignState:
             "max_rounds": int(state.get("max_tool_rounds", DEFAULT_MAX_TOOL_ROUNDS) or DEFAULT_MAX_TOOL_ROUNDS),
             "max_calls": int(state.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS) or 0),
             "max_calls_per_round": DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
+            "max_retries": int(state.get("max_tool_retries", DEFAULT_MAX_TOOL_RETRIES)),
         },
     )
     return {

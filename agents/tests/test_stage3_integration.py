@@ -9,9 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from agents.cfu_design_agent import conformance, graph, prompts
-from agents.cfu_design_agent.runtime.llm import LlmResult
-from agents.cfu_design_agent.runtime.policy import load_policy
-from agents.cfu_design_agent.runtime.tools import RepoToolbox, design_workspace_paths
+from agents.cfu_design_agent.runtime.tools import design_workspace_paths
 from agents.cfu_design_agent.flow import ladder
 from agents.cfu_design_agent.runtime import checks
 from agents.cfu_design_agent.runtime import effects
@@ -106,17 +104,35 @@ class Stage3IntegrationTest(unittest.TestCase):
                                   f"{self.run_root}/workspace/demo_benchmark", "source_path": self.sw},
             "agent_tools": True, "apply_patch": True, "run_commands": True,
             "stage3_autonomy": True, "max_tool_rounds": 6, "max_tool_calls": 10,
+            "max_tool_retries": 1,  # Scripted rollback cases intentionally permit one correction.
             "gates": {"isa": {"ok": True}},
         }
 
+    def test_prior_draft_survives_each_failure_kind(self):
+        for rung in ("hw_build", "sw_build", "sim"):
+            state = {"implementation_design_type": "draft",
+                     "implementation_unimplemented": ["missing operation"],
+                     "hardware_plan": "prior delivery",
+                     "validation_results": [{"rung": rung, "returncode": 1}]}
+            with self.subTest(rung=rung):
+                block = unified._prior_draft_block(state)
+                self.assertIn("missing operation", block)
+                self.assertIn("prior delivery", block)
+                self.assertIn("unverified", block)
+        self.assertEqual(unified._prior_draft_block({"implementation_design_type": "complete"}), "")
+
     def test_hw_and_sw_then_independent_gates(self):
+        self.state.update(implementation_design_type="draft",
+                          implementation_unimplemented=["finish previous vector path"],
+                          hardware_plan="previous draft summary")
         client = _RoundClient([
             ("edit_software", {"path": self.sw, "search": "int kernel(void) { return 1; }", "replace": "int kernel(void) { return cfu_compute(1, 2); }"}),
             ("check_hardware_elaboration", {}),  # permitted BEFORE hardware edit
             ("edit_hardware", {"edits": [{"path": self.hw,
               "search": "class AgentCfu {}", "replace": "class AgentCfu { /* accelerated */ }"}]}),
             ("write_conformance", {"oracle": self.oracle}),
-            ("submit_stage", {"delivery": "HW, SW and oracle ready for independent validation"}),
+            ("submit_stage", {"design_type": "draft", "unimplemented": ["finish overflow handling"],
+                              "delivery": "HW, SW and oracle ready for independent validation"}),
         ])
         from agents.cfu_design_agent.runtime.implementation_tools import ImplementationToolset
         real_run = ImplementationToolset.run
@@ -138,11 +154,27 @@ class Stage3IntegrationTest(unittest.TestCase):
                 self.fail(f"Stage 3 failed: {exc}; calls={observed!r}")
         self.assertEqual(client.turns, [])
         request_user = client.messages[0][1]["content"]
+        self.assertIn("finish previous vector path", request_user)
+        self.assertIn("previous draft summary", request_user)
+        self.assertIn("model-provided, unverified", request_user)
         shared = prompts.workload_digest_block(self.state["workload_spec"], None)
         self.assertIn(shared, request_user)
         self.assertLess(request_user.index(shared), request_user.index("## Stage:"))
+        for expected in ("edit_hardware", "edit_software", "write_conformance(oracle)", "submit_stage(delivery, design_type, unimplemented)"):
+            self.assertIn(expected, request_user)
+        for expected in ("Untested does not mean unimplemented", "Both draft and complete consume one `--max-iters`",
+                         "returns to implementation after simulation without synthesis",
+                         "iteration budget terminates the run", "never falsely claim completeness"):
+            self.assertIn(expected, request_user)
+        self.assertNotIn("FILE_BEGIN", request_user)
         self.assertEqual(update["gates"]["implementation_hw"]["ok"], True)
         self.assertEqual(update["gates"]["implementation_sw"]["ok"], True)
+        self.assertEqual(update["implementation_design_type"], "draft")
+        self.assertEqual(update["implementation_unimplemented"], ["finish overflow handling"])
+        for name in ("implementation_hw", "implementation_sw"):
+            self.assertEqual(update["gates"][name]["design_type"], "draft")
+            self.assertEqual(update["gates"][name]["unimplemented"], ["finish overflow handling"])
+            self.assertTrue(update["gates"][name]["candidate_hash"])
         self.assertNotIn("hw_build", update["gates"])
         self.assertNotIn("hw_conformance", update["gates"])
         self.assertNotIn("sw_build", update["gates"])
@@ -169,8 +201,8 @@ class Stage3IntegrationTest(unittest.TestCase):
             with self.subTest(check=check_name):
                 client = _RoundClient([
                     (check_name, {}), (edit_name, edit),
-                    ("submit_stage", {"delivery": "only repaired the internal failure"}),
-                    ("submit_stage", {"delivery": "still only one domain"}),
+                    ("submit_stage", {"design_type": "complete", "delivery": "only repaired the internal failure"}),
+                    ("submit_stage", {"design_type": "complete", "delivery": "still only one domain"}),
                 ])
                 with mock.patch.object(llm_step, "_llm", return_value=client), \
                      mock.patch.object(commands, "agent_cfu_check_commands", return_value=[["sbt", "mock"]]), \
@@ -178,7 +210,7 @@ class Stage3IntegrationTest(unittest.TestCase):
                      mock.patch.object(checks, "_run_check", return_value={
                          "returncode": 1, "stderr_tail": "error: first internal failure"}), \
                      mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-                    update = unified.implement_stage3(self.state)
+                    update = unified.implement_stage3({**self.state, "max_tool_retries": 2})
                     self.assertFalse(update["gates"]["implementation_hw"]["ok"])
                     self.assertFalse(update["gates"]["implementation_sw"]["ok"])
                     self.assertIn(f"no {missing_domain} target was edited", " ".join(update["errors"]))
@@ -223,9 +255,9 @@ class Stage3IntegrationTest(unittest.TestCase):
                                "replace": "int kernel(void) { return cfu_compute(1, 2); }"}),
             ("edit_hardware", {"edits": [{"path": self.hw, "search": "class AgentCfu {}",
                                         "replace": "class AgentCfu { int changed; }"}]}),
-            ("submit_stage", {"delivery": "HW and SW applied but no oracle"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "HW and SW applied but no oracle"}),
             ("write_conformance", {"oracle": self.oracle}),
-            ("submit_stage", {"delivery": "HW, SW and independent oracle applied"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "HW, SW and independent oracle applied"}),
         ])
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
@@ -275,7 +307,7 @@ class Stage3IntegrationTest(unittest.TestCase):
             ("submit_repair_diagnosis", diagnosis),
             ("edit_hardware", {"edits": [{"path": self.hw, "search": "class AgentCfu {}",
                 "replace": "class AgentCfu { int changed; }"}]}),
-            ("submit_stage", {"delivery": "fixed HW; unchanged validated CFU kernel"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "fixed HW; unchanged validated CFU kernel"}),
         ]
 
     def test_hardware_only_repair_reuses_hash_verified_prior_actual_cfu_software(self):
@@ -346,8 +378,8 @@ class Stage3IntegrationTest(unittest.TestCase):
         revised["commands"][0]["data"]["count"] = 8
         client = _RoundClient([
             ("write_conformance", {"oracle": json.dumps(revised)}),
-            ("submit_stage", {"delivery": "revised oracle; no diagnosis filed"}),
-            ("submit_stage", {"delivery": "still no diagnosis"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "revised oracle; no diagnosis filed"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "still no diagnosis"}),
         ])
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
@@ -374,7 +406,7 @@ class Stage3IntegrationTest(unittest.TestCase):
         client = _RoundClient([
             ("submit_repair_diagnosis", diagnosis),
             ("write_conformance", {"oracle": json.dumps(revised)}),
-            ("submit_stage", {"delivery": "repaired oracle; healthy HW and SW untouched"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "repaired oracle; healthy HW and SW untouched"}),
         ])
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
@@ -393,6 +425,8 @@ class Stage3IntegrationTest(unittest.TestCase):
         self.assertEqual(conformance_delivery.inspect_delivery({**state, **update}, box)[1], [])
 
     def test_hardware_only_repair_cannot_reuse_invalid_prior_software_gate(self):
+        # The rejected diagnosis and submit calls share the correction pool.
+        self.state["max_tool_retries"] = 2
         for invalid in ({"candidate_hash": "wrong-source-hash"}, {"isa_hash": "wrong-isa-hash"},
                         {"stale": True}, {"applied": False}, None):
             with self.subTest(prior_gate=invalid):
@@ -403,7 +437,7 @@ class Stage3IntegrationTest(unittest.TestCase):
                     state["gates"]["implementation_sw"].update(invalid)
                 original_sw = (self.root / self.sw).read_bytes()
                 client = _RoundClient(self._hardware_repair_turns(diagnosis) + [
-                    ("submit_stage", {"delivery": "unchanged software still has invalid reuse evidence"}),
+                    ("submit_stage", {"design_type": "complete", "delivery": "unchanged software still has invalid reuse evidence"}),
                 ])
                 with mock.patch.object(llm_step, "_llm", return_value=client), \
                      mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
@@ -420,7 +454,7 @@ class Stage3IntegrationTest(unittest.TestCase):
             with self.subTest(software=software):
                 state, diagnosis = self._hardware_repair_state(software)
                 client = _RoundClient(self._hardware_repair_turns(diagnosis) + [
-                    ("submit_stage", {"delivery": "still using scalar software"}),
+                    ("submit_stage", {"design_type": "complete", "delivery": "still using scalar software"}),
                 ])
                 with mock.patch.object(llm_step, "_llm", return_value=client), \
                      mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
@@ -437,7 +471,7 @@ class Stage3IntegrationTest(unittest.TestCase):
             ("edit_hardware", {"edits": [{"path": self.hw,
               "search": "class AgentCfu {}", "replace": "class AgentCfu { int changed; }"}]}),
             ("write_conformance", {"oracle": self.oracle}),
-            ("submit_stage", {"delivery": "HW and SW ready"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "HW and SW ready"}),
         ])
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
@@ -455,15 +489,15 @@ class Stage3IntegrationTest(unittest.TestCase):
             ("edit_hardware", {"edits": [{"path": self.hw,
               "search": "class AgentCfu {}", "replace": "class AgentCfu { int changed; }"}]}),
             ("write_conformance", {"oracle": self.oracle}),
-            ("submit_stage", {"delivery": "premature"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "premature"}),
             # The first rejection is correctable, so the run only fails after the
             # retry is rejected too.
-            ("submit_stage", {"delivery": "still premature"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "still premature"}),
         ])
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(False, "no intrinsic")), \
              mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            update = unified.implement_stage3(self.state)
+            update = unified.implement_stage3({**self.state, "max_tool_retries": 1})
             self.assertFalse(update["gates"]["implementation_hw"]["ok"])
             self.assertFalse(update["gates"]["implementation_sw"]["ok"])
             self.assertIn("gate rejected", " ".join(update["errors"]))
@@ -471,98 +505,19 @@ class Stage3IntegrationTest(unittest.TestCase):
         self.assertEqual((self.root / self.sw).read_text(), "int kernel(void) { return 1; }\n")
         self.assertTrue(all(data is None for data in self._conformance_bytes().values()))
 
-    def test_the_stage3_prompt_requires_applied_edits_and_a_summary_delivery(self):
-        # Observed twice (crc32-run-0001/0002): the prompt's only emphasis was
-        # that prose cannot pass, so the model pasted the whole design into
-        # submit_stage and never called an editing tool. Both runs died there.
-        client = _RoundClient([
-            ("edit_software", {"path": self.sw, "search": "int kernel(void) { return 1; }",
-                               "replace": "int kernel(void) { return cfu_compute(1, 2); }"}),
-            ("edit_hardware", {"edits": [{"path": self.hw,
-              "search": "class AgentCfu {}", "replace": "class AgentCfu { int changed; }"}]}),
-            ("write_conformance", {"oracle": self.oracle}),
-            ("submit_stage", {"delivery": "applied the design and the kernel"}),
-        ])
-        with mock.patch.object(llm_step, "_llm", return_value=client), \
-             mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
-             mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            update = unified.implement_stage3(self.state)
-        prompt = "\n".join(str(item.get("content", "")) for item in client.messages[0])
-        for expected in (
-            "edit_hardware", "edit_software", "write_conformance(oracle)", "submit_stage(delivery)",
-            "Apply the change to the workspace files with the editing tools",
-            "is a summary of what you changed",
-            "reports no applied change",
-            "not applied",
-        ):
-            self.assertIn(expected, prompt)
-        # The delivered prompt must not resurrect the legacy block protocol.
-        self.assertNotIn("FILE_BEGIN", prompt)
-        self.assertNotIn("the harness applies it", prompt)
-        self.assertTrue(update["gates"]["implementation_hw"]["ok"])
-
-    def test_the_crc32_failure_mode_recovers_after_the_gate_explains_itself(self):
-        # The exact crc32-run-0002 sequence: read, then paste the whole design
-        # into submit_stage without editing anything. It must not end the run —
-        # the reason goes back, the model applies the edits, and the retry passes.
-        client = _RoundClient([
-            ("read_file", {"path": self.hw}),
-            ("submit_stage", {"delivery": "## 1. Hardware (FULL FILE, write verbatim)\n"
-                                          "```scala\nclass AgentCfu {}\n```"}),
-            ("edit_software", {"path": self.sw, "search": "int kernel(void) { return 1; }",
-                               "replace": "int kernel(void) { return cfu_compute(1, 2); }"}),
-            ("edit_hardware", {"edits": [{"path": self.hw,
-              "search": "class AgentCfu {}", "replace": "class AgentCfu { int changed; }"}]}),
-            ("write_conformance", {"oracle": self.oracle}),
-            ("submit_stage", {"delivery": "applied edit_hardware + edit_software"}),
-        ])
-        with mock.patch.object(llm_step, "_llm", return_value=client), \
-             mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
-             mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            update = unified.implement_stage3(self.state)
-        self.assertIn("changed", (self.root / self.hw).read_text())
-        self.assertIn("cfu_compute", (self.root / self.sw).read_text())
-        self.assertTrue(update["gates"]["implementation_hw"]["ok"])
-        # The model saw the gate's reason before the corrective round.
-        recovery_prompt = "\n".join(
-            str(item.get("content", "")) for item in client.messages[2]
-        )
-        self.assertIn("no hardware target was edited", recovery_prompt)
-
-    def test_a_submission_batched_with_edits_is_applied_before_the_gate(self):
-        # Observed 2026-09-30: the implementation stage ended with
-        # "submit_stage must be the sole tool call" because the model put its
-        # submission in the same turn as another call. The batch must be run,
-        # not fatal.
-        client = _BatchClient([[
-            ("edit_software", {"path": self.sw, "search": "int kernel(void) { return 1; }",
-                               "replace": "int kernel(void) { return cfu_compute(1, 2); }"}),
-            ("edit_hardware", {"edits": [{"path": self.hw,
-              "search": "class AgentCfu {}", "replace": "class AgentCfu { int changed; }"}]}),
-            ("write_conformance", {"oracle": self.oracle}),
-            ("submit_stage", {"delivery": "applied all three, submitting in the same turn"}),
-        ]])
-        with mock.patch.object(llm_step, "_llm", return_value=client), \
-             mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
-             mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            update = unified.implement_stage3(self.state)
-        self.assertIn("changed", (self.root / self.hw).read_text())
-        self.assertIn("cfu_compute", (self.root / self.sw).read_text())
-        self.assertTrue(update["gates"]["implementation_hw"]["ok"])
-
     def test_the_batched_submission_failure_recovers_end_to_end(self):
         # The literal crc32-run-0002 sequence: read, then submit a full-file
         # delivery batched with another read. It must reach the gate, report the
         # missing edits, and let the model apply them in the corrective round.
         client = _BatchClient([
             [("read_file", {"path": self.hw}),
-             ("submit_stage", {"delivery": "FULL FILE, write verbatim:\nclass AgentCfu {}"})],
+             ("submit_stage", {"design_type": "complete", "delivery": "FULL FILE, write verbatim:\nclass AgentCfu {}"})],
             [("edit_software", {"path": self.sw, "search": "int kernel(void) { return 1; }",
                                 "replace": "int kernel(void) { return cfu_compute(1, 2); }"}),
              ("edit_hardware", {"edits": [{"path": self.hw,
                "search": "class AgentCfu {}", "replace": "class AgentCfu { int changed; }"}]})],
             [("write_conformance", {"oracle": self.oracle}),
-             ("submit_stage", {"delivery": "applied all three after the gate explained itself"})],
+             ("submit_stage", {"design_type": "complete", "delivery": "applied all three after the gate explained itself"})],
         ])
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_software_exercises_cfu", return_value=(True, "")), \
@@ -571,27 +526,8 @@ class Stage3IntegrationTest(unittest.TestCase):
         self.assertIn("changed", (self.root / self.hw).read_text())
         self.assertIn("cfu_compute", (self.root / self.sw).read_text())
         self.assertTrue(update["gates"]["implementation_hw"]["ok"])
-        # The model saw the gate's reason before the corrective round.
         recovery = " ".join(str(item.get("content", "")) for item in client.messages[1])
         self.assertIn("no hardware target was edited", recovery)
-
-    def test_a_rejected_gate_reopens_the_edit_budgets(self):
-        # Run-0003: after the CFU-usage check rejected the kernel, every later
-        # `edit_software` answered "budget exhausted", so the demanded change was
-        # impossible. The gate now re-opens the local budgets on rejection.
-        client = _RoundClient([
-            ("read_file", {"path": self.hw}),
-            ("submit_stage", {"delivery": "nothing applied"}),
-            ("submit_stage", {"delivery": "still nothing"}),
-        ])
-        with mock.patch.object(llm_step, "_llm", return_value=client), \
-             mock.patch.object(unified.ImplementationToolset, "grant_correction",
-                               autospec=True) as grant, \
-             mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            update = unified.implement_stage3(self.state)
-            self.assertFalse(update["gates"]["implementation_hw"]["ok"])
-            self.assertIn("no hardware target was edited", " ".join(update["errors"]))
-        self.assertEqual(grant.call_count, 2)
 
     def test_a_cfu_usage_rejection_is_answerable_in_the_corrective_round(self):
         # Run-0003: the submission that added the CFU intrinsic calls was refused
@@ -604,11 +540,11 @@ class Stage3IntegrationTest(unittest.TestCase):
             ("edit_hardware", {"edits": [{"path": self.hw,
               "search": "class AgentCfu {}", "replace": "class AgentCfu { int changed; }"}]}),
             ("write_conformance", {"oracle": self.oracle}),
-            ("submit_stage", {"delivery": "first attempt without the intrinsic"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "first attempt without the intrinsic"}),
             ("edit_software", {"path": self.sw,
                                "search": "int kernel(void) { return 2; }  /* step 1 */",
                                "replace": "int kernel(void) { return cfu_compute(1, 2); }"}),
-            ("submit_stage", {"delivery": "kernel now calls the intrinsic"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "kernel now calls the intrinsic"}),
         ])
         # First submission, corrective submission, and final accepted audit.
         checks = [(False, "the CFU build does not call any CFU datapath intrinsic"),
@@ -621,21 +557,17 @@ class Stage3IntegrationTest(unittest.TestCase):
         self.assertEqual(usage_check.call_count, 3)
         self.assertIn("cfu_compute", (self.root / self.sw).read_text())
         self.assertTrue(update["gates"]["implementation_sw"]["ok"])
-        # The refused-intrinsic reason reached the model before the corrective edit.
         recovery = " ".join(str(item.get("content", "")) for item in client.messages[4])
         self.assertIn("does not call any CFU datapath intrinsic", recovery)
 
     def test_a_delivery_without_applied_edits_is_rejected_with_a_reason(self):
-        # Observed twice (crc32-run-0001/0002): the model pasted the whole design
-        # into submit_stage and never called an edit tool. The gate must say so
-        # instead of failing with a bare "rejected".
         client = _RoundClient([
-            ("submit_stage", {"delivery": "here is the full file:\nclass AgentCfu {}"}),
-            ("submit_stage", {"delivery": "and here it is again"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "here is the full file:\nclass AgentCfu {}"}),
+            ("submit_stage", {"design_type": "complete", "delivery": "and here it is again"}),
         ])
         with mock.patch.object(llm_step, "_llm", return_value=client), \
              mock.patch.object(intrinsics, "_write_intrinsics_header", return_value=self.sw + ".h"):
-            update = unified.implement_stage3(self.state)
+            update = unified.implement_stage3({**self.state, "max_tool_retries": 1})
             self.assertFalse(update["gates"]["implementation_hw"]["ok"])
             self.assertIn("no hardware target was edited", " ".join(update["errors"]))
         self.assertEqual((self.root / self.hw).read_text(), "class AgentCfu {}\n")

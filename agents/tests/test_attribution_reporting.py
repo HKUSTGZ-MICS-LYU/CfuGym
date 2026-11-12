@@ -377,7 +377,7 @@ class TypedFailureTest(unittest.TestCase):
             tool_calls_relpath="09_implementation/tools.yaml", system="s", user="u", fallback="", tools_enabled=True,
             native_tool_loop=True, submit_stage=lambda text: (False, "missing oracle"))
         with self.assertRaises(failures.StageDeliveryFailure) as caught:
-            executor.execute({}, object(), request, client=Client())
+            executor.execute({"max_tool_retries": 1}, object(), request, client=Client())
         self.assertEqual(caught.exception.stage, "implement")
         self.assertEqual(len(caught.exception.tool_calls), 2)
         self.assertFalse(any(call["ok"] for call in caught.exception.tool_calls))

@@ -53,7 +53,10 @@ def expand_run_dir(value: str, run_root: str) -> str:
 
 
 #: Result prefixes a toolset uses for a rejected call rather than an outcome.
-_TOOL_FAILURE_PREFIXES = ("error:", "tool error:", "denied by", "skipped:", "usage error:")
+_TOOL_FAILURE_PREFIXES = (
+    "error:", "tool error:", "denied by", "skipped:", "usage error:",
+    "edit rejected:", "diagnosis rejected:", "repair route rejected:",
+)
 
 
 def tool_result_ok(text: str) -> bool:
@@ -399,7 +402,7 @@ class RepoToolbox:
         if rejected:
             allowed = "AgentCfu.scala, AgentCfuFiber.scala"
             if self.embench_benchmark:
-                allowed += f", benchmarks/embench-iot/src/{self.embench_benchmark}/*.c"
+                allowed += f", {EMBENCH_SOURCE_ROOT}/{self.embench_benchmark}/*.c"
             raise ValueError(
                 "patch touches source paths outside the writable workspace: "
                 + ", ".join(sorted(set(rejected)))
@@ -800,6 +803,11 @@ def design_scaffold_name(rel_path: str) -> str:
 
 
 EMBENCH_SOURCE_ROOT = "benchmarks/embench-iot/src"
+# Custom workloads with the Embench benchmark interface (see
+# benchmark/embench.py CUSTOM_ROOT); their sources redirect exactly like
+# Embench sources and are equally read-only.
+CUSTOM_SOURCE_ROOT = "benchmarks/custom/src"
+BENCHMARK_SOURCE_ROOTS = (EMBENCH_SOURCE_ROOT, CUSTOM_SOURCE_ROOT)
 
 
 def embench_cfu_rel(run_root: str, benchmark: str, filename: str) -> str:
@@ -809,10 +817,12 @@ def embench_cfu_rel(run_root: str, benchmark: str, filename: str) -> str:
 
 def embench_source_target(target: str, benchmark: str) -> str:
     """Basename if target names a source of this run's Embench benchmark."""
-    prefix = f"{EMBENCH_SOURCE_ROOT}/{benchmark}/"
-    if not target.startswith(prefix):
+    if not benchmark:
         return ""
-    return Path(target).name
+    for root in BENCHMARK_SOURCE_ROOTS:
+        if target.startswith(f"{root}/{benchmark}/"):
+            return Path(target).name
+    return ""
 
 
 def redirect_target(target: str, run_root: str, embench_benchmark: str = "") -> str:
@@ -1204,7 +1214,7 @@ def repair_patch_paths(
     workspace copy:
 
     * AgentCfu.scala / AgentCfuFiber.scala -> the design workspace overlay
-    * benchmarks/embench-iot/src/<bench>/<file>.c -> that run's cfu config tree
+    * benchmarks/{embench-iot,custom}/src/<bench>/<file>.c -> that run's cfu config tree
 
     Any other source path is rejected.
 
@@ -1225,7 +1235,7 @@ def repair_patch_paths(
                     replaced = f"{prefix}{replacement}"
                     if replacement not in redirected:
                         redirected.append(replacement)
-                elif target.startswith("src/") or target.startswith(EMBENCH_SOURCE_ROOT):
+                elif target.startswith("src/") or target.startswith(BENCHMARK_SOURCE_ROOTS):
                     rejected.append(target)
                 elif design_scaffold_name(target):
                     # An absolute/out-of-tree path naming a design file is never valid.

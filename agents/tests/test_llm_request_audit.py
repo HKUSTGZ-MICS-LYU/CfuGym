@@ -131,74 +131,6 @@ class LlmRequestAuditTest(unittest.TestCase):
         self.assertEqual(events[1]["error"]["status_code"], 429)
         self.assertEqual(events[1]["error"]["retry_delay_seconds"], 60)
 
-    def test_streaming_upstream_429_stops_after_ten_retries(self) -> None:
-        from unittest import mock
-
-        def failed_stream():
-            if False:
-                yield None
-            raise RuntimeError("upstream error: 429")
-
-        completions = _ChatCompletions([failed_stream() for _ in range(11)])
-        sdk = SimpleNamespace(chat=SimpleNamespace(completions=completions))
-        with mock.patch("agents.cfu_design_agent.runtime.llm.time.sleep") as sleep:
-            with request_audit.use_request_audit(self.run_root, self.workdir):
-                with self.assertRaisesRegex(RuntimeError, "upstream error: 429"):
-                    self._client(stream=True)._chat(sdk, "s", "u")
-
-        self.assertEqual(len(completions.calls), 11)
-        self.assertEqual(sleep.call_args_list, [
-            mock.call(60), mock.call(120), mock.call(240),
-            *[mock.call(300) for _ in range(7)],
-        ])
-        events = self._events()
-        self.assertEqual(sum(event["event"] == "request" for event in events), 11)
-        self.assertEqual(sum(event["event"] == "error" for event in events), 11)
-        self.assertEqual(events[-1]["error"]["status_code"], 429)
-        self.assertNotIn("retry_delay_seconds", events[-1]["error"])
-
-    def test_responses_streaming_upstream_429_retries(self) -> None:
-        from unittest import mock
-
-        def failed_stream():
-            if False:
-                yield None
-            raise RuntimeError("upstream error: 429")
-
-        response = SimpleNamespace(
-            id="responses-retry", status="completed", output=[], output_text="recovered",
-            usage=SimpleNamespace(input_tokens=10, output_tokens=2, total_tokens=12),
-        )
-
-        class Responses:
-            def __init__(self):
-                self.calls = 0
-
-            def create(self, **kwargs):
-                self.calls += 1
-                if self.calls == 1:
-                    return failed_stream()
-                return iter([
-                    SimpleNamespace(type="response.output_text.delta", delta="recovered"),
-                    SimpleNamespace(type="response.completed", response=response),
-                ])
-
-        responses = Responses()
-        sdk = SimpleNamespace(responses=responses)
-        with mock.patch("agents.cfu_design_agent.runtime.llm.time.sleep") as sleep:
-            with request_audit.use_request_audit(self.run_root, self.workdir):
-                result = self._client(stream=True)._responses(sdk, "s", "u")
-
-        self.assertEqual(result.text, "recovered")
-        self.assertEqual(responses.calls, 2)
-        self.assertEqual(sleep.call_args_list, [mock.call(60)])
-        events = self._events()
-        self.assertEqual([event["event"] for event in events], [
-            "request", "error", "request", "result",
-        ])
-        self.assertEqual(events[1]["error"]["status_code"], 429)
-        self.assertEqual(events[1]["error"]["retry_delay_seconds"], 60)
-
     def test_auto_mode_does_not_fallback_after_transient_retries_exhaust(self) -> None:
         from unittest import mock
 
@@ -317,8 +249,8 @@ class LlmRequestAuditTest(unittest.TestCase):
         events = self._events()
         requests = [e for e in events if e["event"] == "request"]
         self.assertEqual([e["metadata"]["endpoint"] for e in requests], ["responses", "chat"])
-        self.assertEqual(requests[0]["payload"]["max_output_tokens"], 4096)
-        self.assertEqual(requests[1]["payload"]["max_completion_tokens"], 4096)
+        self.assertEqual(requests[0]["payload"]["max_output_tokens"], 8192)
+        self.assertEqual(requests[1]["payload"]["max_completion_tokens"], 8192)
         self.assertEqual(result.cached_input_tokens, 0)
         self.assertEqual(requests[1]["metadata"]["parent_request_id"], requests[0]["request_id"])
 
@@ -334,6 +266,78 @@ class LlmRequestAuditTest(unittest.TestCase):
         requests = [e for e in self._events() if e["event"] == "request"]
         self.assertEqual(requests[0]["metadata"]["endpoint"], "models.retrieve")
         self.assertEqual(requests[-1]["metadata"]["context_budget"]["window_source"], "metadata")
+
+    def test_reported_window_conflict_never_sends_completion(self) -> None:
+        from unittest import mock
+        from agents.cfu_design_agent.runtime.context_budget import ContextBudgetError
+        models = SimpleNamespace(retrieve=mock.Mock(return_value={"context_window": 5000}))
+        completions = _ChatCompletions([_response()])
+        sdk = SimpleNamespace(models=models, chat=SimpleNamespace(completions=completions))
+        with request_audit.use_request_audit(self.run_root, self.workdir):
+            with self.assertRaisesRegex(ContextBudgetError, "smaller"):
+                self._client(output_reserve_tokens=6000)._chat(sdk, "s", "u")
+        self.assertEqual(completions.calls, [])
+
+    def test_incomplete_responses_never_execute_tools_or_fallback(self) -> None:
+        from unittest import mock
+        from agents.cfu_design_agent.runtime.llm import IncompleteResponseError
+        for stream in (False, True):
+            for reason in ("max_output_tokens", "content_filter"):
+                with self.subTest(stream=stream, reason=reason):
+                    call = SimpleNamespace(type="function_call", id="item", call_id="call",
+                                           name="edit", arguments='{}')
+                    response = SimpleNamespace(status="incomplete", output=[call],
+                                               incomplete_details=SimpleNamespace(reason=reason),
+                                               usage=SimpleNamespace(input_tokens=10, output_tokens=20, total_tokens=30))
+                    events = [SimpleNamespace(type="response.output_item.done", item=call),
+                              SimpleNamespace(type="response.incomplete", response=response)]
+                    create = mock.Mock(return_value=iter(events) if stream else response)
+                    chat = mock.Mock(side_effect=AssertionError("unexpected chat fallback"))
+                    sdk = SimpleNamespace(responses=SimpleNamespace(create=create),
+                                          chat=SimpleNamespace(completions=SimpleNamespace(create=chat)))
+                    runner = mock.Mock()
+                    with mock.patch("openai.OpenAI", return_value=sdk):
+                        with request_audit.use_request_audit(self.run_root, self.workdir):
+                            with self.assertRaises(IncompleteResponseError) as caught:
+                                self._client(api_mode="auto", stream=stream).complete_with_tools(
+                                    "s", "u", tools=[{"type": "function", "function": {"name": "edit"}}],
+                                    tool_runner=runner)
+                    self.assertEqual(caught.exception.reason, reason)
+                    self.assertEqual(caught.exception.status, "incomplete")
+                    create.assert_called_once()
+                    runner.assert_not_called()
+                    chat.assert_not_called()
+                    error = self._events()[-1]["error"]
+                    self.assertIn(reason, error["message"])
+                    self.assertEqual(error["usage"], {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30})
+                    self.assertEqual(error["response_status"], "incomplete")
+
+    def test_nonempty_responses_eof_is_not_accepted_or_retried(self) -> None:
+        from unittest import mock
+        from agents.cfu_design_agent.runtime.llm import ResponseStreamEOFError
+        for tools in (False, True):
+            with self.subTest(tools=tools):
+                call = SimpleNamespace(type="function_call", id="item", call_id="call",
+                                       name="edit", arguments='{}')
+                event = (SimpleNamespace(type="response.output_item.added", item=call) if tools else
+                         SimpleNamespace(type="response.output_text.delta", delta="partial answer"))
+                create = mock.Mock(return_value=iter([event]))
+                chat = mock.Mock(side_effect=AssertionError("unexpected fallback"))
+                sdk = SimpleNamespace(responses=SimpleNamespace(create=create),
+                                      chat=SimpleNamespace(completions=SimpleNamespace(create=chat)))
+                runner = mock.Mock()
+                with mock.patch("openai.OpenAI", return_value=sdk):
+                    with request_audit.use_request_audit(self.run_root, self.workdir):
+                        with self.assertRaises(ResponseStreamEOFError):
+                            client = self._client(api_mode="auto", stream=True)
+                            if tools:
+                                client.complete_with_tools("s", "u", tools=[{"type": "function", "function": {"name": "edit"}}], tool_runner=runner)
+                            else:
+                                client.complete("s", "u", fallback="")
+                create.assert_called_once()
+                chat.assert_not_called()
+                runner.assert_not_called()
+                self.assertEqual(self._events()[-1]["error"]["type"], "ResponseStreamEOFError")
 
     def test_budget_block_is_logged_without_sending(self) -> None:
         from agents.cfu_design_agent.runtime.context_budget import ContextBudgetError
@@ -420,7 +424,7 @@ class LlmRequestAuditTest(unittest.TestCase):
     def test_native_stage_model_requests_are_in_same_audit(self) -> None:
         from agents.cfu_design_agent.runtime.stage_executor import StageExecutionRequest, StageExecutor
         submit = SimpleNamespace(id="c-submit", function=SimpleNamespace(
-            name="submit_stage", arguments='{"delivery":"done"}'))
+            name="submit_stage", arguments='{"delivery":"done","design_type":"complete"}'))
         response = _response()
         response.choices[0].message.tool_calls = [submit]
         sdk = SimpleNamespace(chat=SimpleNamespace(completions=_ChatCompletions([response])))

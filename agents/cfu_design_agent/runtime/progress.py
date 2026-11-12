@@ -137,18 +137,22 @@ class StageProgress:
         step = NODE_TO_STEP.get(name, name)
         return self.slot_by_step.get(step, len(self.stages))
 
-    def begin(self, name: str) -> None:
-        print(f"{self._prefix(name)} {stage_label(name)} ... running", flush=True)
+    def begin(self, name: str, *, delivery_guard: bool = False) -> None:
+        prefix = "[DELIVERY]" if delivery_guard else self._prefix(name)
+        status = "checking delivery (verification not started)" if delivery_guard else "running"
+        print(f"{prefix} {stage_label(name)} ... {status}", flush=True)
 
-    def end(self, name: str, *, ok: bool, elapsed: float, tokens: int) -> None:
-        status = "OK" if ok else "FAIL"
+    def end(self, name: str, *, ok: bool, elapsed: float, tokens: int,
+            display_status: str | None = None, delivery_guard: bool = False) -> None:
+        status = display_status or ("OK" if ok else "FAIL")
+        prefix = "[DELIVERY]" if delivery_guard else self._prefix(name)
         # Input/output split straight from the usage ledger: the point of the
         # line is to show which step's input is big at a glance.
         from .llm import stage_usage
 
         usage = stage_usage(name)
         print(
-            f"{self._prefix(name)} {stage_label(name)} ... "
+            f"{prefix} {stage_label(name)} ... "
             f"{status} (in={usage['input']} out={usage['output']} tok, {elapsed:.1f}s)",
             flush=True,
         )

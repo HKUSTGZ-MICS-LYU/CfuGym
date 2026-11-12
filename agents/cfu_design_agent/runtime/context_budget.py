@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 UNKNOWN_WINDOW_TOKENS = 32_768
-DEFAULT_OUTPUT_RESERVE = 4_096
+# Default to one quarter of the effective window, capped to leave room for
+# input and avoid assuming every endpoint supports arbitrarily large outputs.
+DEFAULT_OUTPUT_RESERVE = 16_384
 # JSON framing alone is not all a provider counts (message delimiters, roles,
 # tool-call framing). Include a fixed per-message/request allowance as well.
 _REQUEST_OVERHEAD = 256
@@ -92,9 +94,9 @@ def resolve_window(
     if not isinstance(config, Mapping):
         raise ContextBudgetError("config must be an object")
     configured = _optional_number(config, _WINDOW_FIELDS, "config")
-    reserve = _optional_number(config, _RESERVE_FIELDS, "config") or DEFAULT_OUTPUT_RESERVE
+    reserve = _optional_number(config, _RESERVE_FIELDS, "config")
     if configured is not None:
-        return WindowSpec(configured, reserve, "config", True)
+        return WindowSpec(configured, reserve if reserve is not None else min(DEFAULT_OUTPUT_RESERVE, max(1, configured // 4)), "config", True)
     metadata = {} if metadata is None else metadata
     if not isinstance(metadata, Mapping):
         raise ContextBudgetError("model metadata must be an object")
@@ -109,8 +111,10 @@ def resolve_window(
         reported = reported_nested or reported_outer
     else:
         reported = _optional_number(metadata, _WINDOW_FIELDS, "metadata")
-    return WindowSpec(reported or UNKNOWN_WINDOW_TOKENS, reserve,
-                      "metadata" if reported else "unknown-soft", bool(reported))
+    window = reported or UNKNOWN_WINDOW_TOKENS
+    if reserve is None:
+        reserve = min(DEFAULT_OUTPUT_RESERVE, max(1, window // 4))
+    return WindowSpec(window, reserve, "metadata" if reported else "unknown-soft", bool(reported))
 
 
 def _serial_size(value: Any) -> int:

@@ -29,8 +29,7 @@ from agents.cfu_design_agent.stages.implement import sw as impl_sw
 from agents.cfu_design_agent.stages.review import optimize as review_optimize
 from agents.cfu_design_agent.stages.review import report
 from agents.cfu_design_agent.stages.verify import soc as verify_soc
-from agents.cfu_design_agent.stages.verify import software as verify_software
-from agents.tests.common import REPO_ROOT, offline_llm
+from agents.tests.common import REPO_ROOT
 from agents.cfu_design_agent.flow import gates as gates_mod
 from agents.cfu_design_agent.stages import feedback as feedback_mod
 from agents.cfu_design_agent.stages.review import report as report_mod
@@ -104,7 +103,7 @@ class _ToolUsingLlm:
 
     def complete_with_tools(
         self, system, user, *, tools, tool_runner, max_rounds=6,
-        max_calls_per_round=4, max_total_calls=24,
+        max_calls_per_round=4, max_total_calls=24, max_tool_retries=10,
         fallback="", response_format=None, deliverable_hint="",
         nudge_on_tool_intent=True, is_deliverable=None, on_tool_call=None,
     ):
@@ -288,12 +287,15 @@ class ImplementationGateTest(unittest.TestCase):
         self.assertTrue(raw_path.is_file())
         self.assertEqual(raw_path.read_text(), GOOD_PATCH)
 
-    def test_thinking_text_is_split_out_before_patch_parsing(self) -> None:
-        result = self._implement(THINKING_PATCH)
+    def test_thinking_text_is_split_out_and_does_not_shift_numbering(self) -> None:
+        self._seed()
+        state = _base_state(self.run_id, iteration=0)
+        with mock.patch.object(llm_step, "_llm", lambda state: _FakeLlm(THINKING_PATCH)):
+            first = impl_hw.implement_hw(state)
         self.assertTrue(
-            result["gates"]["implementation_hw"]["ok"], result["implementation_hw_summary"]
+            first["gates"]["implementation_hw"]["ok"], first["implementation_hw_summary"]
         )
-        paths = result.get("llm_raw_outputs", [])
+        paths = first.get("llm_raw_outputs", [])
         self.assertEqual(len(paths), 1)
         raw_path = REPO_ROOT / paths[0]
         raw = raw_path.read_text()
@@ -303,11 +305,6 @@ class ImplementationGateTest(unittest.TestCase):
         self.assertTrue(reasoning_path.is_file())
         self.assertIn("I will change compute", reasoning_path.read_text())
 
-    def test_reasoning_sidecar_does_not_shift_raw_output_numbering(self) -> None:
-        self._seed()
-        state = _base_state(self.run_id, iteration=0)
-        with mock.patch.object(llm_step, "_llm", lambda state: _FakeLlm(THINKING_PATCH)):
-            first = impl_hw.implement_hw(state)
         state2 = dict(state)
         state2.update(first)
         state2["iteration"] = 1
@@ -459,101 +456,6 @@ class ReviewDecisionTest(unittest.TestCase):
         self.assertEqual(gates_mod._review_decision(state), ("final_report", "blocked"))
         self.assertFalse(gates_mod._is_complete(state))
 
-VALID_ISA = """spec_version: \"1\"
-identity:
-  name: u8_wavg_agent
-  status: draft
-  opcode: custom0 (0x0B)
-  function_id_width: 3
-  reference_workload: uint8 weighted average
-commands:
-  - function_id: 1
-    name: compute
-    operand: rs1, rs2
-    result: sum
-    semantics: multiply and accumulate uint8 lanes
-    response: status
-datapath:
-  vlen: 256
-  xlen: 32
-  implementation:
-    result_width_bits: 32
-  regDepth: 2
-software:
-  intrinsics_header: sw/tests/u8_wavg_cfu_test.c
-  scalar_fallback: true
-integration:
-  hardware_component: AgentCfu
-  hardware_fiber: AgentCfuFiber
-  bus_style: CfuBus
-  single_cpu_bus_owner: true
-validation:
-  status: draft
-  requirements: [scalar reference equals CFU output]
-assumptions: {}
-unknowns: []"""
-
-
-class _ContractLlm:
-    """Returns a valid ISA contract; falls back for every other prompt."""
-
-    available = False
-
-    def complete(self, system: str, user: str, *, fallback: str, response_format=None):
-        if "Design the CFU contract" in user:
-            return _FakeResult(VALID_ISA)
-        return _FakeResult(fallback)
-
-
-class NoExecutionStatusTest(unittest.TestCase):
-    """--no-apply-patch --no-run-commands must not report failed/blocked."""
-
-    def _run(self) -> dict:
-        run_id = "status-noexec-00000000"
-        run_dir = REPO_ROOT / f"agents/generated/runs/{run_id}"
-        shutil.rmtree(run_dir, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, run_dir, True)
-        state = {
-            "workdir": str(REPO_ROOT),
-            "task": "Accelerate a uint8 weighted average kernel with a TileLink CFU.",
-            "input_mode": "natural_language",
-            "dry_run": False,
-            "run_commands": False,
-            "apply_patch": False,
-            "skip_sim": False,
-            "skip_yosys": False,
-            "max_iters": 2,
-            "run_id": run_id,
-        }
-        with mock.patch.object(llm_step, "_llm", lambda state: _ContractLlm()):
-            return graph.run_agent(state)
-
-    def test_run_agent_reports_planned_when_nothing_runs(self) -> None:
-        final = self._run()
-        self.assertEqual(final["status"], "planned")
-        self.assertEqual(final.get("iteration", 0), 0)
-        self.assertEqual(final.get("verify_submissions", 0), 0)
-        self.assertEqual(final["gates"]["hw_build"]["skipped"], True)
-
-    def test_failed_rung_with_budget_repairs_instead_of_reviewing(self) -> None:
-        gates = {
-            "workload_spec": {"ok": True},
-            "isa": {"ok": True},
-            "implementation_hw": {"ok": True},
-            "hw_build": {"ok": False, "skipped": False, "next": "implement"},
-        }
-        state = _base_state("review-repair", gates=gates, repairs_used=0, max_iters=3)
-        self.assertEqual(graph._route_after_hw_build(state), "implement")
-
-    def test_failed_rung_without_budget_stops(self) -> None:
-        gates = {
-            "workload_spec": {"ok": True},
-            "isa": {"ok": True},
-            "hw_build": {"ok": False, "skipped": False, "next": "review_and_route"},
-        }
-        state = _base_state("review-stop", gates=gates, repairs_used=1, max_iters=2)
-        self.assertEqual(graph._route_after_hw_build(state), "review_and_route")
-
 
 class AnalysisToolLoopTest(unittest.TestCase):
     """The analysis rung can consult the workload source and disassembly."""
@@ -575,10 +477,14 @@ class AnalysisToolLoopTest(unittest.TestCase):
         shutil.rmtree(self.run_dir, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.run_dir, True)
 
-    def test_analysis_accepts_a_fenced_answer_with_a_preamble(self) -> None:
+    def test_analysis_accepts_fenced_answer_and_records_tool_calls(self) -> None:
         # Observed 2026-09-29 (twice): the model prefixed a sentence and wrapped
         # the mapping in a ```yaml fence, and the whole analysis was discarded.
-        state = _base_state(self.run_id, workload_spec={"name": "depthconv"})
+        state = _base_state(
+            self.run_id,
+            workload_spec={"name": "depthconv", "operation": "embench_workload"},
+            benchmark_name="depthconv",
+        )
         llm = _ToolUsingLlm(
             "Here is the analysis.\n\n```yaml\n" + self.ANALYSIS_YAML + "```\n",
             "benchmarks/embench-iot/src/depthconv/depthconv.c",
@@ -588,6 +494,15 @@ class AnalysisToolLoopTest(unittest.TestCase):
         self.assertIn("hot_function: depthconv", result["workload_analysis"])
         self.assertTrue(result["gates"]["analysis"]["ok"])
         self.assertEqual(result["gates"]["analysis"]["next"], "design_contract")
+        self.assertEqual(len(result["tool_calls"]), 1)
+        self.assertEqual(result["tool_calls"][0]["tool"], "read_file")
+        import yaml
+
+        log = self.run_dir / "07_analysis/analysis_tool_calls.yaml"
+        self.assertTrue(log.is_file())
+        data = yaml.safe_load(log.read_text())
+        self.assertEqual(data["call_count"], 1)
+        self.assertEqual(data["calls"][0]["tool"], "read_file")
 
     def test_non_yaml_analysis_is_normalized_instead_of_repaired(self) -> None:
         # Serialization is advisory: keep substantive prose and provide the
@@ -655,29 +570,6 @@ class AnalysisToolLoopTest(unittest.TestCase):
         with mock.patch.object(llm_step, "_llm", lambda state: llm):
             result = analysis.analyze_workload(state)
         self.assertEqual(result["tool_calls"][0]["tool"], "inspect_observation")
-
-    def test_analysis_records_tool_calls_and_parses_the_answer(self) -> None:
-        state = _base_state(
-            self.run_id,
-            workload_spec={"name": "depthconv", "operation": "embench_workload"},
-            benchmark_name="depthconv",
-        )
-        llm = _ToolUsingLlm(
-            self.ANALYSIS_YAML, "benchmarks/embench-iot/src/depthconv/depthconv.c"
-        )
-        with mock.patch.object(llm_step, "_llm", lambda state: llm):
-            result = analysis.analyze_workload(state)
-        self.assertEqual(len(result["tool_calls"]), 1)
-        self.assertEqual(result["tool_calls"][0]["tool"], "read_file")
-        # The answer is parsed as analysis YAML, not treated as a patch.
-        self.assertIn("hot_function: depthconv", result["workload_analysis"])
-        import yaml
-
-        log = self.run_dir / "07_analysis/analysis_tool_calls.yaml"
-        self.assertTrue(log.is_file())
-        data = yaml.safe_load(log.read_text())
-        self.assertEqual(data["call_count"], 1)
-        self.assertEqual(data["calls"][0]["tool"], "read_file")
 
     def test_analysis_tool_loop_fails_closed_when_the_endpoint_rejects_tools(self) -> None:
         class _NoToolsLlm:

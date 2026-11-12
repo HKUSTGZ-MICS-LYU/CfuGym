@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import yaml
 
-from .benchmark.embench import list_benchmarks
+from .benchmark.embench import benchmark_suite, list_all_benchmarks
 from .runtime import source_visibility
 from .runtime.llm import LlmResult, OpenAiTextClient, clean_llm_text
 from .state import RepoContext, WorkloadSpec
@@ -45,7 +45,8 @@ def normalize_workload_spec(
     llm_prompt_sink: Callable[[str, str], None] | None = None,
 ) -> tuple[WorkloadSpec, str]:
     if input_mode == "embench" or benchmark_name:
-        spec = infer_embench_spec(task, benchmark_name or infer_benchmark_name(task, workdir))
+        name = benchmark_name or infer_benchmark_name(task, workdir)
+        spec = infer_embench_spec(task, name, suite=benchmark_suite(name, workdir) if name else "embench-iot")
         return sanitize_spec(spec), yaml.safe_dump(dict(spec), sort_keys=False)
 
     if input_mode == "formatted_spec":
@@ -97,15 +98,19 @@ def normalize_workload_spec(
 
 
 def infer_benchmark_name(task: str, workdir: Path) -> str:
-    """Pick a benchmark name mentioned in the task, else the first available."""
+    """Pick a benchmark name mentioned in the task, else the first available.
+
+    Custom workloads (benchmarks/custom/src) share the Embench interface and
+    are matched too.
+    """
     lowered = task.lower()
-    for name in list_benchmarks(workdir):
+    for name in list_all_benchmarks(workdir):
         if name.lower() in lowered:
             return name
     return ""
 
 
-def infer_embench_spec(task: str, name: str) -> WorkloadSpec:
+def infer_embench_spec(task: str, name: str, *, suite: str = "embench-iot") -> WorkloadSpec:
     if not name:
         raise ValueError("embench workload requires a benchmark name")
     return WorkloadSpec(
@@ -113,7 +118,7 @@ def infer_embench_spec(task: str, name: str) -> WorkloadSpec:
         name=name.replace("-", "_"),
         source_kind="embench",
         description=clean_description(task),
-        benchmark_suite="embench-iot",
+        benchmark_suite=suite,
         benchmark_name=name,
         benchmark_scale=DEFAULT_SCALE_FACTOR,
         warmup_heat=DEFAULT_WARMUP_HEAT,

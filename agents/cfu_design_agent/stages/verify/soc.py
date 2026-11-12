@@ -30,6 +30,12 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
                                    history=f"Skipped SoC generation ({reason})."),
         }
 
+    if not gates_mod._verify_submissions_left(state):
+        note = "Verification-submission budget exhausted before SoC generation."
+        return {"stopped_at": "hw_build", "stage_jobs": "review", "errors": [note],
+                **outcome.stage_result(state, rung=rung, ok=False, next="review_and_route",
+                                       errors=[note], history=note)}
+
     impl_gate = gates_mod._rung_gate(state, "implementation_hw")
     submitted_candidate = not (impl_gate and not impl_gate.get("ok", False))
     verify_submissions = int(state.get("verify_submissions", 0) or 0) + int(submitted_candidate)
@@ -88,7 +94,8 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
             errors.append("hardware_integrity/stale_candidate: candidate changed during SoC generation")
     ok = not errors and bool(results) and all(r.get("returncode") == 0 for r in results)
     snapshot = {}
-    if ok and state.get("cost_backend") == "vivado" and not state.get("skip_cost"):
+    if (ok and state.get("implementation_design_type") != "draft"
+            and state.get("cost_backend") == "vivado" and not state.get("skip_cost")):
         try:
             snapshot = rtl_snapshot.freeze(state)
         except (ValueError, OSError) as exc:
@@ -141,6 +148,11 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
     # iteration_history is append-annotated: these are only this node's new lines.
     history = ["Generated the SoC from the agent design."]
     extra["iteration_history"] = [*(extra.get("iteration_history") or []), *history]
+    # A newly submitted complete declaration supersedes an older draft diagnostic,
+    # even when this candidate subsequently fails its hardware build.
+    if submitted_candidate and state.get("implementation_design_type") == "complete":
+        results.append({"rung": "draft_completion", "kind": "host_gate_check", "returncode": 0,
+                        "command": "implementation complete declaration"})
     update = {
         "validation_results": results,
         "verify_submissions": verify_submissions,

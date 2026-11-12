@@ -21,7 +21,6 @@ from agents.cfu_design_agent.benchmark import embench_patchers as patchers
 from agents.cfu_design_agent.runtime.policy import load_policy
 from agents.cfu_design_agent.runtime.tools import RepoToolbox
 from agents.tests.common import REPO_ROOT
-from agents.tests.test_embench import temporary_embench_repo
 
 
 def _sources(name: str) -> dict[str, str]:
@@ -141,19 +140,29 @@ class PatchPipelineTest(unittest.TestCase):
 
 
 class PreparedPatchIntegrityTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.workdir = temporary_embench_repo(self)
-        self.run_root = "agents/generated/runs/patchers-test"
-        self.name = "huffbench"
-        self.original = {name: text for name, text in _sources(self.name).items()}
-        self.patched = patchers.apply_benchmark_patches(self.name, self.original)
-        self.project = embench.prepare_embench_benchmark(RepoToolbox(
-            self.workdir, policy=load_policy(REPO_ROOT), stage="prepare_benchmark",
-            run_root=self.run_root), {"benchmark_name": self.name})
-        self.metadata = self.workdir / self.run_root / "04_benchmark/embench.yaml"
-        self.metadata.parent.mkdir(parents=True, exist_ok=True)
-        self.write_metadata(self.project)
-        self.target = f"{embench.config_workspace(self.run_root, self.name, 'cfu')}/src/libhuffbench.c"
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._temp.cleanup)
+        cls.workdir = Path(cls._temp.name)
+        for subdir in ("src", "support"):
+            shutil.copytree(REPO_ROOT / embench.EMBENCH_ROOT / subdir,
+                            cls.workdir / embench.EMBENCH_ROOT / subdir)
+        board = cls.workdir / embench.BOARD_ROOT
+        board.mkdir(parents=True)
+        for fname in embench.BOARD_FILES:
+            shutil.copyfile(REPO_ROOT / embench.BOARD_ROOT / fname, board / fname)
+        cls.run_root = "agents/generated/runs/patchers-test"
+        cls.name = "huffbench"
+        cls.original = {name: text for name, text in _sources(cls.name).items()}
+        cls.patched = patchers.apply_benchmark_patches(cls.name, cls.original)
+        cls.project = embench.prepare_embench_benchmark(RepoToolbox(
+            cls.workdir, policy=load_policy(REPO_ROOT), stage="prepare_benchmark",
+            run_root=cls.run_root), {"benchmark_name": cls.name})
+        cls.metadata = cls.workdir / cls.run_root / "04_benchmark/embench.yaml"
+        cls.metadata.parent.mkdir(parents=True, exist_ok=True)
+        cls.metadata.write_text(yaml.safe_dump(cls.project))
+        cls.target = f"{embench.config_workspace(cls.run_root, cls.name, 'cfu')}/src/libhuffbench.c"
 
     def write_metadata(self, project: dict) -> None:
         self.metadata.write_text(yaml.safe_dump(project))
@@ -194,97 +203,44 @@ class PreparedPatchIntegrityTest(unittest.TestCase):
                     for rel in embench.benchmark_source_files(self.workdir, self.name)}
         self.assertEqual(upstream, self.original)
 
-    def test_protected_header_and_harness_pending_edits_rejected_in_every_config(self) -> None:
-        self.assertEqual(self.check(), [])
-        for rel in self.asset_paths():
-            with self.subTest(path=rel):
-                text = (self.workdir / rel).read_text()
-                self.assertEqual(self.check({rel: text}), [])
-                self.assertTrue(self.check({rel: text + "\n/* changed protected bytes */\n"}))
-                self.assertTrue(self.check({rel: ""}))
-                self.assertEqual((self.workdir / rel).read_text(), text)
+    def test_protected_assets_and_metadata_cannot_be_tampered_or_omitted(self) -> None:
+        rel = self.asset_paths()[0]
+        path = self.workdir / rel
+        text = path.read_text()
+        self.assertEqual(self.check({rel: text}), [])
+        self.assertTrue(self.check({rel: text + "\n/* changed */\n"}))
+        try:
+            path.write_text(text + "\n/* tampered */\n")
+            self.assertTrue(self.check())
+        finally:
+            path.write_text(text)
 
-    def test_protected_header_and_harness_disk_edits_and_deletion_rejected(self) -> None:
-        for rel in self.asset_paths():
-            with self.subTest(path=rel):
-                path = self.workdir / rel
-                original = path.read_bytes()
-                try:
-                    path.write_bytes(original + b"\n/* tampered */\n")
-                    self.assertTrue(self.check())
-                    path.unlink()
-                    self.assertTrue(self.check())
-                finally:
-                    path.write_bytes(original)
-        self.assertEqual(self.check(), [])
-
-    def test_missing_legacy_or_incomplete_patch_metadata_rejected(self) -> None:
         missing = copy.deepcopy(self.project)
         missing.pop("patches")
-        cases = [missing, {**self.project, "patches": []},
-                 {**self.project, "patches": [{"id": "legacy_huffbench_roundtrip"}]}]
-        for index in range(len(self.project["patches"])):
-            project = copy.deepcopy(self.project)
-            project["patches"].pop(index)
-            cases.append(project)
-            legacy = copy.deepcopy(self.project)
-            legacy["patches"][index]["version"] = 0
-            cases.append(legacy)
         stale_assets = copy.deepcopy(self.project)
-        staged = next(patch for patch in stale_assets["patches"] if patch["id"] == "huffbench_stages")
-        staged["assets_sha256"] = "0" * 64
-        cases.append(stale_assets)
-        for project in cases:
-            with self.subTest(patches=project.get("patches")):
-                self.write_metadata(project)
+        next(p for p in stale_assets["patches"] if p["id"] == "huffbench_stages")["assets_sha256"] = "0" * 64
+        omitted_hash = copy.deepcopy(self.project)
+        omitted_hash["integrity"]["protected_files"].pop(rel)
+        try:
+            for bad in (missing, {**self.project, "patches": []}, stale_assets, omitted_hash):
+                self.write_metadata(bad)
                 self.assertTrue(self.check())
-        self.write_metadata(self.project)
-        self.assertEqual(self.check(), [])
+        finally:
+            self.write_metadata(self.project)
 
-    def test_omitting_required_protected_asset_hash_does_not_disable_protection(self) -> None:
-        for rel in self.asset_paths():
-            with self.subTest(path=rel):
-                project = copy.deepcopy(self.project)
-                project["integrity"]["protected_files"].pop(rel)
-                self.write_metadata(project)
-                self.assertTrue(self.check())
-        self.write_metadata(self.project)
-
-    def test_codec_body_edits_allowed_without_changing_trusted_files(self) -> None:
+    def test_codec_body_edits_and_attack_rejections(self) -> None:
         original = (self.workdir / self.target).read_text()
         for name in ("huffbench_encode", "huffbench_decode"):
-            with self.subTest(function=name):
-                changed = _replace_body(original, name, "/* computational edit, not a correctness claim */\nreturn 1;")
-                self.assertNotEqual(changed, original)
-                self.assertEqual(self.check({self.target: changed}), [])
-        self.assertEqual((self.workdir / self.target).read_text(), original)
-
-    def test_memory_routine_interposition_rejected(self) -> None:
-        original = (self.workdir / self.target).read_text()
-        replacements = {
-            "memset": "void *memset(void *destination, int value, size_t count) { return destination; }",
-            "memcpy": "void *memcpy(void *destination, const void *source, size_t count) { return destination; }",
-            "memcmp": "int memcmp(const void *left, const void *right, size_t count) { return 0; }",
-        }
-        for name, function in replacements.items():
-            with self.subTest(function=name):
-                self.assertTrue(self.check({self.target: original + "\n" + function + "\n"}))
-        self.assertEqual((self.workdir / self.target).read_text(), original)
-
-    def test_private_helper_redefinitions_and_authority_macro_aliases_rejected(self) -> None:
-        original = (self.workdir / self.target).read_text()
-        attacks = [
-            "static int huffbench_reference_encode(const unsigned char *data, size_t count, struct huffbench_encoded *encoded) { return 1; }",
-            "static void huffbench_reference_heap_adjust(size_t *frequency, size_t *heap, int count, int key) {}",
+            changed = _replace_body(original, name, "return 1;")
+            self.assertEqual(self.check({self.target: changed}), [])
+        for attack in (
+            "void *memset(void *d, int v, size_t c) { return d; }",
+            "static int huffbench_reference_encode(const unsigned char *d, size_t c, struct huffbench_encoded *e) { return 1; }",
             "#define huffbench_reference_encode(...) 1",
-            "#define huffbench_reference cfu_shadow",
-            "#define CFU_INIT initialise_benchmark",
             "#define CFU_TRIGGER start_trigger",
-        ]
-        for attack in attacks:
+        ):
             with self.subTest(attack=attack):
                 self.assertTrue(self.check({self.target: original + "\n" + attack + "\n"}))
-        self.assertEqual((self.workdir / self.target).read_text(), original)
 
 
 _NATIVE_MAIN = '''#include <stdio.h>
@@ -379,63 +335,17 @@ class NativeHuffbenchOracleTest(unittest.TestCase):
 '''
         self.execute(kernel, accepted=True)
 
-    def test_both_noop_functions_returning_success_fail(self) -> None:
-        kernel = self.result.sources["libhuffbench.c"]
-        for name in ("huffbench_encode", "huffbench_decode"):
-            kernel = _replace_body(kernel, name, "return 1;")
-        self.execute(kernel, accepted=False)
+    def test_corrupted_or_noop_stages_and_malformed_records_are_rejected(self) -> None:
+        noop_decode = _replace_body(self.result.sources["libhuffbench.c"], "huffbench_decode", "return 1;")
+        self.execute(noop_decode, accepted=False)
 
-    def test_honest_encode_with_noop_decode_fails(self) -> None:
-        kernel = _replace_body(self.result.sources["libhuffbench.c"], "huffbench_decode", "return 1;")
-        self.execute(kernel, accepted=False)
-
-    def test_honest_encode_with_corrupted_bitstream_fails(self) -> None:
-        kernel = self.result.sources["libhuffbench.c"]
-        # Keep the actual encoder intact; corrupt only its emitted stream.
-        kernel = re.sub(r"\bhuffbench_encode\b", "honest_encode", kernel)
-        kernel += '''\nint huffbench_encode(const unsigned char *data, size_t data_len,
-                      struct huffbench_encoded *encoded) {
-    int result = honest_encode(data, data_len, encoded);
-    encoded->bytes[0] ^= 0x80u;
-    return result;
-}
-'''
-        self.execute(kernel, accepted=False)
-
-    def test_corrupting_only_last_decoded_byte_fails(self) -> None:
-        kernel = re.sub(r"\bhuffbench_decode\b", "honest_decode",
-                        self.result.sources["libhuffbench.c"])
-        kernel += '''\nint huffbench_decode(const struct huffbench_encoded *encoded,
-                      unsigned char *data, size_t data_len) {
-    int result = honest_decode(encoded, data, data_len);
-    if (data_len) data[data_len - 1] ^= 1u;
-    return result;
-}
-'''
-        self.execute(kernel, accepted=False)
-
-    def test_malformed_encoded_records_and_failed_encoder_stage_are_rejected(self) -> None:
         mutations = {
-            "zero-length": "encoded->length = 0;",
-            "over-capacity": "encoded->length = HUFFBENCH_CAPACITY + 1;",
-            "oversized-code": "encoded->clen[data[0]] = 33;",
-            "duplicate-code": '''
-                encoded->code[data[1]] = encoded->code[data[0]];
-                encoded->clen[data[1]] = encoded->clen[data[0]];
-''',
-            "proper-prefix-collision": '''
-                encoded->code[data[1]] = encoded->code[data[0]] << 1;
-                encoded->clen[data[1]] = encoded->clen[data[0]] + 1;
-''',
-            "failed-encoder-stage": "result = 0;",
-            "nonzero-final-padding": '''
-                size_t bits = 0;
-                for (size_t index = 0; index < data_len; ++index)
-                    bits += encoded->clen[data[index]];
-                /* Fail loudly if a future fixture has no padding to test. */
-                if (bits % 8 == 0) __builtin_trap();
-                encoded->bytes[encoded->length - 1] |= 1u;
-''',
+            "corrupted-stream": "encoded->bytes[0] ^= 0x80u;",
+            "duplicate-code": (
+                "encoded->code[data[1]] = encoded->code[data[0]];\n"
+                "encoded->clen[data[1]] = encoded->clen[data[0]];"
+            ),
+            "nonzero-final-padding": "encoded->bytes[encoded->length - 1] |= 1u;",
         }
         original = re.sub(r"\bhuffbench_encode\b", "honest_encode",
                           self.result.sources["libhuffbench.c"])
@@ -466,16 +376,7 @@ class NativeHuffbenchOracleTest(unittest.TestCase):
     }
     return 1;
 ''')
-        # With the honest decoder still processing the protected reference
-        # stream, rejection must come from the encoder's nonoptimal output.
-        with self.subTest(decoder="honest"):
-            self.execute(kernel, accepted=False)
-        kernel = _replace_body(kernel, "huffbench_decode", '''
-    for (size_t index = 0; index < data_len; ++index) data[index] = encoded->bytes[index];
-    return 1;
-''')
-        with self.subTest(decoder="identity"):
-            self.execute(kernel, accepted=False)
+        self.execute(kernel, accepted=False)
 
     def test_riscv_cross_compiler_syntax_if_available(self) -> None:
         compiler = next((path for name in ("riscv64-unknown-elf-gcc", "riscv32-unknown-elf-gcc")

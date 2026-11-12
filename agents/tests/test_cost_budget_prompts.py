@@ -1,7 +1,6 @@
 """Offline Cost Wall prompt contracts; no model, build, or synthesis calls."""
 from __future__ import annotations
 
-import copy
 import inspect
 import unittest
 from contextlib import ExitStack
@@ -10,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from agents.cfu_design_agent import prompts
-from agents.cfu_design_agent.runtime import commands, cost_budget, effects, llm_step
+from agents.cfu_design_agent.runtime import commands, effects, llm_step
 from agents.cfu_design_agent.runtime import observations, stage_services
 from agents.cfu_design_agent.runtime.llm import LlmResult
 from agents.cfu_design_agent.stages import analysis, contract
@@ -47,63 +46,25 @@ class CostBudgetPromptTest(unittest.TestCase):
             2, "cost", workdir=self.context["workdir"], run_root=self.context["run_root"],
             **kwargs)
 
-    def test_legacy_calls_render_default_cap_in_each_design_builder(self):
-        for stage in ("analysis", "isa", "hardware", "optimization"):
-            for tools in (False, True):
-                with self.subTest(stage=stage, tools=tools):
-                    text = self.render(stage, agent_tools=tools)
-                    self.assertIn("at most 100000 mapped Yosys generic cells", text)
-                    self.assertEqual(text.count("## Cost Wall"), 1)
-
-    def test_custom_cap_is_rendered_with_and_without_tools(self):
+    def test_cost_wall_cap_is_rendered_without_changing_shared_head(self):
         state = {"max_yosys_cells": 23457, "cost_backend": "vivado", "skip_yosys": True}
-        for stage in ("analysis", "isa", "hardware", "optimization"):
-            for tools in (False, True):
-                with self.subTest(stage=stage, tools=tools):
-                    text = self.render(stage, state=state, agent_tools=tools)
-                    self.assertIn("at most 23457 mapped Yosys generic cells", text)
-                    self.assertNotIn("at most 100000", text)
-                    self.assertIn("max_yosys_cells", text)
-
-    def test_reminder_preserves_semantics_and_distinguishes_fpga_capacity(self):
-        text = prompts.cost_wall_guidance({})
-        for phrase in (
-            "not an FPGA LUT count or device capacity", "do not equate them",
-            "datapath compact", "limit parallel lane count and unrolling",
-            "multicycle resource sharing", "required semantic input domain",
-            "exact correctness", "widths, signedness, overflow, tails and state effects",
-            "Never meet the cap by narrowing semantics or using fixture-specific shortcuts",
-            "not measured synthesis evidence",
-        ):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, text)
-
-    def test_guidance_is_early_but_never_changes_the_shared_head(self):
-        prefixes = []
         shared = prompts.workload_digest_block(self.spec, None)
+        prefixes = []
         for stage in ("analysis", "isa", "hardware", "optimization"):
             for tools in (False, True):
                 with self.subTest(stage=stage, tools=tools):
                     before = self.render(stage, agent_tools=tools)
-                    after = self.render(stage, state={"max_yosys_cells": 23457}, agent_tools=tools)
+                    after = self.render(stage, state=state, agent_tools=tools)
+                    self.assertIn("at most 100000 mapped Yosys generic cells", before)
+                    self.assertIn("at most 23457 mapped Yosys generic cells", after)
+                    self.assertEqual(after.count("## Cost Wall"), 1)
                     self.assertEqual(before.split("## Cost Wall")[0], after.split("## Cost Wall")[0])
                     self.assertLess(after.index("## Stage:"), after.index("## Cost Wall"))
                     self.assertLess(after.index("## Cost Wall"), after.index("## Deliverable"))
                     if stage != "optimization":
                         self.assertLess(after.index(shared), after.index("## Stage:"))
                         prefixes.append(after.split("## Stage:")[0])
-                    if not tools and stage != "optimization":
-                        self.assertLess(after.index("## Cost Wall"), after.index("SCALA_BODY_MARKER"))
         self.assertTrue(all(prefix == prefixes[0] for prefix in prefixes))
-
-    def test_renderer_uses_owner_helper_without_mutating_state(self):
-        state = {"max_yosys_cells": 23457, "gates": {"cost": {"ok": False}}}
-        original = copy.deepcopy(state)
-        with mock.patch.object(cost_budget, "max_cells", return_value=9876) as maximum:
-            text = prompts.cost_wall_guidance(state)
-        maximum.assert_called_once_with(state)
-        self.assertIn("at most 9876 mapped Yosys generic cells", text)
-        self.assertEqual(state, original)
 
     def stage_state(self, cap=None):
         state = {

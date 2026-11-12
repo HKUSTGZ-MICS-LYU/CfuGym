@@ -1,6 +1,7 @@
 """Content-addressed hardware filesets; never accept simulator or historical RTL."""
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -54,10 +55,17 @@ def freeze(state: dict[str, Any]) -> dict[str, Any]:
     digest = _digest(json.dumps(payload, sort_keys=True).encode())
     base = f"{run}/10_validation/rtl_snapshots/{digest}"
     policy = stage_services._policy(state)
+    # Generated ROM images are Host inputs, not model-authored binaries. Exempt
+    # only the generic .bin deny for this copy; retain all other denies, stage
+    # allowlists and write roots. Never expose this policy to model tools.
+    rom_policy = replace(policy, deny=tuple(rule for rule in policy.deny if rule != "**/*.bin"))
     for rel, data in contents.items():
         destination = f"{base}/rtl/{rel}"
-        policy.check_write("validation", destination)
         path = root / destination
+        if not path.resolve().is_relative_to(root / base):
+            raise ValueError("RTL snapshot destination escapes snapshot root")
+        writer_policy = rom_policy if Path(rel).suffix.lower() == ".bin" else policy
+        writer_policy.check_write("validation", destination)
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             if path.read_bytes() != data:

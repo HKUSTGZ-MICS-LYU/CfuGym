@@ -428,10 +428,20 @@ class IntrinsicsRenderTest(unittest.TestCase):
 
 
 class PrepareWorkspaceTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.run_id = "embench-prep-00000000"
-        self.workdir = temporary_embench_repo(self)
-        self.run_dir = self.workdir / f"agents/generated/runs/{self.run_id}"
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.run_id = "embench-prep-00000000"
+        cls._temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._temp.cleanup)
+        cls.workdir = Path(cls._temp.name)
+        for subdir in ("src", "support"):
+            shutil.copytree(REPO_ROOT / embench.EMBENCH_ROOT / subdir,
+                            cls.workdir / embench.EMBENCH_ROOT / subdir)
+        board = cls.workdir / embench.BOARD_ROOT
+        board.mkdir(parents=True)
+        for fname in embench.BOARD_FILES:
+            shutil.copyfile(REPO_ROOT / embench.BOARD_ROOT / fname, board / fname)
+        cls.run_dir = cls.workdir / f"agents/generated/runs/{cls.run_id}"
 
     def test_prepare_copies_benchmark_support_and_board(self) -> None:
         toolbox = RepoToolbox(
@@ -452,6 +462,9 @@ class PrepareWorkspaceTest(unittest.TestCase):
             self.assertTrue((ws / config / "embench_main.c").exists(), config)
         self.assertEqual(project["verification"], "bench_verify")
         self.assertEqual(set(project["elf_paths"]), {"reference", "profile", "cfu"})
+        main = (ws / "reference/embench_main.c").read_text()
+        self.assertIn("EMBENCH_VERIFY_", main)
+        self.assertIn('correct ? "PASS" : "FAIL"', main)
 
     def test_statemate_time_symbol_is_renamed_only_in_isolated_build_copies(self) -> None:
         import hashlib
@@ -479,22 +492,6 @@ class PrepareWorkspaceTest(unittest.TestCase):
         self.assertEqual(project["integrity"]["reference_sources"][ref_path],
                          hashlib.sha256(copies[0].encode()).hexdigest())
         self.assertTrue(any("time() link collision" in note for note in project["notes"]))
-
-    def test_generated_main_c_carries_the_verify_diagnostic(self) -> None:
-        toolbox = RepoToolbox(
-            self.workdir,
-            policy=load_policy(REPO_ROOT),
-            dry_run=False,
-            stage="prepare_benchmark",
-            run_root=f"agents/generated/runs/{self.run_id}",
-        )
-        project = embench.prepare_embench_benchmark(toolbox, {"benchmark_name": "crc32"})
-        main = (self.workdir / project["workspace"] / "reference/embench_main.c").read_text()
-        self.assertIn("EMBENCH_VERIFY_", main)
-        self.assertIn("EMBENCH_STRINGIFY", main)
-        # Embench verify_benchmark() returns non-zero when correct, so a PASS is
-        # `correct` non-zero (main returns !correct and start.S passes on 0).
-        self.assertIn('correct ? "PASS" : "FAIL"', main)
 
     def test_main_instrumentation_is_a_noop_without_the_verify_call(self) -> None:
         self.assertEqual(embench.instrument_embench_main("int main(void){return 0;}\n"), (

@@ -19,10 +19,17 @@ def _number(value, *, positive: bool = False) -> bool:
             and math.isfinite(value) and (value > 0 if positive else value >= 0))
 
 
+def successful(record: dict) -> bool:
+    """Legacy records remain compatible; explicit draft/invalid types cannot pass."""
+    return (record.get("status") == "complete"
+            and ("implementation_design_type" not in record
+                 or record["implementation_design_type"] in ("complete", "legacy")))
+
+
 def speedup_ratio(record: dict) -> float | None:
     """Keep the stored x100 unit, expose a ratio only for valid performance."""
     value = record.get("speedup_x100")
-    if (record.get("status") == "complete" and not (record.get("infra") or {}).get("infra")
+    if (successful(record) and not (record.get("infra") or {}).get("infra")
             and classification.performance_is_valid(record) and _number(value, positive=True)):
         return value / 100.0
     return None
@@ -36,13 +43,15 @@ def _statistics(values: list) -> dict:
 ESTIMAND_HELP = (
     "attempt_index = verify_submissions (one --max-iters K run allows K candidate submissions to verification). "
     "pass@k_budget = mean over R repeats of 1[complete and attempt_index <= k]; "
-    "pass@k_sample = 1 - C(R-c,k)/C(R,k) with c complete runs (i.i.d. estimator)."
+    "pass@k_sample = 1 - C(R-c,k)/C(R,k) with c complete runs (i.i.d. estimator). "
+    "Explicit draft or invalid implementation types are failures in the denominator; "
+    "pre-schema missing types retain legacy treatment."
 )
 
 
 def _pass_flag(record: dict, k: int) -> int | None:
     """1/0 for a complete run, None (CSV-empty) for a failure."""
-    if record.get("status") != "complete":
+    if not successful(record):
         return None
     attempt = record.get("attempt_index")
     if not isinstance(attempt, int):
@@ -60,7 +69,7 @@ def budget_pass_at_k(records: list[dict], k: int) -> float | None:
 def sample_pass_at_k(records: list[dict], k: int) -> float | None:
     """1 - C(n-c, k) / C(n, k): i.i.d. 'at least one of k samples' estimator."""
     n = len(records)
-    c = sum(1 for r in records if r.get("status") == "complete")
+    c = sum(1 for r in records if successful(r))
     if n == 0 or k > n:
         return None
     if n - c < k:
@@ -106,7 +115,7 @@ def cell_metrics(records: list[dict], bootstrap_iters: int = 10000) -> dict:
     all_records = records
     records = [r for r in records if not (r.get("infra") or {}).get("infra")]
     n = len(records)
-    complete = [r for r in records if r.get("status") == "complete"]
+    complete = [r for r in records if successful(r)]
     failure_tally: dict[str, int] = {}
     for record in records:
         failure = record.get("failure") or {}

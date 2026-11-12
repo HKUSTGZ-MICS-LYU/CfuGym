@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Callable
 
-from . import observations
+from . import observations, processes
 from .agent_tools import FAILURE_SCHEMA, READ_ONLY_TOOL_SCHEMAS, ReadOnlyToolset
 from .coding_session import CodingSession
 from . import coding_tools
@@ -488,6 +488,8 @@ class ImplementationToolset:
             return ""
         try:
             result = self.check_conformance_syntax()
+        except (processes.ValidationCancelled, processes.ProcessTerminationError):
+            raise
         except Exception:
             return ""
         if not isinstance(result, dict):
@@ -509,6 +511,8 @@ class ImplementationToolset:
             result = callback()
             if not isinstance(result, dict):
                 raise TypeError("check callback must return a result mapping")
+        except (processes.ValidationCancelled, processes.ProcessTerminationError):
+            raise
         except Exception as exc:
             result = {"returncode": 1, "stderr_tail": f"check callback failed: {type(exc).__name__}: {exc}"}
         result = observations.record_failure_result(

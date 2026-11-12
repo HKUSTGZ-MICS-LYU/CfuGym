@@ -19,6 +19,9 @@ def render_ladder(state: CfuDesignState) -> str:
              "implementation_sw", "sw_build", "sim", "cost")
     for rung in rungs:
         gate = gates.get(rung)
+        if rung == "cost" and state.get("implementation_design_type") == "draft":
+            lines.append("- cost: not run for draft")
+            continue
         if not isinstance(gate, dict):
             if rung == "hw_conformance" and gates_mod.conformance_mode(state) == "dev":
                 lines.append(
@@ -217,6 +220,9 @@ def render_report(state: CfuDesignState) -> str:
         f"Run root: {state.get('run_root', '')}",
         "",
     ]
+    if state.get("implementation_design_type") == "draft":
+        lines.extend(["## Incomplete Draft", "- diagnostic simulation only; no cost or acceptance",
+                      *[f"- unimplemented: {item}" for item in state.get("implementation_unimplemented") or []], ""])
     llm_request = state.get("llm_request") or {}
     if llm_request:
         lines.extend([
@@ -257,13 +263,16 @@ def render_report(state: CfuDesignState) -> str:
     if state.get("termination"):
         lines.extend(["## Typed Termination", f"- termination: {state['termination']}", ""])
     view = provenance.performance_view(state)
-    if state.get("run_root"):
+    if state.get("run_root") and state.get("implementation_design_type") != "draft":
         lines.extend(["## Performance Provenance",
                       f"- current_performance: {view['current_performance']}",
                       f"- last_observed_valid_performance: {view['last_observed_valid_performance']}", ""])
     lines.append("## Gates")
     for key, value in (state.get("gates") or {}).items():
-        lines.append(f"- {key}: {value}")
+        if key == "cost" and state.get("implementation_design_type") == "draft":
+            lines.append("- cost: not run for this draft (prior gate omitted)")
+        else:
+            lines.append(f"- {key}: {value}")
     lines.append("")
     lines.append("## Validation Ladder")
     lines.append(render_ladder(state))
@@ -273,7 +282,8 @@ def render_report(state: CfuDesignState) -> str:
         best = optimize._best_round(rounds) or {}
         best_index = best.get("round")
         final_index = rounds[-1].get("round")
-        lines.append("## Optimization Rounds")
+        lines.append("## Historical Optimization Rounds (not this draft)" if
+                     state.get("implementation_design_type") == "draft" else "## Optimization Rounds")
         lines.append(
             f"- mode: --loop, {len(rounds)} recorded result(s), best round "
             f"{best_index}, final round {final_index}"
@@ -304,7 +314,7 @@ def render_report(state: CfuDesignState) -> str:
             )
         lines.append("")
     candidate = state.get("best_candidate") or {}
-    if candidate:
+    if candidate and state.get("implementation_design_type") != "draft":
         lines.extend(["## Selected Validated Candidate",
                       f"- delivered source round: {candidate.get('round')}",
                       f"- manifest (ISA, source hashes and validation evidence): {candidate.get('manifest')}",
@@ -371,11 +381,12 @@ def render_report(state: CfuDesignState) -> str:
     lines.append(format_rung_results(state, "sim"))
     lines.append("")
     lines.append("## Hardware Cost")
-    ppa_lines = ppa.lines(state)
+    draft = state.get("implementation_design_type") == "draft"
+    ppa_lines = [] if draft else ppa.lines(state)
     if ppa_lines:
         lines.extend(ppa_lines)
         lines.append("")
-    lines.append(format_results(state.get("cost_results", [])))
+    lines.append("Not run for this draft." if draft else format_results(state.get("cost_results", [])))
     lines.append("")
     lines.append("## Tool Calls")
     tool_calls = state.get("tool_calls") or []

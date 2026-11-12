@@ -18,10 +18,13 @@ import argparse
 import json
 import shlex
 import shutil
+import signal
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from agents.cfu_design_agent.runtime import processes
 from agents.experiments.harness import (
     collection,
     configs,
@@ -33,6 +36,39 @@ from agents.experiments.harness import (
     reporting,
     scheduling,
 )
+
+def _run_jobs(jobs, worker, max_workers):
+    """Cancel registered agent trees before joining interrupted pool threads."""
+    token = processes.CancellationToken()
+
+    def run_one(job):
+        with processes.use_token(token):
+            return worker(job)
+
+    old_term = None
+    if threading.current_thread() is threading.main_thread():
+        old_term = signal.getsignal(signal.SIGTERM)
+        def interrupt(signum, frame):
+            raise KeyboardInterrupt(f'experiment interrupted by signal {signum}')
+        signal.signal(signal.SIGTERM, interrupt)
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = []
+            try:
+                futures = [pool.submit(run_one, job) for job in jobs]
+                results = []
+                for future in futures:
+                    results.extend(future.result())
+                return results
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                token.cancel()
+                raise
+    finally:
+        if old_term is not None:
+            signal.signal(signal.SIGTERM, old_term)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -90,7 +126,7 @@ def build_parser(
                              f"Default: {default_layers!r}. 'full' is the separate legacy flow. "
                              "Aliases: none/l0, isa/l1, vis/l2, devconf/l3, ir/l4.")
     parser.add_argument("--max-iters", type=int, default=5, help="Maximum candidate submissions to verification; K = attempt budget for pass@K (default: 5).")
-    parser.add_argument("--max-conformance-runs", type=int, default=2,
+    parser.add_argument("--max-conformance-runs", type=int, default=5,
                         help="New ladder: run_conformance calls per Implement session (default: 2), not a whole-run limit.")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature forced into the experiment configs (default: 0.7).")
     parser.add_argument("--conda-env", default=DEFAULT_CONDA_ENV,
@@ -101,8 +137,8 @@ def build_parser(
     parser.add_argument("--out-root", default="", help="Experiment output root (default: <workdir>/agents/generated/experiments).")
     parser.add_argument("--jobs", type=int, default=1, help="Concurrent runs (sbt/RTL-sim stay serialized via the lock shim; default: 1).")
     parser.add_argument("--timeout", type=int, default=10800, help="Per-run wall-clock timeout in seconds (default: 3h).")
-    parser.add_argument("--seed", type=int, default=20260212, help="Scheduling shuffle seed.")
-    parser.add_argument("--visibility", default=None, choices=("basic", "standard", "extended"),
+    parser.add_argument("--seed", type=int, default=114514, help="Scheduling shuffle seed.")
+    parser.add_argument("--visibility", default="extended", choices=("basic", "standard", "extended"),
                         help="Legacy full-flow visibility (default: standard). New ladder layers "
                              "have fixed basic/basic/extended/extended/extended tiers; omit this option.")
     parser.add_argument("--profile-cache", default="on", choices=("on", "off", "refresh"))
@@ -350,14 +386,11 @@ def main(
         meta["preflight"] = execution.preflight(opts, generated_configs, shim_dir, lock_env)
         experiment.write_experiment_yaml(exp_dir / "experiment.yaml", meta)
 
-    results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max(1, opts.jobs)) as pool:
-        futures = [
-            pool.submit(execution.execute_one, job, opts, exp_dir, generated_configs, shim_dir, lock_env)
-            for job in jobs
-        ]
-        for future in futures:
-            results.extend(future.result())
+    results = _run_jobs(
+        jobs,
+        lambda job: execution.execute_one(job, opts, exp_dir, generated_configs, shim_dir, lock_env),
+        max(1, opts.jobs),
+    )
 
     result = reporting.aggregate(exp_dir, meta, opts.bootstrap)
     print(f"aggregated: {result['records']} runs, {result['cells']} cells -> {result['summary']}")

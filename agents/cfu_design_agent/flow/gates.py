@@ -188,7 +188,10 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
         # Explicit IR experiments have their own failure, never an HW/LLM one.
         return "final_report", "failed"
     present = [rung for rung in LADDER_RUNGS if isinstance(gates.get(rung), dict)
-               and not disabled_gate(gates.get(rung))]
+               and not disabled_gate(gates.get(rung))
+               and not (state.get("implementation_design_type") == "draft" and
+                        (rung == "cost" or (rung == "validation_pair" and
+                         gates[rung].get("diagnostic_only") and not gates[rung].get("failed_rung"))))]
     executed = [rung for rung in present if not gates[rung].get("skipped")]
     skipped = [rung for rung in present if gates[rung].get("skipped")]
     # A terminal rung failure always reports failed, even when a later rung was
@@ -199,6 +202,9 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
         return "final_report", "planned"
     if skipped:
         return "final_report", "planned"
+    if ("implementation_design_type" in state
+            and state["implementation_design_type"] != "complete"):
+        return "final_report", "blocked"
     if not all(gates.get(key, {}).get("ok", False) for key in required_gates(state)):
         return "final_report", "blocked"
     if state.get("input_fingerprints"):
@@ -210,6 +216,9 @@ def _review_decision(state: CfuDesignState) -> tuple[str, str]:
 
 
 def _is_complete(state: CfuDesignState) -> bool:
+    if ("implementation_design_type" in state
+            and state["implementation_design_type"] != "complete"):
+        return False
     gates = state.get("gates", {})
     profile = gates.get("profile") or {}
     if profile and profile.get("ok") is False and not profile.get("skipped"):

@@ -11,12 +11,12 @@ import os
 import random
 import shlex
 import shutil
-import signal
 import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agents.cfu_design_agent.runtime import processes
 from agents.experiments.harness import collection, layers, locking, naming
 
 
@@ -99,24 +99,17 @@ def git_info(workdir: Path) -> dict:
 
 
 def run_logged(argv: list[str], out_path: Path, err_path: Path, cwd: Path, env: dict, timeout: int) -> dict:
-    """Run a command to log files; kill the whole process group on timeout."""
+    """Run to log files; on timeout clean descendants and the process group."""
     started = datetime.now(timezone.utc).isoformat()
     t0 = time.monotonic()
     timed_out = False
     with out_path.open("wb") as out, err_path.open("wb") as err:
-        proc = subprocess.Popen(
-            argv, cwd=str(cwd), env=env, stdout=out, stderr=err, start_new_session=True
-        )
         try:
-            proc.wait(timeout=timeout)
-            exit_code = proc.returncode
+            result = processes.run(argv, cwd=str(cwd), env=env, stdout=out, stderr=err,
+                                   text=False, timeout=timeout)
+            exit_code = result.returncode
         except subprocess.TimeoutExpired:
             timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-            proc.wait()
             exit_code = None
     return {
         "started_at": started,
@@ -216,7 +209,11 @@ def execute_one(job: dict, opts, exp_dir: Path, configs: dict, shim_dir: Path | 
             if delay:
                 print(f"[warn] {run_name} looks like {kind}; retry "
                       f"{infra_retry}/{opts.infra_retries} in {delay:.0f}s", flush=True)
-                time.sleep(delay)
+                token = processes.current_token()
+                if token is None:
+                    time.sleep(delay)
+                elif token.event.wait(delay):
+                    token.raise_if_cancelled()
             else:
                 print(f"[warn] {run_name} looks like {kind}; retry "
                       f"{infra_retry}/{opts.infra_retries}", flush=True)
