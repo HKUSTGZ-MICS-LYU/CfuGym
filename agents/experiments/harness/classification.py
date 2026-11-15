@@ -34,6 +34,23 @@ RUNG_ORDER = (
 # missing-EDIT_END delivery failure was recorded as stopped_at=hw_build).
 GUARDED_BUILD_RUNGS = {"hw_build": "implementation_hw", "sw_build": "implementation_sw"}
 
+# Stop reasons (not ladder rungs) that mean the model never produced an accepted
+# candidate: `flow/ladder.py::draft_sim_transition` parks the run here when every
+# submission is still a draft and the verification budget is spent.
+DRAFT_STOP_REASONS = frozenset({"draft_completion", "evaluation_budget"})
+
+
+def disabled_gate(gate) -> bool:
+    """True when an ablation switch turned this rung off instead of validating it.
+
+    A disabled gate is stored ``ok: False`` (it was never verified) plus a
+    ``disabled`` marker and is out of scope, so it must never become a run's
+    failure label. The agent framework owns this vocabulary
+    (``cfu_design_agent/flow/gates.py::disabled_gate``); the harness mirrors the
+    predicate because importing that package pulls the LangGraph runtime.
+    """
+    return isinstance(gate, dict) and bool(gate.get("disabled"))
+
 FAILURE_CLASSES = (
     "infra_timeout",
     "infra_rate_limit",
@@ -129,6 +146,50 @@ def _gate_errors(gate: dict) -> str:
     return " | ".join(parts)
 
 
+def _first_failing_rung(gates: dict) -> tuple[str, dict]:
+    """First ladder rung that produced a real failure verdict.
+
+    Rungs an ablation switch disabled are skipped: they carry ``ok: False``
+    because they were never validated, which is not an observed failure.
+    """
+    for rung in RUNG_ORDER:
+        gate = gates.get(rung)
+        if isinstance(gate, dict) and gate.get("ok") is False and not disabled_gate(gate):
+            return rung, gate
+    return "", {}
+
+
+def _failing_rung_and_gate(record: dict, stopped: str) -> tuple[str, dict]:
+    """The rung that produced this run's verdict; never an ablation-disabled one.
+
+    ``stopped_at`` may name a ladder rung, a stop reason that is not a rung
+    (``draft_completion``, ``evaluation_budget``), or an ablated rung. Only a
+    gate that actually produced a verdict can carry the failure label.
+    """
+    gates = record.get("gates") or {}
+    gate = gates.get(stopped) if stopped else None
+    if isinstance(gate, dict):
+        if disabled_gate(gate):
+            return _first_failing_rung(gates)
+        return stopped, gate
+    if stopped:
+        rung, failing = _first_failing_rung(gates)
+        if rung:
+            return rung, failing
+        return stopped, {}  # keep the stop reason; no gate produced a verdict
+    return _first_failing_rung(gates)
+
+
+def _draft_detail(record: dict) -> str:
+    """Why a budget-exhausted run that only ever submitted drafts is a failure."""
+    submitted, budget = record.get("verify_submissions"), record.get("max_iters")
+    if isinstance(submitted, int) and isinstance(budget, int):
+        scope = f"{submitted}/{budget} verification submissions stayed drafts or incomplete designs"
+    else:
+        scope = "every verification submission stayed a draft or incomplete design"
+    return f"{scope}; the ladder never produced a verdict"
+
+
 def classify_failure(record: dict) -> dict | None:
     """Map a non-complete run onto (failure_class, failure_rung, detail).
 
@@ -162,17 +223,7 @@ def classify_failure(record: dict) -> dict | None:
             "failure_detail": "the independent stage gate rejected every submitted delivery",
             "budget_exhausted": None,
         }
-    failing_rung = stopped
-    failing_gate: dict = {}
-    if not failing_rung:
-        for rung in RUNG_ORDER:
-            gate = gates.get(rung)
-            if isinstance(gate, dict) and gate.get("ok") is False:
-                failing_rung = rung
-                failing_gate = gate
-                break
-    else:
-        failing_gate = gates.get(failing_rung) if isinstance(gates.get(failing_rung), dict) else {}
+    failing_rung, failing_gate = _failing_rung_and_gate(record, stopped)
 
     # Attribute a guarded build failure to the implementation rejection behind
     # it: the build rung ran zero commands, so recording it as a build failure
@@ -211,6 +262,10 @@ def classify_failure(record: dict) -> dict | None:
         budget_exhausted = repairs_used >= max_repairs
 
     failure_class, detail = _classify_rung(failing_rung, failing_gate, detail_text, record, status)
+    if failure_class == "no_deliverable" and failing_rung in DRAFT_STOP_REASONS:
+        # The stop reason is not a ladder position; the failure stage is the
+        # implementation that never got past a draft.
+        failing_rung = "implementation"
     infra = record.get("infra") or {}
     if not infra and typed.get("kind") in {"infrastructure", "runtime_exception"}:
         infra = detect_infra("", "", False, 1, termination=typed)
@@ -368,8 +423,13 @@ def _classify_rung(rung: str, gate: dict, detail_text: str, record: dict, status
     if rung == "sim":
         return _classify_sim(gate, detail_text, record)
     if status == "blocked":
-        if isinstance((record.get("gates") or {}).get("isa"), dict) and not (record["gates"]["isa"] or {}).get("ok", True):
-            return "isa_contract", _gate_errors(record["gates"]["isa"] or {})
+        isa_gate = (record.get("gates") or {}).get("isa")
+        if isinstance(isa_gate, dict) and isa_gate.get("ok") is False and not disabled_gate(isa_gate):
+            return "isa_contract", _gate_errors(isa_gate)
+        # Only drafts ever reached the ladder: the run is the model's failure to
+        # deliver an accepted candidate, not a contract or spec verdict.
+        if rung in DRAFT_STOP_REASONS:
+            return "no_deliverable", _draft_detail(record)
         return "spec_invalid", "run blocked before the validation ladder"
     return "unknown", _gate_errors(gate) or f"no failing rung identified (status={status})"
 

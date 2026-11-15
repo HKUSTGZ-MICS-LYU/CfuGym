@@ -331,6 +331,47 @@ class ClassifyTest(unittest.TestCase):
         record = {"status": "blocked", "stopped_at": "", "gates": {}}
         self.assertEqual(rm.classify_failure(record)["failure_class"], "spec_invalid")
 
+    def test_ablation_disabled_gate_never_labels_the_failure(self) -> None:
+        # `--no-isa-contract` records the isa rung as ok: False + a disabled
+        # marker because it was never validated. It is out of scope, so it can
+        # never be the run's failure label (regression: the 2026-11-14 no-isa
+        # sweep filed the statemate draft-only run as failure_class=isa_contract
+        # with the detail "disabled by --no-isa-contract (ablation)").
+        disabled_isa = {
+            "ok": False, "skipped": True, "disabled": "no-isa-contract",
+            "reason": "disabled by --no-isa-contract (ablation)",
+        }
+        record = {
+            "status": "blocked", "stopped_at": "draft_completion",
+            "verify_submissions": 5, "max_iters": 5,
+            "gates": {"isa": disabled_isa, "implementation_hw": {"ok": True, "applied": True, "design_type": "draft"}},
+        }
+        result = rm.classify_failure(record)
+        self.assertEqual(result["failure_class"], "no_deliverable")
+        self.assertEqual(result["failure_rung"], "implementation")
+        self.assertIn("drafts", result["failure_detail"])
+        self.assertNotIn("disabled by", result["failure_detail"])
+        self.assertTrue(result["budget_exhausted"])
+
+        # A blocked run with only the disabled isa gate has no contract verdict.
+        record = {"status": "blocked", "stopped_at": "", "gates": {"isa": disabled_isa}}
+        self.assertEqual(rm.classify_failure(record)["failure_class"], "spec_invalid")
+
+        # Scanning the ladder for a failing rung must skip the disabled gate.
+        record = {
+            "status": "failed", "stopped_at": "",
+            "gates": {"isa": disabled_isa, "sim": {"ok": False, "errors": ["Embench verify failed"]}},
+        }
+        result = rm.classify_failure(record)
+        self.assertEqual(result["failure_class"], "sim_correctness")
+        self.assertEqual(result["failure_rung"], "sim")
+
+        # A stop reason that names the ablated rung is not a verdict either.
+        record = {"status": "failed", "stopped_at": "isa", "gates": {"isa": disabled_isa}}
+        result = rm.classify_failure(record)
+        self.assertNotEqual(result["failure_class"], "isa_contract")
+        self.assertNotIn("disabled by", result["failure_detail"])
+
     def test_guarded_build_failure_points_at_implementation(self) -> None:
         # hw_build refuses to run sbt when implementation_hw applied nothing
         # (gate commands == 0): the failure stage is the implementation
