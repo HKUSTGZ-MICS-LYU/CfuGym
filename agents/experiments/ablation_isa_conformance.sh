@@ -56,9 +56,15 @@ cell_flags() {
 
 # A run's provenance is only as good as the tree it ran on: record HEAD plus a
 # content hash of the unstaged diff and refuse to mix cells across a change.
+# Submodules are excluded: the benchmark builds run `make -C sw` and leave
+# modified/untracked content behind, which flips `sw`'s porcelain letter from
+# ` m` to ` M` and would abort a comparable sweep for build noise alone;
+# a submodule *commit* change is still caught.
 fingerprint() {
-  { git rev-parse HEAD; git diff | sha256sum; git status --porcelain | sha256sum; } \
-    | sha256sum | cut -c1-16
+  { git rev-parse HEAD
+    git diff --ignore-submodules=dirty
+    git status --porcelain --ignore-submodules=dirty
+  } | sha256sum | cut -c1-16
 }
 
 budget_field() {
