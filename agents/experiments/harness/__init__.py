@@ -35,6 +35,7 @@ __all__ = [
     "RUNS_COLUMNS",
     "SBT_SHIM",
     "SHIM_PATH_WRAPPER",
+    "FRAMEWORK_RUNS_DIR",
     "SUITE",
     "agent_script_args",
     "aggregate",
@@ -70,6 +71,7 @@ __all__ = [
     "parse_cli_stdout",
     "parse_report",
     "preflight",
+    "raw_run_name",
     "read_experiment_yaml",
     "reconstruct_episodes",
     "reference_result_value",
@@ -169,6 +171,7 @@ from agents.experiments.harness.parsing import (  # noqa: F401
     parse_cli_stdout,
     parse_report,
 )
+from agents.experiments.harness.raw import FRAMEWORK_RUNS_DIR, raw_run_name  # noqa: F401
 from agents.experiments.harness.reporting import (  # noqa: F401
     FAILURES_COLUMNS,
     PASS_AT_K_COLUMNS,

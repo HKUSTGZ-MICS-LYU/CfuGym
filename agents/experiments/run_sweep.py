@@ -15,16 +15,25 @@ differs from the pass@k matrix (``run_matrix.py``) and the ablation ladder
   needs ``--jobs 1`` (the default); a larger ``--jobs`` overlaps runs.
 * ``--models`` defaults to a single config (``deepseek-pro``); pass a comma
   list to sweep the suite once per model.
+* ``--raw`` turns the preset into cache maintenance: it rebuilds the
+  Embench reference/profile measurement cache for every benchmark and stops,
+  without launching the agent or spending a model call. The measurement is
+  keyed on the repository content, so a commit invalidates every entry; run
+  ``--raw`` once after checking out a new hash, then sweep as usual and every
+  run starts from a cache hit instead of paying 2 builds + 2 simulations.
+  ``--raw`` ignores ``--models``/``--repeats``/``--layers`` and writes no
+  experiment records; ``--profile-cache`` is forced to ``refresh``.
 * Everything after a bare ``--`` is forwarded verbatim to
   ``agents/run_cfu_agent.py``, so that CLI's original parameters apply to
   every run (e.g. ``--skip-sim``, ``--skip-yosys``, ``--task``,
   ``--no-conformance``).  Flags the harness owns (``--embench``/
   ``--llm-config``/``--run-id``/``--max-iters``/``--visibility``/
-  ``--profile-cache``/``--workdir``/``--out-dir``) are rejected there;
-  express those through ``--models``/``--max-iters``/``--visibility``/
-  ``--profile-cache``.  Ablation switches passed here are folded into each
-  run's recorded ablation flags; ``--layers`` stays the way to schedule the
-  capability ladder.
+  ``--profile-cache``/``--workdir``/``--out-dir``) are rejected there, and in
+  ``--raw`` mode the pass-through must keep the measured builds, so
+  ``--skip-sim`` is refused too.  Express the owned ones through
+  ``--models``/``--max-iters``/``--visibility``/``--profile-cache``.
+  Ablation switches passed here are folded into each run's recorded ablation
+  flags; ``--layers`` stays the way to schedule the capability ladder.
 
 Usage (see --help for everything):
 
@@ -37,6 +46,15 @@ Usage (see --help for everything):
 
     # no-conformance mode for every run (keep ISA contract + LLVM IR):
     python3 agents/experiments/run_sweep.py --exp-id sweep-noconf -- --no-conformance
+
+    # after a git hash change: rebuild every benchmark's profile cache first
+    # (no model call, no experiment records), then sweep as usual:
+    python3 agents/experiments/run_sweep.py --exp-id sweep-full --raw
+    python3 agents/experiments/run_sweep.py --exp-id sweep-full --models deepseek41-flash
+
+    # a cheaper subset while iterating on the harness itself:
+    python3 agents/experiments/run_sweep.py --exp-id sweep-full --raw \
+        --benchmarks aha-mont64,crc32
 """
 
 from __future__ import annotations
@@ -86,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         default_benchmarks=all_embench_benchmarks,
         default_repeats=1,
         ordered=True,
+        supports_raw=True,
     )
 
 

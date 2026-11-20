@@ -13,7 +13,7 @@ from langgraph.graph import END, START, StateGraph
 from pathlib import Path
 from typing import Any
 
-from .flow import instrument, policies, wiring
+from .flow import instrument, outcome, policies, wiring
 from .flow.instrument import STAGE_ORDER, disable_progress, enable_progress, progress
 from .flow.ladder import _route_after_analysis, _route_after_cost, _route_after_hw_build, _route_after_hw_conformance, _route_after_implement, _route_after_isa, _route_after_prepare, _route_after_profile, _route_after_review, _route_after_sim, _route_after_sw_build, _route_after_validation, _route_input_target
 from .flow.wiring import NODE_NAMES, ROUTER_NAMES, ROUTE_TARGETS, SUCCESSORS as FLOW_SUCCESSORS
@@ -174,6 +174,55 @@ def _invoke_agent_graph(app: Any, graph_input: CfuDesignState | None, config: di
         final_state = dict(final_state)
         final_state["graph_events"] = [f"streamed {snapshots} state snapshots"]
     return _finalize(final_state)
+
+
+# The deterministic prefix of the flow that measures the Embench baseline and
+# caches it. Every node after ``profile_embench`` consumes the model, so
+# rebuilding the measurement cache stops exactly here.
+PROFILE_ONLY_NODES = (
+    "load_context",
+    "ingest_input",
+    "prepare_embench_benchmark",
+    "profile_embench",
+)
+
+# Rung whose verdict makes the prefix fail closed (a failed precondition must
+# stop the sequence instead of reaching the measurement with a bad workspace).
+_PROFILE_ONLY_RUNGS = {
+    "ingest_input": "workload_spec",
+    "prepare_embench_benchmark": "prepare_benchmark",
+    "profile_embench": "profile",
+}
+
+
+def run_profile_only(initial_state: CfuDesignState) -> CfuDesignState:
+    """Run only the prefix that builds and caches the reference/profile baseline.
+
+    The cache key hashes the whole repository, so one commit invalidates every
+    Embench entry; rebuilding them must not spend a model call. The nodes below
+    are the graph's own prefix, called in the compiled order, and the state is
+    folded with the same reducers LangGraph applies (``flow.outcome``). Design,
+    ladder and report stages never run, so the result is evidence of a
+    measurement, not of a design.
+    """
+    state = dict(initial_state)
+    if not str(state.get("benchmark_name", "") or ""):
+        raise ValueError("profile-only requires an Embench benchmark (--embench <name>)")
+    nodes = python_nodes()
+    stopped = ""
+    for name in PROFILE_ONLY_NODES:
+        update = nodes[name](state)
+        if not isinstance(update, dict):
+            raise TypeError(f"flow node {name!r} returned {type(update).__name__}, not a state update")
+        state = outcome.merge_updates(state, update)
+        rung = _PROFILE_ONLY_RUNGS.get(name, "")
+        gate = (state.get("gates") or {}).get(rung) or {}
+        if rung and not gate.get("ok") and not gate.get("skipped"):
+            stopped = rung
+            break
+    state["profile_only"] = True
+    state["stopped_at"] = stopped
+    return _finalize(state)
 
 
 def python_nodes() -> dict[str, Any]:

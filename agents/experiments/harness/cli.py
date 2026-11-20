@@ -33,6 +33,7 @@ from agents.experiments.harness import (
     layers,
     locking,
     naming,
+    raw,
     reporting,
     scheduling,
 )
@@ -88,7 +89,7 @@ DEFAULT_PYTHON = "python3 -B"
 #: the run's recorded ablation flags (``layers.effective_ablation_flags``).
 RESERVED_AGENT_FLAGS = frozenset({
     "--embench", "--llm-config", "--run-id", "--max-iters", "--visibility",
-    "--profile-cache", "--workdir", "--out-dir",
+    "--profile-cache", "--workdir", "--out-dir", "--profile-only",
 })
 
 AGENT_ARG_HELP = (
@@ -108,6 +109,7 @@ def build_parser(
     default_models=DEFAULT_MODELS,
     default_benchmarks=DEFAULT_BENCHMARKS,
     default_repeats: int = 5,
+    supports_raw: bool = False,
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=description or __doc__,
@@ -161,11 +163,50 @@ def build_parser(
     parser.add_argument("--force", action="store_true", help="Re-run even when a terminal record.json exists.")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip the --test-api connectivity preflight.")
     parser.add_argument("--allow-preflight-fail", action="store_true", help="Continue even if a preflight fails.")
+    if supports_raw:
+        parser.add_argument(
+            "--raw", action="store_true",
+            help="Rebuild the Embench reference/profile measurement cache for every benchmark and "
+                 "stop: no agent, no LLM, no experiment records. Use it after a repository change "
+                 "invalidates the cache. Ignores --models/--repeats/--layers; flags after a bare "
+                 "'--' still apply because they shape the measured build.",
+        )
     return parser
 
 
 def _split(value: str) -> list[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _sbt_lock(opts, out_root: Path, exp_dir: Path) -> tuple[Path | None, dict]:
+    """Resolve the lock file and write the PATH shim when sbt will be launched.
+
+    Resolving the lock file path is unconditional (an archive read still reports
+    where the lock lives); writing the shim is not, so a command rejected by the
+    scheduling controls leaves no ``<exp>/bin`` behind.
+    """
+    lock_file = Path(opts.sbt_lock_file) if opts.sbt_lock_file else out_root / ".locks" / "sbt.lock"
+    if not lock_file.is_absolute():
+        lock_file = opts.workdir / lock_file
+    opts.sbt_lock_file = lock_file
+    if not opts.sbt_lock or opts.collect_only:
+        return None, {}
+    locking.require_flock()
+    shim_dir = exp_dir / "bin"
+    locking.write_sbt_shim(shim_dir)
+    return shim_dir, locking.sbt_lock_env(lock_file, opts.sbt_lock_timeout)
+
+
+def _validate_raw(opts) -> None:
+    """Reject combinations that would make a cache rebuild meaningless."""
+    if opts.aggregate_only or opts.collect_only or opts.dry_run:
+        raise SystemExit("--raw cannot be combined with --aggregate-only/--collect-only/--dry-run")
+    blocked = raw.blocked_agent_args(getattr(opts, "agent_forward", ()))
+    if blocked:
+        raise SystemExit(
+            "--raw rebuilds the measurement, so these forwarded flags are rejected: "
+            + ", ".join(sorted(set(blocked)))
+        )
 
 
 def split_agent_args(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -203,6 +244,7 @@ def main(
     default_benchmarks=DEFAULT_BENCHMARKS,
     default_repeats: int = 5,
     ordered: bool = False,
+    supports_raw: bool = False,
 ) -> int:
     """Run one experiment preset.
 
@@ -213,7 +255,9 @@ def main(
     """
     cli_argv, agent_args = split_agent_args(list(sys.argv[1:] if argv is None else argv))
     validate_agent_args(agent_args)
-    opts = build_parser(description, default_layers, default_models, default_benchmarks, default_repeats).parse_args(cli_argv)
+    opts = build_parser(
+        description, default_layers, default_models, default_benchmarks, default_repeats, supports_raw,
+    ).parse_args(cli_argv)
     # ``agent_args`` stays verbatim for experiment.yaml; the ablation switches
     # in it are folded into each job's recorded ablation flags instead of
     # being forwarded twice (argv + job flags), and everything else is the
@@ -221,6 +265,8 @@ def main(
     opts.agent_args = list(agent_args)
     ablation_args = [a for a in agent_args if a in layers.ABLATION_FLAG_NAMES]
     opts.agent_forward = [a for a in agent_args if a not in layers.ABLATION_FLAG_NAMES]
+    if getattr(opts, "raw", False):
+        _validate_raw(opts)
     opts.workdir = Path(opts.workdir).resolve()
     opts.models = _split(opts.models)
     if opts.benchmarks is not None:
@@ -246,6 +292,13 @@ def main(
         result = reporting.aggregate(exp_dir, prior_experiment, opts.bootstrap)
         print(f"aggregated: {result['records']} runs, {result['cells']} cells -> {result['summary']}")
         return 0
+    # A cache rebuild is not an experiment: dispatch before anything reads the
+    # scheduling knobs, so `--layers`/`--visibility` cannot reject a command that
+    # will not schedule a run, and before experiment.yaml, the LLM configs, the
+    # preflight and the run records are written.
+    if getattr(opts, "raw", False):
+        shim_dir, lock_env = _sbt_lock(opts, out_root, exp_dir)
+        return raw.warm(opts, exp_dir, shim_dir, lock_env)
     if opts.collect_only and prior_experiment.get("layers"):
         opts.layers = list(prior_experiment["layers"])
         for key in ("models", "benchmarks", "repeats", "max_iters"):
@@ -292,10 +345,6 @@ def main(
         raise SystemExit("--max-conformance-runs must be >= 1 for the new ladder")
     if opts.sbt_lock and opts.jobs > 1 and shutil.which("flock") is None:
         raise SystemExit("flock(1) unavailable: use --no-sbt-lock --jobs 1 or install util-linux")
-    lock_file = Path(opts.sbt_lock_file) if opts.sbt_lock_file else out_root / ".locks" / "sbt.lock"
-    if not lock_file.is_absolute():
-        lock_file = opts.workdir / lock_file
-    opts.sbt_lock_file = lock_file
     jobs = scheduling.expand_matrix(opts.models, opts.benchmarks, opts.repeats, opts.layers)
     if not ordered:
         jobs = scheduling.schedule_jobs(jobs, opts.seed)
@@ -322,13 +371,7 @@ def main(
                 job["max_conformance_runs"] = opts.max_conformance_runs
     jobs = scheduling.filter_jobs(jobs, opts.only)
 
-    shim_dir = None
-    lock_env: dict[str, str] = {}
-    if opts.sbt_lock and not opts.collect_only:
-        locking.require_flock()
-        shim_dir = exp_dir / "bin"
-        locking.write_sbt_shim(shim_dir)
-        lock_env = locking.sbt_lock_env(opts.sbt_lock_file, opts.sbt_lock_timeout)
+    shim_dir, lock_env = _sbt_lock(opts, out_root, exp_dir)
 
     if opts.collect_only:
         meta = experiment.read_experiment_yaml(exp_dir / "experiment.yaml")

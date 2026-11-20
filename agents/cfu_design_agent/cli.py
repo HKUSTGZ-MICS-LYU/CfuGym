@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import traceback
 
-from .graph import enable_progress, export_graph_visualization, run_agent
+from .graph import enable_progress, export_graph_visualization, run_agent, run_profile_only
 from .runtime.llm import (
     DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_MAX_TOOL_RETRIES, OpenAiTextClient,
 )
@@ -78,6 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--run-id", default="", help="Explicit run id; defaults to a timestamped unique id.")
+    parser.add_argument(
+        "--profile-only",
+        action="store_true",
+        help=(
+            "Only rebuild the embench reference/profile measurement cache (build + "
+            "simulate both scalar configurations) and stop. Requires --embench; no "
+            "model call is made and no design is produced. Use --profile-cache refresh "
+            "to force the rebuild after the repository changed."
+        ),
+    )
     parser.add_argument(
         "--max-iters",
         type=int,
@@ -300,6 +310,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_profile_only(state: CfuDesignState) -> int:
+    """Rebuild one benchmark's measurement cache and report it machine-readably.
+
+    The single ``profile_only ...`` line is the contract experiment harnesses
+    parse (``agents/experiments/harness/raw.py``): it names the cache key that
+    was written, so a sweep can verify the entry it will later hit.
+    """
+    try:
+        final_state = run_profile_only(state)
+    except Exception as exc:
+        print(f"agent-error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if _flag_env("CFU_AGENT_DEBUG"):
+            traceback.print_exc(file=sys.stderr)
+        return 1
+    benchmark = str(final_state.get("benchmark_name", "") or "")
+    gate = ((final_state.get("gates") or {}).get("profile") or {})
+    cache = gate.get("profile_cache") or {}
+    profiles = final_state.get("embench_profiles") or {}
+    reference = profiles.get("reference") or {}
+    reference_cycles = (reference.get(benchmark) or {}).get("cycles", "")
+    ok = bool(gate.get("ok")) and not gate.get("skipped")
+    print(
+        "profile_only"
+        f" benchmark={benchmark}"
+        f" ok={str(ok).lower()}"
+        f" cache={cache.get('status', '')}"
+        f" saved={str(bool(cache.get('saved'))).lower()}"
+        f" key={cache.get('key', '')}"
+        f" reference_cycles={reference_cycles}"
+        f" run_root={final_state.get('run_root', '')}"
+    )
+    for error in final_state.get("errors") or []:
+        print(f"error={error}")
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     workdir = Path(args.workdir).resolve()
@@ -313,6 +359,16 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--thread-id must equal --run-id (or --resume)")
     if args.checkpoint and not (args.run_id or args.resume):
         raise SystemExit("--checkpoint requires --run-id for safe recovery")
+    if args.profile_only:
+        if not args.embench:
+            raise SystemExit(
+                "--profile-only requires --embench <name>: it rebuilds one benchmark's "
+                "reference/profile measurement cache"
+            )
+        if args.resume:
+            raise SystemExit("--profile-only cannot resume a design run")
+        if args.dry_run:
+            raise SystemExit("--profile-only must execute the builds; it conflicts with --dry-run")
     import math
     import re
     if args.skip_yosys and args.cost_backend != "yosys":
@@ -437,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
     graph_dir = args.export_graph or str(Path(args.out_dir) / "graph")
     graph_paths = {}
     enable_progress()
+    if args.profile_only:
+        return _run_profile_only(state)
     try:
         graph_paths = export_graph_visualization(workdir / graph_dir)
         final_state = run_agent(
