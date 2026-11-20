@@ -2,6 +2,7 @@
 import unittest
 from unittest import mock
 
+from agents.cfu_design_agent import prompts
 from agents.cfu_design_agent.flow import gates, ladder
 from agents.cfu_design_agent.runtime import dependencies, observations
 from agents.cfu_design_agent.stages.verify import cost, parallel, soc, software
@@ -122,6 +123,38 @@ class DraftValidationTest(unittest.TestCase):
             resolved = observations.failure_index({'validation_results': update['validation_results'] + [
                 {'rung': 'draft_completion', 'returncode': 0}]})['failures']
             self.assertEqual(resolved[diagnostic[0]['id']]['status'], 'resolved')
+
+    def test_verification_budget_warns_before_the_last_slot(self):
+        first = prompts.verification_budget_block({'max_iters': 5, 'verify_submissions': 0})
+        self.assertIn("0/5", first)
+        self.assertIn("leaves 4 slot(s)", first)
+        self.assertNotIn("final slot", first)
+        last = prompts.verification_budget_block({'max_iters': 5, 'verify_submissions': 4})
+        self.assertIn("4/5", last)
+        self.assertIn("leaves 0 slot(s)", last)
+        self.assertIn("final slot", last)
+        self.assertIn("end the run incomplete", last)
+        self.assertEqual(prompts.verification_budget_block({'max_iters': 0}), "")
+
+    def test_new_candidate_supersedes_old_failures(self):
+        old_hw = {'rung': 'implementation_hw', 'returncode': 1,
+                  'failure_observation': {'id': 'fail_hw', 'rung': 'implementation_hw'}}
+        old_draft = {'rung': 'draft_completion', 'returncode': 1,
+                     'failure_observation': {'id': 'fail_draft', 'rung': 'draft_completion'}}
+        new_sim = {'rung': 'sim', 'returncode': 1,
+                   'failure_observation': {'id': 'fail_sim', 'rung': 'sim'}}
+        old_cost = {'rung': 'cost', 'returncode': 1,
+                    'failure_observation': {'id': 'fail_cost', 'rung': 'cost'}}
+        state = {'validation_results': [old_hw, old_draft, new_sim],
+                 'cost_results': [old_cost],
+                 'implementation_candidate_epoch': 2,
+                 'implementation_cost_candidate_epoch': 1,
+                 'repair_evidence_epoch': {'validation_results': 0, 'cost_results': 0}}
+        failures = observations.failure_index(state)['failures']
+        self.assertEqual(failures['fail_hw']['status'], 'superseded')
+        self.assertEqual(failures['fail_draft']['status'], 'superseded')
+        self.assertEqual(failures['fail_cost']['status'], 'superseded')
+        self.assertEqual(failures['fail_sim']['status'], 'current')
 
     def test_skipped_sim_records_design_metadata(self):
         state = {'implementation_design_type': 'draft', 'implementation_unimplemented': ['foo'],

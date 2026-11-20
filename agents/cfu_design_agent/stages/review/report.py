@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ...benchmark import embench
-from ...flow import gates as gates_mod, optimize
+from ...flow import evaluations, gates as gates_mod, optimize
 from ...runtime import dev_tests as dev_tests_mod, failures, llm, ppa, provenance, request_usage, stage_services
 from ...state import CfuDesignState
 
@@ -223,6 +223,10 @@ def render_report(state: CfuDesignState) -> str:
     if state.get("implementation_design_type") == "draft":
         lines.extend(["## Incomplete Draft", "- diagnostic simulation only; no cost or acceptance",
                       *[f"- unimplemented: {item}" for item in state.get("implementation_unimplemented") or []], ""])
+    if state.get("implementation_unverified"):
+        lines.extend(["## Unverified Claims",
+                      "- Implementation declaration accepted, but these checks were not run:",
+                      *[f"- {item}" for item in state.get("implementation_unverified") or []], ""])
     llm_request = state.get("llm_request") or {}
     if llm_request:
         lines.extend([
@@ -274,12 +278,14 @@ def render_report(state: CfuDesignState) -> str:
         else:
             lines.append(f"- {key}: {value}")
     lines.append("")
+    lines.append(f"- evaluation attempts: {evaluations.used(state)}/{state.get('max_evals') or 'unlimited'} "
+                 "(failures included; sim/cost share one ticket)")
     lines.append("## Validation Ladder")
     lines.append(render_ladder(state))
     lines.append("")
     rounds = state.get("optimization_rounds") or []
     if rounds:
-        best = optimize._best_round(rounds) or {}
+        best = optimize.select_round(rounds, str(state.get("loop_objective") or "pareto")) or {}
         best_index = best.get("round")
         final_index = rounds[-1].get("round")
         lines.append("## Historical Optimization Rounds (not this draft)" if
@@ -302,6 +308,9 @@ def render_report(state: CfuDesignState) -> str:
                 "worse, or a speed/area tradeoff. The workspace belongs to the final experiment; "
                 "use the validated candidate snapshot below for the selected source delivery."
             )
+        lines.append(f"- delivery objective: {state.get('loop_objective', 'pareto')}; "
+                     f"exploration parent policy: {state.get('loop_parent', 'current')}")
+        lines.append(f"- retained Pareto frontier rounds: {state.get('optimization_frontier', [])}")
         for index, entry in enumerate(rounds):
             lines.append(
                 f"- round {entry.get('round')}: {entry.get('target')} "
@@ -311,7 +320,13 @@ def render_report(state: CfuDesignState) -> str:
                 + (f" improved={bool(entry.get('improved'))}" if entry.get("round") else "")
                 + (" (best)" if entry.get("round") == best_index else "")
                 + (f" — {entry.get('reason')}" if entry.get("reason") else "")
+                + (f"; parent={entry['parent_round']} comparison={entry.get('comparison_to_parent', 'unknown')}"
+                   if "parent_round" in entry else "")
             )
+            if entry.get("hypothesis"):
+                hypothesis = entry["hypothesis"]
+                lines.append(f"  - hypothesis {entry.get('hypothesis_id', '')[:12]}: "
+                             f"{hypothesis.get('change', '')}; predicted: {hypothesis.get('expected_effect', 'unknown')}")
         lines.append("")
     candidate = state.get("best_candidate") or {}
     if candidate and state.get("implementation_design_type") != "draft":

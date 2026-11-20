@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from uuid import uuid4
 
 from langgraph.func import task
 
-from ...flow import ladder, outcome
+from ...flow import evaluations, ladder, outcome
 from ...runtime import dependencies, effects, stage_services, validation_parallel
 from ...state import CfuDesignState
 from . import cost, software
@@ -92,6 +91,11 @@ def _validation_pair_task(evaluation_id: str) -> dict:
 
 
 def validate_candidate(state: CfuDesignState) -> CfuDesignState:
+    execute = any(evaluations.enabled(state, rung) for rung in ("sim", "cost"))
+    return evaluations.run(state, "validation_pair", execute, _validate_candidate)
+
+
+def _validate_candidate(state: CfuDesignState) -> CfuDesignState:
     """Validate one immutable input/round, then make exactly one ladder decision.
 
     The native group task owns both command streams. Worker contexts force plain
@@ -99,8 +103,8 @@ def validate_candidate(state: CfuDesignState) -> CfuDesignState:
     graph, the same coordinator executes directly; legacy simulate/cost entry
     points retain their independent default transitions.
     """
-    evaluation_id = (f"eval-{int(state.get('iteration', 0) or 0)}-"
-                     f"{int(state.get('optimization_round', 0) or 0)}-{uuid4().hex}")
+    # Planning still needs a label, but must not reserve a measured attempt.
+    evaluation_id = str(state.get('evaluation_id') or 'evaluation-planned')
     update = deepcopy(_validation_pair_task(evaluation_id).result() if effects.inside_run()
                       else _evaluate(state, evaluation_id))
     evaluation = update['evaluation']

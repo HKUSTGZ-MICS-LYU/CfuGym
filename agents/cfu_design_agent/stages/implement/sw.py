@@ -223,14 +223,9 @@ def implement_sw(state: CfuDesignState) -> CfuDesignState:
         errors.append(intent_error)
     if apply_result["applied"]:
         errors.extend(stage_services.benchmark_integrity_problems(toolbox))
-        uses_cfu, cfu_problem = intrinsics._software_exercises_cfu(state, toolbox, targets)
+        uses_cfu, cfu_problem = intrinsics._software_usage_check(state, toolbox, targets)
         if not uses_cfu:
             errors.append(cfu_problem)
-        if (state.get("optimization_plan") or {}).get("target") == "extend_isa":
-            added = set(state.get("isa_added_symbols") or [])
-            called = {call["name"] for call in intrinsics._cfu_call_sites(state, toolbox, targets, include_control=True, max_sites=None)}
-            if not added.intersection(called):
-                errors.append("ISA extension software must call a newly added instruction: " + ", ".join(sorted(added)))
     accepted = bool(apply_result["gate_ok"] and not errors)
     if coding_toolset:
         if accepted:

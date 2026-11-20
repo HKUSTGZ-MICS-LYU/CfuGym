@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-from ...flow import gates as gates_mod, ladder, outcome
+from ...flow import evaluations, gates as gates_mod, ladder, outcome
 from ...runtime import effects, commands as commands_mod, hardware_integrity, rtl_snapshot, stage_services
 from ...runtime.tools import SOC_WORKSPACE_SUBDIR
 from ...stages.implement import intrinsics
@@ -29,6 +29,12 @@ def generate_soc(state: CfuDesignState) -> CfuDesignState:
             **outcome.stage_result(state, rung=rung, ok=False, skipped=True, reason=reason,
                                    history=f"Skipped SoC generation ({reason})."),
         }
+
+    if not evaluations.remaining(state):
+        note = "Evaluation budget exhausted before SoC generation."
+        return {"stopped_at": "evaluation_budget", "stage_jobs": "review", "errors": [note],
+                **outcome.stage_result(state, rung=rung, ok=False, next="review_and_route",
+                                       reason="evaluation_budget", errors=[note], history=note)}
 
     if not gates_mod._verify_submissions_left(state):
         note = "Verification-submission budget exhausted before SoC generation."

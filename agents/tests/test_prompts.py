@@ -123,6 +123,15 @@ class RooflinePromptTest(unittest.TestCase):
                 {"storage": "cpu", "access": "write", "role": "rd"},
             ])
 
+    def test_microarchitecture_is_guidance_not_a_frozen_contract(self) -> None:
+        contract = contract_prompt("accelerate it", self.spec, self.analysis, self.context)
+        self.assertIn("advisory design rationale", contract)
+        self.assertIn("must not freeze a specific FSM", contract)
+        cost = prompts.cost_wall_guidance({})
+        self.assertIn("does not mandate a particular FSM", cost)
+        self.assertNotIn("use multicycle resource sharing instead", cost)
+        self.assertIn("Use \"draft\" only for known missing", prompts.SYSTEM_PROMPT)
+
     def test_conformance_prompt_mentions_json_for_json_mode(self) -> None:
         # The conformance request sets json_object mode; a prompt without the word
         # "json" makes OpenAI-compatible gateways answer HTTP 400.

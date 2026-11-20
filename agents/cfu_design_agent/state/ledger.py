@@ -22,6 +22,9 @@ class Ledger(TypedDict, total=False):
     # Answer and pre-verification repairs have independent bounded pools.
     attempts: dict[str, int]
     verify_submissions: int
+    # Replacement ledger: one reservation per candidate sim/cost evaluation,
+    # including failures. Matching serial lanes and native task replays share it.
+    evaluation_attempts: list[dict[str, Any]]
     repairs_used: int
     answer_repairs_used: int
     preverify_repairs_used: int
@@ -31,6 +34,10 @@ class Ledger(TypedDict, total=False):
     last_repair_target: str
     # Historical command evidence before an upstream rewind is no longer current.
     repair_evidence_epoch: dict[str, int]
+    # Index into ``validation_results``/``cost_results`` at the last accepted
+    # implementation candidate. Earlier failures belong to superseded candidates.
+    implementation_candidate_epoch: int
+    implementation_cost_candidate_epoch: int
     repair_route: dict[str, Any]
     # Provenance of the current repair entry; a layer choice can reuse one paid
     # design slot, never an answer/delivery retry and never the same slot twice.

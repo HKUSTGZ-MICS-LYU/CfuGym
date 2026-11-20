@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 from .. import isa, prompts
@@ -9,7 +10,8 @@ from ..flow import ladder, outcome
 from ..isa import IsaLintError
 from ..prompts import SYSTEM_PROMPT
 from ..runtime.llm import DEFAULT_MAX_TOOL_ROUNDS
-from ..runtime import llm_step, parsing, stage_services
+from ..runtime.policy import PolicyError
+from ..runtime import failures, isa_tools, llm_step, parsing, stage_services, tools as tools_mod
 from ..stages import fallbacks, feedback as feedback_mod
 from ..stages.implement import intrinsics
 from ..state import CfuDesignState
@@ -35,34 +37,58 @@ def _contract_evidence_paths(state: CfuDesignState) -> list[tuple[str, str]]:
     return paths
 
 
-def _isa_step(state, client, tools_enabled, stage, label, prompt, fallback):
-    """One ISA-authored answer: tool loop when available, plain call otherwise."""
+def _draft_session(state, stage, seed):
+    if not state.get("run_root"):
+        return None  # Legacy pure planning/unit entry points have no run binding.
+    toolbox = stage_services._toolbox_for_stage(state, "isa")
+    return isa_tools.IsaDraftSession(state, toolbox, seed=seed, stage=stage)
+
+
+def _isa_step(state, client, tools_enabled, stage, label, prompt, fallback, *, session=None):
+    """Obtain a draft delivery; only an independent submission can publish it."""
     if tools_enabled:
-        toolbox = stage_services._toolbox_for_stage(state, "isa")
-        result, raw, _calls = llm_step._run_agent_step(
-            state,
-            toolbox,
-            stage=stage,
-            label=label,
-            artifact_stage="isa",
-            tool_calls_relpath="08_isa/isa_tool_calls.yaml",
-            system=SYSTEM_PROMPT,
-            user=prompt,
-            fallback=fallback,
-            client=client,
-            response_format={"type": "json_object"},
-            deliverable_hint="one evidence-based YAML mapping; ABSTAIN is not accepted",
-        )
-        return result, raw
-    return llm_step._complete_llm(
-        state,
-        stage,
-        label,
-        SYSTEM_PROMPT,
-        prompt,
-        fallback,
-        response_format={"type": "json_object"},
+        if session is None:
+            raise ValueError("ISA editing tools require a run-scoped draft")
+        try:
+            result, raw, _calls = llm_step._run_agent_step(
+                state, session.toolbox, stage=stage, label=label, artifact_stage="isa",
+                tool_calls_relpath="08_isa/isa_tool_calls.yaml", system=SYSTEM_PROMPT,
+                user=prompt, fallback=fallback, client=client,
+                toolset_factory=isa_tools.IsaToolset, toolset_kwargs={"session": session},
+                native_tool_loop=True, submit_tool_name="submit_isa", submit_stage=session.submit,
+                deliverable_hint="read_isa/edit_isa/check_isa then submit_isa; final prose is not submission",
+            )
+        except failures.StageDeliveryFailure as exc:
+            session.rollback()
+            record = {**session.record, "submission_error": str(exc)}
+            ref = stage_services._artifacts_for_stage(state, "isa").write_yaml(
+                "isa", f"08_isa/drafts/{stage}_failure_{len(state.get('llm_raw_outputs') or []):03d}.yaml",
+                {"kind": "model_delivery_failure", "note": "Host failure audit, not a model final answer",
+                 "reason": exc.reason, "terminal_reason": exc.terminal_reason,
+                 "draft": session.record, "tool_calls": list(exc.tool_calls)})
+            return llm_step.LlmResult(session.text, used_llm=True), ref["immutable_path"], record
+        record = dict(session.record)
+        try:
+            candidate_text = session.accepted_text()
+        except ValueError as exc:
+            record["submission_error"] = str(exc)
+            candidate_text = session.text
+        return replace(result, text=candidate_text), raw, record
+    result, raw = llm_step._complete_llm(
+        state, stage, label, SYSTEM_PROMPT, prompt, fallback,
+        response_format=None,  # Plain YAML and EDIT blocks are also supported.
     )
+    record = {}
+    if session is not None:
+        try:
+            is_edit = bool(tools_mod.extract_edit_blocks(result.text))
+            session.apply_delivery(result.text)
+            if is_edit:
+                result = replace(result, text=session.text)
+            record = dict(session.record)
+        except (ValueError, PolicyError, OSError) as exc:
+            record = {**session.record, "submission_error": f"ISA draft delivery rejected: {exc}"}
+    return result, raw, record
 
 
 def _contract_disabled(state: CfuDesignState, node: str) -> CfuDesignState | None:
@@ -82,7 +108,7 @@ def _contract_disabled(state: CfuDesignState, node: str) -> CfuDesignState | Non
                          status="disabled")
     artifacts.write_yaml("isa", "08_isa/validation.yaml", {"status": "disabled", "problems": []})
     return {
-        "isa_spec": {}, "isa_spec_text": "", "design_contract": "",
+        "isa_spec": {}, "isa_spec_text": "", "isa_draft": {}, "design_contract": "",
         "isa_spec_errors": [], "isa_revision": 0, "stage_jobs": "implementation",
         **outcome.stage_result(
             state, rung="isa", ok=False, skipped=True, disabled="no-isa-contract",
@@ -102,20 +128,17 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
     fallback_text = json.dumps(fallback, ensure_ascii=True, indent=2)
     client = llm_step._llm(state)
     tools_enabled = llm_step._tools_enabled(state, client)
-    prompt = prompts.contract_prompt(
-        state["task"],
-        spec,
-        state.get("workload_analysis", ""),
-        state.get("context", {}),
+    session = _draft_session(state, "design_contract", fallback)
+    prompt = prompts.isa_edit_prompt(
+        state["task"], spec, state.get("workload_analysis", ""), state.get("context", {}),
         profile=state.get("embench_profiles"),
         feedback=feedback_mod.isa_repair_feedback(state) + feedback_mod.upstream_repair_feedback(state),
-        agent_tools=tools_enabled,
-        tool_rounds=_tool_rounds(state),
-        artifact_paths=_contract_evidence_paths(state),
-        state=state,
+        agent_tools=tools_enabled, tool_rounds=_tool_rounds(state),
+        artifact_paths=_contract_evidence_paths(state), state=state,
+        draft_text=session.text if session else fallback_text,
     )
-    result, raw_output = _isa_step(
-        state, client, tools_enabled, "design_contract", "isa", prompt, fallback_text
+    result, raw_output, draft_record = _isa_step(
+        state, client, tools_enabled, "design_contract", "isa", prompt, fallback_text, session=session
     )
     if result.text.strip().upper() == "ABSTAIN":
         # ABSTAIN used to be a terminal model choice. Treat it as a rejected
@@ -131,11 +154,19 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
             isa_spec, problems = {}, [f"ISA output is invalid: {exc}"]
     if not problems and not _has_isaable_commands(isa_spec):
         problems = ["no usable commands after ISA extraction"]
+    if draft_record.get("submission_error"):
+        problems = [*problems, draft_record["submission_error"]]
     if problems:
-        # Show what the parser actually saw, not only the resulting symptoms.
-        problems = [*problems, feedback_mod._isa_shape_note(isa_spec)]
-    stage_services._write_isa_artifact(state, isa_spec, problems)
+        note = feedback_mod._isa_shape_note(isa_spec)
+        if note:
+            problems = [*problems, note]
     ok = not problems
+    if ok:
+        stage_services._write_isa_artifact(state, isa_spec, [])
+    else:
+        stage_services._artifacts_for_stage(state, "isa").write_yaml(
+            "isa", f"08_isa/design_attempts/attempt_{len(state.get('llm_raw_outputs') or []):03d}.yaml",
+            {"candidate": isa_spec, "problems": problems, "accepted": False, "draft": draft_record})
     extra, next_node = ladder._ladder_transition(
         state,
         "isa",
@@ -147,16 +178,16 @@ def design_contract(state: CfuDesignState) -> CfuDesignState:
     if feedback_mod._isa_enveloped(result.text):
         history += " (unwrapped from a model envelope)"
     update = {
-        "isa_spec": isa_spec,
-        "isa_revision": 0,
-        "isa_spec_text": parsing._yaml_str(isa_spec),
         "isa_spec_errors": problems,
-        "design_contract": result.text,
+        "isa_draft": {} if ok else {key: value for key, value in draft_record.items() if key != "submission_error"},
         "llm_raw_outputs": [raw_output],
         "stage_jobs": "implementation",
         **outcome.stage_result(state, rung="isa", ok=ok, problems=problems, next=next_node,
                                history=history),
     }
+    if ok:
+        update.update(isa_spec=isa_spec, isa_revision=0, isa_spec_text=parsing._yaml_str(isa_spec),
+                      design_contract=parsing._yaml_str(isa_spec))
     return ladder._apply_transition(update, extra)
 
 
@@ -169,47 +200,33 @@ def extend_isa(state: CfuDesignState) -> CfuDesignState:
     feedback = feedback_mod.isa_repair_feedback(state)
     client = llm_step._llm(state)
     tools_enabled = llm_step._tools_enabled(state, client)
-    run_root = str(state.get("run_root", "") or "").rstrip("/")
-    if tools_enabled and run_root:
-        incumbent_block = (
-            "Incumbent contract (reuse complete hash-matched Run memory, otherwise read it "
-            "before extending; every existing command must be kept):\n"
-            f"- {run_root}/08_isa/cfu_isa.yaml"
-        )
-    else:
-        incumbent_block = f"Incumbent contract:\n{parsing._yaml_str(previous)}"
-    prompt = prompts.contract_prompt(
-        state["task"], state.get("workload_spec", {}),
-        state.get("workload_analysis", ""), state.get("context", {}),
-        profile=state.get("embench_profiles"), feedback=feedback,
-        agent_tools=tools_enabled,
-        tool_rounds=_tool_rounds(state),
-        artifact_paths=_contract_evidence_paths(state),
-        state=state,
-    ) + (
-        "\n=== APPEND-ONLY ISA EXTENSION ===\n"
-        "Return the COMPLETE candidate contract, preserving every existing command, "
-        "encoding, operand/result semantic and shared state/memory/datapath/integration/assumptions "
-        "and software ABI contract (only intrinsic_names may grow). "
-        "Append at least one useful command with a unique (function_id, subfunction_id). "
-        "subfunction_id is funct7 (0..127), default 0; function_id stays funct3 (0..7). "
-        "Old command names cannot be reassigned. New control operations must obey the "
-        "existing state/reset contract. The next rungs implement hardware AND software "
-        "that calls the new operation, then validate correctness and measure cost/cycles.\n"
-        f"Optimization proposal: {(state.get('optimization_plan') or {}).get('reason', '')}\n"
-        + incumbent_block
+    session = _draft_session(state, "extend_isa", previous)
+    prompt = prompts.isa_edit_prompt(
+        state["task"], state.get("workload_spec", {}), state.get("workload_analysis", ""), state.get("context", {}),
+        profile=state.get("embench_profiles"), feedback=feedback, agent_tools=tools_enabled,
+        tool_rounds=_tool_rounds(state), artifact_paths=_contract_evidence_paths(state), state=state,
+        extension=True, draft_text=session.text if session else parsing._yaml_str(previous),
     )
-    result, raw = _isa_step(
-        state, client, tools_enabled, "extend_isa", "isa_extension", prompt, parsing._yaml_str(previous)
+    result, raw, draft_record = _isa_step(
+        state, client, tools_enabled, "extend_isa", "isa_extension", prompt,
+        parsing._yaml_str(previous), session=session,
     )
     try:
         candidate, problems = isa.validate_isa_text(result.text)
         if not problems:
             problems = isa.validate_isa_extension(previous, candidate)
+            if not problems:
+                old_pairs = {(c["function_id"], c.get("subfunction_id", 0)) for c in previous.get("commands") or []}
+                if not any((c["function_id"], c.get("subfunction_id", 0)) not in old_pairs for c in candidate.get("commands") or []):
+                    problems = ["ISA extension must append at least one new command"]
     except (IsaLintError, TypeError, AttributeError) as exc:
         candidate, problems = previous, [f"ISA extension rejected: {exc}"]
+    if draft_record.get("submission_error"):
+        problems = [*problems, draft_record["submission_error"]]
     if problems:
-        problems = [*problems, feedback_mod._isa_shape_note(candidate)]
+        note = feedback_mod._isa_shape_note(candidate)
+        if note:
+            problems = [*problems, note]
     ok = not problems and bool(result.used_llm)
     if not result.used_llm:
         problems = [*problems, "ISA extension requires a model-authored candidate"]
@@ -220,9 +237,10 @@ def extend_isa(state: CfuDesignState) -> CfuDesignState:
     artifacts = stage_services._artifacts_for_stage(state, "isa")
     artifacts.write_yaml("isa", f"08_isa/extensions/attempt_{len(state.get('llm_raw_outputs', [])):03d}.yaml",
                          {"candidate": candidate, "problems": problems, "accepted": ok,
-                          "base_hash": intrinsics._isa_digest({"isa_spec": previous}), "revision": revision})
+                          "base_hash": intrinsics._isa_digest({"isa_spec": previous}), "revision": revision, "draft": draft_record})
     update = {
         "isa_extension_base": previous, "isa_spec_errors": problems,
+        "isa_draft": {} if ok else {key: value for key, value in draft_record.items() if key != "submission_error"},
         "llm_raw_outputs": [raw],
         **outcome.stage_result(state, rung="isa", ok=ok, problems=problems, next=next_node,
                                revision=revision,

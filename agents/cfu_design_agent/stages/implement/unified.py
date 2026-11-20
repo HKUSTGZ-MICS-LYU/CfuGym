@@ -16,19 +16,6 @@ from ...stages import feedback as feedback_mod
 from ...stages.implement import header_transaction, intrinsics, repair_scope, submission
 from ...state import CfuDesignState
 
-def _prior_draft_block(state: CfuDesignState) -> str:
-    """Carry the model's prior declaration forward, not as independent evidence."""
-    if state.get("implementation_design_type") != "draft":
-        return ""
-    items = state.get("implementation_unimplemented")
-    items = items if isinstance(items, list) else []
-    summary = state.get("hardware_plan") or state.get("software_plan") or "(unavailable)"
-    return ("\n\nPrevious draft declaration (model-provided, unverified; not independent "
-            "proof of implementation or verification):\n"
-            + "Unimplemented: " + repr(items) + "\n"
-            + "Previous delivery summary: " + str(summary))
-
-
 @coding_tools.delivery_failure_gate
 @header_transaction.atomic_header
 def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDesignState:
@@ -126,22 +113,6 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         oracle_session = conformance_delivery.ConformanceDelivery(
             state, toolbox, header_path, editable=True, diagnosis_required=bool(feedback))
 
-    def check_conformance_syntax() -> dict[str, Any]:
-        if oracle_session is None:
-            return {
-                "returncode": 1,
-                "stderr_tail": (
-                    "check_conformance_syntax applies to a delivered YAML oracle; "
-                    "this run uses dev tests, so run_conformance compiles them instead"
-                ),
-            }
-        _delivery, problems = oracle_session.current()
-        if problems:
-            return {"returncode": 1, "stderr_tail": "; ".join(problems)}
-        argv = commands_mod._conformance_syntax_command(state, header_path)
-        return effects.run_command(state, toolbox, argv, stage="implementation", rung="conformance_syntax",
-                                   command_id="conformance_syntax", timeout=120, mutate=True)
-
     def run_dev_test(args: dict[str, Any]) -> dict[str, Any]:
         """Evidence-only build+simulate of one dev test (see runtime.dev_tests)."""
         return dev_tests.run_from_state(state, dev_workspace, header_path, args)
@@ -189,18 +160,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                 (f"{run_root}/08_isa/cfu_isa.yaml", "frozen ISA contract (reuse exact hash-matched Run memory; read any missing encoding details)")
             )
         artifact_paths = stage_services.existing_evidence(state, evidence)
-    conformance_step = {
-        "dev": (
-            "3. Prove the design with your own dev tests (`add_conformance_test`, "
-            "`edit_conformance_test`, `run_conformance`); see the dev-test contract "
-            "below. Their result is EVIDENCE — the `sim` rung still owns correctness.\n"
-        ),
-        "gate": (
-            "3. Keep the conformance oracle honest with `write_conformance(oracle)`; "
-            "the host renders C and Verify owns simulation. Strengthen it when a failure "
-            "shows the current checks are blind; never weaken it to hide a defect.\n"
-        ),
-    }.get(conformance_kind, "")
+    conformance_step = prompts.implementation_conformance_step(conformance_kind)
     submit_number = 4 if conformance_on else 3
     contract_free = not state.get("isa_contract", True)
     step_one = (
@@ -232,21 +192,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
             "content or a patch is not applied "
             "anywhere and will be rejected.\n"
             + conformance_step
-            + f"{submit_number}. `submit_stage(delivery, design_type, unimplemented)`: `delivery` is a summary of what you changed, "
-            "which evidence you ran, and what remains unknown — not the change itself. "
-            "Explicitly choose design_type `complete` or `draft`; for draft provide a nonempty "
-            "list of specific unfinished work in `unimplemented`. For complete it may be omitted or empty. "
-            "When routing back to analysis or contract without a completed implementation, "
-            "submit a draft and name the unfinished work. "
-            "Untested does not mean unimplemented: report missing test evidence separately in delivery. "
-            "Both draft and complete consume one `--max-iters` iteration each time they enter verification. "
-            "A draft returns to implementation after simulation without synthesis; exhaustion of the "
-            "iteration budget terminates the run. Aim to submit a genuinely complete implementation "
-            "directly when possible, but never falsely claim completeness to save budget. "
-            "A declaration is not verification evidence and does not relax any safety gate. "
-            "The gate rejects a submission that reports no applied change to a hardware "
-            "and a software target on first delivery; repairs require applied changes "
-            "to each failing domain and validated reuse of an unchanged healthy side."
+            + prompts.implementation_submit_instructions(state, submit_number)
         ),
         context=state.get("context", {}),
         workdir=str(Path(state.get("workdir", ".")).resolve()),
@@ -307,7 +253,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         + schedule_line
         + "\n\n" + prompts.GENERALITY_REVIEW
         + "\nCurrent failure evidence:\n" + feedback
-        + _prior_draft_block(state)
+        + prompts.prior_draft_block(state)
         + scope_line
         + (feedback_mod.repair_route_guidance(tool_mode=True) if feedback else "")
         + conformance_block
@@ -363,7 +309,8 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                             ),
                             "conformance_session": oracle_session,
                             "dev_tests": dev_workspace,
-                            "check_conformance_syntax": check_conformance_syntax,
+                            "check_conformance_syntax": lambda: submission.check_conformance_syntax(
+                                state, toolbox, oracle_session, header_path),
                             "diagnosis_required": bool(feedback)},
         )
         tools = toolsets[-1]
@@ -380,6 +327,7 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
                                                 stage="implement", tool_calls=calls)
         design_type = declaration["design_type"]
         unimplemented = list(declaration.get("unimplemented", []))
+        unverified = list(declaration.get("unverified", []))
         accepted, reason = audit(result.text)
         if not accepted:
             raise failures.StageDeliveryFailure("accepted Stage 3 submission failed final audit: " + reason,
@@ -418,6 +366,9 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
         "hardware_plan": result.text, "software_plan": result.text,
         "implementation_design_type": design_type,
         "implementation_unimplemented": unimplemented,
+        "implementation_unverified": unverified,
+        "implementation_candidate_epoch": len(state.get("validation_results") or []),
+        "implementation_cost_candidate_epoch": len(state.get("cost_results") or []),
         "implementation_hw_summary": "Unified Stage 3 submission; formal gates pending",
         "implementation_sw_summary": "Unified Stage 3 submission; formal gates pending",
         "changed_design_files": hardware_changed, "changed_sw_files": software_changed,
@@ -427,9 +378,11 @@ def implement_with_tools(state: CfuDesignState, *, client: Any = None) -> CfuDes
             "implementation_route": {"ok": True, "next": "generate_soc"},
             "implementation_hw": {"ok": True, "applied": True, "files": hardware_changed,
                                   "design_type": design_type, "unimplemented": list(unimplemented),
+                                  "unverified": list(unverified),
                                   "candidate_hash": hw_hash, "reused": not bool(hardware_changed)},
             "implementation_sw": {"ok": True, "applied": True, "files": software_changed,
                                   "design_type": design_type, "unimplemented": list(unimplemented),
+                                  "unverified": list(unverified),
                                   "candidate_hash": sw_hash, "isa_hash": intrinsics._isa_digest(state),
                                   "intrinsics_header": header_path, "reused": not bool(software_changed)},
         }),

@@ -74,10 +74,15 @@ class ContractToolRoutingTest(_DisposableWorkspaceTest):
             workload_spec={"name": "w", "operation": "crc32", "unknowns": []},
             workload_analysis=f"roofline:\n  bottleneck: memory-bound\n{analysis_body}",
         )
+        def edit_and_submit(_state, _toolbox, **kwargs):
+            session = kwargs["toolset_kwargs"]["session"]
+            session.apply_delivery(VALID_ISA)
+            self.assertEqual(kwargs["submit_tool_name"], "submit_isa")
+            self.assertTrue(kwargs["submit_stage"]("authored the draft")[0])
+            return LlmResult("authored the draft", used_llm=True), "raw", []
         with mock.patch.object(llm_step, "_llm", return_value=_AvailableClient()), \
                 mock.patch.object(
-                    llm_step, "_run_agent_step",
-                    return_value=(LlmResult(VALID_ISA, used_llm=True), "raw", []),
+                    llm_step, "_run_agent_step", side_effect=edit_and_submit,
                 ) as step, \
                 mock.patch.object(llm_step, "_complete_llm") as plain:
             update = contract.design_contract(state)
@@ -103,6 +108,7 @@ class ContractToolRoutingTest(_DisposableWorkspaceTest):
             update = contract.design_contract(state)
         self.assertTrue(update["gates"]["isa"]["ok"])
         plain.assert_called_once()
+        self.assertIsNone(plain.call_args.kwargs.get("response_format"))
         step.assert_not_called()
 
 

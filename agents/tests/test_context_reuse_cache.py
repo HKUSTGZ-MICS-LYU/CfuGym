@@ -44,7 +44,9 @@ class _ProbeClient:
             cached_input_tokens=None,
             message=SimpleNamespace(content="", tool_calls=[SimpleNamespace(
                 id="offline-submit", function=SimpleNamespace(
-                    name="submit_stage", arguments='{"delivery":"offline delivery"}'))]),
+                    name="submit_stage", arguments=(
+                        '{"delivery":"offline delivery","design_type":"complete",'
+                        '"unverified":["offline test did not run"]}')))]),
         )
 
 

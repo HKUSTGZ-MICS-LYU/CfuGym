@@ -140,8 +140,11 @@ class RepairRouteTest(unittest.TestCase):
                 self.assertEqual(update["preverify_repairs_used"], 1)
                 self.assertNotIn("repairs_used", update)
                 self.assertNotIn("answer_repairs_used", update)
-                for key in ("isa_spec", "conformance_delivery", "input_fingerprints", "best_candidate"):
+                for key in ("isa_spec", "conformance_delivery", "input_fingerprints"):
                     self.assertFalse(update[key])
+                self.assertNotIn("best_candidate", update)
+                self.assertNotIn("optimization_plan", update)
+                self.assertEqual({**self.state, **update}["best_candidate"], self.state["best_candidate"])
                 self.assertNotIn("implementation_hw", update["gates"])
                 self.assertNotIn("sim", update["gates"])
                 self.assertEqual("analysis" in update["gates"], target == "contract")

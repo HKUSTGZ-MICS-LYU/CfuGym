@@ -313,13 +313,23 @@ def failure_index(state: dict[str, Any]) -> dict[str, Any]:
     """Index validation/cost failure observations for stage tools.
 
     Each entry carries a ``status``: ``current`` while the failing rung has not
-    produced a later success, ``resolved`` once it has. Resolved IDs stay
-    available for context but must not be cited as current repair targets, so a
-    repair never re-fixes an already-fixed failure.
+    produced a later success, ``resolved`` once it has, ``stale`` after an
+    upstream rewind, or ``superseded`` when a newer implementation candidate
+    replaced its evidence epoch. Non-current IDs stay available for context but
+    must not be cited as current repair targets, so a repair never re-fixes an
+    already-fixed or obsolete failure.
     """
     observations: dict[str, dict[str, Any]] = {}
     status: dict[str, str] = {}
     epoch = state.get("repair_evidence_epoch") or {}
+    # An accepted implementation candidate starts a new evidence epoch. A
+    # failure from an earlier candidate is history: it may explain how the
+    # current source got here, but it must not be cited as a live repair target
+    # after the model has already delivered a new candidate.
+    candidate_epoch = {
+        "validation_results": int(state.get("implementation_candidate_epoch", 0) or 0),
+        "cost_results": int(state.get("implementation_cost_candidate_epoch", 0) or 0),
+    }
     for key in ("validation_results", "cost_results"):
         for position, result in enumerate(state.get(key) or []):
             if not isinstance(result, dict):
@@ -328,7 +338,10 @@ def failure_index(state: dict[str, Any]) -> dict[str, Any]:
             if isinstance(item, dict) and item.get("id"):
                 ident = str(item["id"])
                 observations[ident] = dict(item)
-                status[ident] = "stale" if position < int(epoch.get(key, 0)) else "current"
+                if position < candidate_epoch[key]:
+                    status[ident] = "superseded"
+                else:
+                    status[ident] = "stale" if position < int(epoch.get(key, 0)) else "current"
                 continue
             rung = str(result.get("rung") or "")
             if rung and result.get("returncode") == 0 and not result.get("skipped"):

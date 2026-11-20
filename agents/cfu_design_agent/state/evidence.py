@@ -35,6 +35,8 @@ class Evidence(TypedDict, total=False):
     isa_spec: dict[str, Any]
     isa_spec_text: str
     isa_spec_errors: list[str]
+    # Hash-bound rejected draft for local repair; never the accepted contract.
+    isa_draft: dict[str, Any]
     design_contract: str
     hardware_plan: str
     software_plan: str
@@ -42,6 +44,7 @@ class Evidence(TypedDict, total=False):
     software_patch: str
     implementation_design_type: Literal["draft", "complete"]
     implementation_unimplemented: list[str]
+    implementation_unverified: list[str]
     implementation_hw_summary: str
     implementation_sw_summary: str
     changed_sw_files: list[str]

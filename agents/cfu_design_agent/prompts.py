@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
+import json
 import yaml
 
 from .runtime import cost_budget, source_visibility
@@ -55,6 +56,7 @@ Hard rules:
 - Match every Instruction function id AND subop to the generated intrinsics. Do not rely on an unchecked default subop, ignore unsupported/error CFU responses, clear error status inside the kernel to hide failures, or claim acceleration for a datapath that software never selects.
 - Include a concise command coverage table in the implementation delivery: map each frozen command to its actual function/subop, effective enable condition, operand/data route, completion and declared result/memory effects; disclose unchecked or omitted semantics. This table is a claim, not a substitute for Host evidence.
 - Do not abstain from CFU design. If the opportunity is uncertain or difficult, state the uncertainty in assumptions/unknowns and still return the strongest minimal, testable CFU contract supported by evidence. Never silently narrow the contract or patch only the observed answer. For a repair, explain why implement is sufficient or why an upstream route is necessary.
+- Calibrate implementation claims honestly. "Complete" means you believe every required behavior is implemented; it does not require every test, simulation, synthesis or measurement to have run already. Put unrun checks under "unverified". Use "draft" only for known missing or known-wrong required behavior, not for ordinary uncertainty about an unseen input or for evidence you have not collected yet.
 - Return concise, implementable text. Do not invent performance results."""
 
 
@@ -223,6 +225,10 @@ READ_TOOL_USAGE: dict[str, str] = {
     "write_conformance": "`write_conformance(oracle)` — validate and deliver an independent small-case oracle; host renders C, no simulation.",
     "check_conformance_syntax": "`check_conformance_syntax()` — optional syntax-only check of delivered C; no link or simulation.",
     "submit_stage": "`submit_stage(delivery)` — finish this stage once the edits are applied; `delivery` is a summary of the change, never the change itself.",
+    "read_isa": "`read_isa(start_line?, end_line?)` — numbered current ISA draft; the accepted contract is separate.",
+    "edit_isa": "`edit_isa(edits=[{search, replace}])` — atomic exact SEARCH/REPLACE on this run's ISA draft only.",
+    "check_isa": "`check_isa()` — syntax/schema/encoding/extension ABI lint, not hardware correctness proof.",
+    "submit_isa": "`submit_isa(delivery)` — independent Host recheck and draft submission; summary only, no pasted contract.",
 }
 
 
@@ -450,12 +456,94 @@ def cost_wall_guidance(state: Mapping[str, Any] | None = None) -> str:
         f"The active budget is at most {cap} mapped Yosys generic cells "
         "(`max_yosys_cells`). This generic mapped-cell budget is not an FPGA LUT "
         "count or device capacity; do not equate them. Plan for it now: keep the "
-        "datapath compact, limit parallel lane count and unrolling, and use multicycle "
-        "resource sharing instead of replicating expensive arithmetic or large muxes. "
+        "datapath area-aware. Resource sharing, bounded unrolling and a compact "
+        "schedule often help, but any implementation strategy that preserves the "
+        "required semantics and fits the cap is acceptable; the budget does not "
+        "mandate a particular FSM, pipeline or multiplier count. "
         "Preserve the required semantic input domain and exact correctness, including "
         "widths, signedness, overflow, tails and state effects. Never meet the cap by "
         "narrowing semantics or using fixture-specific shortcuts. An estimate or "
         "design plan is not measured synthesis evidence."
+    )
+
+
+def prior_draft_block(state: Mapping[str, Any] | None = None) -> str:
+    """Carry the model's prior declaration forward, not as independent evidence."""
+    state = state or {}
+    if state.get("implementation_design_type") != "draft":
+        return ""
+    items = state.get("implementation_unimplemented")
+    items = items if isinstance(items, list) else []
+    unverified = state.get("implementation_unverified")
+    unverified = unverified if isinstance(unverified, list) else []
+    summary = state.get("hardware_plan") or state.get("software_plan") or "(unavailable)"
+    return ("\n\nPrevious draft declaration (model-provided, unverified; not independent "
+            "proof of implementation or verification):\n"
+            + "Unimplemented required behavior: " + repr(items) + "\n"
+            + "Not yet verified (not implementation gaps): " + repr(unverified) + "\n"
+            + "Previous delivery summary: " + str(summary))
+
+
+def verification_budget_block(state: Mapping[str, Any] | None = None) -> str:
+    """State the remaining submission budget before the model chooses a type."""
+    state = state or {}
+    maximum = int(state.get("max_iters", 0) or 0)
+    if maximum <= 0:
+        return ""
+    used = int(state.get("verify_submissions", 0) or 0)
+    after = max(0, maximum - used - 1)
+    line = (f"Verification budget: {used}/{maximum} candidate slots used; submitting this "
+            f"candidate enters verification as slot {min(maximum, used + 1)}/{maximum} and "
+            f"leaves {after} slot(s) after it.")
+    if after == 0:
+        line += (" This is the final slot: a draft would consume it, simulate without "
+                 "synthesis, and end the run incomplete with no chance for a complete submission.")
+    return line
+
+
+def implementation_conformance_step(kind: str) -> str:
+    return {
+        "dev": (
+            "3. Prove the design with your own dev tests (`add_conformance_test`, "
+            "`edit_conformance_test`, `run_conformance`); see the dev-test contract "
+            "below. Their result is EVIDENCE — the `sim` rung still owns correctness.\n"
+        ),
+        "gate": (
+            "3. Keep the conformance oracle honest with `write_conformance(oracle)`; "
+            "the host renders C and Verify owns simulation. Strengthen it when a failure "
+            "shows the current checks are blind; never weaken it to hide a defect.\n"
+        ),
+    }.get(kind, "")
+
+
+def implementation_submit_instructions(state: Mapping[str, Any] | None, submit_number: int) -> str:
+    """Submission protocol text: implementation completeness vs unrun evidence."""
+    return (
+        f"{submit_number}. `submit_stage(delivery, design_type, unimplemented, unverified)`: "
+        "`delivery` is a summary of what you changed and the evidence you actually ran — not "
+        "the change itself. Explicitly choose design_type `complete` or `draft`.\n"
+        "Use `complete` when you believe every required contract behavior is implemented. "
+        "You do NOT need to have run every test, simulation, synthesis or measurement: put "
+        "those unrun checks in `unverified`, not in `unimplemented`. An untested but implemented "
+        "design is complete, not a draft; claiming complete is a statement about implementation, "
+        "not proof that verification already passed.\n"
+        "Use `draft` only when you know a required behavior is missing or known wrong. In that "
+        "case `unimplemented` must name the missing or wrong behavior. Never list tests, "
+        "synthesis, cost, measurements, unseen-but-unproven cases, or general uncertainty as "
+        "unimplemented; list them under `unverified` instead. Do not use draft merely to hedge.\n"
+        "When routing back to analysis or contract without a completed implementation, "
+        "submit a draft and name the actual missing behavior.\n"
+        "Both draft and complete consume one `--max-iters` verification slot. A draft returns "
+        "to implementation after simulation without synthesis; exhausting the iteration budget "
+        "terminates the run. Prefer finishing the implementation in this session over spending "
+        "a slot on an avoidable draft: if the missing behavior is actionable with the tools "
+        "available now, make that edit and check it before submitting. Never falsely claim "
+        "completeness to save budget.\n"
+        + verification_budget_block(state) + "\n"
+        "A declaration is not verification evidence and does not relax any safety gate. "
+        "The gate rejects a submission that reports no applied change to a hardware "
+        "and a software target on first delivery; repairs require applied changes "
+        "to each failing domain and validated reuse of an unchanged healthy side."
     )
 
 
@@ -746,6 +834,73 @@ normalizes the response for downstream context.
 {ROOFLINE_ANALYSIS_FIELDS}"""
 
 
+def isa_edit_prompt(
+    task: str, spec: WorkloadSpec, analysis: str, context: RepoContext, *,
+    profile: dict | None = None, feedback: str = "", agent_tools: bool = False,
+    tool_rounds: int = 0, artifact_paths: Iterable[str | tuple[str, str]] = (),
+    state: Mapping[str, Any] | None = None, extension: bool = False, draft_text: str = "",
+) -> str:
+    """ISA editing is a draft transaction, not another full-contract rewrite."""
+    state = state or {}
+    run_root = str(state.get("run_root") or (context or {}).get("run_root") or "").rstrip("/")
+    stage = "extend_isa" if extension else "design_contract"
+    draft_path = f"{run_root}/08_isa/drafts/{stage}.yaml"
+    tool_names = ("read_isa", "edit_isa", "check_isa", "submit_isa", "read_file", "list_dir", "search_text", "list_command_logs")
+    brief = stage_brief(
+        "append-only ISA extension" if extension else "CFU ISA contract editing",
+        design_guidance=cost_wall_guidance(state),
+        deliverable=("Edit the current draft, check it, then call submit_isa with a factual summary. "
+                     "Do not return a full contract as the final answer." if agent_tools else
+                     "One complete YAML/JSON contract, or EDIT_BEGIN SEARCH/REPLACE blocks targeting only the draft below."),
+        context=context, tool_names=tool_names, tool_rounds=tool_rounds,
+        agent_tools=agent_tools, artifact_paths=artifact_paths, shared=workload_digest_block(spec, profile))
+    prior = (f"Read prior workload analysis as needed: {run_root}/07_analysis/workload_analysis.yaml"
+             if agent_tools else source_visibility.mask_model_payload(analysis))
+    protocol = (
+        "Use read_isa for the CURRENT editable draft (numbered lines; page as needed). "
+        "read_file on cfu_isa.yaml reads the last accepted contract, NOT the draft.\n"
+        "edit_isa takes edits=[{search: <exact nonempty text>, replace: <replacement>}]. "
+        "Every SEARCH must match once; a batch is atomic. Correct syntax/compatibility problems "
+        "locally instead of regenerating unrelated sections.\n"
+        "check_isa reports exact schema/ABI field differences. Then call submit_isa(delivery=<summary>). "
+        "The Host rechecks the current draft independently; lint is not hardware correctness proof. "
+        "Prose or a pasted full contract is not submission.\n"
+        if agent_tools else
+        "Return a complete contract as before, or use the existing EDIT_BEGIN <draft path>, "
+        "<<<<<<< SEARCH, =======, >>>>>>> REPLACE, EDIT_END protocol. No other target is writable.\n")
+    boundary = (
+        "APPEND-ONLY EXTENSION: append at least one new command with a unique (function_id, subfunction_id).\n"
+        "Preserve ALL old commands/encodings/operand/result/resource/response/semantic fields exactly, "
+        "plus shared state/reset, memory, input-domain assumptions, operations_contract, actual datapath "
+        "parameters, integration wiring and software ABI. Unknown fields stay protected. "
+        "Do not add resident state or change reset/input semantics implicitly.\n"
+        "Known advisory metadata MAY change: software.kernel_plan, software.extension_kernel_plan, "
+        "software.notes/rationale; datapath.implementation; integration.notes/rationale. "
+        "These are plans, not permission to alter normative contracts. software.intrinsic_names may only grow.\n"
+        if extension else
+        "Author the smallest useful evidence-based contract. State the runtime input domain and unseen-input "
+        "counterexamples in assumptions/validation, and carry the Roofline conclusion into roofline. "
+        "Do not abstain; uncertainty is recorded, not hidden by narrowing semantics.\n")
+    plan = state.get("optimization_plan") or {}
+    hypothesis = ("\nOptimization proposal (predictions, not evidence):\n" + json.dumps({
+        "parent_round": plan.get("parent_round"), "focus": plan.get("focus"),
+        "reason": plan.get("reason", ""), "hypothesis": plan.get("hypothesis") or {}},
+        ensure_ascii=True) + "\n") if extension else ""
+    problems = ("\nPrevious rejected draft: fix these exact problems without discarding other valid edits:\n"
+                + feedback + "\n") if feedback else ""
+    inline = "" if agent_tools else "\nCurrent draft (edit this text):\n" + source_visibility.mask_model_payload(draft_text)
+    return (f"Task:\n{task}\n\n{brief}\n\n{prior}\n\n{protocol}\nDraft target: {draft_path}\n"
+            "The accepted contract is not overwritten until the complete candidate is accepted.\n"
+            + boundary + hypothesis + problems + "\n"
+            "The draft is a YAML/JSON mapping with spec_version, identity, commands, operations_contract, "
+            "state, memory, datapath, software, integration, validation, assumptions, unknowns and roofline. "
+            "assumptions is a mapping; unknowns is a list. function_id is funct3 (0..7); subfunction_id "
+            "is funct7 (0..127, default 0). Command kind is compute/control/load/store. "
+            "Each new command declares CPU/RF resources (storage, access, role); CPU reads use rs1/rs2, "
+            "value responses write rd, acknowledgements do not. Never encode a raw register ID as its value. "
+            "Use the ISA template and check_isa for detailed schema; preserve scalar fallback.\n" + inline)
+
+
 def contract_prompt(
     task: str,
     spec: WorkloadSpec,
@@ -858,7 +1013,12 @@ accumulator, register-file implementation or pipeline. Put only justified algori
 specific parameters under `datapath.implementation` with names, units and rationale
 appropriate to this workload. Omit unused parameters rather than filling in zeros
 for unrelated algorithms. State implementation-specific constraints in
-`assumptions`/`unknowns`. Explain how the hot function will call the intrinsics. The SoC
+`assumptions`/`unknowns`. `datapath.implementation` is advisory design rationale: it
+must not freeze a specific FSM, pipeline, multiplier count, scheduling or unrolling
+strategy unless the task explicitly requires one. The normative contract is the
+command encodings, operand/result semantics, response behavior, resource declarations,
+required input domain, state/reset effects and the cost cap; any implementation that
+satisfies those is valid. Explain how the hot function will call the intrinsics. The SoC
 integration is fixed; do not invent new SoC parameters."""
 
 
@@ -1485,7 +1645,7 @@ def optimization_prompt(
     brief = stage_brief(
         "optimization decision",
         design_guidance=cost_wall_guidance(state),
-        deliverable="One JSON object with the continue/target/focus/reason decision.",
+        deliverable="One JSON decision with continue/target/focus/reason, parent_round and a testable hypothesis.",
         workdir=workdir,
         run_root=run_root,
         tool_names=("read_file", "list_dir", "search_text", "list_command_logs"),
@@ -1517,7 +1677,15 @@ The run already passes every gate. Measured result of the current design:
 Optimization rounds so far (newest last):
 {rounds or "none yet: this would be the first optimization round"}
 
-Optimization budget left: {budget_left} round(s).
+Optimization budget left: {budget_left} additional candidate(s), bounded by both submission and evaluation caps.
+Delivery objective: {(state or {}).get('loop_objective', 'pareto')}.
+Default exploration parent: {(state or {}).get('loop_parent', 'current')}.
+Selected incumbent round: {((state or {}).get('best_candidate') or {}).get('round', 'current')}.
+Retained source rounds: {sorted(((state or {}).get('candidate_snapshots') or {}).keys())}.
+Retained candidate manifests: {dict((key, value.get('manifest', '')) for key, value in ((state or {}).get('candidate_snapshots') or {}).items())}.
+Set parent_round to the current round or a retained source round. The framework
+restores a different parent transactionally before implementation, then validates
+all builds and measurements again; old passing gates are never reused as proof.
 
 Workload specification (existing command encodings/semantics must remain compatible):
 {spec_digest(spec)}
@@ -1542,8 +1710,9 @@ Answer `continue: true` only when you can name a concrete change that should bea
 the current numbers and keep every gate passing (the correctness oracle, the
 minimum speedup floor enforced by the simulation gate, and a successful
 synthesis). Do not repeat a change that
-already ran and did not improve; a round that makes the result worse is a real
-regression in the delivered design, not a free experiment.
+already ran from the same parent. A slower/larger result is a real evaluated
+experiment, not an improvement claim. Tradeoffs may remain on the Pareto frontier;
+the selected source delivery is separate from the mutable last experiment.
 A reasonable speedup alone is not a reason to stop exploring. Consider instruction
 batching, retained intermediates within the existing state contract, control/result
 operations, packing/transfer overhead and area reduction before proposing a stop.
@@ -1554,7 +1723,13 @@ Return exactly one JSON object and nothing else:
 {{"continue": true or false,
   "target": {target_enum},
   "focus": "performance" or "cost",
-  "reason": "<the concrete change you would make, or why you stop>"}}"""
+  "parent_round": <integer round to branch from>,
+  "reason": "<the concrete change you would make, or why you stop>",
+  "hypothesis": {{"bottleneck": "<measured bottleneck>",
+    "change": "<one concrete intervention>", "evidence": ["<artifact path or measured fact>"],
+    "expected_effect": "<predicted cycle/area effect, not a measured claim>",
+    "risks": ["<correctness or regression risk>"],
+    "validation_plan": "<what evidence would support or reject this hypothesis>"}}}}"""
 
 
 def _optimization_block(optimization: str) -> str:
@@ -1563,7 +1738,7 @@ def _optimization_block(optimization: str) -> str:
         return ""
     return (
         "\n=== OPTIMIZATION ROUND ===\n"
-        "Every gate already passes, so this is not a repair: keep the parts that work and\n"
+        "The selected parent previously passed verification, so this is not a repair: keep what works and\n"
         "make one focused change that improves the measured result below.\n"
         + optimization
         + "\n"

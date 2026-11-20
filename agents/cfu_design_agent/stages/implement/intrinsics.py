@@ -250,6 +250,22 @@ def _software_exercises_cfu(
     return False, _cfu_missing_intrinsic_message(state)
 
 
+def _software_usage_check(
+    state: CfuDesignState, toolbox: RepoToolbox, targets: list[tuple[str, str]]
+) -> tuple[bool, str]:
+    """One usage rule for native tools and plain deliveries, including ISA evolution."""
+    exercises, reason = _software_exercises_cfu(state, toolbox, targets)
+    if not exercises:
+        return False, reason
+    if (state.get("optimization_plan") or {}).get("target") == "extend_isa":
+        added = set(state.get("isa_added_symbols") or [])
+        called = {site["name"] for site in _cfu_call_sites(
+            state, toolbox, targets, include_control=True, max_sites=None)}
+        if not added.intersection(called):
+            return False, "ISA extension software must call a newly added instruction: " + ", ".join(sorted(added))
+    return True, ""
+
+
 def _isa_digest(state: CfuDesignState) -> str:
     """Stable digest of the CFU ISA contract, for software/hardware ABI checks."""
     import yaml as _yaml

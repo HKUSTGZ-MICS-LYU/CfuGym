@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import reprlib
 from pathlib import Path
 from typing import Any
 
@@ -353,16 +354,64 @@ def validate_isa_spec(data: dict[str, Any]) -> list[str]:
     return sorted(errors)
 
 
-def validate_isa_extension(previous: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
-    """Validate an append-only ISA revision without mutating either input.
+# These are exact, section-local exceptions, not recursively ignored key names.
+# kernel plans/notes are model-facing prose only. prompts.py defines implementation
+# as advisory; runtime.commands reads datapath's top-level dimensions, never this
+# mapping. Unknown fields (including legacy flat datapath parameters) stay frozen.
+_EXTENSION_ADVISORY_FIELDS = {
+    "software": frozenset({"kernel_plan", "extension_kernel_plan", "notes", "rationale"}),
+    "datapath": frozenset({"implementation"}),
+    "integration": frozenset({"notes", "rationale"}),
+}
+_EXTENSION_MISSING = object()
 
-    All old command fields (including arbitrary semantic metadata) are frozen.
-    Omitted legacy subfunction/kind defaults compare equal to explicit defaults.
-    Shared state/memory/datapath/integration/operations_contract and software ABI
-    remain identical: structural lint cannot prove a changed width/reset/layout
-    preserves old instructions. This deliberately conservative API permits new
-    operations over the existing shared ABI, not incompatible architecture edits.
-    Analysis/validation provenance may evolve; intrinsic_names may only grow.
+
+def _extension_value(value: Any) -> str:
+    """Bound feedback values, including containers, and distinguish absent/null."""
+    if value is _EXTENSION_MISSING:
+        return "<missing>"
+    formatter = reprlib.Repr()
+    formatter.maxstring = formatter.maxother = 160
+    formatter.maxlevel = 3
+    text = formatter.repr(value)
+    return text if len(text) <= 180 else text[:177] + "..."
+
+
+def _extension_changes(before: Any, after: Any, path: str) -> list[str]:
+    """Describe changed leaves without merging, normalizing or mutating values."""
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes: list[str] = []
+        for key in sorted(set(before) | set(after), key=str):
+            child = f"{path}.{key}" if isinstance(key, str) and key.isidentifier() else f"{path}[{key!r}]"
+            changes.extend(_extension_changes(before.get(key, _EXTENSION_MISSING),
+                                              after.get(key, _EXTENSION_MISSING), child))
+        return changes
+    if isinstance(before, list) and isinstance(after, list):
+        changes = []
+        for index in range(max(len(before), len(after))):
+            changes.extend(_extension_changes(before[index] if index < len(before) else _EXTENSION_MISSING,
+                                              after[index] if index < len(after) else _EXTENSION_MISSING,
+                                              f"{path}[{index}]"))
+        return changes
+    if type(before) is type(after) and before == after:
+        return []
+    return [f"{path} (before={_extension_value(before)}; after={_extension_value(after)})"]
+
+
+def validate_isa_extension(previous: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
+    """Return sorted compatibility errors for an append-only revision; no mutation.
+
+    Both inputs must first pass the unchanged initial-contract lint. All old
+    command fields, including unknown semantic fields and prose, remain exact
+    except omitted legacy subfunction/kind defaults. State/reset, memory, input
+    assumptions, operations_contract, actual datapath parameters, integration
+    wiring and software ABI are frozen. Unknown fields are protected by default.
+
+    Only the exact section-local advisory paths in _EXTENSION_ADVISORY_FIELDS
+    may change or be added/removed; intrinsic_names may grow, and existing
+    roofline/validation/unknowns provenance may evolve. This is structural
+    compatibility, not a proof of hardware semantics. Errors retain their legacy
+    category text and add leaf paths plus bounded before/after for local edits.
     """
     errors: list[str] = []
     for label, spec in (("previous", previous), ("candidate", candidate)):
@@ -372,31 +421,60 @@ def validate_isa_extension(previous: dict[str, Any], candidate: dict[str, Any]) 
             errors.extend(f"{label}: {error}" for error in validate_isa_spec(spec))
     if errors:
         return sorted(errors)
+
+    def freeze(before: Any, after: Any, path: str, category: str) -> None:
+        errors.extend(f"{category}: {change}" for change in _extension_changes(before, after, path))
+
     old_identity, new_identity = previous["identity"], candidate["identity"]
     for key in (set(old_identity) | set(new_identity)) - {"status", "subfunction_id_width", "opcode"}:
-        if old_identity.get(key) != new_identity.get(key):
-            errors.append(f"identity.{key} cannot change in an ISA extension")
+        freeze(old_identity.get(key, _EXTENSION_MISSING), new_identity.get(key, _EXTENSION_MISSING),
+               f"identity.{key}", f"identity.{key} cannot change in an ISA extension")
     if parse_opcode(old_identity["opcode"]) != parse_opcode(new_identity["opcode"]):
-        errors.append("identity.opcode cannot change in an ISA extension")
+        freeze(old_identity["opcode"], new_identity["opcode"], "identity.opcode",
+               "identity.opcode cannot change in an ISA extension")
+
     def normalized(command: dict[str, Any]) -> dict[str, Any]:
         return {**command, "subfunction_id": command.get("subfunction_id", 0), "kind": command_kind(command)}
-    new_commands = {(c["function_id"], c.get("subfunction_id", 0)): normalized(c) for c in candidate["commands"]}
-    for command in previous["commands"]:
+
+    new_commands = {(c["function_id"], c.get("subfunction_id", 0)): (index, normalized(c))
+                    for index, c in enumerate(candidate["commands"])}
+    new_commands_by_name = {c["name"]: (index, normalized(c))
+                            for index, c in enumerate(candidate["commands"])}
+    for index, command in enumerate(previous["commands"]):
         key = (command["function_id"], command.get("subfunction_id", 0))
         if key not in new_commands:
-            errors.append(f"old command {command['name']} at {key} was removed or re-encoded")
-        elif normalized(command) != new_commands[key]:
-            errors.append(f"old command {command['name']} at {key} changed semantic/encoding fields")
-    for key in ("state", "memory", "datapath", "integration", "operations_contract", "assumptions"):
-        if previous.get(key, {}) != candidate.get(key, {}):
-            errors.append(f"{key} cannot change in a conservative ISA extension")
+            category = f"old command {command['name']} at {key} was removed or re-encoded"
+            if command["name"] in new_commands_by_name:
+                new_index, new_command = new_commands_by_name[command["name"]]
+                freeze(normalized(command), new_command, f"commands[{new_index}]", category)
+            else:
+                freeze(command, _EXTENSION_MISSING, f"commands[{index}]", category)
+        else:
+            new_index, new_command = new_commands[key]
+            freeze(normalized(command), new_command, f"commands[{new_index}]",
+                   f"old command {command['name']} at {key} changed semantic/encoding fields")
+
+    shared = {"state", "memory", "datapath", "integration", "operations_contract", "assumptions"}
+    # Keep the existing empty-section defaults and provenance exceptions. Unlike
+    # the old section enumeration, also protect unrecognized top-level fields.
+    handled = {"identity", "commands", "software", "roofline", "validation", "unknowns", "spec_version"}
+    for key in (set(previous) | set(candidate)) - handled:
+        default = {} if key in shared else _EXTENSION_MISSING
+        before, after = previous.get(key, default), candidate.get(key, default)
+        advisory = _EXTENSION_ADVISORY_FIELDS.get(key, frozenset())
+        if isinstance(before, dict) and isinstance(after, dict):
+            before = {k: v for k, v in before.items() if k not in advisory}
+            after = {k: v for k, v in after.items() if k not in advisory}
+        freeze(before, after, str(key), f"{key} cannot change in a conservative ISA extension")
+
     old_sw, new_sw = previous["software"], candidate["software"]
-    for key in (set(old_sw) | set(new_sw)) - {"intrinsic_names"}:
-        if old_sw.get(key) != new_sw.get(key):
-            errors.append(f"software.{key} cannot change in an ISA extension")
+    for key in (set(old_sw) | set(new_sw)) - _EXTENSION_ADVISORY_FIELDS["software"] - {"intrinsic_names"}:
+        freeze(old_sw.get(key, _EXTENSION_MISSING), new_sw.get(key, _EXTENSION_MISSING),
+               f"software.{key}", f"software.{key} cannot change in an ISA extension")
     old_names, new_names = old_sw.get("intrinsic_names", []), new_sw.get("intrinsic_names", [])
     if not isinstance(old_names, list) or not isinstance(new_names, list) or any(name not in new_names for name in old_names):
-        errors.append("software.intrinsic_names must preserve all old entries")
+        errors.append("software.intrinsic_names must preserve all old entries: "
+                      f"software.intrinsic_names (before={_extension_value(old_names)}; after={_extension_value(new_names)})")
     return sorted(errors)
 
 

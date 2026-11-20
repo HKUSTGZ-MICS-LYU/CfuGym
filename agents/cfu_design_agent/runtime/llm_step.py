@@ -447,6 +447,7 @@ def _run_agent_step(
     toolset_kwargs: dict[str, Any] | None = None,
     native_tool_loop: bool = False,
     submit_stage: Callable[[str], bool | tuple[bool, str]] | None = None,
+    submit_tool_name: str = "submit_stage",
 ) -> tuple[LlmResult, str, list[dict]]:
     """Compatibility facade for one stage-local model execution.
 
@@ -488,6 +489,7 @@ def _run_agent_step(
             toolset_kwargs=toolset_kwargs,
             native_tool_loop=native_tool_loop,
             submit_stage=submit_stage,
+            submit_tool_name=submit_tool_name,
         ),
         client=client,
     )

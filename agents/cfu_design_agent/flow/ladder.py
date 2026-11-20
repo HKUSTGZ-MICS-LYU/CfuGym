@@ -7,7 +7,7 @@ from typing import Any, Literal
 from langgraph.errors import NodeError
 from langgraph.types import Command
 
-from ..flow import gates, outcome
+from ..flow import evaluations, gates, outcome
 from ..flow.gates import ANSWER_REPAIR_TARGETS, DELIVERY_RETRY_MAX, PREPARE_GATE
 from .. import state as state_mod
 from ..runtime import stage_services
@@ -182,6 +182,9 @@ def _ladder_transition(
         budget_kind = "preverify"
         budget_left = gates._preverify_repairs_left(state)
 
+    if verify_rung:
+        budget_left = budget_left and evaluations.remaining(state)
+
     counter_key, cap = {
         "answer": ("answer_repairs_used", gates.answer_repairs_max(state)),
         "design": ("repairs_used", gates.max_repairs(state)),
@@ -210,7 +213,10 @@ def _ladder_transition(
             "iteration_history": state_mod.append_history(state, note),
         }, target
 
-    if verify_rung and not gates._verify_submissions_left(state):
+    evaluation_exhausted = verify_rung and not evaluations.remaining(state)
+    if evaluation_exhausted:
+        note = f"{rung} failed and the evaluation budget is exhausted (--max-evals {state.get('max_evals')}); stopping."
+    elif verify_rung and not gates._verify_submissions_left(state):
         note = (
             f"{rung} failed and the verification-submission budget is exhausted "
             f"(--max-iters {gates.max_verify_submissions(state)}); stopping the run."
@@ -226,7 +232,7 @@ def _ladder_transition(
             f"(--max-preverify-repairs {gates.preverify_repairs_max(state)}); stopping the run."
         )
     return {
-        "stopped_at": rung,
+        "stopped_at": "evaluation_budget" if evaluation_exhausted else rung,
         "stage_jobs": "review",
         "errors": [note],
         "iteration_history": state_mod.append_history(state, note),
@@ -285,17 +291,26 @@ def repair_route_transition(state: CfuDesignState, route: dict) -> dict:
         update.update({
             "gates": {key: value for key, value in (state.get("gates") or {}).items()
                       if key in preserved},
-            "isa_spec": {}, "isa_spec_text": "", "isa_spec_errors": [], "design_contract": "",
+            "isa_spec": {}, "isa_spec_text": "", "isa_spec_errors": [], "isa_draft": {}, "design_contract": "",
             "isa_extension_base": {}, "isa_added_symbols": [], "conformance_delivery": {},
             "hardware_plan": "", "software_plan": "", "hardware_patch": "", "software_patch": "",
             "implementation_hw_summary": "", "implementation_sw_summary": "",
             "changed_design_files": [], "changed_sw_files": [], "repair_scope": "",
-            "input_fingerprints": {}, "best_candidate": {}, "optimization_plan": {}, "delivered_round": 0,
+            # A rewind invalidates this attempt, not a previously validated delivery.
+            # Keep the pending optimization plan so review records its new result,
+            # rather than reusing the last historical round's identity/metrics.
+            "input_fingerprints": {},
             "flow_memory": {}, "stopped_at": "",
             "repair_evidence_epoch": {key: len(state.get(key) or [])
                                       for key in ("validation_results", "cost_results", "hw_attempts",
                                                   "sw_attempts", "conformance_attempts")},
         })
+        plan = state.get("optimization_plan") or {}
+        if plan.get("target") == "extend_isa":
+            # A full contract redesign is no longer append-only. Keep the round
+            # and proposal identity, but do not require symbols from an aborted extension.
+            update["optimization_plan"] = {**plan, "target": "implement",
+                                           "original_target": "extend_isa", "rewind_target": target}
         if route["target"] == "analysis":
             update["workload_analysis"] = ""
     current = {**state, **update}
@@ -334,7 +349,7 @@ def _route_after_validation(state: CfuDesignState) -> str:
 
 def draft_sim_transition(state: CfuDesignState) -> tuple[dict, str]:
     """A passing draft is feedback, not an accepted candidate."""
-    if gates._verify_submissions_left(state):
+    if gates._verify_submissions_left(state) and evaluations.remaining(state):
         iteration = int(state.get("iteration", 0) or 0) + 1
         target = "implement"
         extra = {"repairs_used": int(state.get("repairs_used", 0) or 0) + 1,
@@ -343,7 +358,8 @@ def draft_sim_transition(state: CfuDesignState) -> tuple[dict, str]:
                                   "iteration": iteration, "route_used": False}}
     else:
         target = "review_and_route"
-        extra = {"stopped_at": "draft_completion", "stage_jobs": "review"}
+        extra = {"stopped_at": "evaluation_budget" if not evaluations.remaining(state) else "draft_completion",
+                 "stage_jobs": "review"}
     note = ("Draft simulation passed; implementation remains incomplete. "
             + ("Continue implementation." if target == "implement" else
                "Verification-submission budget exhausted."))

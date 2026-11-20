@@ -32,7 +32,9 @@ class AbstainBudgetTest(unittest.TestCase):
                 pass
             def write_text(self, *args, **kwargs):
                 pass
-        with mock.patch.object(llm_step, "_complete_llm", return_value=(LlmResult("ABSTAIN", used_llm=True), "raw")), \
+        with mock.patch.object(contract, "_draft_session", return_value=None), \
+             mock.patch.object(llm_step, "_tools_enabled", return_value=False), \
+             mock.patch.object(llm_step, "_complete_llm", return_value=(LlmResult("ABSTAIN", used_llm=True), "raw")), \
              mock.patch.object(services, "_write_isa_artifact"), \
              mock.patch.object(services, "_artifacts_for_stage", return_value=_Artifacts()):
             update = contract.design_contract(self.state)

@@ -4,39 +4,24 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 from ... import prompts
-from ...flow import gates, optimize
+from ...flow import evaluations, gates, optimize
 from ...flow.optimize import OPTIMIZATION_TARGETS
 from ...prompts import SYSTEM_PROMPT
 from ...runtime.llm import DEFAULT_MAX_TOOL_ROUNDS
 from ...runtime import llm_step, parsing, stage_services
 from ...state import CfuDesignState
+from . import candidates
 
 
 def _snapshot_candidate(state: CfuDesignState, entry: dict) -> dict:
     """Preserve verified source inputs; failed later experiments cannot overwrite them."""
     toolbox = stage_services._toolbox_for_stage(state, "implementation")
     artifacts = stage_services._artifacts_for_stage(state, "review")
-    paths = set(state.get("design_files") or [])
-    paths.update(path for path, _ in stage_services._software_targets(state, toolbox))
-    # Retain every model-writable textual dependency, not only the hot kernel.
-    workspace = toolbox.workdir / state.get("run_root", "") / "workspace"
-    if workspace.is_dir():
-        for root, dirs, files in os.walk(workspace):
-            dirs[:] = [name for name in dirs if name not in {"build", "target", ".git", "soc"}]
-            for name in files:
-                path = Path(root) / name
-                rel = path.relative_to(toolbox.workdir).as_posix()
-                if path.suffix in {".c", ".h", ".cpp", ".hpp", ".scala", ".S", ".mk"} or name == "Makefile":
-                    if toolbox.is_read_allowed(rel) and toolbox.is_write_allowed(rel):
-                        paths.add(rel)
-    header = gates._rung_gate(state, "implementation_sw").get("intrinsics_header")
-    if header:
-        paths.add(header)
+    paths = candidates.input_paths(state, toolbox)
     records = []
     prefix = f"12_review/candidates/{entry['round']:03d}"
     for index, path in enumerate(sorted(paths)):
@@ -51,14 +36,16 @@ def _snapshot_candidate(state: CfuDesignState, entry: dict) -> dict:
             raise ValueError(f"validated candidate source changed or is not UTF-8: {path}")
         ref = artifacts.write_text("review", f"{prefix}/sources/{index:03d}_{Path(path).name}",
                                    content, inputs=[path], kind="validated_source")
-        records.append({"source": path, "snapshot": ref["path"], "sha256": ref["sha256"]})
+        records.append({"source": path, "snapshot": ref["immutable_path"], "sha256": ref["sha256"]})
     candidate = {"round": entry["round"], "isa_revision": state.get("isa_revision", 0),
                  "isa_spec": state.get("isa_spec", {}), "metrics": entry,
                  "benchmark_project": state.get("benchmark_project", {}),
                  "workload_spec": state.get("workload_spec", {}),
-                 "files": records, "gates": state.get("gates", {})}
+                 "files": records, "gates": state.get("gates", {}),
+                 "restore_state": {key: state[key] for key in candidates.RESTORE_KEYS if key in state},
+                 "aliases": candidates.snapshot_aliases(state, toolbox, artifacts, prefix)}
     ref = artifacts.write_yaml("review", f"{prefix}/candidate.yaml", candidate)
-    return {"round": entry["round"], "manifest": ref["path"], "files": records}
+    return {"round": entry["round"], "manifest": ref["immutable_path"], "sha256": ref["sha256"], "files": records}
 
 
 def _optimization_paths(state: CfuDesignState) -> list[tuple[str, str]]:
@@ -118,6 +105,9 @@ def _choose_optimization(
     if not bool(state.get("loop_optimize", False)):
         return "", {}, ""
     remaining = gates.max_verify_submissions(state) - int(state.get("verify_submissions", 0) or 0)
+    max_evals = int(state.get("max_evals", 0) or 0)
+    if max_evals:
+        remaining = min(remaining, max_evals - evaluations.used(state))
     if remaining <= 0:
         return "", {
             "continue": False,
@@ -248,7 +238,20 @@ def _choose_optimization(
         allowed = [name for name in OPTIMIZATION_TARGETS
                    if name != "extend_isa" or state.get("isa_contract", True)]
         if target in allowed and reason:
+            current_round = int(rounds[-1]["round"]) if rounds else 0
+            incumbent = (state.get("best_candidate") or {}).get("round", current_round)
+            default_parent = incumbent if state.get("loop_parent", "current") == "incumbent" else current_round
+            parent = parsed.get("parent_round", default_parent)
+            available = {current_round, *[int(key) for key in state.get("candidate_snapshots") or {}]}
+            if isinstance(parent, bool) or not isinstance(parent, int) or parent not in available:
+                return "", {"continue": False, "source": "fallback",
+                            "reason": "optimization parent must be the current round or a retained candidate"}, raw_output
+            proposed = optimize.proposal(parsed, parent)
+            if any(item.get("hypothesis_id") == proposed["hypothesis_id"] for item in rounds):
+                return "", {"continue": False, "source": "duplicate_proposal",
+                            "reason": "the same change was already evaluated from this parent"}, raw_output
             return target, {
+                **proposed,
                 "continue": True,
                 "target": target,
                 "focus": focus,

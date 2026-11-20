@@ -226,7 +226,8 @@ class VivadoCostWorkerTest(unittest.TestCase):
         update, run, load, notify, write = self.call()
         gate = update["gates"]["cost"]
         self.assertTrue(gate["ok"])
-        self.assertEqual(gate["ppa"]["evidence"]["evaluation_id"], "eval-worker")
+        self.assertEqual(gate["ppa"]["evidence"]["evaluation_id"], update["evaluation_id"])
+        self.assertEqual(len(update["evaluation_attempts"]), 1)
         self.assertEqual(gate["ppa"]["yosys_precheck"]["metrics"]["cells"], 123)
         self.assertEqual(run.call_count, 2)
         self.assertIn("yosys_cost_report.py", run.call_args_list[0].args[2][1])
@@ -243,7 +244,7 @@ class VivadoCostWorkerTest(unittest.TestCase):
         self.assertEqual(run.call_count, 3)
         self.assertIn("mock-agentcfu-generator", run.call_args_list[0].args[2])
         self.assertIn("yosys_cost_report.py", run.call_args_list[1].args[2][1])
-        self.assertIn("eval-worker/yosys/rtl", run.call_args_list[0].args[2][2])
+        self.assertIn(f"{update['evaluation_id']}/yosys/rtl", run.call_args_list[0].args[2][2])
         self.assertEqual(run.call_args_list[2].args[2], ["python3", "fixed-runner"])
         load.assert_called_once()
         notify.assert_not_called()

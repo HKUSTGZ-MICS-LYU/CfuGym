@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from ... import state as state_mod
-from ...flow import gates, optimize as flow_optimize, outcome
+from ...flow import evaluations, gates, instrument, optimize as flow_optimize, outcome
 from ...runtime import stage_services
 from ...runtime.policy import PolicyError
-from ...stages.review import optimize as review_optimize, report as review_report
+from ...stages.review import candidates, optimize as review_optimize, report as review_report
 from ...state import CfuDesignState
 
 
@@ -29,6 +29,7 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
     plan = state.get("optimization_plan") or {}
     if not isinstance(plan, dict):
         plan = {}
+    recorded = False
     if (plan or not rounds) and state.get("implementation_design_type") != "draft":
         # Record the round that just finished; with no plan yet this is the
         # baseline produced by the initial ladder.
@@ -39,33 +40,65 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
             source=str(plan.get("source", "") or "baseline"),
             round_index=len(rounds),
         )
-        entry["improved"] = flow_optimize._round_improved(entry, flow_optimize._best_round(rounds))
+        entry["dominates_incumbent"] = flow_optimize._round_improved(entry, flow_optimize._best_round(rounds))
+        entry["improved"] = entry["dominates_incumbent"]
+        for key in ("hypothesis", "hypothesis_id", "hypothesis_complete", "parent_round", "original_target", "rewind_target"):
+            if key in plan:
+                entry[key] = plan[key]
+        parent = next((item for item in rounds if item.get("round") == plan.get("parent_round")), None)
+        entry["comparison_to_parent"] = (
+            "not_measured" if not entry["measured"] else "invalid" if not entry["validated"] else
+            "unattributed" if parent is None else
+            "dominates" if flow_optimize._round_improved(entry, parent) else "no_dominance")
         rounds.append(entry)
+        recorded = True
 
+    objective = str(state.get("loop_objective") or "pareto")
+    selected = flow_optimize.select_round(rounds, objective)
+    if recorded and objective != "pareto":
+        rounds[-1]["improved"] = bool(selected and selected["round"] == rounds[-1]["round"])
+    frontier = flow_optimize.pareto_frontier(rounds)
     best_candidate = state.get("best_candidate") or {}
-    if status == "complete" and rounds and rounds[-1].get("improved"):
-        # A non-loop accepted baseline needs the same immutable, auditable
-        # source delivery as an optimized incumbent.
-        snapshot_required = bool(state.get("loop_optimize") or not best_candidate)
-    else:
-        snapshot_required = False
-    if snapshot_required:
+    snapshots = dict(state.get("candidate_snapshots") or {})
+    if "round" in best_candidate:
+        snapshots.setdefault(str(best_candidate["round"]), best_candidate)
+    if status == "complete" and recorded and any(item["round"] == rounds[-1]["round"] for item in frontier):
         try:
-            best_candidate = review_optimize._snapshot_candidate(state, rounds[-1])
+            snapshot = review_optimize._snapshot_candidate(state, rounds[-1])
+            snapshots[str(snapshot["round"])] = snapshot
         except (OSError, ValueError, PolicyError) as exc:
-            # Preserve the previous verified delivery and expose snapshot failure.
-            rounds[-1]["snapshot_error"] = str(exc)
-            status = "failed"
-            decision = "final_report"
+            # A metric without a deliverable must never displace the incumbent.
+            rounds[-1].update(snapshot_error=str(exc), improved=False)
+            status, decision = "failed", "final_report"
+            frontier = flow_optimize.pareto_frontier(rounds)
+            selected = flow_optimize.select_round(rounds, objective)
+    if selected and str(selected["round"]) in snapshots:
+        best_candidate = snapshots[str(selected["round"])]
+    planner_state = {**state, "best_candidate": best_candidate, "candidate_snapshots": snapshots,
+                     "optimization_frontier": [item["round"] for item in frontier]}
+    if recorded and status == "complete":
+        instrument.report_validated_candidate(planner_state, rounds[-1], rounds, selected, best_candidate)
     target, optimization, raw_output = ("", {}, "")
     max_evals = int(state.get("max_evals", 0) or 0)
-    measured_evals = sum(bool(item.get("measured")) for item in rounds)
+    measured_evals = evaluations.used(state)
     if status == "complete" and max_evals and measured_evals >= max_evals:
         optimization = {"continue": False, "source": "eval_budget",
                         "reason": f"evaluation budget exhausted ({measured_evals}/{max_evals})"}
     elif status == "complete":
-        target, optimization, raw_output = review_optimize._choose_optimization(state, rounds)
+        target, optimization, raw_output = review_optimize._choose_optimization(planner_state, rounds)
 
+    restored: dict[str, Any] = {}
+    parent_round = optimization.get("parent_round", rounds[-1]["round"] if rounds else 0)
+    if target and rounds and parent_round != rounds[-1]["round"]:
+        try:
+            parent_candidate = snapshots.get(str(parent_round))
+            if not parent_candidate:
+                raise ValueError("the requested exploration parent has no retained source snapshot")
+            restored = candidates.restore_parent(planner_state, parent_candidate)
+        except (OSError, ValueError, PolicyError) as exc:
+            target = ""
+            optimization = {**optimization, "continue": False, "source": "restore_failed", "reason": str(exc)}
+    next_state = {**state, **restored}
     stopped = state.get("stopped_at", "")
     note = f"Reviewed the run: {status}."
     if stopped:
@@ -78,25 +111,30 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
         )
     elif status == "planned":
         termination_reason = "PLANNED"
-    elif not gates._verify_submissions_left(state) and status in {"failed", "blocked"}:
+    elif (not gates._verify_submissions_left(state) or not evaluations.remaining(state)
+          or stopped == "evaluation_budget") and status in {"failed", "blocked"}:
         termination_reason = "BUDGET_EXHAUSTED"
     else:
         termination_reason = "UNRECOVERABLE_FAILURE"
     update: dict[str, Any] = {
+        **restored,
         "status": status,
         "termination_reason": termination_reason,
         "stage_jobs": "final_report",
         "optimization_rounds": rounds,
         "best_candidate": best_candidate,
+        "candidate_snapshots": snapshots,
+        "optimization_frontier": [item["round"] for item in frontier],
         "delivered_round": best_candidate.get("round", rounds[-1]["round"] if rounds else 0),
         "optimization_plan": {},
-        **outcome.stage_result(state, rung="review", ok=True, decision=decision, status=status,
+        **outcome.stage_result(next_state, rung="review", ok=True, decision=decision, status=status,
                                next=target or "final_report", optimization=optimization,
+                               restored_parent=parent_round if restored else None,
                                history=note),
         "llm_raw_outputs": optimization.get("raw_outputs") or ([raw_output] if raw_output else []),
     }
     if target == "extend_isa":
-        update["isa_extension_base"] = state.get("isa_spec", {})
+        update["isa_extension_base"] = next_state.get("isa_spec", {})
         update["isa_added_symbols"] = []
         update["isa_spec_errors"] = []
     if target:
@@ -114,12 +152,16 @@ def review_and_route(state: CfuDesignState) -> CfuDesignState:
                 # Stamped on the sim/cost gates of this round's measurements.
                 "optimization_round": len(rounds),
                 "optimization_plan": {
+                    **{key: optimization[key] for key in ("hypothesis", "hypothesis_id", "hypothesis_complete", "parent_round")
+                       if key in optimization},
                     "round": len(rounds),
                     "target": target,
                     "focus": focus,
                     "reason": str(optimization.get("reason", "") or ""),
                     "source": str(optimization.get("source", "") or ""),
-                    "score": flow_optimize.optimization_score(state),
+                    "score": flow_optimize._round_metrics_text(next(
+                        (item for item in rounds if item["round"] == parent_round), rounds[-1])),
+                    "parent_round": parent_round,
                 },
             }
         )

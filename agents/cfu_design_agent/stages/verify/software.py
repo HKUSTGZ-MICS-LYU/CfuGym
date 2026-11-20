@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ...benchmark import cfu_execution, embench
-from ...flow import gates, ladder, outcome
+from ...flow import evaluations, gates, ladder, outcome
 from ...flow.gates import MIN_EMBENCH_SPEEDUP_X100
 from ...runtime import effects, commands as commands_mod, observations, provenance, software_encoding, stage_services, validation_parallel
 from ...runtime.policy import PolicyError
@@ -15,6 +15,11 @@ from ...state import CfuDesignState
 
 
 def build_sw(state: CfuDesignState) -> CfuDesignState:
+    """Checkpoint an evaluation ticket before any simulation/cost effects."""
+    return evaluations.prepare(state, _build_sw(state))
+
+
+def _build_sw(state: CfuDesignState) -> CfuDesignState:
     """Rung 4: compile the accelerated software against the new intrinsics."""
     rung = "sw_build"
     reason = stage_services._profile_reason(state)
@@ -218,11 +223,19 @@ def _semantic_failure_result(state: CfuDesignState, evidence: dict, results: lis
 
 
 def simulate(state: CfuDesignState, *, transition: bool = True) -> CfuDesignState:
+    """Admit one evaluation before running the ELF, including failed attempts."""
+    execute = evaluations.enabled(state, "sim") and not stage_services._profile_reason(state)
+    return evaluations.run(state, "sim", execute,
+                           lambda current: _simulate(current, transition=transition))
+
+
+def _simulate(state: CfuDesignState, *, transition: bool = True) -> CfuDesignState:
     """Rung 5: run the ELF on the generated SoC and check the result."""
     rung = "sim"
     reason = stage_services._profile_reason(state)
     design_evidence = {"implementation_design_type": state.get("implementation_design_type") or "legacy",
-                       "implementation_unimplemented": list(state.get("implementation_unimplemented") or [])}
+                       "implementation_unimplemented": list(state.get("implementation_unimplemented") or []),
+                       "implementation_unverified": list(state.get("implementation_unverified") or [])}
     if reason:
         result = stage_services._skipped_result("sbt MiCoSocSim", state, reason)
         result["rung"] = rung
@@ -371,6 +384,9 @@ def simulate(state: CfuDesignState, *, transition: bool = True) -> CfuDesignStat
         **outcome.stage_result(
             state, rung=rung, ok=ok, skipped=False, next=next_node,
             round=int(state.get("optimization_round", 0) or 0),
+            verify_submission=int(state.get("verify_submissions", 0) or 0),
+            evidence_epoch=dict(state.get("repair_evidence_epoch") or {}),
+            evaluation_id=state.get("evaluation_id", ""),
             **design_evidence,
             **({**sim_evidence, **measurement_evidence} if is_embench else {
                 **sim_evidence,

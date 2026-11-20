@@ -82,9 +82,10 @@ class CostBudgetPromptTest(unittest.TestCase):
 
     def capture_environment(self, stack):
         """Mock execution services; prompt rendering and stage plumbing stay real."""
-        stack.enter_context(mock.patch.object(
-            stage_services, "_toolbox_for_stage",
-            return_value=SimpleNamespace(workdir=Path(self.context["workdir"]))))
+        toolbox = SimpleNamespace(workdir=Path(self.context["workdir"]))
+        stack.enter_context(mock.patch.object(stage_services, "_toolbox_for_stage", return_value=toolbox))
+        stack.enter_context(mock.patch.object(contract, "_draft_session", return_value=SimpleNamespace(
+            toolbox=toolbox, text="offline draft", submit=mock.Mock(), record={})))
         stack.enter_context(mock.patch.object(stage_services, "existing_evidence", return_value=[]))
         stack.enter_context(mock.patch.object(
             stage_services, "_software_targets", return_value=[("offline_kernel.c", "")]))

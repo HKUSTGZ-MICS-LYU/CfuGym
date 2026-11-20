@@ -13,10 +13,29 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...runtime import stage_services
+from ...runtime import commands, effects, stage_services
 from ...runtime.policy import PolicyError
 from ...state import CfuDesignState
 from . import intrinsics, repair_scope
+
+
+def check_conformance_syntax(state: CfuDesignState, toolbox: Any, oracle_session: Any,
+                             header_path: str) -> dict[str, Any]:
+    if oracle_session is None:
+        return {
+            "returncode": 1,
+            "stderr_tail": (
+                "check_conformance_syntax applies to a delivered YAML oracle; "
+                "this run uses dev tests, so run_conformance compiles them instead"
+            ),
+        }
+    _delivery, problems = oracle_session.current()
+    if problems:
+        return {"returncode": 1, "stderr_tail": "; ".join(problems)}
+    argv = commands._conformance_syntax_command(state, header_path)
+    return effects.run_command(state, toolbox, argv, stage="implementation",
+                               rung="conformance_syntax", command_id="conformance_syntax",
+                               timeout=120, mutate=True)
 
 
 def audit_delivery(
@@ -87,7 +106,7 @@ def audit_delivery(
     if problems:
         return False, "hardware integrity: " + "; ".join(problems)
     try:
-        exercises, why = intrinsics._software_exercises_cfu(
+        exercises, why = intrinsics._software_usage_check(
             state, toolbox, stage_services._software_targets(state, toolbox)
         )
     except (ValueError, PolicyError, OSError) as exc:

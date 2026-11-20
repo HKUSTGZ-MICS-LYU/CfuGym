@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ...flow import gates, ladder, outcome
+from ...flow import evaluations, gates, ladder, outcome
 from ...runtime import cost_budget, effects, commands, dependencies, rtl_snapshot, stage_services, validation_parallel
 from ...runtime.tools import SOC_WORKSPACE_SUBDIR
 from ...stages.verify import software
@@ -34,6 +34,11 @@ def _cost_wall_failure(state: CfuDesignState, wall: dict, errors: list[str]) -> 
 
 
 def estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesignState:
+    return evaluations.run(state, "cost", evaluations.enabled(state, "cost"),
+                           lambda current: _estimate_cost(current, transition=transition))
+
+
+def _estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesignState:
     if ("implementation_design_type" in state and
             state["implementation_design_type"] not in ("draft", "complete")):
         raise ValueError("invalid implementation_design_type in cost state")
@@ -152,6 +157,10 @@ def estimate_cost(state: CfuDesignState, *, transition: bool = True) -> CfuDesig
             state, rung="cost", ok=ok, skipped=not execute, next=next_node,
             reason=reason or ("" if execute else "execution-disabled"),
             cancelled=cancelled, cost_wall=wall,
+            metrics=dict((results[-1].get("parsed") or {}).get("cost") or {}) if ok else {},
+            verify_submission=int(state.get("verify_submissions", 0) or 0),
+            evidence_epoch=dict(state.get("repair_evidence_epoch") or {}),
+            evaluation_id=state.get("evaluation_id", ""),
             rtl=rtl, round=int(state.get("optimization_round", 0) or 0),
             history="Ran Yosys cost estimation.",
         ),
@@ -163,7 +172,6 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
     """Run a Yosys synthesis gate before Vivado on the frozen candidate."""
     from ...runtime import vivado
     import re
-    import uuid
 
     execute = bool(state.get("run_commands")) and not state.get("dry_run")
     skipped = bool(state.get("skip_cost")) or not execute
@@ -175,7 +183,7 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
     wall: dict = {}
     cancelled = False
     run = str(state.get("run_root") or "")
-    evaluation_id = str(state.get("evaluation_id") or f"cost-{uuid.uuid4().hex}")
+    evaluation_id = str(state.get("evaluation_id") or "evaluation-planned")
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", evaluation_id):
         raise ValueError("invalid evaluation id")
     eval_root = f"{run}/11_cost/evaluations/{evaluation_id}"
@@ -301,6 +309,8 @@ def _estimate_vivado(state: CfuDesignState, *, transition: bool) -> CfuDesignSta
               **outcome.stage_result(
                   state, rung="cost", ok=ok, skipped=skipped, next=next_node,
                   reason=reason, cancelled=cancelled, backend="vivado", evaluation_id=evaluation_id,
+                  verify_submission=int(state.get("verify_submissions", 0) or 0),
+                  evidence_epoch=dict(state.get("repair_evidence_epoch") or {}),
                   ppa=ppa, input_sha256=cost_input, cost_wall=wall, yosys_precheck=yosys_evidence,
                   round=int(state.get("optimization_round", 0) or 0),
                   history=("Passed Yosys pre-synthesis and Cost Wall before whole-SoC Vivado PPA."

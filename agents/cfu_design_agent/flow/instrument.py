@@ -11,7 +11,7 @@ from typing import Any
 
 from contextlib import nullcontext
 
-from ..runtime import dependencies, effects, failures, flow_memory, llm, progress as progress_mod, request_audit, stage_history
+from ..runtime import candidate_log, dependencies, effects, failures, flow_memory, llm, progress as progress_mod, request_audit, stage_history
 from ..runtime.persistence import RunPersistence
 from ..runtime.progress import StageProgress
 
@@ -43,6 +43,16 @@ def disable_progress() -> None:
 
 def progress() -> StageProgress | None:
     return _PROGRESS
+
+
+def report_validated_candidate(state, entry, rounds, selected, candidate) -> None:
+    """Durable CLI result before another optimization/model interaction starts."""
+    if _PROGRESS is None:
+        return
+    lines = candidate_log.validated_candidate_lines(state, entry, rounds, selected, candidate)
+    if lines:
+        _LIVE_LINE.clear()
+        print("\n" + "\n".join(lines), flush=True)
 
 
 
@@ -233,11 +243,19 @@ def _wrap_node(fn):
             current = {**state, **update}
             after = dependencies.input_fingerprints(current)
             before = state.get("input_fingerprints") or {}
+            checked = set(checked_gates(name))
+            reported = update.get("gates") or {}
+            if name == "review_and_route" and (reported.get("review") or {}).get("restored_parent") is not None:
+                # Parent restoration is Host-owned and hash-checked. Preserve
+                # only its upstream contracts with an exact fingerprint proof;
+                # build/simulation/cost gates must still be rerun.
+                checked.update(key for key in ("analysis", "isa")
+                               if (reported.get(key) or {}).get("ok") and after.get(key) and
+                               (reported.get(key) or {}).get("input_sha256") == after[key])
             if before:
                 gates = update.get("gates", state.get("gates") or {})
                 # A gate checked by this node is freshly evaluated against the
                 # new fingerprint. Other formerly passing gates are not.
-                checked = checked_gates(name)
                 updated_gates = dependencies.invalidate_changed_gates(gates, before, after)
                 if "gates" in update:
                     for key in checked:
@@ -247,7 +265,7 @@ def _wrap_node(fn):
                     update = {**update, "gates": updated_gates}
             if "gates" in update:
                 stamped = {key: dict(value) for key, value in update["gates"].items()}
-                for key in checked_gates(name):
+                for key in checked:
                     if key in stamped:
                         stamped[key]["input_sha256"] = after.get(key, "")
                 update = {**update, "gates": stamped}

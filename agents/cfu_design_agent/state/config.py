@@ -39,6 +39,8 @@ class RunConfig(TypedDict, total=False):
     max_output_tokens: int
     loop_optimize: bool
     loop_policy: str
+    loop_objective: Literal["performance", "cost", "balanced", "pareto"]
+    loop_parent: Literal["incumbent", "current"]
     loop_patience: int
     max_evals: int
     visibility: Visibility

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+import hashlib
+import json
 from typing import Any
 
 from ..flow import gates
@@ -21,8 +24,36 @@ from ..state import CfuDesignState
 OPTIMIZATION_TARGETS = ("implement", "extend_isa")
 
 
+def _current_gate(state: CfuDesignState, rung: str, round_index: int | None = None) -> bool:
+    """Round alone is not identity: repairs can submit several candidates in it."""
+    gate = gates._rung_gate(state, rung)
+    if round_index is None and "optimization_round" in state:
+        round_index = int(state["optimization_round"] or 0)
+    if not gate or any(gate.get(key) for key in ("stale", "skipped", "cancelled")):
+        return False
+    if round_index is not None and int(gate.get("round", 0) or 0) != round_index:
+        return False
+    if state.get("input_fingerprints") and int(state.get("verify_submissions", 0) or 0) > 0:
+        if "verify_submission" not in gate or "evidence_epoch" not in gate:
+            return False  # Legacy observations remain historical, never guessed-current.
+    if "verify_submission" in gate and gate["verify_submission"] != int(state.get("verify_submissions", 0) or 0):
+        return False
+    proof = (gate.get("ppa") or {}).get("evidence") or {}
+    recorded_evaluation = gate.get("evaluation_id") or proof.get("evaluation_id")
+    if state.get("evaluation_id") and recorded_evaluation != state["evaluation_id"]:
+        return False
+    expected = (state.get("input_fingerprints") or {}).get(rung)
+    if expected and gate.get("input_sha256") != expected:
+        return False
+    epoch = gate.get("evidence_epoch")
+    return epoch is None or epoch == dict(state.get("repair_evidence_epoch") or {})
+
+
 def _cost_metric(state: CfuDesignState) -> dict[str, Any]:
-    """Backend-specific area; LUTs must never masquerade as generic cells."""
+    """Read this cost gate, never search backwards across failed evaluations."""
+    gate = gates._rung_gate(state, "cost")
+    if not _current_gate(state, "cost") or not gate.get("ok"):
+        return {}
     if state.get("cost_backend") == "vivado":
         from ..runtime import ppa
         measured = ppa.view(state)
@@ -35,25 +66,28 @@ def _cost_metric(state: CfuDesignState) -> dict[str, Any]:
         return {"backend": "vivado", "metric": "cfu_post_route_lut",
                 "part": data.get("part"), "target_frequency_mhz": data.get("target_frequency_mhz"),
                 "lut": area["lut"], "ff": area.get("ff"), "bram_36k": area.get("bram_36k"), "dsp": area.get("dsp")}
-    for result in reversed(state.get("cost_results") or []):
-        parsed = result.get("parsed") or {}
-        cost = parsed.get("cost") if isinstance(parsed, dict) else None
-        if isinstance(cost, dict) and cost:
-            return {
-                "cells": int(cost.get("cells", 0) or 0),
-                "wire_bits": int(cost.get("wire_bits", 0) or 0),
-                "memories": int(cost.get("memories", 0) or 0),
-                "memory_bits": int(cost.get("memory_bits", 0) or 0),
-            }
-    return {}
+    cost = gate.get("metrics")
+    if cost is None and not gate.get("input_sha256") and not gate.get("evaluation_id"):
+        # Legacy/minimal states may have no gate-local metric. Only the final
+        # successful result is eligible, never a previous successful command.
+        results = state.get("cost_results") or []
+        last = results[-1] if results else {}
+        if last.get("returncode") == 0:
+            cost = (last.get("parsed") or {}).get("cost")
+    if not isinstance(cost, dict) or cost.get("cells") is None:
+        return {}
+    return {key: int(cost[key]) if cost.get(key) is not None else None
+            for key in ("cells", "wire_bits", "memories", "memory_bits")}
 
 
 def optimization_score(state: CfuDesignState) -> str:
     """One line describing the current measured result (cycles, speedup, area)."""
+    from ..runtime import provenance
     gate = gates._rung_gate(state, "sim")
-    speedup_x100 = int(gate.get("speedup_x100", 0) or 0)
-    reference = int(gate.get("reference_cycles", 0) or 0)
-    cfu = int(gate.get("cfu_cycles", 0) or 0)
+    valid = _current_gate(state, "sim") and provenance.observation_is_valid(gate)
+    speedup_x100 = int(gate.get("speedup_x100", 0) or 0) if valid else 0
+    reference = int(gate.get("reference_cycles", 0) or 0) if valid else 0
+    cfu = int(gate.get("cfu_cycles", 0) or 0) if valid else 0
     parts = (
         [f"{reference} -> {cfu} cycles ({speedup_x100 / 100:.2f}x)"]
         if reference and cfu
@@ -82,23 +116,29 @@ def _score_snapshot(
     repeating the previous round's numbers as if they were its own.
     """
     sim = gates._rung_gate(state, "sim")
-    cost_gate = gates._rung_gate(state, "cost")
-    fresh_sim = int(sim.get("round", 0) or 0) == round_index
-    fresh_cost = int(cost_gate.get("round", 0) or 0) == round_index
-    reference = int(sim.get("reference_cycles", 0) or 0) if fresh_sim else 0
-    cfu = int(sim.get("cfu_cycles", 0) or 0) if fresh_sim else 0
+    from ..runtime import provenance
+    fresh_sim = _current_gate(state, "sim", round_index) and provenance.observation_is_valid(sim)
+    fresh_cost = _current_gate(state, "cost", round_index)
+    reference = int(sim["reference_cycles"]) if fresh_sim else None
+    cfu = int(sim["cfu_cycles"]) if fresh_sim else None
+    current_cost = _cost_metric(state) if fresh_cost else {}
     return {
         "round": round_index,
         "target": target,
         "source": source,
         "reason": str(reason or "")[:400],
         "measured": bool(reference and cfu),
-        "validated": gates._is_complete(state) and fresh_sim and fresh_cost,
+        "validated": gates._is_complete(state) and fresh_sim and fresh_cost and bool(current_cost),
         "isa_revision": int(state.get("isa_revision", 0)),
-        "speedup_x100": int(sim.get("speedup_x100", 0) or 0) if fresh_sim else 0,
+        "speedup_x100": int(sim["speedup_x100"]) if fresh_sim else None,
         "reference_cycles": reference,
         "cfu_cycles": cfu,
-        "cost": _cost_metric(state) if fresh_cost else {},
+        "evaluation_id": state.get("evaluation_id", ""),
+        "verify_submission": int(state.get("verify_submissions", 0) or 0),
+        "input_fingerprints": {rung: gates._rung_gate(state, rung).get("input_sha256", "")
+                               for rung in ("sim", "cost")},
+        "evidence_epoch": dict(state.get("repair_evidence_epoch") or {}),
+        "cost": current_cost,
     }
 
 
@@ -112,7 +152,7 @@ def _round_metrics_text(entry: dict[str, Any]) -> str:
     text = f"speedup={speedup / 100:.2f}x" if speedup else "speedup=n/a"
     if cost.get("backend") == "vivado":
         return text + f" CFU_LUT={cost.get('lut', 'n/a')}"
-    return text + (f" cells={cells}" if cells else " cells=n/a")
+    return text + (f" cells={cells}" if cost.get("cells") is not None else " cells=n/a")
 
 
 def _metric_deltas(entry: dict[str, Any], previous: dict[str, Any] | None) -> str:
@@ -126,7 +166,7 @@ def _metric_deltas(entry: dict[str, Any], previous: dict[str, Any] | None) -> st
         parts.append(f"{'+' if speedup >= before else ''}{(speedup - before) / 100:.2f}x")
     cells = int((entry.get("cost") or {}).get("cells", 0) or 0)
     before_cells = int((previous.get("cost") or {}).get("cells", 0) or 0)
-    if cells and before_cells:
+    if (entry.get("cost") or {}).get("cells") is not None and (previous.get("cost") or {}).get("cells") is not None:
         parts.append(f"{'+' if cells >= before_cells else ''}{cells - before_cells} cells")
     current_cost, previous_cost = entry.get("cost") or {}, previous.get("cost") or {}
     if current_cost.get("backend") == previous_cost.get("backend") == "vivado":
@@ -180,19 +220,101 @@ def _round_improved(entry: dict[str, Any], best: dict[str, Any] | None) -> bool:
     if slower:
         return False
     vivado_area = cost.get("backend") == "vivado"
-    if (cells > best_cells if vivado_area else best_cells and (not cells or cells > best_cells)):
+    known, best_known = cost.get("cells") is not None, best_cost.get("cells") is not None
+    if (cells > best_cells if vivado_area else best_known and (not known or cells > best_cells)):
         return False
     faster = ref * best_cycles > best_ref * cycles if exact else bool(best_speed) and speed > best_speed
-    smaller = cells < best_cells if vivado_area else bool(best_cells and cells) and cells < best_cells
+    smaller = cells < best_cells if vivado_area else best_known and known and cells < best_cells
     return faster or smaller
 
 
 def _best_round(rounds: list[dict[str, Any]]) -> dict[str, Any] | None:
     best: dict[str, Any] | None = None
     for entry in rounds:
-        if entry.get("improved"):
+        if (entry.get("improved") and entry.get("validated", True)
+                and entry.get("measured", True) and not entry.get("snapshot_error")):
             best = entry
     return best
+
+
+def _area(entry: dict[str, Any]) -> int | float | None:
+    cost = entry.get("cost") or {}
+    return cost.get("lut") if cost.get("backend") == "vivado" else cost.get("cells")
+
+
+def _cost_basis(entry: dict[str, Any]) -> tuple:
+    cost = entry.get("cost") or {}
+    return (cost.get("backend", "yosys"), cost.get("metric", "cells"),
+            cost.get("part"), cost.get("target_frequency_mhz"))
+
+
+def pareto_frontier(rounds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """All non-dominated validated candidates; equal points keep the earlier source."""
+    frontier: list[dict[str, Any]] = []
+    for entry in rounds:
+        if not entry.get("validated", True) or not entry.get("measured") or entry.get("snapshot_error"):
+            continue
+        comparable = [other for other in frontier if _cost_basis(other) == _cost_basis(entry)]
+        if any(_round_improved(other, entry) for other in comparable):
+            continue
+        equal = any(not _round_improved(entry, other) and
+                    entry.get("reference_cycles", 0) and entry.get("cfu_cycles", 0) and
+                    entry["reference_cycles"] * other.get("cfu_cycles", 0) ==
+                    other.get("reference_cycles", 0) * entry["cfu_cycles"] and
+                    _area(entry) == _area(other) for other in comparable)
+        if equal:
+            continue
+        frontier = [other for other in frontier if not (
+            _cost_basis(other) == _cost_basis(entry) and _round_improved(entry, other))]
+        frontier.append(entry)
+    return frontier
+
+
+def select_round(rounds: list[dict[str, Any]], objective: str = "pareto") -> dict[str, Any] | None:
+    """Choose delivery independently of exploration; never compare unlike EDA bases."""
+    if objective == "pareto":
+        return _best_round(rounds)
+    frontier = pareto_frontier(rounds)
+    if not frontier:
+        return None
+    basis = _cost_basis(frontier[0])
+    eligible = [entry for entry in frontier if _cost_basis(entry) == basis and
+                _area(entry) is not None and _area(entry) >= 0 and
+                (entry.get("reference_cycles") or 0) > 0 and (entry.get("cfu_cycles") or 0) > 0]
+    if not eligible:
+        return _best_round(rounds)
+    def rank(entry):
+        speed = Fraction(entry["reference_cycles"], entry["cfu_cycles"])
+        area = Fraction(str(_area(entry)))
+        tail = (int(entry["round"]),)
+        if objective == "performance":
+            return (-speed, area, *tail)
+        if objective == "cost":
+            return (area, -speed, *tail)
+        if objective == "balanced":
+            return (area / speed, -speed, area, *tail)
+        raise ValueError(f"unknown optimization objective: {objective}")
+    return min(eligible, key=rank)
+
+
+def proposal(parsed: dict[str, Any], parent_round: int) -> dict[str, Any]:
+    """Bounded, auditable hypothesis; legacy reason-only decisions remain usable."""
+    supplied = parsed.get("hypothesis") or {}
+    if not isinstance(supplied, dict):
+        supplied = {}
+    fields: dict[str, Any] = {}
+    for key in ("bottleneck", "change", "expected_effect", "validation_plan"):
+        value = supplied.get(key) or (parsed.get("reason") if key == "change" else "")
+        fields[key] = str(value or "").strip()[:800]
+    for key in ("evidence", "risks"):
+        values = supplied.get(key) or []
+        fields[key] = [str(value).strip()[:300] for value in values[:8]] if isinstance(values, list) else []
+    identity = {"target": parsed.get("target"), "parent_round": parent_round,
+                "change": " ".join(fields["change"].casefold().split())}
+    return {"hypothesis": fields, "hypothesis_id": hashlib.sha256(
+                json.dumps(identity, sort_keys=True).encode()).hexdigest(),
+            "parent_round": parent_round,
+            "hypothesis_complete": all(fields.get(key) for key in fields)}
 
 
 def _rounds_digest(rounds: list[dict[str, Any]]) -> str:

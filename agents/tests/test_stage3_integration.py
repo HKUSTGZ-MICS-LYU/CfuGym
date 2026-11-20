@@ -104,6 +104,7 @@ class Stage3IntegrationTest(unittest.TestCase):
                                   f"{self.run_root}/workspace/demo_benchmark", "source_path": self.sw},
             "agent_tools": True, "apply_patch": True, "run_commands": True,
             "stage3_autonomy": True, "max_tool_rounds": 6, "max_tool_calls": 10,
+            "max_iters": 5,
             "max_tool_retries": 1,  # Scripted rollback cases intentionally permit one correction.
             "gates": {"isa": {"ok": True}},
         }
@@ -115,11 +116,11 @@ class Stage3IntegrationTest(unittest.TestCase):
                      "hardware_plan": "prior delivery",
                      "validation_results": [{"rung": rung, "returncode": 1}]}
             with self.subTest(rung=rung):
-                block = unified._prior_draft_block(state)
+                block = prompts.prior_draft_block(state)
                 self.assertIn("missing operation", block)
                 self.assertIn("prior delivery", block)
                 self.assertIn("unverified", block)
-        self.assertEqual(unified._prior_draft_block({"implementation_design_type": "complete"}), "")
+        self.assertEqual(prompts.prior_draft_block({"implementation_design_type": "complete"}), "")
 
     def test_hw_and_sw_then_independent_gates(self):
         self.state.update(implementation_design_type="draft",
@@ -132,6 +133,7 @@ class Stage3IntegrationTest(unittest.TestCase):
               "search": "class AgentCfu {}", "replace": "class AgentCfu { /* accelerated */ }"}]}),
             ("write_conformance", {"oracle": self.oracle}),
             ("submit_stage", {"design_type": "draft", "unimplemented": ["finish overflow handling"],
+                              "unverified": ["simulation not run"],
                               "delivery": "HW, SW and oracle ready for independent validation"}),
         ])
         from agents.cfu_design_agent.runtime.implementation_tools import ImplementationToolset
@@ -160,20 +162,27 @@ class Stage3IntegrationTest(unittest.TestCase):
         shared = prompts.workload_digest_block(self.state["workload_spec"], None)
         self.assertIn(shared, request_user)
         self.assertLess(request_user.index(shared), request_user.index("## Stage:"))
-        for expected in ("edit_hardware", "edit_software", "write_conformance(oracle)", "submit_stage(delivery, design_type, unimplemented)"):
+        for expected in ("edit_hardware", "edit_software", "write_conformance(oracle)",
+                         "submit_stage(delivery, design_type, unimplemented, unverified)"):
             self.assertIn(expected, request_user)
-        for expected in ("Untested does not mean unimplemented", "Both draft and complete consume one `--max-iters`",
+        for expected in ("An untested but implemented design is complete, not a draft",
+                         "Never list tests, synthesis, cost, measurements",
+                         "Both draft and complete consume one `--max-iters`",
                          "returns to implementation after simulation without synthesis",
-                         "iteration budget terminates the run", "never falsely claim completeness"):
+                         "iteration budget terminates the run", "Never falsely claim completeness"):
             self.assertIn(expected, request_user)
+        self.assertIn("Verification budget:", request_user)
         self.assertNotIn("FILE_BEGIN", request_user)
         self.assertEqual(update["gates"]["implementation_hw"]["ok"], True)
         self.assertEqual(update["gates"]["implementation_sw"]["ok"], True)
         self.assertEqual(update["implementation_design_type"], "draft")
         self.assertEqual(update["implementation_unimplemented"], ["finish overflow handling"])
+        self.assertEqual(update["implementation_unverified"], ["simulation not run"])
+        self.assertIn("implementation_candidate_epoch", update)
         for name in ("implementation_hw", "implementation_sw"):
             self.assertEqual(update["gates"][name]["design_type"], "draft")
             self.assertEqual(update["gates"][name]["unimplemented"], ["finish overflow handling"])
+            self.assertEqual(update["gates"][name]["unverified"], ["simulation not run"])
             self.assertTrue(update["gates"][name]["candidate_hash"])
         self.assertNotIn("hw_build", update["gates"])
         self.assertNotIn("hw_conformance", update["gates"])

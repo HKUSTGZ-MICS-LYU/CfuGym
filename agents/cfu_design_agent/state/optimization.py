@@ -12,6 +12,8 @@ class Optimization(TypedDict, total=False):
     isa_extension_base: dict[str, Any]
     isa_added_symbols: list[str]
     best_candidate: dict[str, Any]
+    candidate_snapshots: dict[str, dict[str, Any]]
+    optimization_frontier: list[int]
     delivered_round: int
     optimization_plan: dict[str, Any]
     optimization_round: int

@@ -264,7 +264,8 @@ class StageExecutorTest(unittest.TestCase):
         output = executor.execute({}, object(), self._request(stage="implement", tools_enabled=True,
                                   native_tool_loop=True, submit_stage=gate), client=client)
         self.assertEqual(output.result.accepted_submit,
-                         {"delivery": "done", "design_type": "draft", "unimplemented": ["finish ALU"]})
+                         {"delivery": "done", "design_type": "draft",
+                          "unimplemented": ["finish ALU"], "unverified": []})
         self.assertEqual(gate.call_count, 1)
         self.assertEqual(len([e for e in calls["live"] if e["name"] == "read_file"
                               and e["result"].startswith("skipped:")]), 3)
@@ -275,6 +276,20 @@ class StageExecutorTest(unittest.TestCase):
         submit_schema = next(tool for tool in converted if tool["name"] == "submit_stage")
         self.assertEqual(submit_schema["parameters"], params)
 
+    def test_complete_submit_may_declare_unrun_verification_only(self) -> None:
+        client = _RoundClient([
+            ("", [("submit_stage", {"delivery": "done", "design_type": "complete",
+                                    "unverified": ["simulation and synthesis not run"]})]),
+        ])
+        executor, _calls = self._executor()
+        output = executor.execute({}, object(), self._request(stage="implement", tools_enabled=True,
+                                  native_tool_loop=True, submit_stage=mock.Mock(return_value=True)),
+                                  client=client)
+        self.assertEqual(output.result.accepted_submit["design_type"], "complete")
+        self.assertEqual(output.result.accepted_submit["unimplemented"], [])
+        self.assertEqual(output.result.accepted_submit["unverified"],
+                         ["simulation and synthesis not run"])
+
     def test_implement_submit_parameter_validation(self) -> None:
         from agents.cfu_design_agent.runtime.stage_executor import implementation_submit_error
         for args in ({}, {"design_type": "bogus"}, {"design_type": "draft"},
@@ -282,12 +297,18 @@ class StageExecutorTest(unittest.TestCase):
                      {"design_type": "complete", "unimplemented": "none"},
                      {"design_type": "complete", "unimplemented": ["unfinished"]},
                      {"design_type": "complete", "unimplemented": [1]},
+                     {"design_type": "complete", "unverified": "none"},
+                     {"design_type": "complete", "unverified": [""]},
+                     {"design_type": "complete", "unverified": [1]},
                      {"design_type": "complete", "extra": True},
                      {"design_type": ["complete"]}):
             with self.subTest(args=args):
                 self.assertTrue(implementation_submit_error(args))
         for args in ({"design_type": "complete"}, {"design_type": "complete", "unimplemented": []},
-                     {"design_type": "draft", "unimplemented": ["unfinished"]}):
+                     {"design_type": "complete", "unverified": ["simulation not run"]},
+                     {"design_type": "draft", "unimplemented": ["unfinished"]},
+                     {"design_type": "draft", "unimplemented": ["unfinished"],
+                      "unverified": ["synthesis not run"]}):
             self.assertEqual(implementation_submit_error(args), "")
 
     def test_native_graph_interleaves_tools_and_gates_explicit_submission(self) -> None:

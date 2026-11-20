@@ -13,7 +13,7 @@ from .runtime.llm import (
     DEFAULT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_MAX_TOOL_RETRIES, OpenAiTextClient,
 )
 from .runtime.llm_config import LlmConfigError, effective_config, list_configs
-from .flow import optimize as flow_optimize
+from .flow import evaluations, optimize as flow_optimize
 from .runtime import cost_budget, provenance, ppa, vivado
 from .stages.review import report as report_mod
 from .state import CfuDesignState
@@ -249,10 +249,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--loop-policy", choices=("explore", "conservative"), default="explore",
                         help="Explore reconsiders a stop once and allows append-only ISA extensions (default).")
+    parser.add_argument("--loop-objective", choices=("performance", "cost", "balanced", "pareto"),
+                         default="performance", help="Delivery preference on the validated Pareto frontier: fastest (default), smallest, area-delay product, or strict incumbent dominance.")
+    parser.add_argument("--loop-parent", choices=("incumbent", "current"), default="incumbent",
+                         help="Default next-round starting point: selected incumbent (default) or current experiment; planner may explicitly choose a retained candidate.")
     parser.add_argument("--loop-patience", type=int, default=3,
                         help="Stop after this many consecutive non-improving measured optimization rounds (default: 3).")
     parser.add_argument("--max-evals", type=int, default=0,
-                        help="Maximum measured evaluation reports including the baseline (0: bounded only by --max-iters).")
+                        help="Maximum candidate sim/cost evaluation attempts, including baseline and failures; each pair counts once (0: bounded only by --max-iters).")
     parser.add_argument(
         "--stream-llm",
         dest="stream_llm",
@@ -391,6 +395,8 @@ def main(argv: list[str] | None = None) -> int:
         "isa_contract": not args.no_isa_contract,
         "loop_optimize": args.loop_optimize,
         "loop_policy": args.loop_policy,
+        "loop_objective": args.loop_objective,
+        "loop_parent": args.loop_parent,
         "loop_patience": max(1, args.loop_patience),
         "max_evals": args.max_evals,
         "stream_llm": args.stream_llm,
@@ -581,9 +587,12 @@ def _print_run_summary(final_state: CfuDesignState) -> None:
     _print_token_usage(final_state)
     rounds = final_state.get("optimization_rounds") or []
     if len(rounds) > 1 or final_state.get("loop_optimize"):
-        best = next((item for item in reversed(rounds) if item.get("improved")), None)
+        best = flow_optimize.select_round(rounds, str(final_state.get("loop_objective") or "pareto"))
         best_round = (best or {}).get("round")
         final_round = rounds[-1].get("round") if rounds else None
+        print(f"  evaluations   = {evaluations.used(final_state)}/{final_state.get('max_evals') or 'unlimited'}")
+        print(f"  loop_objective= {final_state.get('loop_objective', 'pareto')}")
+        print(f"  pareto_rounds = {final_state.get('optimization_frontier', [])}")
         print("  loop:")
         for index, entry in enumerate(rounds):
             marker = ""

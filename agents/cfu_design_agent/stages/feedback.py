@@ -388,7 +388,7 @@ def _isa_shape_note(isa_spec: dict) -> str:
     if not isinstance(isa_spec, dict):
         return "note: the response did not parse as a mapping"
     keys = ", ".join(str(key) for key in isa_spec.keys()) or "(none)"
-    return (
+    return "" if all(key in isa_spec for key in isa.CONTRACT_KEYS) else (
         f"note: the parser read these top-level keys from the response: {keys}. "
         "The contract must BE the top-level object with keys spec_version, identity, "
         "commands, operations_contract, state, memory, datapath, software, integration, "
@@ -778,10 +778,19 @@ def optimization_directive(state: CfuDesignState) -> str:
         "cost": "reduce the synthesized CFU cost (area) without losing performance",
         "performance": "raise the measured speedup without growing the hardware",
     }.get(focus, "improve the measured result")
+    objective = state.get("loop_objective", "pareto")
+    if objective != "pareto":
+        goal = {"performance": "maximize measured speedup within the cost wall",
+                "cost": "minimize measured area while passing the speedup floor",
+                "balanced": "minimize area-delay product while keeping every gate passing"}.get(objective, goal)
     return (
         f"Round {plan.get('round', '?')} focus: {goal}.\n"
-        f"Current validated result: {optimize.optimization_score(state)}\n"
+        f"Parent source round: {plan.get('parent_round', 'current')}.\n"
+        f"Current validated result: {plan.get('score') or optimize.optimization_score(state)}\n"
         f"Planner's reason: {plan.get('reason', '')}\n"
+        + ("Testable hypothesis (predictions, not measured evidence): "
+           + json.dumps(plan["hypothesis"], ensure_ascii=True) + "\n" if plan.get("hypothesis") else "")
+        +
         "Change one thing and keep everything the software already relies on: the ISA "
         "contract is frozen for this implementation attempt; only the extend_isa node "
         "may append commands before hardware/software implementation. Do not alter the "

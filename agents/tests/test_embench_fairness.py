@@ -156,8 +156,12 @@ class FairnessTransportTest(unittest.TestCase):
             self.assertTrue(result["gates"][rung]["ok"])
             self.assertNotIn("measurement_protocol", result["gates"][rung])
             self.assertNotIn("benchmark_integrity", result["gates"][rung])
+        design_keys = {"implementation_design_type", "implementation_unimplemented",
+                       "implementation_unverified"}
         for call in artifact.call_args_list:
-            self.assertEqual(call.kwargs["evidence"], {})
+            evidence = call.kwargs["evidence"]
+            self.assertEqual({key: value for key, value in evidence.items()
+                              if key not in design_keys}, {})
 
     def test_profile_rejects_before_cache_or_commands(self):
         with self.validator(["legacy metadata; start a new run"]), \

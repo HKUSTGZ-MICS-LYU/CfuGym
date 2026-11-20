@@ -10,6 +10,7 @@ CFU contract, simulation or QoR gate passed.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import Any, Callable, Protocol, TypedDict
 
 from .agent_tools import ReadOnlyToolset
@@ -88,6 +89,15 @@ class StageExecutionRequest:
     # not a production-ready resumable Stage 3 implementation.
     stage_checkpointer: Any = None
     stage_thread_id: str = ""
+    # Submission remains an executor-owned gate, separate from repository tools.
+    submit_tool_name: str = "submit_stage"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.submit_tool_name, str) or re.fullmatch(
+            r"[A-Za-z0-9_-]{1,64}", self.submit_tool_name
+        ) is None:
+            raise ValueError("submit_tool_name must be a nonempty function token "
+                             "(1-64 ASCII letters, digits, underscores or hyphens)")
 
 
 @dataclass(frozen=True)
@@ -149,7 +159,7 @@ class StageExecutor:
             return StageExecutionResult(result=result, raw_output=raw_output)
 
         if request.native_tool_loop and request.submit_stage is None:
-            raise ValueError("native tool loop requires an independent submit_stage gate")
+            raise ValueError(f"native tool loop requires an independent {request.submit_tool_name} gate")
         toolset = _RunDirView(
             self._toolset_factory(
                 toolbox,
@@ -281,7 +291,7 @@ class _LoopState(TypedDict, total=False):
     delivery: str
     accepted_submit: dict[str, Any] | None
     empty_turns: int
-    # explore -> repair (bounded) -> finalize (submit_stage only).
+    # explore -> repair (bounded) -> finalize (submission tool only).
     phase: str
     finalize_only: bool
     repair_turns_remaining: int
@@ -317,11 +327,11 @@ def _submit_verdict(
     return bool(verdict), "" if verdict else "the stage gate rejected the delivery without a reason"
 
 
-def implementation_submit_error(args: dict[str, Any]) -> str:
+def implementation_submit_error(args: dict[str, Any], *, submit_tool_name: str = "submit_stage") -> str:
     """Validate the model declaration independently of provider-side schemas."""
-    unknown = set(args) - {"delivery", "design_type", "unimplemented"}
+    unknown = set(args) - {"delivery", "design_type", "unimplemented", "unverified"}
     if unknown:
-        return "submit_stage contains unknown fields: " + ", ".join(sorted(map(str, unknown)))
+        return f"{submit_tool_name} contains unknown fields: " + ", ".join(sorted(map(str, unknown)))
     design_type = args.get("design_type")
     if not isinstance(design_type, str) or design_type not in ("complete", "draft"):
         return "design_type must be explicitly 'complete' or 'draft'"
@@ -330,10 +340,15 @@ def implementation_submit_error(args: dict[str, Any]) -> str:
         not isinstance(item, str) or not item.strip() for item in unimplemented
     ):
         return "unimplemented must be a list of nonempty strings"
+    unverified = args.get("unverified", [])
+    if not isinstance(unverified, list) or any(
+        not isinstance(item, str) or not item.strip() for item in unverified
+    ):
+        return "unverified must be a list of nonempty strings"
     if design_type == "draft" and not unimplemented:
-        return "draft requires a nonempty unimplemented list"
+        return "draft requires a nonempty unimplemented list naming missing behavior"
     if design_type == "complete" and unimplemented:
-        return "complete cannot declare unimplemented work; use draft"
+        return "complete cannot declare unimplemented behavior; use draft"
     return ""
 
 
@@ -356,14 +371,15 @@ def _native_stage_loop(
             callable(getattr(client, "model_round", None))
             or callable(getattr(client, "_chat_round", None))):
         raise failures.StageToolsUnavailable("native loop needs an available single-round model client")
+    submit_name = request.submit_tool_name
     schemas = toolset.schemas()
     permitted = {str(item.get("function", {}).get("name", "")) for item in schemas}
-    if "submit_stage" in permitted:
-        raise ValueError("submit_stage is reserved for the independent stage gate")
+    if submit_name in permitted:
+        raise ValueError(f"{submit_name} is reserved for the independent stage gate")
     if not schemas or not all(name for name in permitted):
         raise ValueError("native stage tool schemas must have explicit names")
     offered = schemas + [{"type": "function", "function": {
-        "name": "submit_stage",
+        "name": submit_name,
         "description": (
             "Finish this stage once the work is already applied: edits go through the "
             "editing tools, and this argument is a short summary of the change, the "
@@ -378,9 +394,15 @@ def _native_stage_loop(
         parameters = offered[-1]["function"]["parameters"]
         parameters["properties"].update({
             "design_type": {"type": "string", "enum": ["complete", "draft"],
-                            "description": "Whether the implementation is complete or a draft."},
+                            "description": ("complete when all required behavior is implemented; "
+                                            "draft only when known behavior is missing or wrong.")},
             "unimplemented": {"type": "array", "items": {"type": "string"},
-                              "description": "Specific unfinished work; required and nonempty for draft."},
+                              "description": ("Required behavior that is missing or known wrong. "
+                                              "Required and nonempty for draft; never list tests or "
+                                              "unrun verification here.")},
+            "unverified": {"type": "array", "items": {"type": "string"},
+                           "description": ("Checks you have not run: tests, simulation, synthesis, "
+                                           "cost or measurements. These are not implementation gaps.")},
         })
         parameters["required"].append("design_type")
         parameters["additionalProperties"] = False
@@ -439,7 +461,7 @@ def _native_stage_loop(
         messages = list(s["messages"])
         if finalize_only:
             messages.append({"role": "user", "content": (
-                "Finalize this stage now. Only submit_stage is available: call it with "
+                f"Finalize this stage now. Only {submit_name} is available: call it with "
                 "a factual summary of changes actually applied, evidence actually run, "
                 "and remaining unknowns. Do not claim unapplied work or call other tools."
             )})
@@ -447,14 +469,14 @@ def _native_stage_loop(
             messages.append({"role": "user", "content": (
                 f"A tool call or submission failed. Apply and check the needed "
                 f"correction now; {repair_remaining} bounded repair model turn(s) remain, "
-                "after which only submit_stage will be available."
+                f"after which only {submit_name} will be available."
             )})
         elif s["tool_rounds"] == round_limit - 1:
             # Warn while tools remain, but do not rely on a reminder alone to
             # protect the final submission turn.
             messages.append({"role": "user", "content": (
                 "This is your last tool round. Make any remaining changes with the "
-                "offered tools now; after this round only submit_stage is available."
+                f"offered tools now; after this round only {submit_name} is available."
             )})
         round_ = round_fn(
             sdk, source_visibility.mask_model_payload(messages), allow_tools=True, tools=tools,
@@ -488,7 +510,7 @@ def _native_stage_loop(
         }
 
     def route_decide(s: _LoopState) -> str:
-        if any(call["name"] == "submit_stage" for call in s["calls"]):
+        if any(call["name"] == submit_name for call in s["calls"]):
             return "final_deliver"
         if s["calls"]:
             return "guarded_tools"
@@ -511,14 +533,14 @@ def _native_stage_loop(
             elif call.get("error"):
                 observation, ok = call["error"], False
             elif s.get("finalize_only", False):
-                observation, ok = "skipped: finalization phase only allows submit_stage", False
+                observation, ok = f"skipped: finalization phase only allows {submit_name}", False
             elif name not in permitted:
                 observation, ok = "denied by access policy: tool not offered for this stage", False
             elif index >= per_round or (
                 not correction
                 and (s["tool_rounds"] >= round_limit or (total_limit and used >= total_limit))
             ):
-                observation, ok = "skipped: tool-call budget reached; submit the stage instead", False
+                observation, ok = f"skipped: tool-call budget reached; call {submit_name} instead", False
             else:
                 try:
                     observation = toolset.run(name, arguments)
@@ -580,46 +602,46 @@ def _native_stage_loop(
         # submit-only retry; never mistake a final paragraph for acceptance.
         max_empty_turns = 1 if s.get("finalize_only", False) else 2
         if s["empty_turns"] >= max_empty_turns:
-            raise failures.StageDeliveryFailure("model did not call submit_stage", terminal_reason="delivery_missing")
+            raise failures.StageDeliveryFailure(f"model did not call {submit_name}", terminal_reason="delivery_missing")
         messages = list(s["messages"])
         messages.append(assistant_text_message(s))
         if s.get("finalize_only", False):
             reminder = (
-                "No stage was submitted. Only submit_stage is available; call it now "
+                f"No stage was submitted. Only {submit_name} is available; call it now "
                 "with a factual delivery. Prose alone cannot pass."
             )
         elif s.get("phase") == "repair" and s.get("repair_turns_remaining", 0) == 0:
             reminder = (
                 "No corrective tool was called. The repair window is over; next only "
-                "submit_stage will be available. Submit a factual delivery."
+                f"{submit_name} will be available. Submit a factual delivery."
             )
         else:
             reminder = (
                 "No stage was submitted. Call an authorized tool or continue working; "
-                "when ready, call submit_stage. Prose alone cannot pass."
+                f"when ready, call {submit_name}. Prose alone cannot pass."
             )
         messages.append({"role": "user", "content": reminder})
         return {"messages": messages, "empty_turns": s["empty_turns"] + 1}
 
     def final_deliver(s: _LoopState) -> dict[str, Any]:
-        submits = [call for call in s["calls"] if call["name"] == "submit_stage"]
-        companions = [call for call in s["calls"] if call["name"] != "submit_stage"]
+        submits = [call for call in s["calls"] if call["name"] == submit_name]
+        companions = [call for call in s["calls"] if call["name"] != submit_name]
         args = _parse_tool_arguments(submits[0]["arguments"])
         delivery = args.get("delivery")
         reason = ""
         if len(submits) != 1:
-            reason = "the final batch needs exactly one submit_stage call"
+            reason = f"the final batch needs exactly one {submit_name} call"
         elif submits[0].get("error"):
             reason = submits[0]["error"]
         elif not isinstance(delivery, str) or not delivery.strip():
-            reason = "empty submit_stage delivery: provide a nonempty delivery string"
+            reason = f"empty {submit_name} delivery: provide a nonempty delivery string"
         elif request.stage == "implement":
-            reason = implementation_submit_error(args)
+            reason = implementation_submit_error(args, submit_tool_name=submit_name)
         # Never apply companions of an ambiguous/malformed submission.
         if reason:
             entries, tool_messages, used, retries = [], [], s["total_calls"], s["tool_retries"]
             for call in companions:
-                observation = "skipped: fix the malformed submit_stage call first"
+                observation = f"skipped: fix the malformed {submit_name} call first"
                 entry = {"round": s["tool_rounds"] + 1, "name": call["name"],
                          "arguments": _parse_tool_arguments(call["arguments"]), "result": observation, "ok": False}
                 entries.append(entry)
@@ -643,7 +665,7 @@ def _native_stage_loop(
         if not accepted and retries == s["tool_retries"]:
             observation, retries, exhausted = llm_mod.tool_failure_feedback(observation, retries, retry_limit)
         for submit in submits:
-            entry = {"round": s["tool_rounds"] + 1, "name": "submit_stage",
+            entry = {"round": s["tool_rounds"] + 1, "name": submit_name,
                      "arguments": _parse_tool_arguments(submit["arguments"]),
                      "result": observation, "ok": accepted}
             entries.append(entry)
@@ -661,7 +683,8 @@ def _native_stage_loop(
                     "phase": "repair", "repair_turns_remaining": correction_turn_limit,
                     "finalize_only": False, "empty_turns": 0}
         declaration = ({"delivery": delivery, "design_type": args["design_type"],
-                        "unimplemented": list(args.get("unimplemented", []))}
+                        "unimplemented": list(args.get("unimplemented", [])),
+                        "unverified": list(args.get("unverified", []))}
                        if request.stage == "implement" else None)
         return {"delivery": delivery, "accepted_submit": declaration,
                 "delivered": True, "transcript": transcript,
@@ -693,7 +716,7 @@ def _native_stage_loop(
                "configurable": {"thread_id": request.stage_thread_id}}
     )
     if not result["delivered"]:
-        raise failures.StageDeliveryFailure("no accepted submit_stage delivery", terminal_reason="delivery_missing")
+        raise failures.StageDeliveryFailure(f"no accepted {submit_name} delivery", terminal_reason="delivery_missing")
     last = result["round_data"]
     final_result = clean_llm_text(LlmResult(
         result["delivery"], used_llm=True,

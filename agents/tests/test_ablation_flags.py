@@ -103,8 +103,9 @@ class ContractShortCircuitTest(unittest.TestCase):
         with mock.patch.object(contract_mod, "_isa_step") as step, \
                 mock.patch.object(contract_mod.llm_step, "_llm", lambda state: None), \
                 mock.patch.object(contract_mod.llm_step, "_tools_enabled", lambda state, client: False), \
-                mock.patch.object(stage_services, "_write_isa_artifact"):
-            step.return_value = (mock.Mock(text="ABSTAIN", used_llm=True), "raw")
+                mock.patch.object(stage_services, "_write_isa_artifact"), \
+                mock.patch.object(stage_services, "_artifacts_for_stage"):
+            step.return_value = (mock.Mock(text="ABSTAIN", used_llm=True), "raw", {})
             update = contract_mod.design_contract(state)
         step.assert_called_once()
         self.assertIsNone(update["gates"]["isa"].get("disabled"))
